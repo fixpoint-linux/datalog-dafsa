@@ -1,0 +1,16 @@
+# build artifacts
+build-tmp/
+*.o
+*.so
+*.a
+
+# binaries
+/dl
+/tests/test_m0
+/tests/test_m1
+/tests/test_m2
+/tests/test_m3
+/tests/test_review_adversarial
+
+# scratch db dirs
+dl-test-*/
