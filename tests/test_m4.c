@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <sys/stat.h>
 
 static int tests_run = 0;
 static int tests_failed = 0;
@@ -713,6 +714,73 @@ static void test_aggregate_carryover(void)
     PASS();
 }
 
+/* ─── Test 8: orphaned snapshot dir cleanup ───────────────────────────── */
+
+static void test_orphan_cleanup(void)
+{
+    dl_db *db;
+    tuple_set ts;
+    char dir[320];
+    char orphan[352];
+    char junk[416];
+
+    TEST("orphan cleanup: stale snapshots/N/ doesn't block next publish");
+
+    setup_db(&db, "orphan");
+
+    /* Publish v1: 2 facts */
+    {
+        uint32_t e[] = {1,2, 2,3};
+        load_rows_csv(db, "edge", 2, e, 2);
+    }
+    assert(dl_publish_snapshot(db) == 0);
+
+    /* Simulate a prior crash *after* rename but *before* the CURRENT flip:
+     * the fully-populated snapshots/2/ dir was left orphaned (its cleanup
+     * never ran because the process died).  Make it non-empty so a plain
+     * rename() into it would hit ENOTEMPTY. */
+    snprintf(dir, sizeof(dir), "build-tmp/m4db_orphan/snapshots");
+    snprintf(orphan, sizeof(orphan), "%s/2", dir);
+    assert(mkdir(orphan, 0755) == 0);
+    snprintf(junk, sizeof(junk), "%s/leftover.bin", orphan);
+    {
+        FILE *f = fopen(junk, "w");
+        assert(f);
+        fprintf(f, "orphaned from a failed CURRENT flip\n");
+        fclose(f);
+    }
+
+    /* Load more facts so the next publish advances to v2 (fixpoint_dirty). */
+    {
+        uint32_t e[] = {3,4};
+        load_rows_csv(db, "edge", 2, e, 1);
+    }
+
+    /* Publish v2: must succeed by first cleaning up the orphaned snapshots/2/.
+     * Before the fix, rename(2.tmp, 2) fails with ENOTEMPTY and publish -1. */
+    assert(dl_publish_snapshot(db) == 0);
+
+    memset(&ts, 0, sizeof(ts));
+    dl_query(db, "edge", tset_cb, &ts);
+    assert(ts.count == 3);  /* v2 has all 3 facts */
+    tset_free(&ts);
+
+    /* A subsequent publish must also succeed (no lingering orphan). */
+    {
+        uint32_t e[] = {4,5};
+        load_rows_csv(db, "edge", 2, e, 1);
+    }
+    assert(dl_publish_snapshot(db) == 0);
+
+    memset(&ts, 0, sizeof(ts));
+    dl_query(db, "edge", tset_cb, &ts);
+    assert(ts.count == 4);
+    tset_free(&ts);
+
+    teardown_db(db, "orphan");
+    PASS();
+}
+
 /* ─── Main ────────────────────────────────────────────────────────────── */
 
 int main(void)
@@ -727,6 +795,7 @@ int main(void)
     test_republish();
     test_m0_m3_regression();
     test_aggregate_carryover();
+    test_orphan_cleanup();
 
     printf("\n---\n");
     printf("%d tests run, %d failed\n", tests_run, tests_failed);

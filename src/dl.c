@@ -25,6 +25,7 @@
 #include <sys/types.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <ftw.h>
 
 /* ─── dl_db struct ────────────────────────────────────────────────────── */
 
@@ -638,13 +639,21 @@ static int atomic_write_str(const char *path, const char *content)
 }
 
 /* Best-effort recursive removal of a directory (for crash cleanup).
- * Uses system() because we don't have nftw in C11.  Path is
- * constructed by us — no shell injection risk. */
+ * Uses nftw() — no shell, so no injection risk from caller-controlled
+ * paths (which may contain quotes or spaces). */
+static int rm_rf_cb(const char *path, const struct stat *st, int typeflag,
+                    struct FTW *ftw)
+{
+    (void)st;
+    (void)ftw;
+    return (typeflag == FTW_D || typeflag == FTW_DP)
+               ? rmdir(path)
+               : unlink(path);
+}
+
 static void rm_rf(const char *path)
 {
-    char cmd[8192];
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", path);
-    (void)system(cmd);
+    (void)nftw(path, rm_rf_cb, 64, FTW_DEPTH | FTW_PHYS);
 }
 
 int dl_publish_snapshot(dl_db *db)
@@ -656,6 +665,7 @@ int dl_publish_snapshot(dl_db *db)
     char buf[4096];
     uint32_t new_version;
     size_t i;
+    int renamed = 0;  /* set once step 5 (rename) succeeds */
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wformat-truncation"
@@ -740,7 +750,13 @@ int dl_publish_snapshot(dl_db *db)
     snprintf(new_dir, sizeof(new_dir),
              "%s/snapshots/%u", db->dir, new_version);
 
+    /* Clean up a stale orphan from a prior crash between rename and the
+     * CURRENT flip.  new_version > snap_version, so any existing dir here
+     * is uncommitted garbage, not a valid snapshot. */
+    rm_rf(new_dir);
+
     if (rename(tmp_dir, new_dir) != 0) goto fail;
+    renamed = 1;
     if (fsync_dir_path(snapshots_dir) != 0) goto fail;
 
     /* FAULT HOOK: after rename (before CURRENT flip) */
@@ -768,6 +784,9 @@ int dl_publish_snapshot(dl_db *db)
 fail:
     /* Best-effort cleanup of .tmp dir */
     rm_rf(tmp_dir);
+    /* If the rename already happened but a later step (e.g. the CURRENT
+     * flip) failed, tmp_dir no longer exists — clean up new_dir instead. */
+    if (renamed) rm_rf(new_dir);
 #pragma GCC diagnostic pop
     return -1;
 }
