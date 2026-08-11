@@ -127,7 +127,7 @@ Tasks:
 **Goal:** full load → declare → compile → publish-snapshot → serve-reads lifecycle.
 
 Tasks:
-1. `snapshot.c`: `dl_publish_snapshot` — run fixpoint once, write materialized goal relations + permutation indices to disk atomically (tmp+fsync+rename+dir fsync, same as `dafsa_save`).
+1. `snapshot.c`: `dl_publish_snapshot` — run fixpoint once, write materialized goal relations to disk atomically (versioned dirs + CURRENT pointer flip, tmp+fsync+rename+dir fsync, same pattern as `dafsa_save`). Permutation indices deferred to M6 (matches architecture §86/§320/§322-324).
 2. mmap read-only views; hot-relation view cache (`dl_query` opens RO mmap per query).
 3. `dl_open`/`dl_query` read path.
 
