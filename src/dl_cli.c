@@ -17,6 +17,7 @@
 
 #include "dl.h"
 #include "intern.h"
+#include "snapshot.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -97,9 +98,11 @@ static void usage(const char *prog)
         "  %s [-d <dir>] load <csv> --rel <name>\n"
         "  %s [-d <dir>] lookup <rel> <val> [<val> ...]\n"
         "  %s [-d <dir>] prefix <rel> [<val> ...]\n"
-        "  %s [-d <dir>] query '<rule>' | <file.dl>\n"
+        "  %s [-d <dir>] query '<rule>' | <file.dl> <goal-rel>\n"
+        "  %s [-d <dir>] publish\n"
+        "  %s [-d <dir>] bound <rel> <val> [<val> ...]\n"
         "Values: bare integer -> raw u32; anything else -> interned string\n",
-        prog, prog, prog, prog);
+        prog, prog, prog, prog, prog, prog);
     exit(1);
 }
 
@@ -255,16 +258,20 @@ int main(int argc, char **argv)
 
     } else if (strcmp(cmd, "query") == 0) {
         const char *source;
+        const char *goal_rel;
         char *source_buf = NULL;
+        long n;
 
         if (argp >= argc) usage(argv[0]);
         source = argv[argp++];
+
+        if (argp >= argc) usage(argv[0]);
+        goal_rel = argv[argp++];
 
         /* Check if source is a file path */
         {
             FILE *f = fopen(source, "r");
             if (f) {
-                /* Read entire file into a buffer */
                 fseek(f, 0, SEEK_END);
                 long sz = ftell(f);
                 fseek(f, 0, SEEK_SET);
@@ -288,13 +295,56 @@ int main(int argc, char **argv)
         }
         free(source_buf);
 
-        if (dl_compile(db) != 0) {
-            fprintf(stderr, "dl: rule evaluation failed\n");
+        /* Publish (runs VM automatically if fixpoint_dirty), then query */
+        if (dl_publish_snapshot(db) != 0) {
+            fprintf(stderr, "dl: publish failed\n");
             dl_close(db);
             return 1;
         }
 
-        printf("Rules compiled and evaluated.\n");
+        n = dl_query(db, goal_rel, print_tuple, db);
+        if (n < 0) {
+            fprintf(stderr, "dl: query failed\n");
+            dl_close(db);
+            return 1;
+        }
+        if (n == 0)
+            printf("(no results)\n");
+
+    } else if (strcmp(cmd, "publish") == 0) {
+        if (dl_publish_snapshot(db) != 0) {
+            fprintf(stderr, "dl: publish failed\n");
+            dl_close(db);
+            return 1;
+        }
+        printf("Snapshot published.\n");
+
+    } else if (strcmp(cmd, "bound") == 0) {
+        const char *rel_name;
+        uint32_t leading[8];
+        uint8_t k;
+
+        if (argp >= argc) usage(argv[0]);
+        rel_name = argv[argp++];
+
+        k = 0;
+        while (argp < argc && k < 8) {
+            leading[k] = cli_parse_value(db, argv[argp]);
+            k++;
+            argp++;
+        }
+
+        {
+            long n = dl_query_bound(db, rel_name, leading, k,
+                                    print_tuple, db);
+            if (n < 0) {
+                fprintf(stderr, "dl: bound query failed\n");
+                dl_close(db);
+                return 1;
+            }
+            if (n == 0)
+                printf("(no results)\n");
+        }
 
     } else {
         usage(argv[0]);

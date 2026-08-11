@@ -27,6 +27,7 @@ LIB_OBJS = src/intern.o \
            src/parser.o \
            src/compiler.o \
            src/vm.o \
+           src/snapshot.o \
            src/dl.o
 
 # Combined object list used for static links (tests, CLI).
@@ -76,10 +77,13 @@ tests/test_m2: tests/test_m2.c $(ALL_OBJS)
 tests/test_m3: tests/test_m3.c $(ALL_OBJS)
 	$(CC) $(CFLAGS) $(INC) -static -o $@ tests/test_m3.c $(ALL_OBJS)
 
+tests/test_m4: tests/test_m4.c $(ALL_OBJS)
+	$(CC) $(CFLAGS) $(INC) -static -o $@ tests/test_m4.c $(ALL_OBJS)
+
 tests/test_review_adversarial: tests/test_review_adversarial.c $(ALL_OBJS)
 	$(CC) $(CFLAGS) $(INC) -static -o $@ tests/test_review_adversarial.c $(ALL_OBJS)
 
-test: tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 dl build-tmp
+test: tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4 dl build-tmp
 	@echo "=== Running M0 unit tests ==="
 	LD_LIBRARY_PATH=. ./tests/test_m0
 	@echo ""
@@ -91,6 +95,9 @@ test: tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 dl build-tmp
 	@echo ""
 	@echo "=== Running M3 unit tests ==="
 	LD_LIBRARY_PATH=. ./tests/test_m3
+	@echo ""
+	@echo "=== Running M4 unit tests ==="
+	LD_LIBRARY_PATH=. ./tests/test_m4
 	@echo ""
 	@echo "=== Running CLI smoke test ==="
 	@sh tests/smoke.sh
@@ -108,5 +115,5 @@ test-m2: tests/test_m2 dl build-tmp
 clean:
 	rm -f vendor/*.o src/*.o
 	rm -f libdatalog.so dl
-	rm -f tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3
+	rm -f tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4
 	rm -rf /tmp/dl-test-db build-tmp/smoke build-tmp/m1

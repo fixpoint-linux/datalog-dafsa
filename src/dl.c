@@ -15,6 +15,7 @@
 #include "parser.h"
 #include "compiler.h"
 #include "vm.h"
+#include "snapshot.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -22,6 +23,8 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 /* ─── dl_db struct ────────────────────────────────────────────────────── */
 
@@ -41,6 +44,14 @@ struct dl_db {
     /* M1: compiled rules */
     compiled_rule **crules;
     int             n_crules;
+
+    /* M4: snapshot support */
+    int              fixpoint_dirty;  /* 1 if rules loaded / facts changed
+                                         since last compile/publish */
+    uint32_t         snap_version;    /* current snapshot version, 0=none */
+    view_cache_slot  vcache[DL_VIEW_CACHE_SZ];
+    int            (*fault_hook)(dl_fpoint, void *);
+    void            *fault_user;
 };
 
 /* ─── Internal helpers ────────────────────────────────────────────────── */
@@ -90,6 +101,13 @@ dl_db *dl_open(const char *dir)
     db->dir = strdup(dir);
     if (!db->dir) { free(db); return NULL; }
 
+    /* M4: set initial snapshot state */
+    db->fixpoint_dirty = 0;
+    db->snap_version   = 0;
+    memset(db->vcache, 0, sizeof(db->vcache));
+    db->fault_hook = NULL;
+    db->fault_user = NULL;
+
     /* Load or create interner */
     {
         char *fwd_path = make_path(db, "symbols", ".dafsa");
@@ -132,6 +150,10 @@ dl_db *dl_open(const char *dir)
         free(rels_path);
     }
 
+    /* M4: detect existing snapshot and fixpoint state */
+    db->snap_version = snapshot_read_current(db->dir);
+    db->fixpoint_dirty = (db->n_crules > 0) ? 1 : 0;
+
     return db;
 }
 
@@ -139,6 +161,9 @@ void dl_close(dl_db *db)
 {
     size_t i;
     if (!db) return;
+
+    /* M4: close all cached snapshot views */
+    vcache_invalidate(db->vcache);
 
     /* Save interner */
     {
@@ -388,6 +413,9 @@ int dl_load_facts(dl_db *db, const char *rel_name, const char *csv_path)
         }
     }
 
+    /* M4: facts changed, mark fixpoint dirty */
+    db->fixpoint_dirty = 1;
+
     return loaded;
 }
 
@@ -471,6 +499,9 @@ int dl_load_rules(dl_db *db, const char *dl_source)
         db->n_crules = new_total;
     }
 
+    /* M4: new rules loaded, mark fixpoint dirty */
+    db->fixpoint_dirty = 1;
+
     /* Clean up parser AST */
     {
         int i;
@@ -486,22 +517,32 @@ int dl_compile(dl_db *db)
 {
     if (!db) return -1;
     if (db->n_crules == 0) return 0; /* nothing to compile */
-    return vm_execute(db, db->crules, db->n_crules);
+
+    if (vm_execute(db, db->crules, db->n_crules) != 0)
+        return -1;
+
+    /* M4: compilation successful, fixpoint is now clean */
+    db->fixpoint_dirty = 0;
+    return 0;
 }
 
 long dl_query(dl_db *db, const char *goal_rel, dl_tuple_cb cb, void *user)
 {
-    int ret;
-
     if (!db) return -1;
 
-    /* Compile and run rules if any are loaded */
-    if (db->n_crules > 0) {
-        ret = vm_execute(db, db->crules, db->n_crules);
-        if (ret != 0) return -1;
+    /* M4 snapshot path: if we have a published snapshot, read from mmap */
+    if (db->snap_version > 0 && goal_rel && cb) {
+        return snapshot_query_scan(db->dir, db->snap_version,
+                                   db->vcache,
+                                   goal_rel, NULL, 0, cb, user);
     }
 
-    /* Stream the goal relation */
+    /* Legacy M3 path: compile and run rules, then stream in-memory */
+    if (db->n_crules > 0) {
+        if (vm_execute(db, db->crules, db->n_crules) != 0)
+            return -1;
+    }
+
     if (goal_rel && cb) {
         int idx = find_rel(db, goal_rel);
         if (idx < 0) return -1;
@@ -509,4 +550,235 @@ long dl_query(dl_db *db, const char *goal_rel, dl_tuple_cb cb, void *user)
     }
 
     return 0;
+}
+
+/* ─── M4: bound query ──────────────────────────────────────────────────── */
+
+long dl_query_bound(dl_db *db, const char *goal_rel,
+                    const uint32_t *leading, uint8_t k,
+                    dl_tuple_cb cb, void *user)
+{
+    if (!db) return -1;
+
+    /* Snapshot path */
+    if (db->snap_version > 0 && goal_rel && cb) {
+        return snapshot_query_scan(db->dir, db->snap_version,
+                                   db->vcache,
+                                   goal_rel, leading, k, cb, user);
+    }
+
+    /* Legacy path */
+    {
+        int idx = find_rel(db, goal_rel);
+        if (idx < 0) return -1;
+        return rel_prefix(db->rels[idx].rel, leading, k, cb, user);
+    }
+}
+
+/* ─── M4: snapshot publish ─────────────────────────────────────────────── */
+
+/* fsync helpers (mirror dafsa_persist.c) */
+static int fsync_dir_of_path(const char *path)
+{
+    const char *slash = strrchr(path, '/');
+    char *dir;
+    int fd, ret = -1;
+
+    if (!slash)
+        slash = path;  /* shouldn't happen */
+    if (slash == path) {
+        /* path is "/foo" */
+        fd = open("/", O_RDONLY | O_DIRECTORY);
+        if (fd >= 0) { ret = fsync(fd); close(fd); }
+        return ret;
+    }
+    dir = strndup(path, (size_t)(slash - path));
+    if (!dir) return -1;
+    fd = open(dir, O_RDONLY | O_DIRECTORY);
+    if (fd >= 0) { ret = fsync(fd); close(fd); }
+    free(dir);
+    return ret;
+}
+
+static int fsync_dir_path(const char *dirpath)
+{
+    int fd = open(dirpath, O_RDONLY | O_DIRECTORY);
+    int ret = -1;
+    if (fd >= 0) { ret = fsync(fd); close(fd); }
+    return ret;
+}
+
+/* Write a string to a file with atomic rename (tmp+fsync+rename+dir-fsync) */
+static int atomic_write_str(const char *path, const char *content)
+{
+    char tmp[8192];
+    int fd;
+    size_t len = strlen(content);
+    size_t off = 0;
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+#pragma GCC diagnostic pop
+    fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return -1;
+
+    while (off < len) {
+        ssize_t w = write(fd, content + off, len - off);
+        if (w < 0) { close(fd); remove(tmp); return -1; }
+        off += (size_t)w;
+    }
+
+    if (fsync(fd) != 0) { close(fd); remove(tmp); return -1; }
+    close(fd);
+
+    if (rename(tmp, path) != 0) { remove(tmp); return -1; }
+    if (fsync_dir_of_path(path) != 0) return -1;
+    return 0;
+}
+
+/* Best-effort recursive removal of a directory (for crash cleanup).
+ * Uses system() because we don't have nftw in C11.  Path is
+ * constructed by us — no shell injection risk. */
+static void rm_rf(const char *path)
+{
+    char cmd[8192];
+    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", path);
+    (void)system(cmd);
+}
+
+int dl_publish_snapshot(dl_db *db)
+{
+    char snapshots_dir[4096];
+    char tmp_dir[4096];
+    char new_dir[4096];
+    char current_path[4096];
+    char buf[4096];
+    uint32_t new_version;
+    size_t i;
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+
+    if (!db) return -1;
+
+    /* 1. Run VM if rules exist and fixpoint is dirty */
+    if (db->n_crules > 0 && db->fixpoint_dirty) {
+        if (vm_execute(db, db->crules, db->n_crules) != 0)
+            return -1;
+        db->fixpoint_dirty = 0;
+    }
+
+    /* 2. Determine new version */
+    new_version = db->snap_version + 1;
+
+    /* 3. Ensure snapshots directory exists */
+    snprintf(snapshots_dir, sizeof(snapshots_dir),
+             "%s/snapshots", db->dir);
+    mkdir(snapshots_dir, 0755);
+
+    /* 4. Build into <db>/snapshots/<new_v>.tmp/ */
+    snprintf(tmp_dir, sizeof(tmp_dir),
+             "%s/snapshots/%u.tmp", db->dir, new_version);
+
+    /* Clean up any stale .tmp from a previous crash */
+    rm_rf(tmp_dir);
+
+    if (mkdir(tmp_dir, 0755) != 0)
+        return -1;
+
+    /* 4a. Save interner */
+    {
+        char fwd[4096], rev[4096];
+        snprintf(fwd, sizeof(fwd), "%s/symbols.dafsa", tmp_dir);
+        snprintf(rev, sizeof(rev), "%s/symbols.array", tmp_dir);
+        if (intern_save(db->ir, fwd, rev) != 0)
+            goto fail;
+    }
+
+    /* 4b. Save each relation + write manifest */
+    {
+        char manifest_path[4096];
+        FILE *mf;
+
+        snprintf(manifest_path, sizeof(manifest_path),
+                 "%s/manifest.txt", tmp_dir);
+        mf = fopen(manifest_path, "w");
+        if (!mf) goto fail;
+
+        fprintf(mf, "# Datalog-DAFSA snapshot version %u\n", new_version);
+
+        for (i = 0; i < db->nrels; i++) {
+            char rel_path[4096];
+            uint8_t arity = rel_arity(db->rels[i].rel);
+
+            fprintf(mf, "%s:%d\n", db->rels[i].name, (int)arity);
+
+            snprintf(rel_path, sizeof(rel_path), "%s/%s.dafsa",
+                     tmp_dir, db->rels[i].name);
+            if (rel_save(db->rels[i].rel, rel_path) != 0) {
+                fclose(mf);
+                goto fail;
+            }
+
+            /* FAULT HOOK: after each relation save */
+            if (db->fault_hook &&
+                db->fault_hook(DL_FPOINT_AFTER_REL_SAVE,
+                               db->fault_user) != 0) {
+                fclose(mf);
+                goto fail;
+            }
+        }
+
+        if (fclose(mf) != 0) goto fail;
+    }
+
+    /* 4c. fsync the tmp dir */
+    if (fsync_dir_path(tmp_dir) != 0) goto fail;
+
+    /* 5. Atomic rename: .tmp → final dir */
+    snprintf(new_dir, sizeof(new_dir),
+             "%s/snapshots/%u", db->dir, new_version);
+
+    if (rename(tmp_dir, new_dir) != 0) goto fail;
+    if (fsync_dir_path(snapshots_dir) != 0) goto fail;
+
+    /* FAULT HOOK: after rename (before CURRENT flip) */
+    if (db->fault_hook &&
+        db->fault_hook(DL_FPOINT_AFTER_RENAME, db->fault_user) != 0) {
+        /* Clean up the already-renamed new_dir */
+        rm_rf(new_dir);
+        goto fail;
+    }
+
+    /* 6. Atomic CURRENT flip */
+    snprintf(current_path, sizeof(current_path),
+             "%s/snapshots/CURRENT", db->dir);
+    snprintf(buf, sizeof(buf), "%u\n", new_version);
+    if (atomic_write_str(current_path, buf) != 0)
+        goto fail;
+
+    /* 7. Invalidate cache + update snap_version */
+    vcache_invalidate(db->vcache);
+    db->snap_version = new_version;
+
+#pragma GCC diagnostic pop
+    return 0;
+
+fail:
+    /* Best-effort cleanup of .tmp dir */
+    rm_rf(tmp_dir);
+#pragma GCC diagnostic pop
+    return -1;
+}
+
+/* ─── Fault hook registration ──────────────────────────────────────────── */
+
+void dl_set_fault_hook(dl_db *db,
+                       int (*hook)(dl_fpoint fp, void *user),
+                       void *user)
+{
+    if (!db) return;
+    db->fault_hook = hook;
+    db->fault_user = user;
 }

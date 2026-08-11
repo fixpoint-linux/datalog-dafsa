@@ -75,8 +75,35 @@ int dl_load_rules(dl_db *db, const char *dl_source);
 int dl_compile(dl_db *db);
 
 /* Evaluate all compiled rules and stream the goal relation's tuples via cb.
- * Returns the number of tuples emitted, or -1 on error. */
+ * Returns the number of tuples emitted, or -1 on error.
+ * If a snapshot has been published, reads from mmap'd snapshot (bypasses VM). */
 long dl_query(dl_db *db, const char *goal_rel, dl_tuple_cb cb, void *user);
+
+/* Prefix-bind k leading columns and enumerate via cb.
+ * Reads from snapshot if published, else falls back to in-memory path. */
+long dl_query_bound(dl_db *db, const char *goal_rel,
+                    const uint32_t *leading, uint8_t k,
+                    dl_tuple_cb cb, void *user);
+
+/* ─── Snapshot publish (M4) ────────────────────────────────────────────── */
+
+/* Atomic publish: saves interner + all relations to a versioned snapshot
+ * directory, flips the CURRENT pointer.  Returns 0 on success, -1 on error.
+ * After publish, dl_query reads from mmap instead of the VM. */
+int dl_publish_snapshot(dl_db *db);
+
+/* ─── Fault-injection hooks (test-only, NULL in production) ────────────── */
+
+typedef enum {
+    DL_FPOINT_AFTER_REL_SAVE,
+    DL_FPOINT_AFTER_RENAME
+} dl_fpoint;
+
+/* Set a fault-injection hook.  At each fpoint during publish, if hook is
+ * non-NULL it is called; non-zero return aborts the publish. */
+void dl_set_fault_hook(dl_db *db,
+                       int (*hook)(dl_fpoint fp, void *user),
+                       void *user);
 
 #ifdef __cplusplus
 }
