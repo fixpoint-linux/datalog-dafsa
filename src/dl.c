@@ -16,6 +16,7 @@
 #include "compiler.h"
 #include "vm.h"
 #include "snapshot.h"
+#include "tupleset.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -334,6 +335,7 @@ int dl_load_facts(dl_db *db, const char *rel_name, const char *csv_path)
     ssize_t linelen;
     int idx, loaded = 0;
     uint8_t arity;
+    tuple_set ts;
 
     if (!db || !rel_name || !csv_path) return -1;
 
@@ -344,6 +346,21 @@ int dl_load_facts(dl_db *db, const char *rel_name, const char *csv_path)
 
     f = fopen(csv_path, "r");
     if (!f) return -1;
+
+    /* Collect new facts in a tuple_set */
+    if (ts_init(&ts, arity) != 0) {
+        fclose(f);
+        return -1;
+    }
+
+    /* If the relation already had facts (e.g. loaded from disk on open),
+     * union them into ts so we rebuild the combined set. */
+    if (rel_prefix(db->rels[idx].rel, NULL, 0,
+                   ts_sink_cb, &ts) < 0) {
+        ts_free(&ts);
+        fclose(f);
+        return -1;
+    }
 
     while ((linelen = getline(&line, &linecap, f)) > 0) {
         char *fields[8];
@@ -382,6 +399,7 @@ int dl_load_facts(dl_db *db, const char *rel_name, const char *csv_path)
                 uint32_t sym = intern_str(db->ir, fields[i]);
                 if (sym == 0) {
                     /* Intern failed (OOM) — abort */
+                    ts_free(&ts);
                     fclose(f);
                     free(line);
                     return -1;
@@ -390,20 +408,31 @@ int dl_load_facts(dl_db *db, const char *rel_name, const char *csv_path)
             }
         }
 
-        /* Add the fact */
+        /* Add to tuple_set (hash dedup) */
         {
-            int rc = rel_add(db->rels[idx].rel, cols);
+            int rc = ts_add(&ts, cols);
             if (rc < 0) {
+                ts_free(&ts);
                 fclose(f);
                 free(line);
                 return -1;
             }
-            if (rc == 1) loaded++;
         }
     }
 
     free(line);
     fclose(f);
+
+    /* Sort and bulk-build the DAFSA */
+    ts_sort(&ts);
+
+    if (rel_build_from_tupleset(db->rels[idx].rel, &ts) != 0) {
+        ts_free(&ts);
+        return -1;
+    }
+
+    loaded = (int)ts.count;
+    ts_free(&ts);
 
     /* Auto-save after load */
     {

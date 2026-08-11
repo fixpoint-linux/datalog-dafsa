@@ -18,6 +18,9 @@
 /* Opaque */
 typedef struct relation relation;
 
+/* Forward declaration — full definition in tupleset.h */
+struct tuple_set;
+
 /* ─── Lifecycle ───────────────────────────────────────────────────────── */
 
 /* Create an empty relation of given arity (1-8). Returns NULL on error. */
@@ -45,6 +48,15 @@ int rel_add(relation *rel, const uint32_t *cols);
 /* Exact membership test. Returns 1 if present, 0 if absent.
  * DAFSA mapping: dafsa_lookup_n */
 int rel_exact(const relation *rel, const uint32_t *cols);
+
+/* Replace rel->d with a fresh minimal DAFSA bulk-built from a SORTED,
+ * DEDUPLICATED tuple_set. Old DAFSA freed. Caller must have ts_sort()'d.
+ * Returns 0 on success, -1 on error (rel->d unchanged on error). */
+int rel_build_from_tupleset(relation *rel, const struct tuple_set *ts);
+
+/* Callback for rel_prefix that sinks enumerated tuples into a tuple_set.
+ * Usage: rel_prefix(rel, NULL, 0, ts_sink_cb, &ts) unions all facts. */
+int ts_sink_cb(const uint32_t *cols, uint8_t arity, void *user);
 
 /* ─── Prefix enumeration ──────────────────────────────────────────────── */
 

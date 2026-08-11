@@ -1024,16 +1024,15 @@ static int eval_stratum_recursive(dl_db *db, compiled_rule **rules, int n)
 
     /* ── 6. Materialize: bulk-write idb to DAFSA ───────────────────── */
     for (i = 0; i < nr; i++) {
-        void *r = db_rel(db, rd[i].rel_id);
-        if (!r) continue;
+        relation *rel = (relation *)db_rel(db, rd[i].rel_id);
+        if (!rel) continue;
 
-        ts_sort(&rd[i].idb);  /* ensure sorted */
-
-        long ti;
-        for (ti = 0; ti < rd[i].idb.count; ti++) {
-            const uint32_t *t = rd[i].idb.data + ti * rd[i].idb.arity;
-            rel_add((void *)r, t);
-        }
+        /* Union pre-existing facts (edb or prior stratum) into idb,
+         * then sort and bulk-build the minimal DAFSA.  The union is a
+         * no-op for pure-idb relations (start empty). */
+        rel_prefix(rel, NULL, 0, ts_sink_cb, &rd[i].idb);
+        ts_sort(&rd[i].idb);
+        rel_build_from_tupleset(rel, &rd[i].idb);
     }
 
     /* ── 7. Clean up ───────────────────────────────────────────────── */

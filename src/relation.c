@@ -17,6 +17,7 @@
 #include "relation.h"
 #include "dafsa.h"
 #include "dafsa_internal.h"
+#include "tupleset.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -248,4 +249,78 @@ long rel_prefix(const relation *rel,
 
     prefix_dfs(rel->d, current, buf, 0, &ctx);
     return ctx.count;
+}
+
+/* ─── Bulk build from tuple set ──────────────────────────────────────── */
+
+/* ts_sink_cb: rel_enum_cb-compatible callback that adds tuples to a tuple_set.
+ * This is used to union existing DAFSA facts into a tuple_set before bulk
+ * rebuilding from combined (existing + new) data. */
+int ts_sink_cb(const uint32_t *cols, uint8_t arity, void *user)
+{
+    tuple_set *ts = (tuple_set *)user;
+    (void)arity;
+    return (ts_add(ts, cols) < 0) ? -1 : 0;
+}
+
+int rel_build_from_tupleset(relation *rel, const struct tuple_set *ts)
+{
+    unsigned char **keys = NULL;
+    size_t        *lens = NULL;
+    dafsa         *new_d = NULL;
+    long           n;
+    int            ret = -1;
+
+    if (!rel || !ts) return -1;
+    if (ts->arity != rel->arity) return -1;
+
+    n = ts->count;
+
+    if (n == 0) {
+        /* Empty set: just reset to an empty DAFSA */
+        dafsa *empty = dafsa_create();
+        if (!empty) return -1;
+        dafsa_free(rel->d);
+        rel->d = empty;
+        return 0;
+    }
+
+    /* Build keys[] and lens[] arrays from the sorted tuple_set.
+     * Each key is 4*arity+1 bytes: u32BE columns + trailing \0. */
+    keys = calloc((size_t)n, sizeof(unsigned char *));
+    lens = calloc((size_t)n, sizeof(size_t));
+    if (!keys || !lens) goto out;
+
+    {
+        long i;
+        for (i = 0; i < n; i++) {
+            const uint32_t *cols = ts->data + (size_t)i * ts->arity;
+            unsigned char *key = malloc(MAX_KEY_LEN);
+            if (!key) goto out;
+            keys[i] = key;
+            lens[i] = encode_key(key, cols, ts->arity);
+        }
+    }
+
+    new_d = dafsa_build_sorted((const unsigned char *const *)keys,
+                               (const size_t *)lens, (size_t)n);
+    if (!new_d) goto out;
+
+    /* Swap: free old DAFSA, install new one */
+    dafsa_free(rel->d);
+    rel->d = new_d;
+    new_d = NULL;  /* prevent double-free */
+    ret = 0;
+
+out:
+    if (keys) {
+        long i;
+        for (i = 0; i < n; i++)
+            free(keys[i]);
+        free(keys);
+    }
+    free(lens);
+    /* new_d is only non-NULL on failure — discard */
+    dafsa_free(new_d);
+    return ret;
 }

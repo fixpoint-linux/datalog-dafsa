@@ -17,7 +17,8 @@ VENDOR_OBJS = vendor/dafsa.o \
               vendor/dafsa_persist.o \
               vendor/dafsa_view.o \
               vendor/dafsa_crc32.o \
-              vendor/dafsa_wal.o
+              vendor/dafsa_wal.o \
+              vendor/dafsa_build.o
 
 # ─── Our library objects ─────────────────────────────────────────────────
 
@@ -83,7 +84,10 @@ tests/test_m4: tests/test_m4.c $(ALL_OBJS)
 tests/test_review_adversarial: tests/test_review_adversarial.c $(ALL_OBJS)
 	$(CC) $(CFLAGS) $(INC) -static -o $@ tests/test_review_adversarial.c $(ALL_OBJS)
 
-test: tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4 dl build-tmp
+tests/test_bulk: tests/test_bulk.c $(ALL_OBJS)
+	$(CC) $(CFLAGS) $(INC) -static -o $@ tests/test_bulk.c $(ALL_OBJS)
+
+test: tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4 tests/test_bulk dl build-tmp
 	@echo "=== Running M0 unit tests ==="
 	LD_LIBRARY_PATH=. ./tests/test_m0
 	@echo ""
@@ -98,6 +102,9 @@ test: tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4 dl b
 	@echo ""
 	@echo "=== Running M4 unit tests ==="
 	LD_LIBRARY_PATH=. ./tests/test_m4
+	@echo ""
+	@echo "=== Running bulk DAFSA tests ==="
+	LD_LIBRARY_PATH=. ./tests/test_bulk
 	@echo ""
 	@echo "=== Running CLI smoke test ==="
 	@sh tests/smoke.sh
@@ -116,4 +123,5 @@ clean:
 	rm -f vendor/*.o src/*.o
 	rm -f libdatalog.so dl
 	rm -f tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4
+	rm -f tests/test_bulk
 	rm -rf /tmp/dl-test-db build-tmp/smoke build-tmp/m1

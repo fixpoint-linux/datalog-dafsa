@@ -17,7 +17,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-typedef struct {
+typedef struct tuple_set {
     uint32_t *data;      /* sorted unique tuples, arity-strided */
     long      count;     /* number of tuples */
     long      cap;       /* capacity in tuples */

@@ -22,6 +22,16 @@ typedef struct dafsa dafsa;   /* opaque */
 dafsa *dafsa_create(void);                 /* empty DAFSA; NULL on OOM */
 void   dafsa_free(dafsa *d);              /* NULL-safe */
 
+/* Bulk-build a MINIMAL DAFSA from a SORTED, DEDUPLICATED key list in ~linear time.
+ * Keys are length-delimited (may contain embedded NUL). Result, when saved via
+ * dafsa_save, is byte-identical to building the same keys via dafsa_add_n in any
+ * order (both yield the unique minimal DFA and dafsa_save canonicalizes).
+ * PRE: keys[] are in unsigned-byte lexicographic order, no duplicates.
+ * Returns new handle (free with dafsa_free) or NULL on OOM/bad args.
+ * nkeys==0 => empty dafsa. */
+dafsa *dafsa_build_sorted(const unsigned char *const *keys,
+                          const size_t *lens, size_t nkeys);
+
 /* ─── Persistence (M0 stubs — implemented in M1) ───────────────────── */
 
 dafsa *dafsa_load(const char *path);            /* M0 stub: returns NULL */
