@@ -111,7 +111,8 @@ static void test_byte_determinism_random(void)
                     unsigned char *k = big_block + (size_t)ki * keylen;
                     int ci;
                     for (ci = 0; ci < arity; ci++) {
-                        uint32_t v = rand32(&seed, 256);
+                        /* Full 32-bit range to stress register hash table */
+                        uint32_t v = rand32(&seed, 0xFFFFFFFFu);
                         u32be(k + 4 * ci, v);
                     }
                     k[keylen - 1] = 0x00;
@@ -176,8 +177,37 @@ static void test_byte_determinism_random(void)
                                (const size_t *)lens_buf, (size_t)nkeys);
         if (!B) { failures++; goto cleanup; }
 
-        /* Save both and compare */
+        /* ── POSITIVE CHECK (THE GATE): every input key must be present ──
+         * This is the check that catches over-merging bugs where the bulk
+         * result is a strict subset.  Run FIRST, independently — byte
+         * comparison can pass on trials that don't trigger the bug. */
         {
+            int ki;
+            for (ki = 0; ki < nkeys; ki++) {
+                if (!dafsa_lookup_n(B, keys_buf[ki], lens_buf[ki])) {
+                    fprintf(stderr, "\n  POSITIVE-CHECK FAIL: trial=%d key=%d missing from bulk\n",
+                            trial, ki);
+                    failures++;
+                    break;
+                }
+            }
+        }
+
+        /* Reference must also have all keys (sanity) */
+        if (failures == 0) {
+            int ki;
+            for (ki = 0; ki < nkeys; ki++) {
+                if (!dafsa_lookup_n(A, keys_buf[ki], lens_buf[ki])) {
+                    fprintf(stderr, "\n  REFERENCE-CHECK FAIL: trial=%d key=%d missing from incr\n",
+                            trial, ki);
+                    failures++;
+                    break;
+                }
+            }
+        }
+
+        /* Save both and compare */
+        if (failures == 0) {
             int sv_a = dafsa_save(A, "/tmp/test_bulk_A.pdwg");
             int sv_b = dafsa_save(B, "/tmp/test_bulk_B.pdwg");
             if (sv_a != 0 || sv_b != 0) {
@@ -188,19 +218,7 @@ static void test_byte_determinism_random(void)
             }
         }
 
-        /* Language equality check */
-        if (failures == 0) {
-            int ki;
-            for (ki = 0; ki < nkeys; ki++) {
-                if (dafsa_lookup_n(A, keys_buf[ki], lens_buf[ki]) != 1 ||
-                    dafsa_lookup_n(B, keys_buf[ki], lens_buf[ki]) != 1) {
-                    failures++;
-                    break;
-                }
-            }
-        }
-
-        /* Negative samples */
+        /* Negative samples: ensure both DAFSAs agree on non-keys */
         if (failures == 0) {
             int ns;
             for (ns = 0; ns < 20; ns++) {
@@ -321,6 +339,131 @@ static void test_incremental_order_independence(void)
     dafsa_free(d2);
     remove("/tmp/test_ord1.pdwg");
     remove("/tmp/test_ord2.pdwg");
+}
+
+/* ─── E1d: Deterministic reproducer case (arity=8, full uint32) ──────── */
+
+static void test_arity8_full_range(void)
+{
+    TEST("E1d arity-8 full-uint32 stress (100 trials×100 keys)");
+
+    unsigned int seed = 7;  /* same seed as reproducer */
+    int trial;
+    int failures = 0;
+
+    for (trial = 0; trial < 100; trial++) {
+        const int arity = 8;
+        const int nkeys_orig = 100;
+        const size_t keylen = (size_t)(4 * arity + 1); /* 33 bytes */
+        int nkeys = nkeys_orig;
+        int ki;
+        unsigned char *big_block = NULL;
+        unsigned char **keys_buf = NULL;
+        size_t *lens_buf = NULL;
+        dafsa *A = NULL, *B = NULL;
+
+        keys_buf = calloc((size_t)(nkeys_orig + 5), sizeof(unsigned char *));
+        lens_buf = calloc((size_t)(nkeys_orig + 5), sizeof(size_t));
+        if (!keys_buf || !lens_buf) { failures++; goto cleanup2; }
+
+        big_block = malloc((size_t)nkeys_orig * keylen);
+        if (!big_block) { failures++; goto cleanup2; }
+
+        for (ki = 0; ki < nkeys_orig; ki++) {
+            unsigned char *k = big_block + (size_t)ki * keylen;
+            int ci;
+            for (ci = 0; ci < arity; ci++) {
+                uint32_t v = rand32(&seed, 0xFFFFFFFFu);
+                u32be(k + 4 * ci, v);
+            }
+            k[keylen - 1] = 0x00;
+            keys_buf[ki] = k;
+            lens_buf[ki] = keylen;
+        }
+
+        /* Sort (insertion) */
+        {
+            int ki;
+            for (ki = 1; ki < nkeys; ki++) {
+                int j = ki;
+                while (j > 0) {
+                    int cmp = memcmp(keys_buf[j-1], keys_buf[j], keylen);
+                    if (cmp <= 0) break;
+                    {
+                        unsigned char *tk = keys_buf[j-1];
+                        keys_buf[j-1] = keys_buf[j];
+                        keys_buf[j] = tk;
+                    }
+                    {
+                        size_t tl = lens_buf[j-1];
+                        lens_buf[j-1] = lens_buf[j];
+                        lens_buf[j] = tl;
+                    }
+                    j--;
+                }
+            }
+        }
+
+        /* Dedup */
+        {
+            int di, wi = (nkeys > 0) ? 1 : 0;
+            for (di = 1; di < nkeys; di++) {
+                if (memcmp(keys_buf[di], keys_buf[wi-1], keylen) != 0) {
+                    keys_buf[wi] = keys_buf[di];
+                    lens_buf[wi] = lens_buf[di];
+                    wi++;
+                }
+            }
+            nkeys = wi;
+        }
+
+        A = dafsa_create();
+        if (!A) { failures++; goto cleanup2; }
+        for (ki = 0; ki < nkeys; ki++)
+            dafsa_add_n(A, keys_buf[ki], lens_buf[ki]);
+
+        B = dafsa_build_sorted((const unsigned char *const *)keys_buf,
+                               (const size_t *)lens_buf, (size_t)nkeys);
+        if (!B) { failures++; goto cleanup2; }
+
+        /* Positive check: every key present */
+        for (ki = 0; ki < nkeys; ki++) {
+            if (!dafsa_lookup_n(B, keys_buf[ki], lens_buf[ki])) {
+                fprintf(stderr, "\n  E1d POSITIVE FAIL: trial=%d key=%d/%d missing\n",
+                        trial, ki, nkeys);
+                failures++;
+                break;
+            }
+        }
+
+        /* Byte-determinism */
+        if (failures == 0) {
+            dafsa_save(A, "/tmp/test_e1d_A.pdwg");
+            dafsa_save(B, "/tmp/test_e1d_B.pdwg");
+            if (!files_equal("/tmp/test_e1d_A.pdwg", "/tmp/test_e1d_B.pdwg")) {
+                dafsa_stats_out sa, sb;
+                dafsa_stats(A, &sa); dafsa_stats(B, &sb);
+                fprintf(stderr, "\n  E1d BYTE-DIVERGE: trial=%d statesA=%u statesB=%u\n",
+                        trial, sa.n_states_reachable, sb.n_states_reachable);
+                failures++;
+            }
+        }
+
+    cleanup2:
+        dafsa_free(B);
+        dafsa_free(A);
+        free(big_block);
+        free(keys_buf);
+        free(lens_buf);
+        remove("/tmp/test_e1d_A.pdwg");
+        remove("/tmp/test_e1d_B.pdwg");
+        if (failures > 0) break;
+    }
+
+    if (failures > 0)
+        FAIL("arity-8 full-range divergence");
+    else
+        PASS();
 }
 
 /* ─── E2: Edge cases ──────────────────────────────────────────────────── */
@@ -656,6 +799,7 @@ int main(void)
     printf("======================\n\n");
 
     test_byte_determinism_random();
+    test_arity8_full_range();
     test_determinism();
     test_incremental_order_independence();
     test_empty();
