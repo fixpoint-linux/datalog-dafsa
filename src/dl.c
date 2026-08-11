@@ -25,7 +25,7 @@
 #include <sys/types.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <ftw.h>
+#include <dirent.h>
 
 /* ─── dl_db struct ────────────────────────────────────────────────────── */
 
@@ -638,22 +638,34 @@ static int atomic_write_str(const char *path, const char *content)
     return 0;
 }
 
-/* Best-effort recursive removal of a directory (for crash cleanup).
- * Uses nftw() — no shell, so no injection risk from caller-controlled
- * paths (which may contain quotes or spaces). */
-static int rm_rf_cb(const char *path, const struct stat *st, int typeflag,
-                    struct FTW *ftw)
-{
-    (void)st;
-    (void)ftw;
-    return (typeflag == FTW_D || typeflag == FTW_DP)
-               ? rmdir(path)
-               : unlink(path);
-}
-
+/* Best-effort recursive removal of a file or directory (for crash cleanup).
+ * No shell (no injection risk from caller-controlled paths, which may contain
+ * quotes or spaces).  Uses opendir/readdir recursion — POSIX, no _XOPEN_SOURCE
+ * requirement (unlike nftw).  Post-order: children removed before parents. */
 static void rm_rf(const char *path)
 {
-    (void)nftw(path, rm_rf_cb, 64, FTW_DEPTH | FTW_PHYS);
+    DIR *d;
+    struct dirent *e;
+
+    d = opendir(path);
+    if (d) {
+        while ((e = readdir(d)) != NULL) {
+            char child[4096];
+            struct stat st;
+            if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+                continue;
+            snprintf(child, sizeof(child), "%s/%s", path, e->d_name);
+            if (lstat(child, &st) == 0 && S_ISDIR(st.st_mode))
+                rm_rf(child);               /* recurse first */
+            else
+                unlink(child);
+        }
+        closedir(d);
+        rmdir(path);
+        return;
+    }
+    /* Not a directory (or doesn't exist) — treat as a single file. */
+    unlink(path);
 }
 
 int dl_publish_snapshot(dl_db *db)
