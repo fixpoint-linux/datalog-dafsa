@@ -1,6 +1,6 @@
 # Implementation Plan: DAFSA-Backed Deductive Database (Datalog VM)
 
-**Status:** M0-M3 complete (2026-08-11). 62 tests green (M0=9, M1=18, M2=18, M3=17 + smoke). Next: M4.
+**Status:** M0-M5 complete (2026-08-12). 111 tests green (M0=9, M1=18, M2=18, M3=17, M4=8, bulk=16, M5=25 + smoke). Next: M6.
 **Goal:** Turn the architecture into a concrete, executable build plan with file layout, per-milestone tasks, and verification for each step.
 **Repos involved:** this project (new, e.g. `~/projects/datalog-dafsa/`), consuming the proven jing-meta DAFSA C engine (`indexer/dafsa/dafsa.c` + `dafsa_core.c` + `dafsa_persist.c` + `dafsa_view.c` + `dafsa_wal.c` + `dafsa.h`).
 
@@ -142,6 +142,8 @@ Tasks:
 
 ### M5 — Regex/pattern walker (~1 wk)
 **Goal:** third fact-store primitive live.
+
+**STATUS: COMPLETE (2026-08-12).** src/regexwalk.{c,h}: recursive-descent regex parser (subset: literals incl `\\`/`\xHH`/`\0`, `.`, `[a-z]`/`[^abc]`, `*`/`+`/`?`, `|`, `()`), Thompson NFA (symbolic transitions), subset-construction → dense DFA. **Full-key byte matching** (implicit `^...$`); keys are 4*arity+1 u32BE bytes. DFA cap 50k (hard) + early-abort at 8192 states (pathological regex rejected in ~200ms, not ~15s). Automaton-intersection product DFS walkers `regex_dfa_walk` (in-memory) + `regex_dfa_walk_view` (mmap) with on-recursion-stack visited set (handles regex-DFA cycles from `*`/`+`, allows shared-DAFSA-suffix re-exploration, no dups). Integration: `rel_pattern`, `view_pattern`, `dl_pattern` API, CLI `dl pattern <rel> '<regex>'`, and **OP_WALK** VM instruction via `~ '<regex>'` body-atom syntax (pattern compiled eagerly at rule-load). 25 M5 tests + reviewer adversarial suite (50+ cases) = CLEAN. Reviewer SHOULD-FIX (slow cap) fixed with early-abort.
 
 Tasks:
 1. `regexwalk.c`: regex → DFA compiler (borrow `rust-fst` `Automata` trait shape + `regex-automata` DFA builder; cap DFA states ~50k per architecture §10-risk-6).
