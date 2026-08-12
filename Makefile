@@ -98,7 +98,10 @@ tests/test_m6: tests/test_m6.c $(ALL_OBJS)
 tests/test_m6_review: tests/test_m6_review.c $(ALL_OBJS)
 	$(CC) $(CFLAGS) $(INC) -static -o $@ tests/test_m6_review.c $(ALL_OBJS)
 
-test: tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4 tests/test_bulk tests/test_m5 tests/test_m6 tests/test_m6_review dl build-tmp
+tests/test_m6_deep_review: tests/test_m6_deep_review.c $(ALL_OBJS)
+	$(CC) $(CFLAGS) $(INC) -static -o $@ tests/test_m6_deep_review.c $(ALL_OBJS)
+
+test: tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4 tests/test_bulk tests/test_m5 tests/test_m6 tests/test_m6_review tests/test_m6_deep_review dl build-tmp
 	@echo "=== Running M0 unit tests ==="
 	LD_LIBRARY_PATH=. ./tests/test_m0
 	@echo ""
@@ -125,6 +128,9 @@ test: tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4 test
 	@echo ""
 	@echo "=== Running M6 adversarial tests ==="
 	LD_LIBRARY_PATH=. ./tests/test_m6_review
+	@echo ""
+	@echo "=== Running M6 deep adversarial tests ==="
+	LD_LIBRARY_PATH=. ./tests/test_m6_deep_review
 	@echo ""
 	@echo "=== Running CLI smoke test ==="
 	@sh tests/smoke.sh

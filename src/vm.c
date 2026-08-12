@@ -1028,6 +1028,11 @@ static int eval_nonrecursive(dl_db *db, compiled_rule **rules, int n)
                            0 /* commit */, NULL, NULL);
         if (m < 0) return -1;
         (void)m;
+        /* M6: IDB DAFSA was populated — mark perms dirty and rebuild
+         * so subsequent rules (even within the same stratum) see fresh
+         * perm indices for non-leading joins. */
+        permindex_mark_dirty(db, rules[i]->head_rel_id);
+        if (permindex_build_dirty(db) != 0) return -1;
     }
     return 0;
 }
@@ -1209,6 +1214,18 @@ static int eval_stratum_recursive(dl_db *db, compiled_rule **rules, int n)
                 return -1;
             }
             (void)m;
+            /* M6: rebuild perms so recursive rules (or higher strata)
+             * see fresh non-leading join indices */
+            permindex_mark_dirty(db, cr->head_rel_id);
+            if (permindex_build_dirty(db) != 0) {
+                for (ri = 0; ri < nr; ri++) {
+                    ts_free(&rd[ri].idb);
+                    ts_free(&rd[ri].delta);
+                    ts_free(&rd[ri].next_delta);
+                }
+                free(rd);
+                return -1;
+            }
         } else {
             /* Recursive rule: collect base tuples into idb/delta */
             int hri = cr->head_rel_id;
@@ -1492,6 +1509,37 @@ static int eval_stratum_recursive(dl_db *db, compiled_rule **rules, int n)
         rel_prefix(rel, NULL, 0, ts_sink_cb, &rd[i].idb);
         ts_sort(&rd[i].idb);
         rel_build_from_tupleset(rel, &rd[i].idb);
+    }
+
+    /* M6: materialize rebuilt the DAFSA — mark perms dirty and rebuild
+     * so higher strata see fresh non-leading join indices for these
+     * now-populated recursive IDB relations. */
+    {
+        int mi;
+        for (mi = 0; mi < nr; mi++)
+            permindex_mark_dirty(db, rd[mi].rel_id);
+        if (permindex_build_dirty(db) != 0) {
+            /* Clean up on error */
+            for (mi = 0; mi < nr; mi++) {
+                ts_free(&rd[mi].idb);
+                ts_free(&rd[mi].delta);
+                ts_free(&rd[mi].next_delta);
+            }
+            free(rd);
+            {
+                int _rdi, _pi;
+                for (_rdi = 0; _rdi < nr; _rdi++) {
+                    for (_pi = 0; _pi < perm_count[_rdi]; _pi++)
+                        ts_free(&idb_perm_shadows[_rdi][_pi]);
+                    free(perm_ids[_rdi]);
+                    free(idb_perm_shadows[_rdi]);
+                }
+                free(perm_count); free(perm_ids); free(perm_cap);
+                free(idb_perm_shadows);
+            }
+            #undef REBUILD_PERM_SHADOWS
+            return -1;
+        }
     }
 
     /* ── 7. Clean up ───────────────────────────────────────────────── */

@@ -137,6 +137,21 @@ int permindex_build_dirty(struct dl_db *db)
     return 0;
 }
 
+/* ─── Mark permutation indices dirty for a relation ─────────────────── */
+
+void permindex_mark_dirty(struct dl_db *db, int rel_id)
+{
+    struct dl_db_internal *d = (struct dl_db_internal *)db;
+    int pi;
+
+    if (!db) return;
+
+    for (pi = 0; pi < d->n_perms; pi++) {
+        if (d->perms[pi].rel_id == rel_id)
+            d->perms[pi].dirty = 1;
+    }
+}
+
 /* ─── Free all permutation index relations ────────────────────────────── */
 
 void permindex_free_all(struct dl_db *db)

@@ -47,6 +47,9 @@ int permindex_build(struct dl_db *db, int rel_id, int perm_id);
 /* Build all dirty permutation indices. Returns 0 on success (or if no dirty). */
 int permindex_build_dirty(struct dl_db *db);
 
+/* Mark all permutation indices for a relation as dirty. */
+void permindex_mark_dirty(struct dl_db *db, int rel_id);
+
 /* Free all permutation index relations (for dl_close). */
 void permindex_free_all(struct dl_db *db);
 

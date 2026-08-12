@@ -402,6 +402,67 @@ static void test_t6_recursive_non_leading(void)
     teardown_db(db, "t6");
 }
 
+/* ─── T6b: non-recursive IDB perm index regression ─────────────────── */
+/* Reproduction of M6 review BLOCKER: non-recursive IDB relations used
+ * in non-leading joins produced silently-empty results because perm
+ * indices were built from empty DAFSAs at vm_execute start and never
+ * rebuilt after IDB DAFSAs were populated by exec_rule. */
+static void test_t6b_nonrecursive_idb_perm(void)
+{
+    dl_db *db;
+    int loaded;
+    tuple_set result;
+
+    TEST("T6b: non-recursive IDB non-leading join (regression)");
+
+    setup_db(&db, "t6b");
+
+    /* f1(a,b,c) */
+    {
+        uint32_t rows[] = {1,10,100, 2,20,200};
+        loaded = load_rows_csv(db, "f1", 3, rows, 2);
+        assert(loaded == 2);
+    }
+
+    /* f2(d,e) */
+    {
+        uint32_t rows[] = {1000,10, 2000,20, 3000,10};
+        loaded = load_rows_csv(db, "f2", 2, rows, 3);
+        assert(loaded == 3);
+    }
+
+    /* r1, r2 are IDB (copy from EDB), q joins on col 1 of r2 (non-leading) */
+    int rc = dl_load_rules(db,
+        "r1(X,Y,Z):-f1(X,Y,Z).\n"
+        "r2(W,V):-f2(W,V).\n"
+        "q(X):-r1(X,Y,Z),r2(W,Y).\n");
+    if (rc != 0) {
+        FAIL("compile failed");
+        teardown_db(db, "t6b");
+        return;
+    }
+
+    assert(dl_compile(db) == 0);
+
+    memset(&result, 0, sizeof(result));
+    long n = dl_query(db, "q", tset_cb, &result);
+    assert(n >= 0);
+
+    /* Expected: r1(1,10,100) joins r2(1000,10) and r2(3000,10) → q(1)
+     *           r1(2,20,200) joins r2(2000,20) → q(2)
+     *           → q = {1, 2} */
+    if (result.count == 2) {
+        PASS();
+    } else {
+        printf("  got %ld tuples, expected 2\n", result.count);
+        FAIL("non-recursive IDB non-leading join: "
+             "expected {1,2}, got empty or wrong");
+    }
+
+    tset_free(&result);
+    teardown_db(db, "t6b");
+}
+
 /* ─── T8: publish_with_perms ──────────────────────────────────────────── */
 static void test_t8_publish_with_perms(void)
 {
@@ -556,6 +617,7 @@ int main(void)
     test_t3_perm_index_declared();
     test_t5_perm_index_correct();
     test_t6_recursive_non_leading();
+    test_t6b_nonrecursive_idb_perm();
     test_t8_publish_with_perms();
     test_t9_property_random();
 
