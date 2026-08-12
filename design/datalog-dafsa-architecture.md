@@ -1,6 +1,6 @@
 # Architectural Design: DAFSA-Backed Deductive Database (Datalog VM)
 
-**Status:** Design only -- greenfield. No code.
+**Status:** Implemented M0-M7 (2026-08-12): fact store, interner, parser/compiler/VM, aggregates/equality/disjunction, snapshot publish + mmap query path, regex walker, permutation indices + hash-join, durability (lock + interner + WAL). 148 tests green. Remaining: M8+ v2 (deferred).
 **Author:** advisor-offpeak (GLM-5.2 deep-think), routed tier=hard.
 **Grounded in:** the proven jing-meta DAFSA C engine (Carrasco & Forcada 2002 incremental minimal acyclic DFA), measured ~5.8 B/key at 9.47M keys / 55 MB; PDWG v4 on-disk format; mmap zero-copy `dafsa_view`; WAL `DAWL` + compaction. Verified via `indexer/dafsa/dafsa.h` and `dafsa_view.c`.
 
