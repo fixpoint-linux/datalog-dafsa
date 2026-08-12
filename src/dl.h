@@ -1,12 +1,14 @@
 /*
- * dl.h — Public C API for the DAFSA-backed Datalog VM (M0: fact store + interner)
+ * dl.h — Public C API for the DAFSA-backed Datalog VM (M7 complete)
  *
- * M0 scope:
- *   dl_open / dl_close
- *   dl_declare_relation
- *   dl_load_facts
- *   dl_lookup
- *   dl_prefix
+ * M7 scope:
+ *   fact store + interner
+ *   rule parser / compiler / VM
+ *   aggregates, equality, disjunction
+ *   snapshot publish + mmap query path
+ *   regex / pattern walker
+ *   permutation indices + hash-join
+ *   durability (lock, WAL, incremental add/delete)
  */
 #ifndef DL_H
 #define DL_H

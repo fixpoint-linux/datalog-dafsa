@@ -209,7 +209,8 @@ static void t_a09_quant(void) {
 
     key_set s3 = walk_collect(d,"a*b?");
     CHECK(ks_has(&s3,"") && ks_has(&s3,"a") && ks_has(&s3,"aa") && ks_has(&s3,"ab") && ks_has(&s3,"b"), "a*b?");
-    CHECK(!ks_has(&s3,"aaa") && !ks_has(&s3,"aab"), "!aaa,!aab");
+    /* a*b? matches aaa (a* consumes all a's, b? empty) and aab (a*=aa, b?=b). */
+    CHECK(ks_has(&s3,"aaa") && ks_has(&s3,"aab"), "aaa,aab match too");
     ks_free(&s3);
     dafsa_free(d); PASS();
 }
@@ -765,9 +766,85 @@ static void t_i13_class_dash_end(void) {
 int main(void)
 {
     printf("M5 Adversarial Review Tests\n"); fflush(stdout);
-    printf("about to call t_a01\n"); fflush(stdout);
+
+    /* A: Regex correctness oracle */
     t_a01_literal();
-    printf("t_a01 done\n"); fflush(stdout);
+    t_a02_alt();
+    t_a03_star_group();
+    t_a04_dot_star_prefix();
+    t_a05_dot_star_anywhere();
+    t_a06_neg_class();
+    t_a07_range_class();
+    t_a08_nested();
+    t_a09_quant();
+    t_a10_dot_null_ff();
+    t_a11_xHH();
+    t_a12_esc_nul();
+    t_a13_nrt();
+    t_a14_10_alt();
+    t_a15_nested_alt();
+    t_a16_star_empty();
+    t_a17_plus();
+    t_a18_class_literal_meta();
+    t_a19_neg_range();
+    t_a20_all_dot_star();
+
+    /* B: DFA state cap */
+    t_b01_cap_exceeded();
+    t_b02_large_bounded();
+
+    /* C: Termination + completeness */
+    t_c01_star_terminates();
+    t_c02_shared_suffix();
+    t_c03_multi_prefix();
+    t_c04_no_dupes();
+
+    /* D: Full-key semantics */
+    t_d01_no_prefix();
+    t_d02_no_suffix();
+    t_d03_star_anchored();
+
+    /* E: Integration */
+    t_e01_empty_rel();
+    t_e02_nonexistent();
+    t_e03_inmemory();
+
+    /* F: OP_WALK edge cases */
+    t_f01_walk_edb();
+    t_f02_syntax_err();
+    t_f03_walk_idb();
+
+    /* G: Memory / robustness */
+    t_g01_free_no_leak();
+    t_g02_empty_pat();
+    t_g03_bad_hex();
+    t_g04_unclosed_paren();
+    t_g05_desc_range();
+    t_g06_trail_bslash();
+    t_g07_extra_paren();
+    t_g08_bad_octal();
+
+    /* H: Byte handling */
+    t_h01_all_bytes_class();
+    t_h02_mid_key_null();
+    t_h03_neg_class_ff();
+    t_h04_high_bytes();
+
+    /* I: More adversarial patterns */
+    t_i01_abc_star();
+    t_i02_concat_alt();
+    t_i03_multi_star();
+    t_i04_dot_star_empty();
+    t_i05_opt_grp();
+    t_i06_plus_vs_star();
+    t_i07_optional_char();
+    t_i08_deep_nest();
+    t_i09_star_alt_literal();
+    t_i10_backslash();
+    t_i11_dot_plus();
+    t_i12_nested_star();
+    t_i13_class_dash_end();
+
     printf("\n%d tests run, %d failed\n", tests_run, tests_failed);
     return tests_failed ? 1 : 0;
 }

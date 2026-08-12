@@ -175,6 +175,10 @@ static void rx_lex(rx_parser *p)
 
     if (p->has_tok) { p->has_tok = 0; return; }
 
+    /* Once an error has been recorded, always report EOF so the parser's
+     * loops terminate instead of re-reading a stale token forever. */
+    if (p->errmsg) { p->tok.kind = RX_TOKEN_EOF; return; }
+
     if (!*s) { p->tok.kind = RX_TOKEN_EOF; return; }
 
     /* Escapes */
@@ -292,11 +296,18 @@ static int parse_char_class(rx_parser *p, sym_edge *out)
            rx_peek(p)->kind != RX_TOKEN_EOF) {
         unsigned char ch;
 
-        if (rx_match(p, RX_TOKEN_DOT)) {
-            ch = '.';
-        } else if (rx_peek(p)->kind == RX_TOKEN_CHAR) {
-            ch = rx_next(p)->ch;
-        } else {
+        /* Inside a character class every metacharacter is a literal byte:
+         * '.', '*', '+', '?', '|', '(', ')' all stand for themselves. */
+        switch (rx_peek(p)->kind) {
+        case RX_TOKEN_DOT:      ch = '.'; rx_next(p); break;
+        case RX_TOKEN_STAR:     ch = '*'; rx_next(p); break;
+        case RX_TOKEN_PLUS:     ch = '+'; rx_next(p); break;
+        case RX_TOKEN_QUES:     ch = '?'; rx_next(p); break;
+        case RX_TOKEN_PIPE:     ch = '|'; rx_next(p); break;
+        case RX_TOKEN_LPAREN:   ch = '('; rx_next(p); break;
+        case RX_TOKEN_RPAREN:   ch = ')'; rx_next(p); break;
+        case RX_TOKEN_CHAR:     ch = rx_next(p)->ch; break;
+        default:
             rx_error(p, "unexpected token in character class");
             return -1;
         }
@@ -330,7 +341,12 @@ static int parse_char_class(rx_parser *p, sym_edge *out)
             bitmap[ch >> 3] |= (uint8_t)(1u << (ch & 7));
             any = 1;
             if (have_prev) {
+                /* A pending range start (from a '-' we consumed) that never
+                 * became an ascending range: e.g. a descending range like
+                 * [z-a].  Emit the previous char AND the '-' as literals so
+                 * the dash is not silently dropped. */
                 bitmap[prev >> 3] |= (uint8_t)(1u << (prev & 7));
+                bitmap['-' >> 3] |= (uint8_t)(1u << ('-' & 7));
                 have_prev = 0;
             }
             prev = -1;
@@ -832,6 +848,14 @@ regex_dfa *regex_compile(const char *pattern)
             if (n.errmsg) msg = n.errmsg;
             dfa->errmsg = strdup(msg);
         }
+        goto fail;
+    }
+
+    /* A lexer error (e.g. trailing backslash) records errmsg even though the
+     * parser loop exits normally on the EOF token — surface it, don't drop it. */
+    if (p.errmsg) {
+        dfa = calloc(1, sizeof(*dfa));
+        if (dfa) dfa->errmsg = strdup(p.errmsg);
         goto fail;
     }
 

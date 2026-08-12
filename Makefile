@@ -1,5 +1,6 @@
-# Makefile for datalog-dafsa M2: M0 + M1 + fixpoint + negation
-# Builds libdatalog.so (shared), dl CLI, and test harness.
+# Makefile for datalog-dafsa M7: fact store, interner, parser, compiler, VM,
+# aggregates, snapshot, regex, permutation indices, durability.
+# Builds libdatalog.so (shared), dl CLI, tests, and bench.
 
 CC       = gcc
 CFLAGS   = -O2 -Wall -Wextra -Werror -std=c11 -fPIC -D_POSIX_C_SOURCE=200809L
@@ -39,7 +40,7 @@ ALL_OBJS = $(VENDOR_OBJS) $(LIB_OBJS)
 
 # ─── Targets ─────────────────────────────────────────────────────────────
 
-.PHONY: all clean test test-m1 test-m2
+.PHONY: all clean test bench test-m1 test-m2
 
 all: build-tmp libdatalog.so dl
 
@@ -84,14 +85,17 @@ tests/test_m3: tests/test_m3.c $(ALL_OBJS)
 tests/test_m4: tests/test_m4.c $(ALL_OBJS)
 	$(CC) $(CFLAGS) $(INC) -static -o $@ tests/test_m4.c $(ALL_OBJS)
 
-tests/test_review_adversarial: tests/test_review_adversarial.c $(ALL_OBJS)
-	$(CC) $(CFLAGS) $(INC) -static -o $@ tests/test_review_adversarial.c $(ALL_OBJS)
+tests/test_m4_review: tests/test_m4_review.c $(ALL_OBJS)
+	$(CC) $(CFLAGS) $(INC) -static -o $@ tests/test_m4_review.c $(ALL_OBJS)
 
 tests/test_bulk: tests/test_bulk.c $(ALL_OBJS)
 	$(CC) $(CFLAGS) $(INC) -static -o $@ tests/test_bulk.c $(ALL_OBJS)
 
 tests/test_m5: tests/test_m5.c $(ALL_OBJS)
 	$(CC) $(CFLAGS) $(INC) -static -o $@ tests/test_m5.c $(ALL_OBJS)
+
+tests/test_m5_review: tests/test_m5_review.c $(ALL_OBJS)
+	$(CC) $(CFLAGS) $(INC) -static -o $@ tests/test_m5_review.c $(ALL_OBJS)
 
 tests/test_m6: tests/test_m6.c $(ALL_OBJS)
 	$(CC) $(CFLAGS) $(INC) -static -o $@ tests/test_m6.c $(ALL_OBJS)
@@ -105,7 +109,14 @@ tests/test_m6_deep_review: tests/test_m6_deep_review.c $(ALL_OBJS)
 tests/test_m7: tests/test_m7.c $(ALL_OBJS)
 	$(CC) $(CFLAGS) $(INC) -static -o $@ tests/test_m7.c $(ALL_OBJS)
 
-test: tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4 tests/test_bulk tests/test_m5 tests/test_m6 tests/test_m6_review tests/test_m6_deep_review tests/test_m7 dl build-tmp
+tests/bench: tests/bench.c $(ALL_OBJS)
+	$(CC) $(CFLAGS) $(INC) -static -o $@ tests/bench.c $(ALL_OBJS)
+
+bench: tests/bench
+	@echo "=== Running demonstration benchmark ==="
+	LD_LIBRARY_PATH=. ./tests/bench
+
+test: tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4 tests/test_m4_review tests/test_bulk tests/test_m5 tests/test_m5_review tests/test_m6 tests/test_m6_review tests/test_m6_deep_review tests/test_m7 dl build-tmp
 	@echo "=== Running M0 unit tests ==="
 	LD_LIBRARY_PATH=. ./tests/test_m0
 	@echo ""
@@ -121,11 +132,17 @@ test: tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4 test
 	@echo "=== Running M4 unit tests ==="
 	LD_LIBRARY_PATH=. ./tests/test_m4
 	@echo ""
+	@echo "=== Running M4 adversarial review tests ==="
+	LD_LIBRARY_PATH=. ./tests/test_m4_review
+	@echo ""
 	@echo "=== Running bulk DAFSA tests ==="
 	LD_LIBRARY_PATH=. ./tests/test_bulk
 	@echo ""
 	@echo "=== Running M5 regex walker tests ==="
 	LD_LIBRARY_PATH=. ./tests/test_m5
+	@echo ""
+	@echo "=== Running M5 adversarial review tests ==="
+	LD_LIBRARY_PATH=. ./tests/test_m5_review
 	@echo ""
 	@echo "=== Running M6 permutation index tests ==="
 	LD_LIBRARY_PATH=. ./tests/test_m6
@@ -156,6 +173,7 @@ clean:
 	rm -f vendor/*.o src/*.o
 	rm -f libdatalog.so dl
 	rm -f tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4 \
-	      tests/test_m5 tests/test_m6 tests/test_m6_review tests/test_bulk \
-	      tests/test_m6_deep_review tests/test_m7
+	      tests/test_m4_review tests/test_m5 tests/test_m5_review tests/test_m6 \
+	      tests/test_m6_review tests/test_bulk \
+	      tests/test_m6_deep_review tests/test_m7 tests/bench
 	rm -rf /tmp/dl-test-db build-tmp/smoke build-tmp/m1
