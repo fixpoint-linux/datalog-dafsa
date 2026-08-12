@@ -1,6 +1,6 @@
 # Implementation Plan: DAFSA-Backed Deductive Database (Datalog VM)
 
-**Status:** M0-M5 complete (2026-08-12). 111 tests green (M0=9, M1=18, M2=18, M3=17, M4=8, bulk=16, M5=25 + smoke). Next: M6.
+**Status:** M0-M6 complete (2026-08-12). 135 tests green (M0=9, M1=18, M2=18, M3=17, M4=8, bulk=16, M5=25, M6=8, M6-review=5, M6-deep-review=10 + smoke). Next: M7.
 **Goal:** Turn the architecture into a concrete, executable build plan with file layout, per-milestone tasks, and verification for each step.
 **Repos involved:** this project (new, e.g. `~/projects/datalog-dafsa/`), consuming the proven jing-meta DAFSA C engine (`indexer/dafsa/dafsa.c` + `dafsa_core.c` + `dafsa_persist.c` + `dafsa_view.c` + `dafsa_wal.c` + `dafsa.h`).
 
@@ -159,6 +159,8 @@ Tasks:
 
 ### M6 — Permutation indices + hash-join fallback (~1 wk)
 **Goal:** join strategy fully covers arbitrary access patterns.
+
+**STATUS: COMPLETE (2026-08-12). FULL scope (user-confirmed): real in-frame hash table in OP_HASH_JOIN + recursive IDB perm shadows + snapshot persistence.** Removed the M2 non-leading-column-join rejection. New opcodes OP_LOOKUP_PERM=11, OP_HASH_JOIN=12. compiler derives column permutations for non-leading shared-col joins, emits OP_LOOKUP_PERM (perm_id in imm); permindex.c builds permuted DAFSA indices (bulk, dirty-tracked, rebuilt at vm_execute prologue + after IDB materialization); perm-aware bind_row_perm/seek_valid_perm/backtrack (INVARIANT: slots[c] always = slot for ORIGINAL column c); recursive IDB perm shadows (permuted sorted tuple_set, rebuilt each fixpoint iter); snapshot writes <rel>__PI<hex>__.dafsa + manifest. __PI<hex>__ names reserved. BLOCKER found+fixed by reviewer: IDB perm indices were built from empty DAFSAs (built at prologue before IDB populated; rel_add didn't mark dirty) → silent empty results for non-recursive IDB non-leading joins; fixed by permindex_mark_dirty + rebuild after each non-recursive rule and after IDB materialization. 8 M6 tests + 5 review + 10 deep-review. Reviewer: perm↔binding mapping CORRECT.
 
 Tasks:
 1. `compiler.c`: observe access patterns; declare permutation indices for non-leading-column join keys (Soufflé-style index-building pass).
