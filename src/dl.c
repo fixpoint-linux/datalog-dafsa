@@ -10,6 +10,7 @@
  */
 
 #include "dl.h"
+#include "dl_internal.h"
 #include "intern.h"
 #include "relation.h"
 #include "parser.h"
@@ -31,38 +32,7 @@
 #include <unistd.h>
 #include <dirent.h>
 
-/* ─── dl_db struct ────────────────────────────────────────────────────── */
-
-#define MAX_RELS 64  /* enough for M0 */
-
-typedef struct {
-    char     *name;
-    relation *rel;
-} rel_entry;
-
-struct dl_db {
-    char      *dir;
-    interner  *ir;
-    rel_entry  rels[MAX_RELS];
-    size_t     nrels;
-    int        lock_fd;    /* M7: fcntl lock file descriptor, or -1 */
-
-    /* M1: compiled rules */
-    compiled_rule **crules;
-    int             n_crules;
-
-    /* M4: snapshot support */
-    int              fixpoint_dirty;  /* 1 if rules loaded / facts changed
-                                         since last compile/publish */
-    uint32_t         snap_version;    /* current snapshot version, 0=none */
-    view_cache_slot  vcache[DL_VIEW_CACHE_SZ];
-    int            (*fault_hook)(dl_fpoint, void *);
-    void            *fault_user;
-
-    /* M6: permutation indices */
-    perm_index_entry  perms[MAX_PERMS];
-    int               n_perms;
-};
+/* dl_db layout lives in dl_internal.h (shared with internal consumers) */
 
 /* ─── Internal helpers ────────────────────────────────────────────────── */
 

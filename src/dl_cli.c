@@ -16,6 +16,7 @@
  */
 
 #include "dl.h"
+#include "dl_internal.h"
 #include "intern.h"
 #include "snapshot.h"
 #include "regexwalk.h"
@@ -26,19 +27,11 @@
 
 static const char *DB_DIR = "dl-test-db";
 
-/*
- * The dl_db struct layout (must match dl.c).
- * We reach in to access the interner for CLI value parsing.
- */
-struct dl_db_internal {
-    char      *dir;
-    interner  *ir;
-};
-
+/* Reach into the opaque dl_db handle via the shared internal layout
+ * (dl_internal.h) to access the interner for CLI value parsing. */
 static interner *cli_get_interner(dl_db *db)
 {
-    struct dl_db_internal *dbi = (struct dl_db_internal *)db;
-    return dbi->ir;
+    return db->ir;
 }
 
 /* Parse a CLI value: integer -> raw u32, else intern -> sym_id */

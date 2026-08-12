@@ -8,6 +8,7 @@
 
 #include "permindex.h"
 #include "dl.h"
+#include "dl_internal.h"
 #include "relation.h"
 #include "tupleset.h"
 #include "snapshot.h"
@@ -16,43 +17,28 @@
 #include <string.h>
 #include <stdio.h>
 
-/* ─── Internal dl_db access (must match dl.c) ────────────────────────── */
+/* ─── Internal dl_db access (authoritative layout in dl_internal.h) ──── */
 
-struct dl_db_internal {
-    char *dir; void *ir;
-    struct { char *name; void *rel; } rels[64];
-    size_t nrels;
-    int _m7_lock_fd;            /* M7: fcntl lock fd (must match dl_db layout) */
-    void *crules; int n_crules;
-    int fixpoint_dirty; uint32_t snap_version;
-    view_cache_slot vcache[DL_VIEW_CACHE_SZ];
-    void *fault_hook; void *fault_user;
-    perm_index_entry perms[MAX_PERMS];
-    int n_perms;
-};
-
-static void *db_rel_raw(struct dl_db *db, int idx)
+static relation *db_rel_raw(dl_db *db, int idx)
 {
-    struct dl_db_internal *d = (struct dl_db_internal *)db;
-    if (idx < 0 || (size_t)idx >= d->nrels) return NULL;
-    return d->rels[idx].rel;
+    if (idx < 0 || (size_t)idx >= db->nrels) return NULL;
+    return db->rels[idx].rel;
 }
 
 /* ─── Build a single permutation index ────────────────────────────────── */
 
-int permindex_build(struct dl_db *db, int rel_id, int perm_id)
+int permindex_build(dl_db *db, int rel_id, int perm_id)
 {
-    struct dl_db_internal *d = (struct dl_db_internal *)db;
     perm_index_entry *pe;
     relation *base_rel;
     tuple_set ts;
     uint8_t ar;
 
-    if (!db || perm_id < 0 || perm_id >= d->n_perms) return -1;
-    pe = &d->perms[perm_id];
+    if (!db || perm_id < 0 || perm_id >= db->n_perms) return -1;
+    pe = &db->perms[perm_id];
     if (pe->rel_id != rel_id) return -1;
 
-    base_rel = (relation *)db_rel_raw(db, rel_id);
+    base_rel = db_rel_raw(db, rel_id);
     if (!base_rel) return -1;
 
     ar = pe->arity;
@@ -124,14 +110,13 @@ int permindex_build(struct dl_db *db, int rel_id, int perm_id)
 
 int permindex_build_dirty(struct dl_db *db)
 {
-    struct dl_db_internal *d = (struct dl_db_internal *)db;
     int i;
 
     if (!db) return 0;
 
-    for (i = 0; i < d->n_perms; i++) {
-        if (d->perms[i].dirty) {
-            if (permindex_build(db, d->perms[i].rel_id, i) != 0)
+    for (i = 0; i < db->n_perms; i++) {
+        if (db->perms[i].dirty) {
+            if (permindex_build(db, db->perms[i].rel_id, i) != 0)
                 return -1;
         }
     }
@@ -142,14 +127,13 @@ int permindex_build_dirty(struct dl_db *db)
 
 void permindex_mark_dirty(struct dl_db *db, int rel_id)
 {
-    struct dl_db_internal *d = (struct dl_db_internal *)db;
     int pi;
 
     if (!db) return;
 
-    for (pi = 0; pi < d->n_perms; pi++) {
-        if (d->perms[pi].rel_id == rel_id)
-            d->perms[pi].dirty = 1;
+    for (pi = 0; pi < db->n_perms; pi++) {
+        if (db->perms[pi].rel_id == rel_id)
+            db->perms[pi].dirty = 1;
     }
 }
 
@@ -157,15 +141,14 @@ void permindex_mark_dirty(struct dl_db *db, int rel_id)
 
 void permindex_free_all(struct dl_db *db)
 {
-    struct dl_db_internal *d = (struct dl_db_internal *)db;
     int i;
 
     if (!db) return;
 
-    for (i = 0; i < d->n_perms; i++) {
-        if (d->perms[i].pidx_rel) {
-            rel_free(d->perms[i].pidx_rel);
-            d->perms[i].pidx_rel = NULL;
+    for (i = 0; i < db->n_perms; i++) {
+        if (db->perms[i].pidx_rel) {
+            rel_free(db->perms[i].pidx_rel);
+            db->perms[i].pidx_rel = NULL;
         }
     }
 }

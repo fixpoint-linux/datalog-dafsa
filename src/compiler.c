@@ -12,6 +12,7 @@
  */
 
 #include "compiler.h"
+#include "dl_internal.h"
 #include "intern.h"
 #include "relation.h"
 #include "regexwalk.h"
@@ -21,52 +22,35 @@
 #include <string.h>
 #include <stdio.h>
 
-/* ─── dl_db internals access (must match dl.c) ──────────────────────── */
-
-struct dl_db_internal {
-    char *dir; void *ir;
-    struct { char *name; void *rel; } rels[64];
-    size_t nrels;
-    int _m7_lock_fd;            /* M7: fcntl lock fd (must match dl_db layout) */
-    void *crules; int n_crules;
-    int fixpoint_dirty; uint32_t snap_version;
-    view_cache_slot vcache[DL_VIEW_CACHE_SZ];
-    void *fault_hook; void *fault_user;
-    perm_index_entry perms[MAX_PERMS];
-    int n_perms;
-};
+/* ─── dl_db internals access (authoritative layout in dl_internal.h) ─── */
 
 static int db_find_rel(dl_db *db, const char *name)
 {
-    struct dl_db_internal *d = (struct dl_db_internal *)db;
     size_t i;
-    for (i = 0; i < d->nrels; i++)
-        if (strcmp(d->rels[i].name, name) == 0) return (int)i;
+    for (i = 0; i < db->nrels; i++)
+        if (strcmp(db->rels[i].name, name) == 0) return (int)i;
     return -1;
 }
 
 static uint8_t db_rel_arity(dl_db *db, int idx)
 {
-    struct dl_db_internal *d = (struct dl_db_internal *)db;
-    if (idx < 0 || (size_t)idx >= d->nrels) return 0;
-    return rel_arity((const void *)d->rels[idx].rel);
+    if (idx < 0 || (size_t)idx >= db->nrels) return 0;
+    return rel_arity(db->rels[idx].rel);
 }
 
 static const char *db_rel_name(dl_db *db, int idx)
 {
-    struct dl_db_internal *d = (struct dl_db_internal *)db;
-    if (idx < 0 || (size_t)idx >= d->nrels) return NULL;
-    return d->rels[idx].name;
+    if (idx < 0 || (size_t)idx >= db->nrels) return NULL;
+    return db->rels[idx].name;
 }
 
 static size_t db_rel_count(dl_db *db)
 {
-    struct dl_db_internal *d = (struct dl_db_internal *)db;
-    return d->nrels;
+    return db->nrels;
 }
 
-static void *db_get_interner(dl_db *db)
-{ return ((struct dl_db_internal *)db)->ir; }
+static interner *db_get_interner(dl_db *db)
+{ return db->ir; }
 
 /* ─── Variable slot tracking ────────────────────────────────────────── */
 

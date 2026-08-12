@@ -19,6 +19,7 @@
  *   vm_query()          — thin wrapper: execute then stream goal via rel_prefix
  */
 #include "vm.h"
+#include "dl_internal.h"
 #include "relation.h"
 #include "regexwalk.h"
 #include "tupleset.h"
@@ -29,34 +30,19 @@
 #include <string.h>
 #include <stdio.h>
 
-/* ─── dl_db internal access (must match dl.c prefix) ─────────────────── */
+/* ─── dl_db internal access (authoritative layout in dl_internal.h) ──── */
 
-struct dl_db_internal {
-    char *dir; void *ir;
-    struct { char *name; void *rel; } rels[64];
-    size_t nrels;
-    int _m7_lock_fd;            /* M7: fcntl lock fd (must match dl_db layout) */
-    void *crules; int n_crules;
-    int fixpoint_dirty; uint32_t snap_version;
-    view_cache_slot vcache[DL_VIEW_CACHE_SZ];
-    void *fault_hook; void *fault_user;
-    perm_index_entry perms[MAX_PERMS];
-    int n_perms;
-};
-
-static void *db_rel(dl_db *db, int idx)
+static relation *db_rel(dl_db *db, int idx)
 {
-    struct dl_db_internal *d = (struct dl_db_internal *)db;
-    if (idx < 0 || (size_t)idx >= d->nrels) return NULL;
-    return d->rels[idx].rel;
+    if (idx < 0 || (size_t)idx >= db->nrels) return NULL;
+    return db->rels[idx].rel;
 }
 
 static int db_find(dl_db *db, const char *name)
 {
-    struct dl_db_internal *d = (struct dl_db_internal *)db;
     size_t i;
-    for (i = 0; i < d->nrels; i++)
-        if (!strcmp(d->rels[i].name, name)) return (int)i;
+    for (i = 0; i < db->nrels; i++)
+        if (!strcmp(db->rels[i].name, name)) return (int)i;
     return -1;
 }
 
@@ -1119,7 +1105,7 @@ static int eval_stratum_recursive(dl_db *db, compiled_rule **rules, int n)
     }
 
     {
-        struct dl_db_internal *di = (struct dl_db_internal *)db;
+        dl_db *di = db;
         int pi;
         for (pi = 0; pi < di->n_perms; pi++) {
             int p_rel_id = di->perms[pi].rel_id;
@@ -1177,7 +1163,7 @@ static int eval_stratum_recursive(dl_db *db, compiled_rule **rules, int n)
         for (_rdi = 0; _rdi < nr; _rdi++) { \
             for (_pi = 0; _pi < perm_count[_rdi]; _pi++) { \
                 int _db_pi = perm_ids[_rdi][_pi]; \
-                struct dl_db_internal *_di = (struct dl_db_internal *)db; \
+                dl_db *_di = db; \
                 const uint8_t *_perm_arr = _di->perms[_db_pi].perm; \
                 uint8_t _ar = _di->perms[_db_pi].arity; \
                 tuple_set *_shadow = &idb_perm_shadows[_rdi][_pi]; \
