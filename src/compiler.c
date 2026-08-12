@@ -27,6 +27,7 @@ struct dl_db_internal {
     char *dir; void *ir;
     struct { char *name; void *rel; } rels[64];
     size_t nrels;
+    int _m7_lock_fd;            /* M7: fcntl lock fd (must match dl_db layout) */
     void *crules; int n_crules;
     int fixpoint_dirty; uint32_t snap_version;
     view_cache_slot vcache[DL_VIEW_CACHE_SZ];

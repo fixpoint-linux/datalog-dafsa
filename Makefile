@@ -31,6 +31,7 @@ LIB_OBJS = src/intern.o \
            src/snapshot.o \
            src/regexwalk.o \
            src/permindex.o \
+           src/util.o \
            src/dl.o
 
 # Combined object list used for static links (tests, CLI).
@@ -101,7 +102,10 @@ tests/test_m6_review: tests/test_m6_review.c $(ALL_OBJS)
 tests/test_m6_deep_review: tests/test_m6_deep_review.c $(ALL_OBJS)
 	$(CC) $(CFLAGS) $(INC) -static -o $@ tests/test_m6_deep_review.c $(ALL_OBJS)
 
-test: tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4 tests/test_bulk tests/test_m5 tests/test_m6 tests/test_m6_review tests/test_m6_deep_review dl build-tmp
+tests/test_m7: tests/test_m7.c $(ALL_OBJS)
+	$(CC) $(CFLAGS) $(INC) -static -o $@ tests/test_m7.c $(ALL_OBJS)
+
+test: tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4 tests/test_bulk tests/test_m5 tests/test_m6 tests/test_m6_review tests/test_m6_deep_review tests/test_m7 dl build-tmp
 	@echo "=== Running M0 unit tests ==="
 	LD_LIBRARY_PATH=. ./tests/test_m0
 	@echo ""
@@ -132,6 +136,9 @@ test: tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4 test
 	@echo "=== Running M6 deep adversarial tests ==="
 	LD_LIBRARY_PATH=. ./tests/test_m6_deep_review
 	@echo ""
+	@echo "=== Running M7 durability tests ==="
+	LD_LIBRARY_PATH=. ./tests/test_m7
+	@echo ""
 	@echo "=== Running CLI smoke test ==="
 	@sh tests/smoke.sh
 
@@ -149,5 +156,6 @@ clean:
 	rm -f vendor/*.o src/*.o
 	rm -f libdatalog.so dl
 	rm -f tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4 \
-	      tests/test_m5 tests/test_m6 tests/test_m6_review tests/test_bulk
+	      tests/test_m5 tests/test_m6 tests/test_m6_review tests/test_bulk \
+	      tests/test_m6_deep_review tests/test_m7
 	rm -rf /tmp/dl-test-db build-tmp/smoke build-tmp/m1

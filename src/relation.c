@@ -22,13 +22,20 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <errno.h>
 
 #define MAX_ARITY 8
 #define MAX_KEY_LEN (MAX_ARITY * 4 + 1)  /* 33 */
 
 struct relation {
-    dafsa  *d;
-    uint8_t arity;
+    dafsa     *d;
+    uint8_t    arity;
+    dafsa_wal *wal;       /* M7: per-relation WAL handle, or NULL */
+    char      *wal_path;  /* M7: path to WAL file (owned) */
 };
 
 /* ─── Key encoding helpers ────────────────────────────────────────────── */
@@ -118,6 +125,8 @@ void rel_free(relation *rel)
 {
     if (!rel) return;
     dafsa_free(rel->d);
+    if (rel->wal) dafsa_wal_close(rel->wal);
+    free(rel->wal_path);
     free(rel);
 }
 
@@ -148,6 +157,17 @@ int rel_exact(const relation *rel, const uint32_t *cols)
 
     key_len = encode_key(key, cols, rel->arity);
     return dafsa_lookup_n(rel->d, key, key_len);
+}
+
+int rel_delete(relation *rel, const uint32_t *cols)
+{
+    unsigned char key[MAX_KEY_LEN];
+    size_t key_len;
+
+    if (!rel || !cols) return -1;
+
+    key_len = encode_key(key, cols, rel->arity);
+    return dafsa_delete_n(rel->d, key, key_len);
 }
 
 /* ─── Prefix enumeration ──────────────────────────────────────────────── */
@@ -324,6 +344,171 @@ out:
     /* new_d is only non-NULL on failure — discard */
     dafsa_free(new_d);
     return ret;
+}
+
+/* ─── WAL operations (M7) ──────────────────────────────────────────────── */
+
+/* WAL replay callback: apply ADD or DEL to the in-memory DAFSA.
+ * Idempotent: ADD of existing = dup (returns 0, dafsa_add_n handles it),
+ * DEL of absent = no-op (returns 0, dafsa_delete_n handles it). */
+struct wal_replay_ctx {
+    relation *rel;
+    int       ok;  /* becomes -1 on first error */
+};
+
+static int wal_replay_cb(uint8_t op, const unsigned char *key,
+                         uint32_t key_len, void *user)
+{
+    struct wal_replay_ctx *ctx = (struct wal_replay_ctx *)user;
+    int rc;
+
+    if (ctx->ok != 0) return 0;  /* already failed, skip */
+
+    if (op == DAFSA_WAL_OP_ADD) {
+        rc = dafsa_add_n(ctx->rel->d, key, key_len);
+        if (rc < 0) ctx->ok = -1;
+    } else if (op == DAFSA_WAL_OP_DEL) {
+        rc = dafsa_delete_n(ctx->rel->d, key, key_len);
+        if (rc < 0) ctx->ok = -1;
+    }
+    return 0;
+}
+
+int rel_wal_replay_into(relation *rel)
+{
+    struct wal_replay_ctx ctx;
+
+    if (!rel || !rel->wal) return -1;
+
+    ctx.rel = rel;
+    ctx.ok  = 0;
+
+    if (dafsa_wal_replay(rel->wal, wal_replay_cb, &ctx) != 0)
+        return -1;
+
+    return ctx.ok;
+}
+
+int rel_wal_append_add(relation *rel,
+                       const unsigned char *key, uint32_t key_len)
+{
+    if (!rel || !rel->wal || !key) return -1;
+    if (dafsa_wal_append_add(rel->wal, key, key_len) != 0) return -1;
+    if (dafsa_wal_sync(rel->wal) != 0) return -1;
+    return 0;
+}
+
+int rel_wal_append_del(relation *rel,
+                       const unsigned char *key, uint32_t key_len)
+{
+    if (!rel || !rel->wal || !key) return -1;
+    if (dafsa_wal_append_del(rel->wal, key, key_len) != 0) return -1;
+    if (dafsa_wal_sync(rel->wal) != 0) return -1;
+    return 0;
+}
+
+/* fsync helper: fsync the directory containing a path */
+static int fsync_parent_dir(const char *path)
+{
+    const char *slash = strrchr(path, '/');
+    char *dir;
+    int fd, ret = -1;
+
+    if (!slash || slash == path) {
+        fd = open("/", O_RDONLY | O_DIRECTORY);
+        if (fd >= 0) { ret = fsync(fd); close(fd); }
+        return ret;
+    }
+    dir = strndup(path, (size_t)(slash - path));
+    if (!dir) return -1;
+    fd = open(dir, O_RDONLY | O_DIRECTORY);
+    if (fd >= 0) { ret = fsync(fd); close(fd); }
+    free(dir);
+    return ret;
+}
+
+int rel_compact(relation *rel, const char *dafsa_path)
+{
+    if (!rel || !rel->wal || !dafsa_path) return -1;
+
+    /* 1. Save DAFSA atomically (dafsa_save already does tmp+fsync+rename+dir-fsync) */
+    if (dafsa_save(rel->d, dafsa_path) != 0) return -1;
+
+    /* 2. ftruncate WAL to 16 bytes (header-only) and fsync */
+    if (ftruncate(rel->wal->fd, 16) != 0) return -1;
+    if (fsync(rel->wal->fd) != 0) return -1;
+    rel->wal->size = 16;
+
+    /* 3. fsync the directory containing the WAL */
+    if (fsync_parent_dir(rel->wal_path) != 0) return -1;
+
+    return 0;
+}
+
+uint64_t rel_wal_size(const relation *rel)
+{
+    if (!rel || !rel->wal) return 0;
+    return dafsa_wal_size(rel->wal);
+}
+
+uint64_t rel_dafsa_size(const relation *rel)
+{
+    dafsa_stats_out st;
+    if (!rel || !rel->d) return 0;
+    dafsa_stats(rel->d, &st);
+    /* Return a rough byte estimate based on state/transition counts.
+     * This is used for the 25% compaction threshold. */
+    uint64_t est = (uint64_t)st.n_states_reachable * 64ULL  /* ~64B per State */
+                 + (uint64_t)st.n_trans * 8ULL;             /* ~8B per transition */
+    return est;
+}
+
+/* Open a relation with WAL: load base + replay + compact */
+relation *rel_open_writable(const char *dafsa_path, const char *wal_path,
+                            uint8_t arity)
+{
+    relation *rel;
+    int wal_exists = 0;
+
+    if (arity == 0 || arity > MAX_ARITY) return NULL;
+
+    rel = calloc(1, sizeof(*rel));
+    if (!rel) return NULL;
+
+    /* Load base DAFSA */
+    rel->d = dafsa_load(dafsa_path);
+    if (!rel->d) {
+        rel->d = dafsa_create();
+        if (!rel->d) { free(rel); return NULL; }
+    }
+    rel->arity = arity;
+
+    /* Open WAL (rw) — auto-repairs torn tail */
+    {
+        struct stat st;
+        wal_exists = (stat(wal_path, &st) == 0 && st.st_size > 16);
+    }
+
+    rel->wal = dafsa_wal_open_rw(wal_path);
+    if (!rel->wal) { dafsa_free(rel->d); free(rel); return NULL; }
+
+    rel->wal_path = strdup(wal_path);
+    if (!rel->wal_path) { dafsa_wal_close(rel->wal); dafsa_free(rel->d); free(rel); return NULL; }
+
+    /* If WAL had records > header, replay them into in-memory DAFSA */
+    if (wal_exists) {
+        if (rel_wal_replay_into(rel) != 0) {
+            rel_free(rel);
+            return NULL;
+        }
+        /* Compact immediately: save DAFSA + truncate WAL */
+        if (rel_compact(rel, dafsa_path) != 0) {
+            rel_free(rel);
+            return NULL;
+        }
+    }
+
+    return rel;
 }
 
 /* ─── Regex pattern walk ──────────────────────────────────────────────── */

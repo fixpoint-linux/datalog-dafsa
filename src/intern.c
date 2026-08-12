@@ -10,9 +10,13 @@
 
 #include "intern.h"
 #include "dafsa.h"
+#include "util.h"
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 #define INTERN_REV_INIT_CAP 256
 
@@ -147,15 +151,16 @@ int intern_save(interner *ir, const char *fwd_path, const char *rev_path)
 {
     FILE *f;
     uint32_t i;
+    char tmp_path[8192];
 
     if (!ir || !fwd_path || !rev_path) return -1;
 
-    /* Save forward DAFSA */
+    /* Save forward DAFSA (already atomic: dafsa_save does tmp+fsync+rename) */
     if (dafsa_save(ir->fwd, fwd_path) != 0) return -1;
 
-    /* Save reverse array: one string per line (NUL is not valid in our
-     * strings; if a stored string contains NUL, we truncate at it). */
-    f = fopen(rev_path, "w");
+    /* Save reverse array atomically: streaming tmp+fsync+rename+dir-fsync */
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", rev_path);
+    f = fopen(tmp_path, "w");
     if (!f) return -1;
 
     for (i = 1; i < ir->next_id; i++) {
@@ -163,17 +168,25 @@ int intern_save(interner *ir, const char *fwd_path, const char *rev_path)
         if (s) {
             if (fputs(s, f) == EOF || fputc('\n', f) == EOF) {
                 fclose(f);
+                unlink(tmp_path);
                 return -1;
             }
         } else {
             if (fputc('\n', f) == EOF) {
                 fclose(f);
+                unlink(tmp_path);
                 return -1;
             }
         }
     }
 
-    if (fclose(f) != 0) return -1;
+    if (fflush(f) != 0) { fclose(f); unlink(tmp_path); return -1; }
+    if (fsync(fileno(f)) != 0) { fclose(f); unlink(tmp_path); return -1; }
+    if (fclose(f) != 0) { unlink(tmp_path); return -1; }
+
+    if (rename(tmp_path, rev_path) != 0) { unlink(tmp_path); return -1; }
+    if (fsync_dir_of_path(rev_path) != 0) return -1;
+
     return 0;
 }
 

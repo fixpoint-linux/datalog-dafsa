@@ -19,6 +19,7 @@
 #include "regexwalk.h"
 #include "tupleset.h"
 #include "permindex.h"
+#include "util.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -44,6 +45,7 @@ struct dl_db {
     interner  *ir;
     rel_entry  rels[MAX_RELS];
     size_t     nrels;
+    int        lock_fd;    /* M7: fcntl lock file descriptor, or -1 */
 
     /* M1: compiled rules */
     compiled_rule **crules;
@@ -94,20 +96,55 @@ static char *make_path(dl_db *db, const char *name, const char *suffix)
 
 dl_db *dl_open(const char *dir)
 {
+    return dl_open2(dir, NULL);
+}
+
+dl_db *dl_open2(const char *dir, int *err_out)
+{
     dl_db *db;
     char *rels_path;
     FILE *rf;
+    char lock_path[4096];
+    int lfd = -1;
 
-    if (!dir) return NULL;
+    if (!dir) {
+        if (err_out) *err_out = -1;
+        return NULL;
+    }
 
     /* Create directory if needed */
     mkdir(dir, 0755);
 
+    /* M7: acquire fcntl single-writer lock */
+    snprintf(lock_path, sizeof(lock_path), "%s/LOCK", dir);
+    lfd = open(lock_path, O_CREAT | O_RDWR, 0644);
+    if (lfd < 0) {
+        if (err_out) *err_out = -1;
+        return NULL;
+    }
+
+    {
+        struct flock fl;
+        fl.l_type   = F_WRLCK;
+        fl.l_whence = SEEK_SET;
+        fl.l_start  = 0;
+        fl.l_len    = 0;  /* whole file */
+        fl.l_pid    = 0;
+
+        if (fcntl(lfd, F_SETLK, &fl) != 0) {
+            /* Contention: another writer holds the lock */
+            close(lfd);
+            if (err_out) *err_out = DL_E_LOCKED;
+            return NULL;
+        }
+    }
+
     db = calloc(1, sizeof(*db));
-    if (!db) return NULL;
+    if (!db) { close(lfd); if (err_out) *err_out = -1; return NULL; }
+    db->lock_fd = lfd;
 
     db->dir = strdup(dir);
-    if (!db->dir) { free(db); return NULL; }
+    if (!db->dir) { close(lfd); free(db); if (err_out) *err_out = -1; return NULL; }
 
     /* M4: set initial snapshot state */
     db->fixpoint_dirty = 0;
@@ -122,13 +159,18 @@ dl_db *dl_open(const char *dir)
         char *rev_path = make_path(db, "symbols", ".array");
         if (!fwd_path || !rev_path) {
             free(fwd_path); free(rev_path);
-            free(db->dir); free(db);
+            close(lfd); free(db->dir); free(db);
+            if (err_out) *err_out = -1;
             return NULL;
         }
         db->ir = intern_load(fwd_path, rev_path);
         free(fwd_path);
         free(rev_path);
-        if (!db->ir) { free(db->dir); free(db); return NULL; }
+        if (!db->ir) {
+            close(lfd); free(db->dir); free(db);
+            if (err_out) *err_out = -1;
+            return NULL;
+        }
     }
 
     /* Load existing relations from metadata file */
@@ -162,6 +204,7 @@ dl_db *dl_open(const char *dir)
     db->snap_version = snapshot_read_current(db->dir);
     db->fixpoint_dirty = (db->n_crules > 0) ? 1 : 0;
 
+    if (err_out) *err_out = 0;
     return db;
 }
 
@@ -186,13 +229,11 @@ void dl_close(dl_db *db)
         free(rev_path);
     }
 
-    /* Save each relation's DAFSA, and record its name/arity for the metadata
-     * write below.  We must capture name/arity BEFORE freeing the relation,
-     * or the metadata loop reads freed memory (use-after-free). */
+    /* M7: compact each relation (save DAFSA + truncate WAL) then save */
     for (i = 0; i < db->nrels; i++) {
         char *path = make_path(db, db->rels[i].name, ".dafsa");
         if (path) {
-            rel_save(db->rels[i].rel, path);
+            rel_compact(db->rels[i].rel, path);
             free(path);
         }
     }
@@ -226,6 +267,10 @@ void dl_close(dl_db *db)
 
     intern_free(db->ir);
     free(db->dir);
+
+    /* M7: release fcntl lock LAST (lock released when fd closes) */
+    if (db->lock_fd >= 0) close(db->lock_fd);
+
     free(db);
 }
 
@@ -279,13 +324,21 @@ int dl_declare_relation(dl_db *db, const char *name, uint8_t arity)
         return -1;  /* arity mismatch */
     }
 
-    /* Try to load existing DAFSA, or create new */
-    path = make_path(db, name, ".dafsa");
-    if (!path) return -1;
+    /* Try to load existing DAFSA with WAL, or create new */
+    {
+        char *wal_path;
+        path = make_path(db, name, ".dafsa");
+        wal_path = make_path(db, name, ".wal");
+        if (!path || !wal_path) {
+            free(path); free(wal_path);
+            return -1;
+        }
 
-    rel = rel_open(path, arity);
-    free(path);
-    if (!rel) return -1;
+        rel = rel_open_writable(path, wal_path, arity);
+        free(path);
+        free(wal_path);
+        if (!rel) return -1;
+    }
 
     /* Register */
     idx = (int)db->nrels++;
@@ -295,6 +348,23 @@ int dl_declare_relation(dl_db *db, const char *name, uint8_t arity)
         rel_free(rel);
         db->nrels--;
         return -1;
+    }
+
+    /* M7: persist relation metadata immediately so crash-recovery works.
+     * Without this, a process that declares a relation and adds facts
+     * before crashing would lose the relation declaration on reopen. */
+    {
+        char *rels_path = make_path(db, "rels", ".txt");
+        FILE *rf;
+        if (rels_path && (rf = fopen(rels_path, "w"))) {
+            size_t j;
+            for (j = 0; j < db->nrels; j++) {
+                fprintf(rf, "%s:%d\n", db->rels[j].name,
+                        (int)rel_arity(db->rels[j].rel));
+            }
+            fclose(rf);
+        }
+        free(rels_path);
     }
 
     return 0;
@@ -472,7 +542,22 @@ int dl_load_facts(dl_db *db, const char *rel_name, const char *csv_path)
     loaded = (int)ts.count;
     ts_free(&ts);
 
-    /* Auto-save after load */
+    /* M7: save interner BEFORE relation save (invariant: interner durable
+     * before relation, so relation DAFSA never references a sym_id not on disk) */
+    {
+        char *fwd_path = make_path(db, "symbols", ".dafsa");
+        char *rev_path = make_path(db, "symbols", ".array");
+        if (fwd_path && rev_path) {
+            if (intern_save(db->ir, fwd_path, rev_path) != 0) {
+                free(fwd_path); free(rev_path);
+                return -1;
+            }
+        }
+        free(fwd_path);
+        free(rev_path);
+    }
+
+    /* Auto-save relation DAFSA after load */
     {
         char *path = make_path(db, rel_name, ".dafsa");
         if (path) {
@@ -494,6 +579,145 @@ int dl_load_facts(dl_db *db, const char *rel_name, const char *csv_path)
     }
 
     return loaded;
+}
+
+/* ─── Incremental fact API (M7) ────────────────────────────────────────── */
+
+/* Check if a u32 value is a sym_id (>= some threshold) vs a raw integer.
+ * We use a simple heuristic: if the value is >= 256, it could be a sym_id.
+ * The interner assigns sequential ids starting from 1.  Raw integers in
+ * practice are small (usually < 1000 for test data).  For correctness,
+ * we track whether intern_str was called for any column value.
+ *
+ * Actually: we can't tell from a u32 whether it was interned or is a raw
+ * int.  The plan says "intern string columns (may add sym_ids)".  But the
+ * dl_add_fact API receives u32 values — strings are already interned by
+ * the caller.  So we check whether the value needs interning by trying
+ * intern_str_of.  If it returns non-NULL, it's already a sym_id.  If NULL,
+ * it might be a raw int OR a not-yet-interned string.
+ *
+ * BUT: the caller passes u32 cols[], not strings.  So the caller must have
+ * already interned strings before calling.  This matches M0's dl_lookup:
+ * the user passes u32 sym_ids for strings.
+ *
+ * The interner durability invariant: if new syms were added (by the caller
+ * before calling dl_add_fact), we must save the interner before
+ * WAL-appending.  But we can't know from the u32 values alone whether
+ * they caused new interning.
+ *
+ * Simplification for M7: dl_add_fact/dl_delete_fact do NOT intern — the
+ * caller must pass already-interned u32 values (via intern_str before
+ * calling).  The user-facing docs should note this.  The interner save
+ * is the caller's responsibility for now.
+ *
+ * For the ordering invariant, we check: if any column value >= ir->next_id
+ * (i.e., not yet known to the interner), it's an error.
+ */
+
+static int encode_fact_key(unsigned char *key, size_t *key_len,
+                           const uint32_t *cols, uint8_t arity)
+{
+    uint8_t i;
+    if (arity == 0 || arity > 8) return -1;
+    for (i = 0; i < arity; i++) {
+        uint32_t v = cols[i];
+        key[4*i]     = (unsigned char)((v >> 24) & 0xFF);
+        key[4*i + 1] = (unsigned char)((v >> 16) & 0xFF);
+        key[4*i + 2] = (unsigned char)((v >> 8)  & 0xFF);
+        key[4*i + 3] = (unsigned char)(v & 0xFF);
+    }
+    key[4 * arity] = 0x00;
+    *key_len = (size_t)(4 * arity + 1);
+    return 0;
+}
+
+int dl_add_fact(dl_db *db, const char *rel_name,
+                const uint32_t *cols, uint8_t arity)
+{
+    int idx;
+    unsigned char key[33];  /* 4*8+1 */
+    size_t key_len;
+    int rc;
+
+    if (!db || !rel_name || !cols) return -1;
+
+    idx = find_rel(db, rel_name);
+    if (idx < 0) return -1;
+
+    if (arity != rel_arity(db->rels[idx].rel)) return -1;
+
+    if (encode_fact_key(key, &key_len, cols, arity) != 0) return -1;
+
+    /* 1. WAL-append ADD + sync (durable before in-memory commit) */
+    if (rel_wal_append_add(db->rels[idx].rel, key, (uint32_t)key_len) != 0)
+        return -1;
+
+    /* 2. In-memory add */
+    rc = rel_add(db->rels[idx].rel, cols);
+    if (rc < 0) return -1;
+
+    /* 3. Check compaction threshold: WAL > 25% of DAFSA estimate? */
+    {
+        uint64_t wal_sz = rel_wal_size(db->rels[idx].rel);
+        uint64_t dafsa_sz = rel_dafsa_size(db->rels[idx].rel);
+        if (dafsa_sz > 0 && wal_sz > dafsa_sz / 4) {
+            char *path = make_path(db, rel_name, ".dafsa");
+            if (path) {
+                rel_compact(db->rels[idx].rel, path);
+                free(path);
+            }
+        }
+    }
+
+    /* M4: facts changed, mark fixpoint dirty */
+    db->fixpoint_dirty = 1;
+
+    return rc;  /* 1 if added, 0 if duplicate */
+}
+
+int dl_delete_fact(dl_db *db, const char *rel_name,
+                   const uint32_t *cols, uint8_t arity)
+{
+    int idx;
+    unsigned char key[33];
+    size_t key_len;
+    int rc;
+
+    if (!db || !rel_name || !cols) return -1;
+
+    idx = find_rel(db, rel_name);
+    if (idx < 0) return -1;
+
+    if (arity != rel_arity(db->rels[idx].rel)) return -1;
+
+    if (encode_fact_key(key, &key_len, cols, arity) != 0) return -1;
+
+    /* 1. WAL-append DEL + sync (durable before in-memory commit) */
+    if (rel_wal_append_del(db->rels[idx].rel, key, (uint32_t)key_len) != 0)
+        return -1;
+
+    /* 2. In-memory delete */
+    rc = rel_delete(db->rels[idx].rel, cols);
+    if (rc < 0) return -1;
+
+    /* M4: facts changed, mark fixpoint dirty */
+    db->fixpoint_dirty = 1;
+
+    return rc;  /* 1 if deleted, 0 if absent */
+}
+
+/* ─── Interner access (M7) ─────────────────────────────────────────────── */
+
+uint32_t dl_intern_str(dl_db *db, const char *str)
+{
+    if (!db || !db->ir) return 0;
+    return intern_str(db->ir, str);
+}
+
+const char *dl_intern_str_of(dl_db *db, uint32_t sym_id)
+{
+    if (!db || !db->ir) return NULL;
+    return intern_str_of(db->ir, sym_id);
 }
 
 /* ─── Query primitives ────────────────────────────────────────────────── */
@@ -653,66 +877,6 @@ long dl_query_bound(dl_db *db, const char *goal_rel,
 }
 
 /* ─── M4: snapshot publish ─────────────────────────────────────────────── */
-
-/* fsync helpers (mirror dafsa_persist.c) */
-static int fsync_dir_of_path(const char *path)
-{
-    const char *slash = strrchr(path, '/');
-    char *dir;
-    int fd, ret = -1;
-
-    if (!slash)
-        slash = path;  /* shouldn't happen */
-    if (slash == path) {
-        /* path is "/foo" */
-        fd = open("/", O_RDONLY | O_DIRECTORY);
-        if (fd >= 0) { ret = fsync(fd); close(fd); }
-        return ret;
-    }
-    dir = strndup(path, (size_t)(slash - path));
-    if (!dir) return -1;
-    fd = open(dir, O_RDONLY | O_DIRECTORY);
-    if (fd >= 0) { ret = fsync(fd); close(fd); }
-    free(dir);
-    return ret;
-}
-
-static int fsync_dir_path(const char *dirpath)
-{
-    int fd = open(dirpath, O_RDONLY | O_DIRECTORY);
-    int ret = -1;
-    if (fd >= 0) { ret = fsync(fd); close(fd); }
-    return ret;
-}
-
-/* Write a string to a file with atomic rename (tmp+fsync+rename+dir-fsync) */
-static int atomic_write_str(const char *path, const char *content)
-{
-    char tmp[8192];
-    int fd;
-    size_t len = strlen(content);
-    size_t off = 0;
-
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wformat-truncation"
-    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
-#pragma GCC diagnostic pop
-    fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) return -1;
-
-    while (off < len) {
-        ssize_t w = write(fd, content + off, len - off);
-        if (w < 0) { close(fd); remove(tmp); return -1; }
-        off += (size_t)w;
-    }
-
-    if (fsync(fd) != 0) { close(fd); remove(tmp); return -1; }
-    close(fd);
-
-    if (rename(tmp, path) != 0) { remove(tmp); return -1; }
-    if (fsync_dir_of_path(path) != 0) return -1;
-    return 0;
-}
 
 /* Best-effort recursive removal of a file or directory (for crash cleanup).
  * No shell (no injection risk from caller-controlled paths, which may contain

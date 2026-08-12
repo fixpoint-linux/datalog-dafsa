@@ -28,6 +28,14 @@ typedef struct dl_db dl_db;
 dl_db  *dl_open(const char *dir);
 void    dl_close(dl_db *db);
 
+/* Error codes for dl_open2 */
+#define DL_E_LOCKED 1   /* database is locked by another writer */
+
+/* Open with explicit error reporting.  On success, *err_out=0 and handle
+ * is returned.  On failure, *err_out is set and NULL is returned.
+ * err_out may be NULL (behaviour identical to dl_open). */
+dl_db  *dl_open2(const char *dir, int *err_out);
+
 /* ─── Schema ──────────────────────────────────────────────────────────── */
 
 /* Declare a relation with a fixed arity (1-8).  Creates an empty DAFSA
@@ -41,6 +49,20 @@ int dl_declare_relation(dl_db *db, const char *name, uint8_t arity);
  * Values: quoted strings (interned) or bare integers (stored raw as u32).
  * Returns number of facts loaded, or -1 on error. */
 int dl_load_facts(dl_db *db, const char *rel, const char *csv_path);
+
+/* ─── Incremental fact API (M7) ────────────────────────────────────────── */
+
+/* Add a single fact to a relation.  cols has `arity` u32 values.
+ * Returns 1 if added, 0 if duplicate, -1 on error.
+ * Durable: WAL-appended + fsync'd before in-memory commit. */
+int dl_add_fact(dl_db *db, const char *rel,
+                const uint32_t *cols, uint8_t arity);
+
+/* Delete a single fact from a relation.  cols has `arity` u32 values.
+ * Returns 1 if deleted, 0 if absent, -1 on error.
+ * Durable: WAL-appended + fsync'd before in-memory commit. */
+int dl_delete_fact(dl_db *db, const char *rel,
+                   const uint32_t *cols, uint8_t arity);
 
 /* ─── Query primitives ────────────────────────────────────────────────── */
 
@@ -115,6 +137,14 @@ typedef enum {
 void dl_set_fault_hook(dl_db *db,
                        int (*hook)(dl_fpoint fp, void *user),
                        void *user);
+
+/* ─── Interner access (M7) ─────────────────────────────────────────────── */
+
+/* Intern a string, return its sym_id (1-based).  Returns 0 on OOM. */
+uint32_t    dl_intern_str(dl_db *db, const char *str);
+
+/* Look up a sym_id → string.  Returns NULL if id is out of range. */
+const char *dl_intern_str_of(dl_db *db, uint32_t sym_id);
 
 #ifdef __cplusplus
 }
