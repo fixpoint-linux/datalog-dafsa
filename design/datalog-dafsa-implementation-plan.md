@@ -1,6 +1,6 @@
 # Implementation Plan: DAFSA-Backed Deductive Database (Datalog VM)
 
-**Status:** M0-M6 complete (2026-08-12). 135 tests green (M0=9, M1=18, M2=18, M3=17, M4=8, bulk=16, M5=25, M6=8, M6-review=5, M6-deep-review=10 + smoke). Next: M7.
+**Status:** M0-M7 complete (2026-08-12). 148 tests green (M0=9, M1=18, M2=18, M3=17, M4=8, bulk=16, M5=25, M6=8, M6-review=5, M6-deep=10, M7=14 + smoke). Next: M8+ (v2 deferred).
 **Goal:** Turn the architecture into a concrete, executable build plan with file layout, per-milestone tasks, and verification for each step.
 **Repos involved:** this project (new, e.g. `~/projects/datalog-dafsa/`), consuming the proven jing-meta DAFSA C engine (`indexer/dafsa/dafsa.c` + `dafsa_core.c` + `dafsa_persist.c` + `dafsa_view.c` + `dafsa_wal.c` + `dafsa.h`).
 
@@ -176,6 +176,8 @@ Tasks:
 
 ### M7 — Durability wiring (~1 wk)
 **Goal:** crash-safe publish.
+
+**STATUS: COMPLETE (2026-08-12). FULL scope (user-confirmed).** Key finding: dl_load_facts bulk-rebuilds + atomically saves (M6 path), so the WAL's only consumer is the NEW incremental API. Implemented: (1) fcntl(F_SETLK,F_WRLCK) single-writer lock on <db>/LOCK via dl_open2 (DL_E_LOCKED on contention; released last in dl_close); (2) interner durability — atomic symbols.array write (tmp+fsync+rename, shared src/util.{c,h} atomic_write_str/fsync_dir) + save interner after every dl_load_facts ordered BEFORE rel_save; (3) incremental dl_add_fact/dl_delete_fact with per-relation WAL (open→replay→truncate on dl_open, compaction@25% + at dl_close, idempotent replay). Ordering invariant: interner durable BEFORE WAL-append BEFORE rel_add. 14 M7 tests incl. fork+_exit crash-recovery. **BLOCKER found+fixed by reviewer**: dl_add_fact didn't save interner before WAL-append → recovered facts referenced sym_ids absent from durable interner (dl_intern_str_of=NULL, silent corruption); fixed by interner dirty-flag (intern_is_dirty) + save-before-WAL + duplicate-check (skip WAL if rel_exact). Shadow dl_db_internal structs updated with _m7_lock_fd (M6 perm fix).
 
 Tasks:
 1. Wire WAL + compaction (already in dafsa.c) into the publish lifecycle.
