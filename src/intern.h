@@ -39,4 +39,12 @@ int  intern_save(interner *ir, const char *fwd_path, const char *rev_path);
 /* Load from files (or return an empty interner if files don't exist). */
 interner *intern_load(const char *fwd_path, const char *rev_path);
 
+/* ─── Dirty tracking (M7: durability ordering invariant) ──────────────── */
+
+/* Returns 1 if the interner has new syms not yet saved to disk. */
+int  intern_is_dirty(interner *ir);
+
+/* Clear the dirty flag (caller must have saved first). */
+void intern_clear_dirty(interner *ir);
+
 #endif /* INTERN_H */

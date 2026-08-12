@@ -694,6 +694,93 @@ static void test_t13_snapshot_no_wal(void)
     PASS();
 }
 
+/* ─── T14: dl_add_fact saves interner before WAL (BLOCKER regression) ───── */
+static void test_t14_add_fact_interner_durability(void)
+{
+    TEST("T14: dl_add_fact saves interner before WAL (M7 BLOCKER fix)");
+    rm_dir("build-tmp/m7t14");
+    mkdir("build-tmp/m7t14", 0755);
+
+    /* ── Child: intern NEW strings, add fact, crash ── */
+    pid_t pid = fork();
+    assert(pid >= 0);
+
+    if (pid == 0) {
+        dl_db *db = dl_open("build-tmp/m7t14");
+        assert(db != NULL);
+        assert(dl_declare_relation(db, "r", 2) == 0);
+
+        /* Intern NEW strings (these did NOT exist before) */
+        uint32_t s1 = dl_intern_str(db, "zulu_one");
+        uint32_t s2 = dl_intern_str(db, "zulu_two");
+        assert(s1 > 0 && s2 > 0);
+
+        /* Add fact — dl_add_fact must save interner BEFORE WAL-append */
+        uint32_t cols[2] = {s1, s2};
+        assert(dl_add_fact(db, "r", cols, 2) == 1);
+
+        /* Crash: _exit without dl_close — simulates kill-9 */
+        _exit(0);
+    }
+
+    /* ── Parent: wait for child, then verify recovery WITHOUT re-interning ── */
+    {
+        int status;
+        waitpid(pid, &status, 0);
+        assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+
+    /* Reopen: WAL replay recovers the fact.  The sym_ids in the recovered
+     * fact must be decodable via dl_intern_str_of WITHOUT re-interning
+     * (the old T8 test hid the bug by re-interning in the same order). */
+    dl_db *db = dl_open("build-tmp/m7t14");
+    assert(db != NULL);
+
+    /* Enumerate via dl_prefix — capture the raw sym_ids from the DAFSA */
+    long count = 0;
+    uint32_t captured[2] = {0, 0};
+    {
+        int capture_cb(const uint32_t *cols, uint8_t arity, void *user) {
+            (void)user;
+            assert(arity == 2);
+            captured[0] = cols[0];
+            captured[1] = cols[1];
+            return 0;
+        }
+        long n = dl_prefix(db, "r", NULL, 0, (dl_tuple_cb)capture_cb, NULL);
+        assert(n == 1);
+        count = n;
+    }
+    assert(count == 1);
+    assert(captured[0] != 0 && captured[1] != 0);
+
+    /* CRITICAL: dl_intern_str_of must return the correct strings.
+     * If the interner was NOT saved before the WAL record, this returns NULL
+     * — that's the BLOCKER. */
+    const char *s1 = dl_intern_str_of(db, captured[0]);
+    const char *s2 = dl_intern_str_of(db, captured[1]);
+    assert(s1 != NULL);
+    assert(s2 != NULL);
+    assert(strcmp(s1, "zulu_one") == 0);
+    assert(strcmp(s2, "zulu_two") == 0);
+
+    /* Verify sym_ids are consistent with re-interning */
+    uint32_t r1 = dl_intern_str(db, "zulu_one");
+    uint32_t r2 = dl_intern_str(db, "zulu_two");
+    assert(r1 == captured[0]);
+    assert(r2 == captured[1]);
+
+    /* Also verify the fact is actually present */
+    {
+        uint32_t cols[2] = {r1, r2};
+        assert(dl_lookup(db, "r", cols, 2) == 1);
+    }
+
+    dl_close(db);
+    rm_dir("build-tmp/m7t14");
+    PASS();
+}
+
 /* ─── Main ─────────────────────────────────────────────────────────────── */
 
 int main(void)
@@ -718,6 +805,9 @@ int main(void)
     test_t11_compaction_threshold();
     test_t12_dl_close_compaction();
     test_t13_snapshot_no_wal();
+
+    /* M7 BLOCKER regression */
+    test_t14_add_fact_interner_durability();
 
     printf("\n%d tests run, %d failed\n", tests_run, tests_failed);
     return tests_failed ? 1 : 0;

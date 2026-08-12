@@ -25,6 +25,7 @@ struct interner {
     char   **rev;          /* reverse array: rev[sym_id-1] -> string */
     uint32_t rev_cap;      /* capacity of rev */
     uint32_t next_id;      /* next sym_id to allocate (1-based) */
+    int      dirty;        /* M7: 1 if new syms added since last save */
 };
 
 /* ─── Callback for dafsa_prefix_enum: capture the first sym_id ──────── */
@@ -100,6 +101,7 @@ uint32_t intern_str(interner *ir, const char *str)
         return ctx.id;
 
     /* 2. Allocate new sym_id */
+    ir->dirty = 1;
     {
         uint32_t id = ir->next_id++;
         unsigned char key_buf[4096 + 1 + 4]; /* str + \0 + u32BE */
@@ -187,6 +189,7 @@ int intern_save(interner *ir, const char *fwd_path, const char *rev_path)
     if (rename(tmp_path, rev_path) != 0) { unlink(tmp_path); return -1; }
     if (fsync_dir_of_path(rev_path) != 0) return -1;
 
+    ir->dirty = 0;
     return 0;
 }
 
@@ -257,4 +260,17 @@ interner *intern_load(const char *fwd_path, const char *rev_path)
 fail:
     intern_free(ir);
     return NULL;
+}
+
+/* ─── Dirty tracking (M7) ──────────────────────────────────────────────── */
+
+int intern_is_dirty(interner *ir)
+{
+    if (!ir) return 0;
+    return ir->dirty;
+}
+
+void intern_clear_dirty(interner *ir)
+{
+    if (ir) ir->dirty = 0;
 }

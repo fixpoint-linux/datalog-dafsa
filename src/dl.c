@@ -582,36 +582,22 @@ int dl_load_facts(dl_db *db, const char *rel_name, const char *csv_path)
 }
 
 /* ─── Incremental fact API (M7) ────────────────────────────────────────── */
-
-/* Check if a u32 value is a sym_id (>= some threshold) vs a raw integer.
- * We use a simple heuristic: if the value is >= 256, it could be a sym_id.
- * The interner assigns sequential ids starting from 1.  Raw integers in
- * practice are small (usually < 1000 for test data).  For correctness,
- * we track whether intern_str was called for any column value.
+/*
+ * dl_add_fact / dl_delete_fact: incremental fact insert/delete with WAL.
  *
- * Actually: we can't tell from a u32 whether it was interned or is a raw
- * int.  The plan says "intern string columns (may add sym_ids)".  But the
- * dl_add_fact API receives u32 values — strings are already interned by
- * the caller.  So we check whether the value needs interning by trying
- * intern_str_of.  If it returns non-NULL, it's already a sym_id.  If NULL,
- * it might be a raw int OR a not-yet-interned string.
+ * The caller MUST intern string columns via dl_intern_str() BEFORE calling
+ * dl_add_fact — the cols[] array must contain already-interned sym_ids.
+ * dl_add_fact will NOT intern strings itself.
  *
- * BUT: the caller passes u32 cols[], not strings.  So the caller must have
- * already interned strings before calling.  This matches M0's dl_lookup:
- * the user passes u32 sym_ids for strings.
+ * Ordering invariant (crash safety):
+ *   1. If new syms were added (interner is dirty), save interner atomically
+ *      BEFORE the WAL record.  This guarantees WAL replay can decode sym_ids.
+ *   2. Check rel_exact — skip WAL if fact already present/absent (avoids
+ *      WAL bloat; the fact is already durable).
+ *   3. WAL-append + fsync (durable before in-memory commit).
+ *   4. In-memory add/delete.
  *
- * The interner durability invariant: if new syms were added (by the caller
- * before calling dl_add_fact), we must save the interner before
- * WAL-appending.  But we can't know from the u32 values alone whether
- * they caused new interning.
- *
- * Simplification for M7: dl_add_fact/dl_delete_fact do NOT intern — the
- * caller must pass already-interned u32 values (via intern_str before
- * calling).  The user-facing docs should note this.  The interner save
- * is the caller's responsibility for now.
- *
- * For the ordering invariant, we check: if any column value >= ir->next_id
- * (i.e., not yet known to the interner), it's an error.
+ * dl_delete_fact does NOT save the interner (deletes don't create new syms).
  */
 
 static int encode_fact_key(unsigned char *key, size_t *key_len,
@@ -648,15 +634,39 @@ int dl_add_fact(dl_db *db, const char *rel_name,
 
     if (encode_fact_key(key, &key_len, cols, arity) != 0) return -1;
 
-    /* 1. WAL-append ADD + sync (durable before in-memory commit) */
+    /* 1. Interner-before-WAL invariant (M7 BLOCKER fix):
+     * If new syms were added (caller interned strings before this call),
+     * save the interner BEFORE WAL-append so crash recovery can decode
+     * the sym_ids in the WAL. */
+    if (intern_is_dirty(db->ir)) {
+        char *fwd_path = make_path(db, "symbols", ".dafsa");
+        char *rev_path = make_path(db, "symbols", ".array");
+        if (!fwd_path || !rev_path) {
+            free(fwd_path); free(rev_path);
+            return -1;
+        }
+        if (intern_save(db->ir, fwd_path, rev_path) != 0) {
+            free(fwd_path); free(rev_path);
+            return -1;
+        }
+        free(fwd_path);
+        free(rev_path);
+    }
+
+    /* 2. Duplicate check: if already present, skip WAL (SHOULD-FIX).
+     * A duplicate fact is already durable, so no WAL record needed. */
+    if (rel_exact(db->rels[idx].rel, cols))
+        return 0;
+
+    /* 3. WAL-append ADD + sync (durable before in-memory commit) */
     if (rel_wal_append_add(db->rels[idx].rel, key, (uint32_t)key_len) != 0)
         return -1;
 
-    /* 2. In-memory add */
+    /* 4. In-memory add */
     rc = rel_add(db->rels[idx].rel, cols);
     if (rc < 0) return -1;
 
-    /* 3. Check compaction threshold: WAL > 25% of DAFSA estimate? */
+    /* 5. Check compaction threshold: WAL > 25% of DAFSA estimate? */
     {
         uint64_t wal_sz = rel_wal_size(db->rels[idx].rel);
         uint64_t dafsa_sz = rel_dafsa_size(db->rels[idx].rel);
@@ -672,7 +682,7 @@ int dl_add_fact(dl_db *db, const char *rel_name,
     /* M4: facts changed, mark fixpoint dirty */
     db->fixpoint_dirty = 1;
 
-    return rc;  /* 1 if added, 0 if duplicate */
+    return 1;  /* added */
 }
 
 int dl_delete_fact(dl_db *db, const char *rel_name,
@@ -692,18 +702,23 @@ int dl_delete_fact(dl_db *db, const char *rel_name,
 
     if (encode_fact_key(key, &key_len, cols, arity) != 0) return -1;
 
-    /* 1. WAL-append DEL + sync (durable before in-memory commit) */
+    /* 1. Absent check: if not present, skip WAL (SHOULD-FIX).
+     * No interner save needed — deletes don't create new syms. */
+    if (!rel_exact(db->rels[idx].rel, cols))
+        return 0;
+
+    /* 2. WAL-append DEL + sync (durable before in-memory commit) */
     if (rel_wal_append_del(db->rels[idx].rel, key, (uint32_t)key_len) != 0)
         return -1;
 
-    /* 2. In-memory delete */
+    /* 3. In-memory delete */
     rc = rel_delete(db->rels[idx].rel, cols);
     if (rc < 0) return -1;
 
     /* M4: facts changed, mark fixpoint dirty */
     db->fixpoint_dirty = 1;
 
-    return rc;  /* 1 if deleted, 0 if absent */
+    return 1;  /* deleted */
 }
 
 /* ─── Interner access (M7) ─────────────────────────────────────────────── */
