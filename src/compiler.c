@@ -15,6 +15,8 @@
 #include "intern.h"
 #include "relation.h"
 #include "regexwalk.h"
+#include "permindex.h"
+#include "snapshot.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -25,6 +27,12 @@ struct dl_db_internal {
     char *dir; void *ir;
     struct { char *name; void *rel; } rels[64];
     size_t nrels;
+    void *crules; int n_crules;
+    int fixpoint_dirty; uint32_t snap_version;
+    view_cache_slot vcache[DL_VIEW_CACHE_SZ];
+    void *fault_hook; void *fault_user;
+    perm_index_entry perms[MAX_PERMS];
+    int n_perms;
 };
 
 static int db_find_rel(dl_db *db, const char *name)
@@ -690,39 +698,6 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
         }
     }
 
-    /* ── 7. join-column check (skip negated atoms) ───────────────── */
-    for (bi = 1; bi < r->nbody; bi++) {
-        atom *c = r->body[bi];
-        if (c->negated || c->aggregate) continue;
-        if (strcmp(c->pred, "=") == 0) continue;
-        int sc[8] = {0}, k = 0;
-        for (j = 0; j < c->nargs; j++) {
-            if (c->args[j]->kind != TOK_VAR) continue;
-            int bp;
-            for (bp = 0; bp < bi; bp++) {
-                if (r->body[bp]->negated || r->body[bp]->aggregate) continue;
-                atom *p = r->body[bp];
-                if (strcmp(p->pred, "=") == 0) continue;
-                int q;
-                for (q = 0; q < p->nargs; q++)
-                    if (p->args[q]->kind == TOK_VAR &&
-                        !strcmp(p->args[q]->text, c->args[j]->text))
-                        { sc[j] = 1; break; }
-                if (sc[j]) break;
-            }
-        }
-        while (k < c->nargs && sc[k]) k++;
-        if (k == 0) {
-            int any = 0, first = -1;
-            for (j = 0; j < c->nargs; j++) if (sc[j]) { any = 1; if (first < 0) first = j; }
-            if (any && first > 0) {
-                fprintf(stderr, "compile error: non-leading-column join not supported "
-                        "in M2 (rule '%s', atom '%s': shared var at col %d, not 0)\n",
-                        r->head->pred, c->pred, first); goto fail;
-            }
-        }
-    }
-
     /* ── 8. emit bytecode ────────────────────────────────────────── */
 
     {
@@ -832,7 +807,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
                 continue;
             }
 
-            /* Positive atom: LOOKUP or SCAN */
+            /* Positive atom: LOOKUP, OP_LOOKUP_PERM, or SCAN */
             int sc[8] = {0}, k = 0;
             for (j = 0; j < curr->nargs; j++) {
                 if (curr->args[j]->kind != TOK_VAR) continue;
@@ -880,6 +855,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
                     eq->op = OP_EQ_CONST; eq->a = ts[j]; eq->imm = cv;
                 }
             } else if (k > 0) {
+                /* Leading shared columns: OP_LOOKUP */
                 ip->op = OP_LOOKUP; ip->a = (uint8_t)bri[bi]; ip->b = (uint8_t)k; ip->c = (uint8_t)curr->nargs;
                 ip->body_idx = (uint8_t)bi;
                 uint8_t slot_map[8]; int si = 0;
@@ -911,26 +887,87 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
                     eq->op = OP_EQ_CONST; eq->a = slot_map[j]; eq->imm = cv;
                 }
             } else {
-                ip->op = OP_SCAN; ip->a = (uint8_t)bri[bi]; ip->b = (uint8_t)curr->nargs;
-                ip->body_idx = (uint8_t)bi;
-                uint8_t ts[8];
-                for (j = 0; j < curr->nargs; j++) {
-                    if (curr->args[j]->kind == TOK_VAR) {
-                        int vi = v_find(&vt, curr->args[j]->text);
-                        ts[j] = vt.e[vi].slot;
-                    } else {
-                        char cname[16];
-                        snprintf(cname, sizeof(cname), "__k%d", cc++);
-                        int vi = v_add(&vt, cname);
-                        ts[j] = vt.e[vi].slot;
+                /* No leading shared columns.  Check for non-leading join. */
+                int any_shared = 0;
+                for (j = 0; j < curr->nargs; j++) if (sc[j]) { any_shared = 1; break; }
+
+                if (any_shared) {
+                    /* M6: non-leading-column join → OP_LOOKUP_PERM */
+                    uint8_t perm_arr[8], n_join = 0, n_other = 0;
+                    uint8_t join_cols[8], other_cols[8];
+                    int pj;
+
+                    /* Collect join columns (sc[j]==1) in increasing order */
+                    for (j = 0; j < curr->nargs; j++) {
+                        if (sc[j]) join_cols[n_join++] = (uint8_t)j;
+                        else       other_cols[n_other++] = (uint8_t)j;
                     }
-                }
-                for (j = 0; j < curr->nargs; j++) ip->slots[j] = ts[j];
-                for (j = 0; j < curr->nargs; j++) {
-                    if (curr->args[j]->kind == TOK_VAR) continue;
-                    uint32_t cv; if (token_const(db, curr->args[j], &cv)) goto fail;
-                    vm_instr *eq = i_emit(&ib);
-                    eq->op = OP_EQ_CONST; eq->a = ts[j]; eq->imm = cv;
+
+                    /* Build perm: join cols first, then other cols */
+                    for (pj = 0; pj < n_join; pj++)
+                        perm_arr[pj] = join_cols[pj];
+                    for (pj = 0; pj < n_other; pj++)
+                        perm_arr[(int)n_join + pj] = other_cols[pj];
+
+                    int perm_id = dl_db_declare_perm(db, bri[bi],
+                        (uint8_t)curr->nargs, perm_arr);
+                    if (perm_id < 0) {
+                        fprintf(stderr, "compile error: too many permutation "
+                                "indices (rule '%s')\n", r->head->pred);
+                        goto fail;
+                    }
+
+                    ip->op = OP_LOOKUP_PERM;
+                    ip->a   = (uint8_t)bri[bi];
+                    ip->b   = n_join;  /* perm-prefix length */
+                    ip->c   = (uint8_t)curr->nargs;
+                    ip->imm = (uint32_t)perm_id;
+                    ip->body_idx = (uint8_t)bi;
+
+                    /* slots indexed by ORIGINAL column: slots[c] = var slot */
+                    for (j = 0; j < curr->nargs; j++) {
+                        if (curr->args[j]->kind == TOK_VAR) {
+                            int vi = v_find(&vt, curr->args[j]->text);
+                            ip->slots[j] = vt.e[vi].slot;
+                        } else {
+                            char cname[16];
+                            snprintf(cname, sizeof(cname), "__k%d", cc++);
+                            int vi = v_add(&vt, cname);
+                            ip->slots[j] = vt.e[vi].slot;
+                        }
+                    }
+
+                    /* Emit EQ_CONST for any constant args */
+                    for (j = 0; j < curr->nargs; j++) {
+                        if (curr->args[j]->kind == TOK_VAR) continue;
+                        uint32_t cv;
+                        if (token_const(db, curr->args[j], &cv)) goto fail;
+                        vm_instr *eq = i_emit(&ib);
+                        eq->op = OP_EQ_CONST; eq->a = ip->slots[j]; eq->imm = cv;
+                    }
+                } else {
+                    /* No shared columns at all: OP_SCAN */
+                    ip->op = OP_SCAN; ip->a = (uint8_t)bri[bi]; ip->b = (uint8_t)curr->nargs;
+                    ip->body_idx = (uint8_t)bi;
+                    uint8_t ts[8];
+                    for (j = 0; j < curr->nargs; j++) {
+                        if (curr->args[j]->kind == TOK_VAR) {
+                            int vi = v_find(&vt, curr->args[j]->text);
+                            ts[j] = vt.e[vi].slot;
+                        } else {
+                            char cname[16];
+                            snprintf(cname, sizeof(cname), "__k%d", cc++);
+                            int vi = v_add(&vt, cname);
+                            ts[j] = vt.e[vi].slot;
+                        }
+                    }
+                    for (j = 0; j < curr->nargs; j++) ip->slots[j] = ts[j];
+                    for (j = 0; j < curr->nargs; j++) {
+                        if (curr->args[j]->kind == TOK_VAR) continue;
+                        uint32_t cv; if (token_const(db, curr->args[j], &cv)) goto fail;
+                        vm_instr *eq = i_emit(&ib);
+                        eq->op = OP_EQ_CONST; eq->a = ts[j]; eq->imm = cv;
+                    }
                 }
             }
         }

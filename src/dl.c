@@ -18,6 +18,7 @@
 #include "snapshot.h"
 #include "regexwalk.h"
 #include "tupleset.h"
+#include "permindex.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -55,6 +56,10 @@ struct dl_db {
     view_cache_slot  vcache[DL_VIEW_CACHE_SZ];
     int            (*fault_hook)(dl_fpoint, void *);
     void            *fault_user;
+
+    /* M6: permutation indices */
+    perm_index_entry  perms[MAX_PERMS];
+    int               n_perms;
 };
 
 /* ─── Internal helpers ────────────────────────────────────────────────── */
@@ -168,6 +173,9 @@ void dl_close(dl_db *db)
     /* M4: close all cached snapshot views */
     vcache_invalidate(db->vcache);
 
+    /* M6: free permutation indices */
+    permindex_free_all(db);
+
     /* Save interner */
     {
         char *fwd_path = make_path(db, "symbols", ".dafsa");
@@ -223,6 +231,28 @@ void dl_close(dl_db *db)
 
 /* ─── Schema ──────────────────────────────────────────────────────────── */
 
+/* M6: check if a name matches the reserved __PI<hex>__ suffix pattern */
+static int is_reserved_pi_name(const char *name)
+{
+    const char *p;
+    int hex_digits = 0;
+
+    /* Must contain __PI */
+    p = strstr(name, "__PI");
+    if (!p) return 0;
+
+    p += 4; /* skip __PI */
+    hex_digits = 0;
+    while ((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f')) {
+        hex_digits++;
+        p++;
+    }
+    if (hex_digits == 0) return 0;
+    if (strncmp(p, "__", 2) != 0) return 0;
+
+    return 1;
+}
+
 int dl_declare_relation(dl_db *db, const char *name, uint8_t arity)
 {
     int idx;
@@ -232,6 +262,13 @@ int dl_declare_relation(dl_db *db, const char *name, uint8_t arity)
     if (!db || !name) return -1;
     if (arity == 0 || arity > 8) return -1;
     if (db->nrels >= MAX_RELS) return -1;
+
+    /* M6: reject reserved permutation index names */
+    if (is_reserved_pi_name(name)) {
+        fprintf(stderr, "error: relation name '%s' uses reserved __PI<hex>__ suffix\n",
+                name);
+        return -1;
+    }
 
     /* Check if already declared */
     idx = find_rel(db, name);
@@ -446,6 +483,15 @@ int dl_load_facts(dl_db *db, const char *rel_name, const char *csv_path)
 
     /* M4: facts changed, mark fixpoint dirty */
     db->fixpoint_dirty = 1;
+
+    /* M6: mark permutation indices of this relation dirty */
+    {
+        int pi;
+        for (pi = 0; pi < db->n_perms; pi++) {
+            if (db->perms[pi].rel_id == idx)
+                db->perms[pi].dirty = 1;
+        }
+    }
 
     return loaded;
 }
@@ -782,6 +828,33 @@ int dl_publish_snapshot(dl_db *db)
             }
         }
 
+        /* M6: save permutation indices */
+        {
+            int pi;
+            for (pi = 0; pi < db->n_perms; pi++) {
+                perm_index_entry *pe = &db->perms[pi];
+                if (!pe->pidx_rel) continue;
+                {
+                    char pi_name[128];
+                    char pi_path[4096];
+                    uint8_t ar = pe->arity;
+
+                    snprintf(pi_name, sizeof(pi_name), "%s__PI%x__",
+                             db->rels[pe->rel_id].name, pi);
+                    fprintf(mf, "%s:%d # perm index of %s\n",
+                            pi_name, (int)ar,
+                            db->rels[pe->rel_id].name);
+
+                    snprintf(pi_path, sizeof(pi_path), "%s/%s.dafsa",
+                             tmp_dir, pi_name);
+                    if (rel_save(pe->pidx_rel, pi_path) != 0) {
+                        fclose(mf);
+                        goto fail;
+                    }
+                }
+            }
+        }
+
         if (fclose(mf) != 0) goto fail;
     }
 
@@ -831,6 +904,47 @@ fail:
     if (renamed) rm_rf(new_dir);
 #pragma GCC diagnostic pop
     return -1;
+}
+
+/* ─── M6: Permutation index API ──────────────────────────────────────── */
+
+int dl_db_declare_perm(dl_db *db, int rel_id, uint8_t arity,
+                       const uint8_t perm[8])
+{
+    int i;
+
+    if (!db || rel_id < 0 || arity == 0 || arity > 8) return -1;
+    if (db->n_perms >= MAX_PERMS) return -1;
+
+    /* Check for duplicate: same rel_id + same perm */
+    for (i = 0; i < db->n_perms; i++) {
+        if (db->perms[i].rel_id == rel_id &&
+            db->perms[i].arity == arity &&
+            memcmp(db->perms[i].perm, perm, arity) == 0)
+            return i;  /* return existing perm_id */
+    }
+
+    i = db->n_perms++;
+    db->perms[i].rel_id   = rel_id;
+    db->perms[i].arity    = arity;
+    memcpy(db->perms[i].perm, perm, 8);
+    db->perms[i].pidx_rel = NULL;
+    db->perms[i].dirty    = 1;  /* build on next exec */
+    return i;
+}
+
+const uint8_t *dl_db_get_perm(dl_db *db, int rel_id, int perm_id)
+{
+    if (!db || perm_id < 0 || perm_id >= db->n_perms) return NULL;
+    if (db->perms[perm_id].rel_id != rel_id) return NULL;
+    return db->perms[perm_id].perm;
+}
+
+struct relation *dl_db_get_perm_rel(dl_db *db, int rel_id, int perm_id)
+{
+    if (!db || perm_id < 0 || perm_id >= db->n_perms) return NULL;
+    if (db->perms[perm_id].rel_id != rel_id) return NULL;
+    return db->perms[perm_id].pidx_rel;
 }
 
 /* ─── Fault hook registration ──────────────────────────────────────────── */

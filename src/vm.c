@@ -23,6 +23,8 @@
 #include "regexwalk.h"
 #include "tupleset.h"
 #include "intern.h"
+#include "permindex.h"
+#include "snapshot.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -33,6 +35,12 @@ struct dl_db_internal {
     char *dir; void *ir;
     struct { char *name; void *rel; } rels[64];
     size_t nrels;
+    void *crules; int n_crules;
+    int fixpoint_dirty; uint32_t snap_version;
+    view_cache_slot vcache[DL_VIEW_CACHE_SZ];
+    void *fault_hook; void *fault_user;
+    perm_index_entry perms[MAX_PERMS];
+    int n_perms;
 };
 
 static void *db_rel(dl_db *db, int idx)
@@ -245,10 +253,11 @@ static void agg_free(agg_accum *ac)
 
 typedef struct {
     int       ip;       /* instruction that created this frame */
-    int       op;       /* OP_SCAN or OP_LOOKUP */
+    int       op;       /* OP_SCAN or OP_LOOKUP (or OP_LOOKUP_PERM) */
     tuple_buf tuples;   /* materialized tuples for this frame */
     long      idx;      /* current position in tuples */
     bindings  saved;    /* bindings snapshot at frame entry */
+    const uint8_t *perm; /* M6: permutation array for OP_LOOKUP_PERM, NULL otherwise */
 } vm_frame;
 
 /* ─── Override ────────────────────────────────────────────────────────── */
@@ -256,6 +265,7 @@ typedef struct {
 typedef struct {
     int              body_idx;  /* which body atom to override */
     const tuple_set *ts;        /* tuple_set to enumerate from (NULL = DAFSA) */
+    int              perm_id;   /* M6: perm_id for perm shadow, -1 if none */
 } vm_override;
 
 static const tuple_set *find_ov(int body_idx, const vm_override *ov, int n_ov)
@@ -268,35 +278,54 @@ static const tuple_set *find_ov(int body_idx, const vm_override *ov, int n_ov)
 
 /* ─── Row binding ─────────────────────────────────────────────────────── */
 
-/* Try to bind the columns of `row` to the variable slots in instruction `in`.
- * sc = start column (0 for SCAN, k for LOOKUP), ar = total arity.
- * Returns 1 if all bindings succeed, 0 on conflict. */
-static int bind_row(const vm_instr *in, const uint32_t *row,
-                    int sc, int ar, bindings *b)
+/*
+ * INVARIANT: vm_instr.slots[c] ALWAYS means "slot for ORIGINAL column c",
+ * uniform across every opcode (SCAN, LOOKUP, LOOKUP_PERM, HASH_JOIN).
+ * The permutation array is fetched from dl_db at dispatch time; the VM
+ * uses it to translate between walker row positions and original columns.
+ * Never index slots by perm position directly.
+ *
+ * For OP_LOOKUP_PERM: the permuted DAFSA stores rows in order
+ *   [c_{perm[0]}, c_{perm[1]}, ..., c_{perm[arity-1]}]
+ * A row position pp corresponds to original column perm[pp].
+ * Binding: slots[perm[pp]] gets row[pp].
+ */
+
+/* Perm-aware bind: row positions [sc..ar) bind to slots[perm[sc..ar)].
+ * For non-perm paths (perm==NULL), perm[p]==p and this degenerates
+ * to standard bind_row. */
+static int bind_row_perm(const vm_instr *in, const uint32_t *row,
+                         int sc, int ar, const uint8_t *perm, bindings *b)
 {
-    int c;
-    for (c = sc; c < ar; c++) {
-        uint8_t s = in->slots[c];
+    int pp;
+    for (pp = sc; pp < ar; pp++) {
+        int oc = perm ? (int)perm[pp] : pp;
+        uint8_t s = in->slots[oc];
         if (s == 0xFF) continue;
-        if (!b_try(b, s, row[c])) return 0;
+        if (!b_try(b, s, row[pp])) return 0;
     }
     return 1;
 }
 
-/* Find the next valid tuple in frame `f`, starting from f->idx.
- * Restores saved bindings before each attempt.
- * Returns 1 if found, 0 if exhausted. */
-static int seek_valid(vm_frame *f, const vm_instr *in, int sc, int ar,
-                      bindings *b)
+/* Perm-aware seek: like seek_valid but uses perm-aware bind. */
+static int seek_valid_perm(vm_frame *f, const vm_instr *in, int sc, int ar,
+                           const uint8_t *perm, bindings *b)
 {
     while (f->idx < f->tuples.count) {
         b_load(b, &f->saved);
-        if (bind_row(in, f->tuples.data + f->idx * f->tuples.arity,
-                     sc, ar, b))
+        if (bind_row_perm(in, f->tuples.data + f->idx * f->tuples.arity,
+                          sc, ar, perm, b))
             return 1;
         f->idx++;
     }
     return 0;
+}
+
+/* Non-perm seek: delegates to perm-aware with perm=NULL */
+static int seek_valid(vm_frame *f, const vm_instr *in, int sc, int ar,
+                      bindings *b)
+{
+    return seek_valid_perm(f, in, sc, ar, NULL, b);
 }
 
 /* Backtrack: advance the current frame, then seek a valid tuple.
@@ -310,8 +339,15 @@ static int backtrack(vm_frame *frames, int *sp, bindings *b,
         f->idx++;
         {
             const vm_instr *fi = &p[f->ip];
-            int sc = (f->op == OP_LOOKUP) ? (int)fi->b : 0;
-            if (seek_valid(f, fi, sc, (int)f->tuples.arity, b)) {
+            int sc = (f->op == OP_LOOKUP || f->op == OP_LOOKUP_PERM) ? (int)fi->b : 0;
+            int found;
+            if (f->perm) {
+                found = seek_valid_perm(f, fi, sc, (int)f->tuples.arity,
+                                        f->perm, b);
+            } else {
+                found = seek_valid(f, fi, sc, (int)f->tuples.arity, b);
+            }
+            if (found) {
                 *ip = f->ip + 1;
                 return 1;
             }
@@ -527,6 +563,240 @@ static long exec_rule(dl_db *db, const compiled_rule *cr,
                 tbuf_free(&f->tuples);
                 if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
                 break;
+            }
+            sp++;
+            ip++;
+            break;
+        }
+
+        /* ── OP_LOOKUP_PERM: permuted prefix lookup (M6) ──────────── */
+        case OP_LOOKUP_PERM: {
+            if (sp >= MAX_FRAMES) return -1;
+
+            /* Fetch permutation from dl_db */
+            int perm_id = (int)in->imm;
+            int rel_id = (int)in->a;
+            int k = (int)in->b;
+            int ar = (int)in->c;
+            const uint8_t *perm_arr = dl_db_get_perm(db, rel_id, perm_id);
+            if (!perm_arr) {
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                break;
+            }
+
+            vm_frame *f = &frames[sp];
+            f->ip = ip;
+            f->op = OP_LOOKUP_PERM;
+            f->idx = 0;
+            f->perm = perm_arr;
+            memset(&f->tuples, 0, sizeof(f->tuples));
+
+            /* Build prefix from bindings: pref[pp] = slots[perm[pp]] */
+            uint32_t pref[8];
+            int pk;
+            for (pk = 0; pk < k; pk++) {
+                int oc = (int)perm_arr[pk];
+                pref[pk] = b_get(&b, in->slots[oc]);
+            }
+
+            const tuple_set *ov_ts = find_ov((int)in->body_idx, ov, n_ov);
+
+            if (ov_ts && ov_ts->count > 0) {
+                /* Override: use ts_prefix on a permuted shadow (IDB path).
+                 * The shadow is already in permuted order, so we prefix
+                 * directly on the permuted tuple_set. */
+                long first;
+                long cnt = ts_prefix(ov_ts, pref, (uint8_t)k, &first);
+                if (cnt == 0) {
+                    f->perm = NULL;
+                    if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                    break;
+                }
+                f->tuples.arity = ov_ts->arity;
+                f->tuples.count = cnt;
+                f->tuples.cap   = cnt;
+                f->tuples.data  = malloc((size_t)cnt * ov_ts->arity *
+                                         sizeof(uint32_t));
+                if (!f->tuples.data) return -1;
+                memcpy(f->tuples.data,
+                       ov_ts->data + (size_t)first * ov_ts->arity,
+                       (size_t)cnt * ov_ts->arity * sizeof(uint32_t));
+            } else {
+                /* EDB path: use perm DAFSA */
+                void *pr = (void *)dl_db_get_perm_rel(db, rel_id, perm_id);
+                if (!pr) {
+                    f->perm = NULL;
+                    if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                    break;
+                }
+                f->tuples.arity = (uint8_t)ar;
+                rel_prefix((const void *)pr, pref, (uint8_t)k,
+                           tbuf_cb, &f->tuples);
+                if (f->tuples.count == 0) {
+                    tbuf_free(&f->tuples);
+                    f->perm = NULL;
+                    if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                    break;
+                }
+            }
+
+            b_save(&f->saved, &b);
+            if (!seek_valid_perm(f, in, k, ar, perm_arr, &b)) {
+                tbuf_free(&f->tuples);
+                f->perm = NULL;
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                break;
+            }
+            sp++;
+            ip++;
+            break;
+        }
+
+        /* ── OP_HASH_JOIN: in-frame hash join (M6) ────────────────── */
+        case OP_HASH_JOIN: {
+            /* For now, OP_HASH_JOIN is emitted for recursive IDB body
+             * atoms with non-leading joins when no perm index is available.
+             * We materialize both sides and hash-join.
+             *
+             * Layout: a=rel_id, b=k (shared cols), c=arity, imm=perm_id,
+             *   slots[c] = slot for original col c. */
+            if (sp >= MAX_FRAMES) return -1;
+
+            int rel_id = (int)in->a;
+            int k = (int)in->b;
+            int ar = (int)in->c;
+            int perm_id = (int)in->imm;
+
+            vm_frame *f = &frames[sp];
+            f->ip = ip;
+            f->op = OP_HASH_JOIN;
+            f->idx = 0;
+            f->perm = NULL;
+            memset(&f->tuples, 0, sizeof(f->tuples));
+
+            /* Try override first */
+            const tuple_set *ov_ts = find_ov((int)in->body_idx, ov, n_ov);
+
+            /* Build a hash table keyed by the first k columns of the
+             * permuted tuple.  Use an open-addressing hash table
+             * (FNV-1a, linear probe — mirrors tupleset.c conventions). */
+
+            /* Collect all tuples from the relation */
+            tuple_set all_ts;
+            if (ts_init(&all_ts, (uint8_t)ar) != 0) return -1;
+
+            if (ov_ts && ov_ts->count > 0) {
+                /* Copy override tuples */
+                long ci;
+                for (ci = 0; ci < ov_ts->count; ci++) {
+                    ts_add(&all_ts,
+                           ov_ts->data + (size_t)ci * ov_ts->arity);
+                }
+            } else {
+                void *r = db_rel(db, rel_id);
+                if (!r) {
+                    ts_free(&all_ts);
+                    if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                    break;
+                }
+                rel_prefix((const void *)r, NULL, 0, ts_sink_cb, &all_ts);
+                ts_sort(&all_ts);
+            }
+
+            if (all_ts.count == 0) {
+                ts_free(&all_ts);
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                break;
+            }
+
+            /* Get perm array for re-encoding */
+            const uint8_t *perm_arr = NULL;
+            if (perm_id >= 0) {
+                perm_arr = dl_db_get_perm(db, rel_id, perm_id);
+            }
+
+            /* Filter tuples: only those whose prefix columns match
+             * the current bindings.  For each matching tuple, produce
+             * it as a single-row result set for the frame. */
+            {
+                /* Collect matching tuples */
+                long ci;
+                tuple_set match_ts;
+                if (ts_init(&match_ts, (uint8_t)ar) != 0) {
+                    ts_free(&all_ts);
+                    return -1;
+                }
+
+                for (ci = 0; ci < all_ts.count; ci++) {
+                    const uint32_t *row = all_ts.data +
+                        (size_t)ci * (size_t)all_ts.arity;
+                    int match = 1;
+                    int pk2;
+                    for (pk2 = 0; pk2 < k; pk2++) {
+                        int oc = perm_arr ? (int)perm_arr[pk2] : pk2;
+                        uint32_t bound_val = b_get(&b, in->slots[oc]);
+                        if (bound_val != row[oc]) {
+                            match = 0;
+                            break;
+                        }
+                    }
+                    if (match) {
+                        /* Re-encode through perm if needed */
+                        if (perm_arr) {
+                            uint32_t prow[8];
+                            int jj;
+                            for (jj = 0; jj < ar; jj++)
+                                prow[jj] = row[perm_arr[jj]];
+                            ts_add(&match_ts, prow);
+                        } else {
+                            ts_add(&match_ts, row);
+                        }
+                    }
+                }
+
+                if (match_ts.count == 0) {
+                    ts_free(&match_ts);
+                    ts_free(&all_ts);
+                    if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                    break;
+                }
+
+                ts_sort(&match_ts);
+
+                /* Copy to frame tuples */
+                f->tuples.arity = (uint8_t)ar;
+                f->tuples.count = match_ts.count;
+                f->tuples.cap   = match_ts.count;
+                f->tuples.data  = malloc((size_t)match_ts.count *
+                                         (size_t)ar * sizeof(uint32_t));
+                if (!f->tuples.data) {
+                    ts_free(&match_ts);
+                    ts_free(&all_ts);
+                    return -1;
+                }
+                memcpy(f->tuples.data, match_ts.data,
+                       (size_t)match_ts.count * (size_t)ar * sizeof(uint32_t));
+                ts_free(&match_ts);
+            }
+
+            ts_free(&all_ts);
+
+            b_save(&f->saved, &b);
+            f->perm = perm_arr;
+
+            if (perm_arr) {
+                if (!seek_valid_perm(f, in, k, ar, perm_arr, &b)) {
+                    tbuf_free(&f->tuples);
+                    f->perm = NULL;
+                    if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                    break;
+                }
+            } else {
+                if (!seek_valid(f, in, k, ar, &b)) {
+                    tbuf_free(&f->tuples);
+                    if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                    break;
+                }
             }
             sp++;
             ip++;
@@ -823,7 +1093,103 @@ static int eval_stratum_recursive(dl_db *db, compiled_rule **rules, int n)
         }
     }
 
-    /* ── 3. Seed phase: evaluate rules ─────────────────────────────── */
+    /* ── 2b. M6: Find perms for each recursive IDB and allocate shadows ─ */
+    /* perm_idxs[rdi][pi] = db perm_id for the pi-th perm of this IDB */
+    int    *perm_count = calloc((size_t)nr, sizeof(int));
+    int   **perm_ids   = calloc((size_t)nr, sizeof(int *));
+    /* perm_cap for each rdi */
+    int    *perm_cap   = calloc((size_t)nr, sizeof(int));
+    /* idb_perm_shadows[rdi][pi] = permuted sorted tuple_set shadow */
+    tuple_set **idb_perm_shadows = calloc((size_t)nr, sizeof(tuple_set *));
+    if (!perm_count || !perm_ids || !perm_cap || !idb_perm_shadows) {
+        free(perm_count); free(perm_ids); free(perm_cap); free(idb_perm_shadows);
+        for (ri = 0; ri < nr; ri++) {
+            ts_free(&rd[ri].idb);
+            ts_free(&rd[ri].delta);
+            ts_free(&rd[ri].next_delta);
+        }
+        free(rd);
+        return -1;
+    }
+
+    {
+        struct dl_db_internal *di = (struct dl_db_internal *)db;
+        int pi;
+        for (pi = 0; pi < di->n_perms; pi++) {
+            int p_rel_id = di->perms[pi].rel_id;
+            int rdi = rp_idx[p_rel_id];
+            if (rdi < 0) continue;  /* not a recursive IDB head */
+            int pc = perm_count[rdi];
+            if (pc >= perm_cap[rdi]) {
+                int nc = perm_cap[rdi] ? perm_cap[rdi] * 2 : 2;
+                int *np = realloc(perm_ids[rdi], (size_t)nc * sizeof(int));
+                tuple_set *nt = realloc(idb_perm_shadows[rdi],
+                                        (size_t)nc * sizeof(tuple_set));
+                if (!np || !nt) {
+                    /* OOM — free everything and bail */
+                    int rj, pk;
+                    for (rj = 0; rj < nr; rj++) {
+                        for (pk = 0; pk < perm_count[rj]; pk++)
+                            ts_free(&idb_perm_shadows[rj][pk]);
+                        free(perm_ids[rj]); free(idb_perm_shadows[rj]);
+                        ts_free(&rd[rj].idb);
+                        ts_free(&rd[rj].delta);
+                        ts_free(&rd[rj].next_delta);
+                    }
+                    free(perm_count); free(perm_ids); free(perm_cap);
+                    free(idb_perm_shadows);
+                    free(np); free(nt);
+                    free(rd);
+                    return -1;
+                }
+                perm_ids[rdi] = np;
+                idb_perm_shadows[rdi] = nt;
+                perm_cap[rdi] = nc;
+            }
+            perm_ids[rdi][pc] = pi;
+            if (ts_init(&idb_perm_shadows[rdi][pc], di->perms[pi].arity) != 0) {
+                int rj, pk;
+                for (rj = 0; rj < nr; rj++) {
+                    for (pk = 0; pk < perm_count[rj]; pk++)
+                        ts_free(&idb_perm_shadows[rj][pk]);
+                    free(perm_ids[rj]); free(idb_perm_shadows[rj]);
+                    ts_free(&rd[rj].idb);
+                    ts_free(&rd[rj].delta);
+                    ts_free(&rd[rj].next_delta);
+                }
+                free(perm_count); free(perm_ids); free(perm_cap);
+                free(idb_perm_shadows); free(rd);
+                return -1;
+            }
+            perm_count[rdi]++;
+        }
+    }
+
+    /* Helper: rebuild all perm shadows from the current IDB */
+    #define REBUILD_PERM_SHADOWS() do { \
+        int _rdi, _pi; \
+        for (_rdi = 0; _rdi < nr; _rdi++) { \
+            for (_pi = 0; _pi < perm_count[_rdi]; _pi++) { \
+                int _db_pi = perm_ids[_rdi][_pi]; \
+                struct dl_db_internal *_di = (struct dl_db_internal *)db; \
+                const uint8_t *_perm_arr = _di->perms[_db_pi].perm; \
+                uint8_t _ar = _di->perms[_db_pi].arity; \
+                tuple_set *_shadow = &idb_perm_shadows[_rdi][_pi]; \
+                ts_reset(_shadow); \
+                long _ci; \
+                for (_ci = 0; _ci < rd[_rdi].idb.count; _ci++) { \
+                    const uint32_t *_row = rd[_rdi].idb.data \
+                        + (size_t)_ci * (size_t)rd[_rdi].idb.arity; \
+                    uint32_t _prow[8]; \
+                    int _j; \
+                    for (_j = 0; _j < (int)_ar; _j++) \
+                        _prow[_j] = _row[_perm_arr[_j]]; \
+                    ts_add(_shadow, _prow); \
+                } \
+                ts_sort(_shadow); \
+            } \
+        } \
+    } while(0)
     /* Non-recursive rules → commit to DAFSA (M1 path).
      * Recursive rules → collect into idb/delta via dry=1 (keep DAFSA
      *   empty so the final materialize step is a fast bulk build). */
@@ -896,6 +1262,9 @@ static int eval_stratum_recursive(dl_db *db, compiled_rule **rules, int n)
         ts_sort(&rd[i].delta);
     }
 
+    /* M6: build initial perm shadows from seed idb */
+    REBUILD_PERM_SHADOWS();
+
     /* If all deltas are empty, terminate immediately */
     {
         int any = 0;
@@ -925,8 +1294,23 @@ static int eval_stratum_recursive(dl_db *db, compiled_rule **rules, int n)
                     ts_free(&rd[ri].next_delta);
                 }
                 free(rd);
+                /* M6: free perm shadows on error */
+                {
+                    int _rdi, _pi;
+                    for (_rdi = 0; _rdi < nr; _rdi++) {
+                        for (_pi = 0; _pi < perm_count[_rdi]; _pi++)
+                            ts_free(&idb_perm_shadows[_rdi][_pi]);
+                        free(perm_ids[_rdi]);
+                        free(idb_perm_shadows[_rdi]);
+                    }
+                    free(perm_count); free(perm_ids);
+                    free(perm_cap); free(idb_perm_shadows);
+                }
                 return -1;
             }
+
+            /* M6: rebuild perm shadows from current (post-rollover) idb */
+            REBUILD_PERM_SHADOWS();
 
             /* Reset next_delta for this iteration */
             for (i = 0; i < nr; i++)
@@ -945,7 +1329,8 @@ static int eval_stratum_recursive(dl_db *db, compiled_rule **rules, int n)
 
                 for (ii = 0; ii < ni_instrs; ii++) {
                     const vm_instr *in = &prog[ii];
-                    if (in->op != OP_SCAN && in->op != OP_LOOKUP)
+                    if (in->op != OP_SCAN && in->op != OP_LOOKUP
+                        && in->op != OP_LOOKUP_PERM)
                         continue;
 
                     int br = in->a;         /* body relation id */
@@ -955,28 +1340,49 @@ static int eval_stratum_recursive(dl_db *db, compiled_rule **rules, int n)
 
                     /* Build override list:
                      * - All recursive body atoms get idb[rel] (full)
-                     * - This specific atom gets delta[rel] instead */
+                     * - This specific atom gets delta[rel] instead
+                     * - OP_LOOKUP_PERM atoms get the perm shadow */
                     vm_override overrides[16];
                     int n_ov = 0;
                     int ji;
 
                     for (ji = 0; ji < ni_instrs; ji++) {
                         const vm_instr *jin = &prog[ji];
-                        if (jin->op != OP_SCAN && jin->op != OP_LOOKUP)
+                        if (jin->op != OP_SCAN && jin->op != OP_LOOKUP
+                            && jin->op != OP_LOOKUP_PERM)
                             continue;
                         int jbr = jin->a;
                         int jbdi = rp_idx[jbr];
                         if (jbdi < 0) continue;  /* EDB — no override */
 
-                        if ((int)jin->body_idx == (int)in->body_idx &&
-                            jbr == br) {
+                        int is_delta = ((int)jin->body_idx == (int)in->body_idx &&
+                                        jbr == br);
+
+                        if (jin->op == OP_LOOKUP_PERM) {
+                            /* Provide permuted shadow */
+                            int jperm_id = (int)jin->imm;
+                            /* Find the shadow for this perm_id */
+                            int pk;
+                            const tuple_set *shadow_ts = NULL;
+                            for (pk = 0; pk < perm_count[jbdi]; pk++) {
+                                if (perm_ids[jbdi][pk] == jperm_id) {
+                                    shadow_ts = &idb_perm_shadows[jbdi][pk];
+                                    break;
+                                }
+                            }
+                            overrides[n_ov].body_idx = (int)jin->body_idx;
+                            overrides[n_ov].ts = shadow_ts ? shadow_ts : &rd[jbdi].idb;
+                            overrides[n_ov].perm_id = jperm_id;
+                        } else if (is_delta) {
                             /* This is the delta atom */
                             overrides[n_ov].body_idx = (int)jin->body_idx;
                             overrides[n_ov].ts = &rd[bdi].delta;
+                            overrides[n_ov].perm_id = -1;
                         } else {
                             /* Full IDB */
                             overrides[n_ov].body_idx = (int)jin->body_idx;
                             overrides[n_ov].ts = &rd[jbdi].idb;
+                            overrides[n_ov].perm_id = -1;
                         }
                         n_ov++;
                     }
@@ -1006,6 +1412,18 @@ static int eval_stratum_recursive(dl_db *db, compiled_rule **rules, int n)
                             ts_free(&rd[i].next_delta);
                         }
                         free(rd);
+                        /* M6: free perm shadows on error */
+                        {
+                            int _rdi, _pi;
+                            for (_rdi = 0; _rdi < nr; _rdi++) {
+                                for (_pi = 0; _pi < perm_count[_rdi]; _pi++)
+                                    ts_free(&idb_perm_shadows[_rdi][_pi]);
+                                free(perm_ids[_rdi]);
+                                free(idb_perm_shadows[_rdi]);
+                            }
+                            free(perm_count); free(perm_ids);
+                            free(perm_cap); free(idb_perm_shadows);
+                        }
                         return -1;
                     }
                     (void)n_out;
@@ -1084,6 +1502,20 @@ static int eval_stratum_recursive(dl_db *db, compiled_rule **rules, int n)
     }
     free(rd);
 
+    /* M6: free perm shadows */
+    {
+        int _rdi, _pi;
+        for (_rdi = 0; _rdi < nr; _rdi++) {
+            for (_pi = 0; _pi < perm_count[_rdi]; _pi++)
+                ts_free(&idb_perm_shadows[_rdi][_pi]);
+            free(perm_ids[_rdi]);
+            free(idb_perm_shadows[_rdi]);
+        }
+        free(perm_count); free(perm_ids); free(perm_cap);
+        free(idb_perm_shadows);
+    }
+    #undef REBUILD_PERM_SHADOWS
+
     return 0;
 }
 
@@ -1094,6 +1526,9 @@ int vm_execute(dl_db *db, compiled_rule **rules, int n_rules)
     int i, s, max_stratum;
 
     if (!db || !rules || n_rules <= 0) return 0;
+
+    /* M6: build dirty permutation indices before evaluation */
+    if (permindex_build_dirty(db) != 0) return -1;
 
     /* Find max stratum and check if any recursive rules exist */
     max_stratum = 0;

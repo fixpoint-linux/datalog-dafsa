@@ -30,6 +30,8 @@ typedef enum {
     OP_AGG_ACC   = 8,   /* M3: accumulate a binding into a group bucket */
     OP_AGG_EMIT  = 9,   /* M3: emit one tuple per aggregate group */
     OP_WALK      = 10,  /* M5: SCAN with regex pattern filter */
+    OP_LOOKUP_PERM = 11, /* M6: permuted prefix lookup */
+    OP_HASH_JOIN   = 12, /* M6: real in-frame hash join */
 } vm_opcode;
 
 typedef struct {

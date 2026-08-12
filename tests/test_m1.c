@@ -334,24 +334,22 @@ static void test_err_negation(void)
     PASS();
 }
 
-/* ─── Test 3e: Non-leading-column join (if implemented) ──────────────── */
+/* ─── Test 3e: Non-leading-column join (M6: now allowed) ──────────────── */
 
 static void test_err_nonleading_join(void)
 {
     dl_db *db;
-    const char *rule = "result(A,C):-edge(A,B),edge(C,B).";
 
-    TEST("compile error: non-leading-column join");
+    TEST("non-leading-column join now compiles (M6)");
 
     setup_db(&db);
     assert(dl_declare_relation(db, "edge", 2) == 0);
 
-    int ret = dl_load_rules(db, rule);
-    /* This SHOULD fail because the join is on column 1 of the inner edge,
-     * not column 0. B is at column 1 of the inner edge(C,B). */
-    if (ret == 0) {
+    int ret = dl_load_rules(db, "result(A,C):-edge(A,B),edge(C,B).");
+    /* M6: non-leading joins are now supported via permutation indices */
+    if (ret != 0) {
         teardown_db(db);
-        FAIL("expected compile error, got success");
+        FAIL("non-leading join should compile in M6");
         return;
     }
 
