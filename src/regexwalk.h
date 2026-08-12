@@ -30,6 +30,7 @@ typedef struct dafsa_view dafsa_view;
 /* ─── Regex DFA ───────────────────────────────────────────────────────── */
 
 #define REGEX_DFA_MAX_STATES 50000
+#define REGEX_DFA_ABORT_EARLY 8192
 
 typedef struct regex_dfa {
     uint32_t  n_states;          /* number of states (0 = error / empty) */
@@ -49,7 +50,8 @@ typedef struct regex_dfa {
  * Errors:
  *   - NULL / empty pattern
  *   - Unescaped NUL in pattern
- *   - State cap exceeded (REGEX_DFA_MAX_STATES)
+ *   - State cap exceeded (REGEX_DFA_MAX_STATES; aborts early via
+ *     REGEX_DFA_ABORT_EARLY for pathological patterns)
  *   - Memory allocation failure
  *   - Syntax errors (unbalanced brackets, etc.)
  */

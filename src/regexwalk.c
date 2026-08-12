@@ -893,7 +893,22 @@ regex_dfa *regex_compile(const char *pattern)
 
     /* Main BFS loop */
     while (queue_head < queue_tail) {
-        int dfa_s = dfa_queue[queue_head++];
+        int dfa_s;
+
+        /* Early-abort: reject pathological patterns quickly.  A pattern
+         * that needs more than REGEX_DFA_ABORT_EARLY DFA states is far
+         * beyond any useful regex; bailing here costs a fraction of the
+         * time that reaching REGEX_DFA_MAX_STATES would (each state does
+         * 256 byte-values x NFA closure).  REGEX_DFA_MAX_STATES remains
+         * the absolute ceiling for memory safety (trans array sizing). */
+        if (queue_tail >= REGEX_DFA_ABORT_EARLY) {
+            dfa = calloc(1, sizeof(*dfa));
+            if (dfa) dfa->errmsg = strdup(
+                "regex state cap exceeded (8192)");
+            goto fail;
+        }
+
+        dfa_s = dfa_queue[queue_head++];
 
         /* Restore the NFA set for this DFA state */
         {
