@@ -14,6 +14,7 @@
 #include "compiler.h"
 #include "intern.h"
 #include "relation.h"
+#include "regexwalk.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -471,6 +472,45 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
 
     v_init(&vt); i_init(&ib);
 
+    /* M5: compiled regex patterns for body atoms with ~ */
+    regex_dfa **pat_dfa = NULL;
+    int         n_pat   = 0;
+    int         pat_cap = 0;
+    uint8_t    *pat_idx = NULL;  /* pat_idx[bi] = pattern index, or 0xFF if none */
+
+    /* ── M5: compile patterns from body atoms ────────────────────────── */
+    pat_idx = malloc((size_t)r->nbody * sizeof(uint8_t));
+    if (!pat_idx) goto fail;
+    for (i = 0; i < r->nbody; i++)
+        pat_idx[i] = 0xFF;
+
+    for (bi = 0; bi < r->nbody; bi++) {
+        atom *ba = r->body[bi];
+        if (!ba->pattern) continue;
+        if (ba->negated) {
+            fprintf(stderr, "compile error: negated pattern atom not supported "
+                    "(rule '%s')\n", r->head->pred); goto fail;
+        }
+        regex_dfa *dfa = regex_compile(ba->pattern);
+        if (dfa->errmsg) {
+            fprintf(stderr, "compile error: bad regex pattern '%s': %s "
+                    "(rule '%s')\n",
+                    ba->pattern, dfa->errmsg, r->head->pred);
+            regex_dfa_free(dfa);
+            goto fail;
+        }
+        if (n_pat >= pat_cap) {
+            int nc = pat_cap ? pat_cap * 2 : 4;
+            regex_dfa **np = realloc(pat_dfa,
+                                     (size_t)nc * sizeof(regex_dfa *));
+            if (!np) { regex_dfa_free(dfa); goto fail; }
+            pat_dfa = np;
+            pat_cap = nc;
+        }
+        pat_idx[bi] = (uint8_t)n_pat;
+        pat_dfa[n_pat++] = dfa;
+    }
+
     /* ── 1. detect M3 aggregate body atom ─────────────────────────── */
     for (bi = 0; bi < r->nbody; bi++) {
         if (r->body[bi]->aggregate) {
@@ -725,11 +765,17 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
             }
         }
 
-        /* First positive body atom → SCAN */
+        /* First positive body atom → SCAN or WALK */
         {
             atom *a0 = r->body[first_pos];
             vm_instr *ip = i_emit(&ib);
-            ip->op = OP_SCAN; ip->a = (uint8_t)bri[first_pos]; ip->b = (uint8_t)a0->nargs;
+            if (pat_idx[first_pos] != 0xFF) {
+                ip->op = OP_WALK;
+                ip->imm = pat_idx[first_pos];  /* pattern index */
+            } else {
+                ip->op = OP_SCAN;
+            }
+            ip->a = (uint8_t)bri[first_pos]; ip->b = (uint8_t)a0->nargs;
             ip->body_idx = (uint8_t)first_pos;
             uint8_t ts[8];
             for (j = 0; j < a0->nargs; j++) {
@@ -806,7 +852,34 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
             while (k < curr->nargs && sc[k]) k++;
 
             vm_instr *ip = i_emit(&ib);
-            if (k > 0) {
+            if (pat_idx[bi] != 0xFF) {
+                /* Pattern atom: always full scan with regex filter */
+                ip->op = OP_WALK;
+                ip->imm = pat_idx[bi];
+                ip->a = (uint8_t)bri[bi];
+                ip->b = (uint8_t)curr->nargs;
+                ip->body_idx = (uint8_t)bi;
+                uint8_t ts[8];
+                for (j = 0; j < curr->nargs; j++) {
+                    if (curr->args[j]->kind == TOK_VAR) {
+                        int vi = v_find(&vt, curr->args[j]->text);
+                        ts[j] = vt.e[vi].slot;
+                    } else {
+                        char cname[16];
+                        snprintf(cname, sizeof(cname), "__k%d", cc++);
+                        int vi = v_add(&vt, cname);
+                        ts[j] = vt.e[vi].slot;
+                    }
+                }
+                for (j = 0; j < curr->nargs; j++) ip->slots[j] = ts[j];
+                for (j = 0; j < curr->nargs; j++) {
+                    if (curr->args[j]->kind == TOK_VAR) continue;
+                    uint32_t cv;
+                    if (token_const(db, curr->args[j], &cv)) goto fail;
+                    vm_instr *eq = i_emit(&ib);
+                    eq->op = OP_EQ_CONST; eq->a = ts[j]; eq->imm = cv;
+                }
+            } else if (k > 0) {
                 ip->op = OP_LOOKUP; ip->a = (uint8_t)bri[bi]; ip->b = (uint8_t)k; ip->c = (uint8_t)curr->nargs;
                 ip->body_idx = (uint8_t)bi;
                 uint8_t slot_map[8]; int si = 0;
@@ -973,6 +1046,11 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
     cr->is_recursive = 0;
     cr->has_aggregate = (agg_body_idx >= 0);
 
+    /* M5: transfer compiled patterns */
+    cr->n_patterns = n_pat;
+    cr->patterns   = pat_dfa;  pat_dfa = NULL;
+    n_pat = 0;
+
     if (rel_strata && head_ri >= 0)
         cr->stratum = rel_strata[head_ri];
 
@@ -987,6 +1065,11 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
 
 fail:
     v_free(&vt); i_free(&ib); free(bri);
+    free(pat_idx);
+    if (pat_dfa) {
+        for (i = 0; i < n_pat; i++) regex_dfa_free(pat_dfa[i]);
+        free(pat_dfa);
+    }
     return cr;
 }
 
@@ -1075,5 +1158,10 @@ void compiled_rule_free(compiled_rule *cr)
     free(cr->head_pred);
     if (cr->vars) { for (i = 0; i < cr->n_vars; i++) free(cr->vars[i].name); free(cr->vars); }
     free(cr->instrs);
+    if (cr->patterns) {
+        for (i = 0; i < cr->n_patterns; i++)
+            regex_dfa_free(cr->patterns[i]);
+        free(cr->patterns);
+    }
     free(cr);
 }

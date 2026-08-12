@@ -28,6 +28,8 @@ typedef enum {
     TOK_NOT,         /* ! */
     TOK_AGGREGATE,   /* count, sum, min, max */
     TOK_EQ,          /* = */
+    TOK_TILDE,       /* ~ */
+    TOK_STRING,      /* 'quoted string' — for regex patterns */
 } token_kind;
 
 typedef struct {
@@ -44,6 +46,7 @@ typedef struct {
     int     negated;       /* 1 if preceded by ! */
     int     aggregate;     /* 1 if aggregate (count/sum/min/max) */
     token  *agg_op;        /* aggregate operator token, NULL if not agg */
+    char   *pattern;       /* M5: regex pattern string (from ~ '...'), or NULL */
 } atom;
 
 /* A rule: head :- body1, body2, ..., bodyN. */

@@ -29,6 +29,7 @@ LIB_OBJS = src/intern.o \
            src/compiler.o \
            src/vm.o \
            src/snapshot.o \
+           src/regexwalk.o \
            src/dl.o
 
 # Combined object list used for static links (tests, CLI).
@@ -87,7 +88,10 @@ tests/test_review_adversarial: tests/test_review_adversarial.c $(ALL_OBJS)
 tests/test_bulk: tests/test_bulk.c $(ALL_OBJS)
 	$(CC) $(CFLAGS) $(INC) -static -o $@ tests/test_bulk.c $(ALL_OBJS)
 
-test: tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4 tests/test_bulk dl build-tmp
+tests/test_m5: tests/test_m5.c $(ALL_OBJS)
+	$(CC) $(CFLAGS) $(INC) -static -o $@ tests/test_m5.c $(ALL_OBJS)
+
+test: tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4 tests/test_bulk tests/test_m5 dl build-tmp
 	@echo "=== Running M0 unit tests ==="
 	LD_LIBRARY_PATH=. ./tests/test_m0
 	@echo ""
@@ -106,6 +110,9 @@ test: tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4 test
 	@echo "=== Running bulk DAFSA tests ==="
 	LD_LIBRARY_PATH=. ./tests/test_bulk
 	@echo ""
+	@echo "=== Running M5 regex walker tests ==="
+	LD_LIBRARY_PATH=. ./tests/test_m5
+	@echo ""
 	@echo "=== Running CLI smoke test ==="
 	@sh tests/smoke.sh
 
@@ -123,5 +130,5 @@ clean:
 	rm -f vendor/*.o src/*.o
 	rm -f libdatalog.so dl
 	rm -f tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4
-	rm -f tests/test_bulk
+	rm -f tests/test_m5 tests/test_bulk
 	rm -rf /tmp/dl-test-db build-tmp/smoke build-tmp/m1

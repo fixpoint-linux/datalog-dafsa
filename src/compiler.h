@@ -12,6 +12,7 @@
 
 #include "parser.h"
 #include "dl.h"
+#include "regexwalk.h"
 #include <stdint.h>
 
 #define MAX_VARS   64
@@ -28,6 +29,7 @@ typedef enum {
     OP_NEG_CHECK = 7,   /* M2: negated atom membership check */
     OP_AGG_ACC   = 8,   /* M3: accumulate a binding into a group bucket */
     OP_AGG_EMIT  = 9,   /* M3: emit one tuple per aggregate group */
+    OP_WALK      = 10,  /* M5: SCAN with regex pattern filter */
 } vm_opcode;
 
 typedef struct {
@@ -57,6 +59,10 @@ typedef struct {
 
     /* M3 field */
     int        has_aggregate; /* 1 if this rule uses a grouped aggregate */
+
+    /* M5 fields */
+    int        n_patterns;    /* number of compiled regex DFAs */
+    regex_dfa **patterns;     /* indexed by OP_WALK imm field */
 } compiled_rule;
 
 int  compile_rules(dl_db *db, rule **rules, int n_rules,

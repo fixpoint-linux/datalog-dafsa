@@ -20,6 +20,7 @@
  */
 #include "vm.h"
 #include "relation.h"
+#include "regexwalk.h"
 #include "tupleset.h"
 #include "intern.h"
 #include <stdlib.h>
@@ -412,6 +413,46 @@ static long exec_rule(dl_db *db, const compiled_rule *cr,
                 f->tuples.arity = in->b;
                 rel_prefix((const void *)r, NULL, 0, tbuf_cb, &f->tuples);
             }
+
+            if (f->tuples.count == 0) {
+                tbuf_free(&f->tuples);
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                break;
+            }
+
+            b_save(&f->saved, &b);
+            if (!seek_valid(f, in, 0, (int)f->tuples.arity, &b)) {
+                tbuf_free(&f->tuples);
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                break;
+            }
+            sp++;
+            ip++;
+            break;
+        }
+
+        /* ── OP_WALK: full scan with regex pattern filter ───────────── */
+        case OP_WALK: {
+            if (sp >= MAX_FRAMES) return -1;
+            vm_frame *f = &frames[sp];
+            f->ip = ip;
+            f->op = OP_SCAN;  /* treated as SCAN for backtrack */
+            f->idx = 0;
+            memset(&f->tuples, 0, sizeof(f->tuples));
+
+            /* Get the compiled regex DFA from the rule */
+            int pat_idx = (int)in->imm;
+            if (pat_idx < 0 || pat_idx >= cr->n_patterns) {
+                ip = ni; break;
+            }
+            regex_dfa *dfa = cr->patterns[pat_idx];
+
+            void *r = db_rel(db, in->a);
+            if (!r) { ip = ni; break; }
+            f->tuples.arity = in->b;
+
+            /* Use rel_pattern to enumerate matching tuples */
+            rel_pattern((const void *)r, dfa, tbuf_cb, &f->tuples);
 
             if (f->tuples.count == 0) {
                 tbuf_free(&f->tuples);

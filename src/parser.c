@@ -148,9 +148,24 @@ static int lex(parser *p)
     } else if (*s == '=') {
         t = tok_new(TOK_EQ, NULL, 0);
         s++;
+    } else if (*s == '~') {
+        t = tok_new(TOK_TILDE, NULL, 0);
+        s++;
     } else if (*s == ':' && *(s + 1) == '-') {
         t = tok_new(TOK_COLONMINUS, NULL, 0);
         s += 2;
+    } else if (*s == '\'') {
+        /* Single-quoted string: read until closing quote */
+        const char *start = s + 1;
+        s++;
+        while (*s && *s != '\'') s++;
+        if (*s != '\'') {
+            fprintf(stderr, "parser: unclosed single-quoted string at position %ld\n",
+                    (long)(s - p->src));
+            return -1;
+        }
+        t = tok_new(TOK_STRING, start, (size_t)(s - start));
+        s++;
     } else if (*s == '"') {
         /* Quoted string: read until closing quote */
         const char *start = s + 1;
@@ -264,6 +279,7 @@ static void atom_free(atom *a)
     int i;
     if (!a) return;
     free(a->pred);
+    free(a->pattern);
     if (a->args) {
         for (i = 0; i < a->nargs; i++)
             tok_free(a->args[i]);
@@ -492,6 +508,25 @@ static atom *parse_body_atom(parser *p)
         atom *a = parse_atom(p);
         if (!a) return NULL;
         a->negated = negated;
+
+        /* M5: check for ~ 'pattern' suffix */
+        {
+            token *t = peek(p);
+            if (t && t->kind == TOK_TILDE) {
+                advance(p);
+                t = peek(p);
+                if (!t || t->kind != TOK_STRING) {
+                    fprintf(stderr, "parser: expected pattern string "
+                            "after '~'\n");
+                    atom_free(a);
+                    return NULL;
+                }
+                a->pattern = strdup(t->text);
+                if (!a->pattern) { atom_free(a); return NULL; }
+                advance(p);
+            }
+        }
+
         return a;
     }
 }

@@ -18,6 +18,7 @@
 #include "dl.h"
 #include "intern.h"
 #include "snapshot.h"
+#include "regexwalk.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -101,8 +102,9 @@ static void usage(const char *prog)
         "  %s [-d <dir>] query '<rule>' | <file.dl> <goal-rel>\n"
         "  %s [-d <dir>] publish\n"
         "  %s [-d <dir>] bound <rel> <val> [<val> ...]\n"
+        "  %s [-d <dir>] pattern <rel> '<regex>'\n"
         "Values: bare integer -> raw u32; anything else -> interned string\n",
-        prog, prog, prog, prog, prog, prog);
+        prog, prog, prog, prog, prog, prog, prog);
     exit(1);
 }
 
@@ -339,6 +341,37 @@ int main(int argc, char **argv)
                                     print_tuple, db);
             if (n < 0) {
                 fprintf(stderr, "dl: bound query failed\n");
+                dl_close(db);
+                return 1;
+            }
+            if (n == 0)
+                printf("(no results)\n");
+        }
+
+    } else if (strcmp(cmd, "pattern") == 0) {
+        const char *rel_name;
+        const char *pattern;
+
+        if (argp >= argc) usage(argv[0]);
+        rel_name = argv[argp++];
+
+        if (argp >= argc) usage(argv[0]);
+        pattern = argv[argp++];
+
+        {
+            regex_dfa *dfa = regex_compile(pattern);
+            if (dfa->errmsg) {
+                fprintf(stderr, "dl: bad pattern '%s': %s\n",
+                        pattern, dfa->errmsg);
+                regex_dfa_free(dfa);
+                dl_close(db);
+                return 1;
+            }
+
+            long n = dl_pattern(db, rel_name, dfa, print_tuple, db);
+            regex_dfa_free(dfa);
+            if (n < 0) {
+                fprintf(stderr, "dl: pattern query failed\n");
                 dl_close(db);
                 return 1;
             }

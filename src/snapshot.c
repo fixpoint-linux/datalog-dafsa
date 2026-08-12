@@ -16,6 +16,7 @@
 #include "snapshot.h"
 #include "dafsa.h"
 #include "dafsa_internal.h"
+#include "regexwalk.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -169,7 +170,7 @@ void vcache_invalidate(view_cache_slot *vcache)
 }
 
 /* Open or find a cached view. */
-static dafsa_view *view_open_cached(view_cache_slot *vcache,
+void *view_open_cached(view_cache_slot *vcache,
                                     const char *rel_name,
                                     const char *sdir)
 {
@@ -219,7 +220,7 @@ static dafsa_view *view_open_cached(view_cache_slot *vcache,
 
 /* ─── manifest_find_rel ────────────────────────────────────────────────── */
 
-static int manifest_find_rel(const char *sdir, const char *rel_name,
+int manifest_find_rel(const char *sdir, const char *rel_name,
                              uint8_t *arity_out)
 {
     char path[8192];
@@ -289,4 +290,52 @@ long snapshot_query_scan(const char *db_dir, uint32_t snap_version,
     if (!v) return -1;
 
     return view_prefix(v, arity, leading, k, cb, user);
+}
+
+/* ─── Regex pattern walk (mmap view) ──────────────────────────────────── */
+
+struct vpat_ctx {
+    uint8_t     arity;
+    dl_tuple_cb cb;
+    void       *user;
+    long        count;
+};
+
+static int vpat_cb(const unsigned char *key_bytes, size_t key_len,
+                   void *user)
+{
+    struct vpat_ctx *ctx = (struct vpat_ctx *)user;
+    uint32_t cols[MAX_ARITY];
+    uint8_t i;
+
+    if (key_len != (size_t)ctx->arity * 4 + 1) return 0;
+
+    for (i = 0; i < ctx->arity; i++) {
+        cols[i] = ((uint32_t)key_bytes[4*i]     << 24) |
+                  ((uint32_t)key_bytes[4*i + 1] << 16) |
+                  ((uint32_t)key_bytes[4*i + 2] << 8)  |
+                  ((uint32_t)key_bytes[4*i + 3]);
+    }
+
+    ctx->count++;
+    return ctx->cb(cols, ctx->arity, ctx->user);
+}
+
+long view_pattern(void *view_handle, uint8_t arity,
+                  const struct regex_dfa *dfa,
+                  dl_tuple_cb cb, void *user)
+{
+    dafsa_view *v = (dafsa_view *)view_handle;
+    struct vpat_ctx ctx;
+
+    if (!v || !dfa || !cb) return -1;
+
+    ctx.arity = arity;
+    ctx.cb    = cb;
+    ctx.user  = user;
+    ctx.count = 0;
+
+    long n = regex_dfa_walk_view(v, dfa, vpat_cb, &ctx);
+    if (n < 0) return -1;
+    return ctx.count;
 }

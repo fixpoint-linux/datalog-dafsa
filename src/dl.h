@@ -85,6 +85,17 @@ long dl_query_bound(dl_db *db, const char *goal_rel,
                     const uint32_t *leading, uint8_t k,
                     dl_tuple_cb cb, void *user);
 
+/* ─── Regex pattern query ─────────────────────────────────────────────── */
+
+/* Forward declaration (full struct in regexwalk.h) */
+struct regex_dfa;
+
+/* Enumerate all tuples in a relation whose full key matches the compiled
+ * regex DFA.  Reads from snapshot if published, else falls back to
+ * in-memory path.  Returns tuple count or -1 on error. */
+long dl_pattern(dl_db *db, const char *rel, const struct regex_dfa *dfa,
+                dl_tuple_cb cb, void *user);
+
 /* ─── Snapshot publish (M4) ────────────────────────────────────────────── */
 
 /* Atomic publish: saves interner + all relations to a versioned snapshot

@@ -73,4 +73,15 @@ long rel_prefix(const relation *rel,
                 const uint32_t *leading, uint8_t k,
                 rel_enum_cb cb, void *user);
 
+/* ─── Regex pattern walk ──────────────────────────────────────────────── */
+
+/* Forward declaration (full struct in regexwalk.h) */
+struct regex_dfa;
+
+/* Walk full keys of the relation matching the compiled regex pattern.
+ * Enumerates complete tuples whose full DAFSA key (4*arity+1 bytes)
+ * matches the regex DFA.  Returns count or -1 on error. */
+long rel_pattern(const relation *rel, const struct regex_dfa *dfa,
+                 rel_enum_cb cb, void *user);
+
 #endif /* RELATION_H */

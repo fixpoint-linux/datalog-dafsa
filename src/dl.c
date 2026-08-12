@@ -16,6 +16,7 @@
 #include "compiler.h"
 #include "vm.h"
 #include "snapshot.h"
+#include "regexwalk.h"
 #include "tupleset.h"
 
 #include <stdlib.h>
@@ -841,4 +842,39 @@ void dl_set_fault_hook(dl_db *db,
     if (!db) return;
     db->fault_hook = hook;
     db->fault_user = user;
+}
+
+/* ─── Regex pattern query ──────────────────────────────────────────────── */
+
+long dl_pattern(dl_db *db, const char *rel_name, const struct regex_dfa *dfa,
+                dl_tuple_cb cb, void *user)
+{
+    int idx;
+
+    if (!db || !rel_name || !dfa || !cb) return -1;
+
+    /* Snapshot path */
+    if (db->snap_version > 0) {
+        char sdir[8192];
+        uint8_t arity = 0;
+        dafsa_view *v;
+
+        snprintf(sdir, sizeof(sdir), "%s/snapshots/%u",
+                 db->dir, db->snap_version);
+
+        if (!manifest_find_rel(sdir, rel_name, &arity))
+            return -1;
+
+        v = view_open_cached(db->vcache, rel_name, sdir);
+        if (!v) return -1;
+
+        return view_pattern(v, arity, dfa, cb, user);
+    }
+
+    /* In-memory path */
+    idx = find_rel(db, rel_name);
+    if (idx < 0) return -1;
+
+    return rel_pattern(db->rels[idx].rel, dfa,
+                       (rel_enum_cb)cb, user);
 }
