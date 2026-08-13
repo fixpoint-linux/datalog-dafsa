@@ -1042,36 +1042,47 @@ static void test_cli_commands(void)
 {
     TEST("cli: dl publish + dl bound + dl query");
 
+    /* Resolve the repo root at runtime (works regardless of where the repo
+     * is mounted — the sandbox uses /workspace, the host uses
+     * /home/arch/projects/datalog-dafsa).  The CLI is run with cwd == repo
+     * root, so relative build-tmp/ paths resolve from here. */
+    char base[4096];
+    if (!getcwd(base, sizeof(base))) { FAIL("getcwd"); return; }
+    char data_csv[4160], cli_dir[4160], cmd[8400];
+
+    snprintf(data_csv, sizeof(data_csv), "%s/build-tmp/adb_cli_data.csv", base);
+    snprintf(cli_dir, sizeof(cli_dir), "%s/build-tmp/adb_cli", base);
+
     /* Create CSV */
     {
-        FILE *f = fopen("/home/arch/projects/datalog-dafsa/build-tmp/adb_cli_data.csv", "w");
+        FILE *f = fopen(data_csv, "w");
+        if (!f) { FAIL("cli data csv fopen"); return; }
         fprintf(f, "1,2\n2,3\n3,4\n");
         fclose(f);
     }
 
     /* Load */
     {
-        int rc = system(
-            "cd /home/arch/projects/datalog-dafsa && "
+        snprintf(cmd, sizeof(cmd),
+            "cd '%s' && "
             "rm -rf build-tmp/adb_cli && "
             "./dl -d build-tmp/adb_cli load build-tmp/adb_cli_data.csv "
-            "--rel edge >/dev/null 2>&1");
-        if (rc != 0) { FAIL("cli load"); return; }
+            "--rel edge >/dev/null 2>&1", base);
+        if (system(cmd) != 0) { FAIL("cli load"); return; }
     }
 
     /* Publish */
     {
-        int rc = system(
-            "cd /home/arch/projects/datalog-dafsa && "
-            "./dl -d build-tmp/adb_cli publish >/dev/null 2>&1");
-        if (rc != 0) { FAIL("cli publish"); return; }
+        snprintf(cmd, sizeof(cmd),
+            "cd '%s' && ./dl -d build-tmp/adb_cli publish >/dev/null 2>&1", base);
+        if (system(cmd) != 0) { FAIL("cli publish"); return; }
     }
 
     /* Bound */
     {
-        FILE *f = popen(
-            "cd /home/arch/projects/datalog-dafsa && "
-            "./dl -d build-tmp/adb_cli bound edge 2 2>/dev/null", "r");
+        snprintf(cmd, sizeof(cmd),
+            "cd '%s' && ./dl -d build-tmp/adb_cli bound edge 2 2>/dev/null", base);
+        FILE *f = popen(cmd, "r");
         if (!f) { FAIL("cli bound"); return; }
         char buf[256];
         int lines = 0;
@@ -1088,10 +1099,10 @@ static void test_cli_commands(void)
 
     /* Query */
     {
-        FILE *f = popen(
-            "cd /home/arch/projects/datalog-dafsa && "
-            "./dl -d build-tmp/adb_cli query 'tc(X,Y):-edge(X,Y).' tc 2>/dev/null",
-            "r");
+        snprintf(cmd, sizeof(cmd),
+            "cd '%s' && ./dl -d build-tmp/adb_cli query "
+            "'tc(X,Y):-edge(X,Y).' tc 2>/dev/null", base);
+        FILE *f = popen(cmd, "r");
         if (!f) { FAIL("cli query"); return; }
         char buf[256];
         int lines = 0;
@@ -1104,8 +1115,8 @@ static void test_cli_commands(void)
         }
     }
 
-    system("rm -rf /home/arch/projects/datalog-dafsa/build-tmp/adb_cli "
-           "/home/arch/projects/datalog-dafsa/build-tmp/adb_cli_data.csv");
+    snprintf(cmd, sizeof(cmd), "rm -rf '%s' '%s'", cli_dir, data_csv);
+    system(cmd);
     PASS();
 }
 
