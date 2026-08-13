@@ -1,6 +1,6 @@
 /*
  * magic.c — Magic-sets AST→AST adornment rewrite (M8 v2 multi-predicate slice,
- *           v3 SIPS body-reordering slice)
+ *           v3 SIPS body-reordering slice, v4 negation+aggregate slice)
  *
  * SIPS slice: a deterministic greedy body-atom permutation is computed once
  * per rule at transform time (sips_body_order) and shared CONSISTENTLY between
@@ -26,8 +26,23 @@
  *   (c) dependency-seed magic (body IDB atom Q != P):
  *       magic_Q__gamma(bound args) :- magic_P__alpha(head bound), prefix'
  *
+ * Negation / aggregates are SUPPORTED under a conservative soundness
+ * boundary (never silently mis-evaluate):
+ *   - a negated body atom is allowed only if its predicate is OUTSIDE the
+ *     adorned closure (EDB, or an IDB predicate not reached by positive
+ *     references).  Negation on an adorned-closure predicate is REJECTED:
+ *     a magic-seeded slice is not the full complement.  The negated atom is
+ *     evaluated against the FULL materialization of its predicate (the
+ *     clone aliases src's relations, so dl_query_magic_adorn must ensure
+ *     those IDB relations are compiled — see dl.c).
+ *   - an aggregate is allowed only if the rule contains no positive body
+ *     atom whose predicate is in the adorned closure (the aggregate must
+ *     read the FULL group, not a bound slice).  Over-conservative; the
+ *     precise soundness condition (group-by key fully bound) is a future
+ *     relaxation documented here.
  * Conservative REJECTS (never silently mis-evaluate):
- *   - negation / aggregate in any reachable rule
+ *   - negation on an adorned-closure predicate (see above)
+ *   - aggregate in a rule with an adorned-closure body atom (see above)
  *   - k == 0 (caller routes to dl_query)
  *   - cross-predicate mutual recursion (predicate dep-graph SCC size > 1)
  *   - multiple distinct adornments for one predicate
@@ -313,11 +328,19 @@ static int set_pred_names(pred_adorn *p)
     return 0;
 }
 
-/* Adorned name for a body atom, or its own pred if it's an EDB atom. */
+/* Adorned name for a body atom, or its own pred if it's an EDB atom, a
+ * negated atom, or an aggregate atom.  NEGATED ATOMS MUST NEVER BE RENAMED:
+ * negation tests the FULL materialization of its predicate, never a
+ * magic-seeded slice.  (A negated closure-IDB atom is REJECTED upstream; a
+ * negated EDB or non-closure-IDB atom keeps its original predicate.)  An
+ * aggregate atom's `pred` is its result variable name, never a relation. */
 static const char *renamed_pred(const atom *A, const pa_vec *adorns)
 {
-    int qi = pa_find(adorns, A->pred);
-    return (qi >= 0) ? adorns->v[qi].adorned_name : A->pred;
+    int qi;
+    if (A->negated || A->aggregate) return A->pred;
+    qi = pa_find(adorns, A->pred);
+    if (qi < 0 || !adorns->v[qi].assigned) return A->pred;
+    return adorns->v[qi].adorned_name;
 }
 
 /* ─── Predicate dependency graph + acyclic-SCC check ──────────────────── */
@@ -459,8 +482,11 @@ static int sips_atom_better(int score, int n_new, int edb, int idx,
  * failure.  Greedy loop: (1) fire any equality ("=", 2 var args) with one side
  * already bound — place it next and propagate the other side; (2) else pick the
  * best-scoring non-equality atom and add its vars to bound; (3) re-sweep
- * equalities.  Aggregates/negated atoms are skipped defensively (they are
- * rejected earlier in the worklist, before this is consumed). */
+ * equalities.  Negated and aggregate atoms are eligible only once ALL their
+ * variable args are already bound (negation-safety enforced at the SIPS
+ * level); when placed, they are zero-propagation — their vars are NOT added
+ * to bound (a negated atom only consumes bindings; an aggregate's result var
+ * is consumed by the head, not by later body atoms). */
 static int sips_body_order(const rule *R, const char *alpha,
                            const pa_vec *adorns, int *body_order_out,
                            char *err, size_t errsz)
@@ -516,13 +542,18 @@ static int sips_body_order(const rule *R, const char *alpha,
         /* (2) Score remaining non-equality atoms; pick the best. */
         {
             int best = -1, best_score = 0, best_new = 0, best_edb = 0;
+            int best_nonprop = 0;   /* best atom is negated/aggregate */
             for (i = 0; i < n; i++) {
                 const atom *A = R->body[i];
-                int score, n_new, edb;
+                int score, n_new, edb, nonprop;
                 if (placed[i] || !A || !A->pred) continue;
                 if (strcmp(A->pred, "=") == 0) continue;  /* none fireable now */
-                if (A->aggregate || A->negated) continue; /* rejected earlier */
+                nonprop = (A->aggregate || A->negated);
                 sips_atom_score(A, &bound, &score, &n_new);
+                /* Negated/aggregate atoms are eligible only when every
+                 * variable arg is bound (n_new == 0, i.e. score == nargs).
+                 * Until then they are deferred. */
+                if (nonprop && n_new > 0) continue;
                 edb = (pa_find(adorns, A->pred) < 0);
                 if (best < 0 ||
                     sips_atom_better(score, n_new, edb, i,
@@ -531,15 +562,18 @@ static int sips_body_order(const rule *R, const char *alpha,
                     best_score = score;
                     best_new = n_new;
                     best_edb = edb;
+                    best_nonprop = nonprop;
                 }
             }
             if (best >= 0) {
                 const atom *A = R->body[best];
                 body_order_out[out_n++] = best;
                 placed[best] = 1;
-                for (j = 0; j < A->nargs; j++)
-                    if (A->args[j]->kind == TOK_VAR)
-                        if (ns_add(&bound, A->args[j]->text) != 0) goto oom;
+                if (!best_nonprop) {
+                    for (j = 0; j < A->nargs; j++)
+                        if (A->args[j]->kind == TOK_VAR)
+                            if (ns_add(&bound, A->args[j]->text) != 0) goto oom;
+                }
                 continue;
             }
         }
@@ -601,12 +635,15 @@ static int walk_rule_adorns(const rule *R, const char *alpha,
             }
             continue;
         }
-        if (A->aggregate) {
-            snprintf(err, errsz, "aggregate in rule for '%s' not supported",
-                     R->head->pred);
-            free(bound.v);
-            return -1;
-        }
+
+        /* Negated and aggregate atoms neither propagate adornment nor add
+         * vars to bound: a negated atom only CONSUMES bindings (SIPS
+         * schedules it only once all its var args are bound), and an
+         * aggregate reads a full group whose result var is consumed by the
+         * head, not by later body atoms.  The negation/aggregate soundness
+         * REJECTs are enforced in a post-pass after the worklist completes
+         * (see Phase B) so they are independent of rule/atom ordering. */
+        if (A->negated || A->aggregate) continue;
 
         qi = pa_find(adorns, A->pred);
         if (qi >= 0) {
@@ -880,10 +917,6 @@ int magic_transform_adorn(const rule *const *ast_rules, int n_ast,
                 const rule *R = ast_rules[i];
                 if (!R || !R->head || !R->head->pred) continue;
                 if (strcmp(R->head->pred, ppred) != 0) continue;
-                if (R->has_negation)
-                    REJECT("negation in rule for '%s' not supported", ppred);
-                if (R->has_aggregate)
-                    REJECT("aggregate in rule for '%s' not supported", ppred);
                 if (!body_orders[i]) {
                     body_orders[i] = malloc((size_t)R->nbody * sizeof(int));
                     if (!body_orders[i]) REJECT("out of memory");
@@ -902,6 +935,49 @@ int magic_transform_adorn(const rule *const *ast_rules, int n_ast,
     }
     free(queue);
     queue = NULL;
+
+    /* ── Negation / aggregate soundness post-pass ──
+     * The adorned closure is now fully assigned (fixpoint reached).  Check
+     * the soundness boundary AFTER the worklist so the test is independent
+     * of rule/atom ordering (a predicate may be assigned by a LATER positive
+     * occurrence than a negated one that references it).  Never silently
+     * mis-evaluate:
+     *   (a) a negated atom whose predicate is IN the adorned closure would
+     *       test a magic-seeded slice, not the full complement → REJECT.
+     *   (b) an aggregate in a rule that also joins an adorned-closure
+     *       predicate would read a bound slice instead of the full group →
+     *       REJECT (over-conservative; see header doc). */
+    for (i = 0; i < n_ast; i++) {
+        const rule *R = ast_rules[i];
+        int hi, jj;
+        if (!R || !R->head || !R->head->pred) continue;
+        hi = pa_find(&adorns, R->head->pred);
+        if (hi < 0 || !adorns.v[hi].assigned) continue;  /* unreachable rule */
+        for (jj = 0; jj < R->nbody; jj++) {
+            const atom *A = R->body[jj];
+            if (!A || !A->pred) continue;
+            if (A->negated) {
+                int qi = pa_find(&adorns, A->pred);
+                if (qi >= 0 && adorns.v[qi].assigned)
+                    REJECT("negation on adorned-closure predicate '%s' "
+                           "not supported", A->pred);
+            } else if (A->aggregate) {
+                int a2;
+                for (a2 = 0; a2 < R->nbody; a2++) {
+                    const atom *B = R->body[a2];
+                    if (!B || !B->pred) continue;
+                    if (B->negated || B->aggregate) continue;
+                    if (strcmp(B->pred, "=") == 0) continue;
+                    {
+                        int qi = pa_find(&adorns, B->pred);
+                        if (qi >= 0 && adorns.v[qi].assigned)
+                            REJECT("aggregate in rule with adorned-closure "
+                                   "body atom '%s' not supported", B->pred);
+                    }
+                }
+            }
+        }
+    }
 
     /* ── MAX_RELS budget: 2 fresh rels per adorned predicate ── */
     {
@@ -951,7 +1027,12 @@ int magic_transform_adorn(const rule *const *ast_rules, int n_ast,
             }
             mhead = atom_copy(R->head, P->adorned_name);
             if (!mhead) { atoms_free(mbody, total); REJECT("out of memory"); }
-            mr = make_rule(mhead, mbody, total, 0, 0);
+            /* Propagate the source rule's negation/aggregate flags so the
+             * synthesized rule is self-consistent (the compiler re-derives
+             * them from body atoms, but rule_free and future consumers rely
+             * on the flags). */
+            mr = make_rule(mhead, mbody, total, R->has_negation,
+                           R->has_aggregate);
             if (!mr) {
                 atom_free_local(mhead);
                 atoms_free(mbody, total);
@@ -969,12 +1050,18 @@ int magic_transform_adorn(const rule *const *ast_rules, int n_ast,
                 atom **mgbody;
                 atom *mghead;
                 rule *mgr;
-                int total2, jj, qi;
+                int total2, jj, qi, mg_neg, mg_agg;
                 const char *target_magic, *target_adorn;
 
                 if (!A || !A->pred) continue;
+                /* Negated and aggregate atoms never seed magic: a negated
+                 * atom's predicate is OUTSIDE the closure (a negated
+                 * closure-IDB atom is REJECTED in the post-pass), and an
+                 * aggregate atom's `pred` is its result variable name. */
+                if (A->negated || A->aggregate) continue;
                 qi = pa_find(&adorns, A->pred);
                 if (qi < 0) continue;   /* EDB body atom: no magic rule */
+                if (!adorns.v[qi].assigned) continue;  /* defensive */
 
                 target_magic = adorns.v[qi].magic_name;
                 target_adorn = adorns.v[qi].adorn;
@@ -990,17 +1077,25 @@ int magic_transform_adorn(const rule *const *ast_rules, int n_ast,
                     atom_free_local(mghead); free(mgbody);
                     REJECT("out of memory");
                 }
+                mg_neg = 0; mg_agg = 0;
                 for (jj = 0; jj < j; jj++) {
                     int bjj = ord ? ord[jj] : jj;
-                    mgbody[1 + jj] = atom_copy(R->body[bjj],
-                                               renamed_pred(R->body[bjj], &adorns));
+                    const atom *B = R->body[bjj];
+                    if (!B) continue;
+                    if (B->negated) mg_neg = 1;
+                    if (B->aggregate) mg_agg = 1;
+                    mgbody[1 + jj] = atom_copy(B,
+                                               renamed_pred(B, &adorns));
                     if (!mgbody[1 + jj]) {
                         atom_free_local(mghead);
                         atoms_free(mgbody, 1 + jj);
                         REJECT("out of memory");
                     }
                 }
-                mgr = make_rule(mghead, mgbody, total2, 0, 0);
+                /* Prefix may contain a negated atom (e.g. !blocked before an
+                 * IDB join), so derive the flags from the prefix rather than
+                 * hard-coding (0,0). */
+                mgr = make_rule(mghead, mgbody, total2, mg_neg, mg_agg);
                 if (!mgr) {
                     atom_free_local(mghead);
                     atoms_free(mgbody, total2);

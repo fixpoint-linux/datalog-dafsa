@@ -1240,6 +1240,25 @@ long dl_query_magic_adorn(dl_db *db, const char *goal_rel,
 
     if (db->n_ast_rules <= 0) return -1;  /* no retained AST (shouldn't happen) */
 
+    /* Negation/aggregate soundness: a negated or aggregated body atom in a
+     * reachable rule is evaluated against the FULL materialization of its
+     * predicate — the clone shallow-aliases src's relations, and a negated
+     * non-closure IDB atom (or an aggregate over one) must see the compiled
+     * tuples, not an empty relation.  If the fixpoint is dirty and any rule
+     * uses negation/aggregate, materialize src first (mirrors dl_query's
+     * compile-on-query behavior).  This is the ONLY case dl_query_magic
+     * mutates the db: all-positive programs (T11/T27) stay non-mutating. */
+    if (db->fixpoint_dirty) {
+        int ri;
+        for (ri = 0; ri < db->n_ast_rules; ri++) {
+            const rule *R = db->ast_rules[ri];
+            if (R && (R->has_negation || R->has_aggregate)) {
+                if (dl_compile(db) != 0) return -1;
+                break;
+            }
+        }
+    }
+
     /* 3. Clone (Option C). */
     eval_db_clone(db, &edb);
     n_aliased = edb.nrels;

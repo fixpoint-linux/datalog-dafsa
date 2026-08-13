@@ -5,6 +5,17 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
+- M8 magic-sets: negation + aggregates in adorned rules.  Negated body atoms
+  and aggregates are now supported under a conservative soundness boundary —
+  a negated atom is allowed only on a predicate OUTSIDE the adorned closure
+  (EDB, or an IDB not reached by positive references), and an aggregate is
+  allowed only in a rule with no adorned-closure body atom.  Negation on an
+  adorned-closure predicate and aggregates over a closure predicate are still
+  rejected with a clear reason (never a silent wrong answer).  `dl_query_magic`
+  now materializes the source fixpoint (internal `dl_compile`) when a rule uses
+  negation/aggregate and the fixpoint is dirty, so a negated non-closure IDB is
+  evaluated against its full materialization — the no-mutation guarantee now
+  holds only for all-positive programs.
 - Top-level `README.md` (intro, quickstart, how-it-works, API summary,
   milestone table, build/license notes).
 - `CHANGELOG.md` and `LICENSE` (MIT).

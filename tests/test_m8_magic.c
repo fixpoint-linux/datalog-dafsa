@@ -9,15 +9,18 @@
  *           no-out-edges)
  *   T7      equality in body (Z=W alias) — accepted, still equivalent
  *   T8      multi-rule same head
- *   T9      conservative REJECTS (negation, aggregate) → dl_query_magic -1;
- *           SIPS now ACCEPTS the different-adornment (T9c) and non-leading
- *           (T9d) recursive shapes — verified against ground truth
+ *   T9      negation/aggregate now ACCEPTED (negated EDB, aggregate over EDB);
+ *           SIPS ACCEPTS the different-adornment (T9c) and non-leading (T9d)
+ *           recursive shapes — verified against ground truth
  *   T10     k==0 routes to dl_query
  *   T11     no-mutation: db fields + interner byte-identical before/after
  *   T12     magic works WITHOUT a prior dl_compile (scoped re-eval from EDB)
  *   T13     property test: 200 random graphs x 5 sources, bound vs magic
  *   T29-T33 SIPS body-reordering: suboptimal order, multi-pred reorder,
  *           equality-heavy, TC-FB positive, order-independence property
+ *   T34-T38 negation + aggregates: negated non-closure IDB, sum/min/max over
+ *           EDB, REJECT negated closure IDB, REJECT aggregate over closure,
+ *           negated-EDB property test
  *
  * Regression: full `make test` (224 existing tests) still passes.
  */
@@ -197,6 +200,10 @@ static int cmp_bound_magic(dl_db *db, uint32_t src)
     tset_free(&rm);
     return eq;
 }
+
+/* Forward decl: generic arity-2 bound-vs-magic comparator (defined in the
+ * T14-T19 section, but used earlier by T9's negation/aggregate cases). */
+static int cmp_bound_magic_rel(dl_db *db, const char *rel, uint32_t src);
 
 /* ─── T1: chain ───────────────────────────────────────────────────────── */
 
@@ -525,45 +532,48 @@ static void test_t9_rejections(void)
 {
     dl_db *db;
 
-    TEST("T9: negation/aggregate reject; different-adornment/non-leading accept");
+    TEST("T9: negation/aggregate accepted; different-adornment/non-leading accept");
 
-    /* negation */
+    /* negation over EDB — now SUPPORTED, verify vs ground truth */
     {
         uint32_t e[] = {1, 2, 2, 3};
-        tuple_set r;
-        uint32_t leading[1] = { 1 };
+        uint32_t b[] = {1, 2};
+        uint32_t sources[2] = {1, 2};
+        int si;
         setup_db(&db, "t9a");
         load_rows(db, "edge", 2, e, 2, "t9a");
-        assert(dl_declare_relation(db, "blocked", 2) == 0);
+        load_rows(db, "blocked", 2, b, 1, "t9a");
         assert(dl_load_rules(db,
-            "tc(X,Y):-edge(X,Y),!blocked(X,Y).\n") == 0);
-        memset(&r, 0, sizeof(r));
-        if (dl_query_magic(db, "tc", leading, 1, tset_cb, &r) != -1) {
-            FAIL("negation not rejected");
-            tset_free(&r);
-            teardown_db(db, "t9a");
-            return;
+            "ntc(X,Y):-edge(X,Y),!blocked(X,Y).\n") == 0);
+        assert(dl_compile(db) == 0);
+        for (si = 0; si < 2; si++) {
+            if (!cmp_bound_magic_rel(db, "ntc", sources[si])) {
+                printf("  source %u mismatch\n", sources[si]);
+                FAIL("T9a negated-EDB bound vs magic mismatch");
+                teardown_db(db, "t9a");
+                return;
+            }
         }
-        tset_free(&r);
         teardown_db(db, "t9a");
     }
-    /* aggregate */
+    /* aggregate over EDB — now SUPPORTED, verify vs ground truth */
     {
         uint32_t e[] = {1, 2, 1, 3};
-        tuple_set r;
-        uint32_t leading[1] = { 1 };
+        uint32_t sources[2] = {1, 2};
+        int si;
         setup_db(&db, "t9b");
         load_rows(db, "edge", 2, e, 2, "t9b");
         assert(dl_load_rules(db,
             "cnt(X,N):-edge(X,Y),N=count().\n") == 0);
-        memset(&r, 0, sizeof(r));
-        if (dl_query_magic(db, "cnt", leading, 1, tset_cb, &r) != -1) {
-            FAIL("aggregate not rejected");
-            tset_free(&r);
-            teardown_db(db, "t9b");
-            return;
+        assert(dl_compile(db) == 0);
+        for (si = 0; si < 2; si++) {
+            if (!cmp_bound_magic_rel(db, "cnt", sources[si])) {
+                printf("  source %u mismatch\n", sources[si]);
+                FAIL("T9b aggregate-EDB bound vs magic mismatch");
+                teardown_db(db, "t9b");
+                return;
+            }
         }
-        tset_free(&r);
         teardown_db(db, "t9b");
     }
     /* recursive call that under left-to-right needed a DIFFERENT adornment
@@ -1707,6 +1717,200 @@ static void test_t33_order_independence(void)
     PASS();
 }
 
+/* ─── T34-T38: negation + aggregates in adorned rules ─────────────────── */
+
+static void test_t34_negated_nonclosure_idb(void)
+{
+    dl_db *db;
+    uint32_t e[] = {1,2, 2,3};
+
+    TEST("T34: negated non-closure IDB (!tc) — magic == bound (empty)");
+
+    setup_db(&db, "t34");
+    load_rows(db, "edge", 2, e, 2, "t34");
+    assert(dl_load_rules(db,
+        "tc(X,Y):-edge(X,Y).\n"
+        "tc(X,Y):-edge(X,Z),tc(Z,Y).\n"
+        "ntc(X,Y):-edge(X,Y),!tc(X,Y).\n") == 0);
+
+    /* No explicit dl_compile: the negation guard in dl_query_magic_adorn
+     * must auto-compile so !tc sees the FULL materialization.  Without it,
+     * tc would be empty and ntc would wrongly equal edge ({(1,2)}). */
+    {
+        tuple_set rm;
+        uint32_t leading[1] = { 1 };
+        memset(&rm, 0, sizeof(rm));
+        long nm = dl_query_magic(db, "ntc", leading, 1, tset_cb, &rm);
+        if (nm < 0) {
+            FAIL("T34 negated non-closure IDB rejected");
+            tset_free(&rm);
+            teardown_db(db, "t34");
+            return;
+        }
+        if (nm != 0) {
+            FAIL("T34 expected empty ntc (tc covers all edges)");
+            tset_free(&rm);
+            teardown_db(db, "t34");
+            return;
+        }
+        tset_free(&rm);
+    }
+
+    /* Materialized now (auto-compile above); bound vs magic must agree. */
+    if (!cmp_bound_magic_rel(db, "ntc", 1) ||
+        !cmp_bound_magic_rel(db, "ntc", 2) ||
+        !cmp_bound_magic_rel(db, "ntc", 99)) {
+        FAIL("T34 bound vs magic mismatch");
+        teardown_db(db, "t34");
+        return;
+    }
+
+    PASS();
+    teardown_db(db, "t34");
+}
+
+static void test_t35_aggregate_edb(void)
+{
+    dl_db *db;
+    uint32_t w[] = {1,5, 1,3, 2,10, 2,20, 2,30};
+    uint32_t sources[2] = {1, 2};
+    int si;
+
+    TEST("T35: sum/min/max over EDB — magic == bound");
+
+    setup_db(&db, "t35");
+    load_rows(db, "edge", 2, w, 5, "t35");
+    assert(dl_load_rules(db,
+        "sump(X,S):-edge(X,W),S=sum(W).\n"
+        "minp(X,M):-edge(X,W),M=min(W).\n"
+        "maxp(X,M):-edge(X,W),M=max(W).\n") == 0);
+    assert(dl_compile(db) == 0);
+
+    for (si = 0; si < 2; si++) {
+        if (!cmp_bound_magic_rel(db, "sump", sources[si]) ||
+            !cmp_bound_magic_rel(db, "minp", sources[si]) ||
+            !cmp_bound_magic_rel(db, "maxp", sources[si])) {
+            printf("  source %u mismatch\n", sources[si]);
+            FAIL("T35 aggregate-EDB bound vs magic mismatch");
+            teardown_db(db, "t35");
+            return;
+        }
+    }
+
+    PASS();
+    teardown_db(db, "t35");
+}
+
+static void test_t36_reject_negated_closure_idb(void)
+{
+    dl_db *db;
+    uint32_t e[] = {1,2, 2,3};
+    tuple_set r;
+    uint32_t leading[1] = {1};
+
+    TEST("T36: negated closure IDB (!p where p in closure) → -1");
+
+    setup_db(&db, "t36");
+    load_rows(db, "edge", 2, e, 2, "t36");
+    assert(dl_load_rules(db,
+        "g(X,Y):-edge(X,Y),!p(X,Y).\n"
+        "g(X,Y):-p(X,Y).\n"
+        "p(X,Y):-edge(X,Y).\n") == 0);
+    memset(&r, 0, sizeof(r));
+    if (dl_query_magic(db, "g", leading, 1, tset_cb, &r) != -1) {
+        FAIL("negated closure IDB not rejected");
+        tset_free(&r);
+        teardown_db(db, "t36");
+        return;
+    }
+    tset_free(&r);
+    PASS();
+    teardown_db(db, "t36");
+}
+
+static void test_t37_reject_aggregate_over_closure(void)
+{
+    dl_db *db;
+    uint32_t e[] = {1,2, 2,3};
+    tuple_set r;
+    uint32_t leading[1] = {1};
+
+    TEST("T37: aggregate over closure IDB (count over tc) → -1");
+
+    setup_db(&db, "t37");
+    load_rows(db, "edge", 2, e, 2, "t37");
+    assert(dl_load_rules(db,
+        "tc(X,Y):-edge(X,Y).\n"
+        "tc(X,Y):-edge(X,Z),tc(Z,Y).\n"
+        "cnt(X,N):-tc(X,Y),N=count().\n") == 0);
+    memset(&r, 0, sizeof(r));
+    if (dl_query_magic(db, "cnt", leading, 1, tset_cb, &r) != -1) {
+        FAIL("aggregate over closure IDB not rejected");
+        tset_free(&r);
+        teardown_db(db, "t37");
+        return;
+    }
+    tset_free(&r);
+    PASS();
+    teardown_db(db, "t37");
+}
+
+static void test_t38_negated_edb_property(void)
+{
+    TEST("T38: property — 100 graphs x 3 sources, negated-EDB bound==magic");
+
+    int iter;
+    for (iter = 0; iter < 100; iter++) {
+        dl_db *db;
+        char suffix[32];
+        int N = 8 + (int)(iter % 12);         /* 8..19 nodes */
+        int M = 20 + (int)((iter * 7) % 60);  /* 20..79 edges */
+        uint32_t *edges, *blocked;
+        int ei;
+        uint32_t sources[3];
+        int si;
+
+        snprintf(suffix, sizeof(suffix), "neg_%d", iter);
+        setup_db(&db, suffix);
+
+        edges = malloc((size_t)M * 2 * sizeof(uint32_t));
+        for (ei = 0; ei < M; ei++) {
+            edges[ei*2]     = rng_rand((uint32_t)N) + 1;
+            edges[ei*2 + 1] = rng_rand((uint32_t)N) + 1;
+        }
+        load_rows(db, "edge", 2, edges, M, suffix);
+        free(edges);
+
+        /* Random blocked EDB: a random set of candidate edges. */
+        {
+            int nb = (int)(rng_rand((uint32_t)M) + 1);
+            blocked = malloc((size_t)nb * 2 * sizeof(uint32_t));
+            for (ei = 0; ei < nb; ei++) {
+                blocked[ei*2]     = rng_rand((uint32_t)N) + 1;
+                blocked[ei*2 + 1] = rng_rand((uint32_t)N) + 1;
+            }
+            load_rows(db, "blocked", 2, blocked, nb, suffix);
+            free(blocked);
+        }
+
+        assert(dl_load_rules(db,
+            "ntc(X,Y):-edge(X,Y),!blocked(X,Y).\n") == 0);
+        assert(dl_compile(db) == 0);
+
+        for (si = 0; si < 3; si++) {
+            sources[si] = rng_rand((uint32_t)(N + 2)) + 1;
+            if (!cmp_bound_magic_rel(db, "ntc", sources[si])) {
+                printf("  iter %d source %u mismatch\n", iter, sources[si]);
+                FAIL("T38 negated-EDB property test failed");
+                teardown_db(db, suffix);
+                return;
+            }
+        }
+        teardown_db(db, suffix);
+    }
+    PASS();
+}
+
 /* ─── Main ────────────────────────────────────────────────────────────── */
 
 int main(void)
@@ -1747,6 +1951,11 @@ int main(void)
     test_t31_equality_heavy();
     test_t32_tc_fb_positive();
     test_t33_order_independence();
+    test_t34_negated_nonclosure_idb();
+    test_t35_aggregate_edb();
+    test_t36_reject_negated_closure_idb();
+    test_t37_reject_aggregate_over_closure();
+    test_t38_negated_edb_property();
 
     printf("\n%d tests run, %d failed\n", tests_run, tests_failed);
     return tests_failed ? 1 : 0;
