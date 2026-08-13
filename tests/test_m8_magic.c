@@ -808,6 +808,320 @@ static void test_t13_property(void)
     PASS();
 }
 
+/* ─── T14-T19: multi-predicate dependency closure ─────────────────────── */
+
+/* Compare dl_query_bound vs dl_query_magic for a generic arity-2 goal
+ * rel(src, ?) with k=1. */
+static int cmp_bound_magic_rel(dl_db *db, const char *rel, uint32_t src)
+{
+    tuple_set rb, rm;
+    uint32_t leading[1];
+    long nb, nm;
+    int eq;
+
+    memset(&rb, 0, sizeof(rb));
+    memset(&rm, 0, sizeof(rm));
+    leading[0] = src;
+
+    nb = dl_query_bound(db, rel, leading, 1, tset_cb, &rb);
+    nm = dl_query_magic(db, rel, leading, 1, tset_cb, &rm);
+
+    if (nb < 0 || nm < 0) { tset_free(&rb); tset_free(&rm); return 0; }
+    if (nb != nm) { tset_free(&rb); tset_free(&rm); return 0; }
+    eq = tset_sorted_eq(&rb, &rm);
+    tset_free(&rb);
+    tset_free(&rm);
+    return eq;
+}
+
+/* path (non-recursive) depends on tc (self-recursive) over `edge`. */
+static void load_path_tc_rules(dl_db *db)
+{
+    int rc = dl_load_rules(db,
+        "path(X,Y):-edge(X,Y).\n"
+        "path(X,Y):-edge(X,Z),tc(Z,Y).\n"
+        "tc(X,Y):-edge(X,Y).\n"
+        "tc(X,Y):-edge(X,Z),tc(Z,Y).\n");
+    assert(rc == 0);
+}
+
+/* path (SELF-recursive) depends on tc (self-recursive) over `edge` — two
+ * distinct recursive SCCs, exercising the chained-recursive-dependent
+ * strict-stratification path. */
+static void load_rpath_tc_rules(dl_db *db)
+{
+    int rc = dl_load_rules(db,
+        "path(X,Y):-edge(X,Y).\n"
+        "path(X,Y):-edge(X,Z),path(Z,Y).\n"
+        "path(X,Y):-edge(X,Z),tc(Z,Y).\n"
+        "tc(X,Y):-edge(X,Y).\n"
+        "tc(X,Y):-edge(X,Z),tc(Z,Y).\n");
+    assert(rc == 0);
+}
+
+/* ─── T14: 2-pred DAG path+tc ─────────────────────────────────────────── */
+
+static void test_t14_multipred_path_tc(void)
+{
+    dl_db *db;
+    uint32_t sources[4];
+    int i;
+
+    TEST("T14: 2-pred DAG path+tc — bound vs magic for several sources");
+
+    /* 14a: non-recursive path depends on recursive tc (stratification
+     * case 1: recursive -> non-recursive dependent). */
+    {
+        uint32_t e[] = {1,2, 2,3, 3,4, 4,5, 2,10, 10,11, 5,6, 6,7,
+                        20,21, 21,22, 1,20, 7,1};
+        setup_db(&db, "t14a");
+        load_rows(db, "edge", 2, e, 12, "t14a");
+        load_path_tc_rules(db);
+        assert(dl_compile(db) == 0);
+        sources[0] = 1; sources[1] = 2; sources[2] = 20; sources[3] = 99;
+        for (i = 0; i < 4; i++) {
+            if (!cmp_bound_magic_rel(db, "path", sources[i])) {
+                printf("  source %u mismatch (non-recursive path)\n",
+                       sources[i]);
+                FAIL("T14 path+tc bound vs magic mismatch");
+                teardown_db(db, "t14a");
+                return;
+            }
+        }
+        teardown_db(db, "t14a");
+    }
+
+    /* 14b: SELF-recursive path depends on recursive tc (stratification
+     * case 2: recursive -> recursive chained dependent, two SCCs). */
+    {
+        uint32_t e[] = {1,2, 2,3, 3,1, 1,4, 4,5, 5,6, 10,11, 11,12, 6,10};
+        setup_db(&db, "t14b");
+        load_rows(db, "edge", 2, e, 9, "t14b");
+        load_rpath_tc_rules(db);
+        assert(dl_compile(db) == 0);
+        sources[0] = 1; sources[1] = 4; sources[2] = 10; sources[3] = 99;
+        for (i = 0; i < 4; i++) {
+            if (!cmp_bound_magic_rel(db, "path", sources[i])) {
+                printf("  source %u mismatch (recursive path)\n", sources[i]);
+                FAIL("T14 recursive-path+tc bound vs magic mismatch");
+                teardown_db(db, "t14b");
+                return;
+            }
+        }
+        teardown_db(db, "t14b");
+    }
+    PASS();
+}
+
+/* ─── T15: 3-pred linear chain ────────────────────────────────────────── */
+
+static void test_t15_three_pred_chain(void)
+{
+    dl_db *db;
+    uint32_t e[] = {1,2, 2,3, 3,4, 10,11, 11,12, 4,20, 20,21};
+    uint32_t sources[3] = {1, 10, 99};
+    int i;
+
+    TEST("T15: 3-pred linear chain r3->r2->r1->edge");
+
+    setup_db(&db, "t15");
+    load_rows(db, "edge", 2, e, 7, "t15");
+    assert(dl_load_rules(db,
+        "r3(X,Y):-r2(X,Y).\n"
+        "r2(X,Y):-r1(X,Y).\n"
+        "r1(X,Y):-edge(X,Y).\n") == 0);
+    assert(dl_compile(db) == 0);
+
+    for (i = 0; i < 3; i++) {
+        if (!cmp_bound_magic_rel(db, "r3", sources[i])) {
+            printf("  source %u mismatch\n", sources[i]);
+            FAIL("T15 3-pred chain bound vs magic mismatch");
+            teardown_db(db, "t15");
+            return;
+        }
+    }
+    PASS();
+    teardown_db(db, "t15");
+}
+
+/* ─── T16: non-recursive goal depends on self-recursive pred ──────────── */
+
+static void test_t16_nonrecursive_goal_recursive_dep(void)
+{
+    dl_db *db;
+    uint32_t e[] = {1,2, 2,3, 3,4, 1,5, 5,6};
+    uint32_t sources[3] = {1, 2, 99};
+    int i;
+
+    TEST("T16: non-recursive goal reach depends on self-recursive tc");
+
+    setup_db(&db, "t16");
+    load_rows(db, "edge", 2, e, 5, "t16");
+    assert(dl_load_rules(db,
+        "reach(X,Y):-edge(X,Y).\n"
+        "reach(X,Y):-edge(X,Z),tc(Z,Y).\n"
+        "tc(X,Y):-edge(X,Y).\n"
+        "tc(X,Y):-edge(X,Z),tc(Z,Y).\n") == 0);
+    assert(dl_compile(db) == 0);
+
+    for (i = 0; i < 3; i++) {
+        if (!cmp_bound_magic_rel(db, "reach", sources[i])) {
+            printf("  source %u mismatch\n", sources[i]);
+            FAIL("T16 reach+tc bound vs magic mismatch");
+            teardown_db(db, "t16");
+            return;
+        }
+    }
+    teardown_db(db, "t16");
+
+    /* 16b: a dependency called with a FULLY-bound (bb) adornment — the
+     * non-goal predicate q gets a different (more bound) adornment than the
+     * goal p, exercising adornment generality across the predicate
+     * boundary (trap: bound-var propagation into Q's call site). */
+    {
+        uint32_t e2[] = {1,2, 1,3, 2,4};
+        setup_db(&db, "t16b");
+        load_rows(db, "edge", 2, e2, 3, "t16b");
+        assert(dl_load_rules(db,
+            "p(X,Y):-edge(X,Y),q(X,Y).\n"
+            "q(X,Y):-edge(X,Y).\n") == 0);
+        assert(dl_compile(db) == 0);
+        if (!cmp_bound_magic_rel(db, "p", 1)) {
+            FAIL("T16b bb-adorned dependency mismatch");
+            teardown_db(db, "t16b");
+            return;
+        }
+        teardown_db(db, "t16b");
+    }
+    PASS();
+}
+
+/* ─── T17: REJECT cross-predicate mutual recursion ────────────────────── */
+
+static void test_t17_reject_mutual_recursion(void)
+{
+    dl_db *db;
+    uint32_t e[] = {1,2, 2,3};
+    tuple_set r;
+    uint32_t leading[1] = {1};
+
+    TEST("T17: cross-predicate mutual recursion p:-q,q:-p → -1");
+
+    setup_db(&db, "t17");
+    load_rows(db, "edge", 2, e, 2, "t17");
+    assert(dl_load_rules(db,
+        "p(X,Y):-edge(X,Y).\n"
+        "p(X,Y):-q(X,Y).\n"
+        "q(X,Y):-p(X,Y).\n") == 0);
+    memset(&r, 0, sizeof(r));
+    if (dl_query_magic(db, "p", leading, 1, tset_cb, &r) != -1) {
+        FAIL("mutual recursion not rejected");
+        tset_free(&r);
+        teardown_db(db, "t17");
+        return;
+    }
+    tset_free(&r);
+    PASS();
+    teardown_db(db, "t17");
+}
+
+/* ─── T18: REJECT multiple distinct adornments ────────────────────────── */
+
+static void test_t18_reject_multiple_adornments(void)
+{
+    dl_db *db;
+    uint32_t e[] = {1,2, 2,3};
+    tuple_set r;
+    uint32_t leading[1] = {1};
+
+    TEST("T18: multiple distinct adornments (p bf, q calls p bb) → -1");
+
+    /* 18a: the plan's literal example — note it also contains a p<->q
+     * cycle, so it is rejected by the mutual-recursion check first. */
+    setup_db(&db, "t18a");
+    load_rows(db, "edge", 2, e, 2, "t18a");
+    assert(dl_load_rules(db,
+        "p(X,Y):-edge(X,Y),q(X).\n"
+        "p(X,Y):-edge(X,Z),p(Z,Y).\n"
+        "q(X):-edge(X,Y),p(X,Y).\n") == 0);
+    memset(&r, 0, sizeof(r));
+    if (dl_query_magic(db, "p", leading, 1, tset_cb, &r) != -1) {
+        FAIL("multiple adornments not rejected");
+        tset_free(&r);
+        teardown_db(db, "t18a");
+        return;
+    }
+    tset_free(&r);
+    teardown_db(db, "t18a");
+
+    /* 18b: a PURE acyclic multiple-adornment case (no mutual recursion):
+     * goal r calls p with adorn bf, and also calls s, whose rule calls p
+     * with adorn bb (both args bound via edge).  r->p and r->s->p form a
+     * DAG, so the conflict is genuinely the distinct-adornment reject. */
+    setup_db(&db, "t18b");
+    load_rows(db, "edge", 2, e, 2, "t18b");
+    assert(dl_load_rules(db,
+        "r(X,Y):-p(X,Y).\n"
+        "r(X,Y):-s(X,Y).\n"
+        "s(X,Y):-edge(X,Y),p(X,Y).\n"
+        "p(X,Y):-edge(X,Y).\n") == 0);
+    memset(&r, 0, sizeof(r));
+    if (dl_query_magic(db, "r", leading, 1, tset_cb, &r) != -1) {
+        FAIL("pure multiple adornments not rejected");
+        tset_free(&r);
+        teardown_db(db, "t18b");
+        return;
+    }
+    tset_free(&r);
+    PASS();
+    teardown_db(db, "t18b");
+}
+
+/* ─── T19: extended multi-predicate property test ─────────────────────── */
+
+static void test_t19_multipred_property(void)
+{
+    TEST("T19: property — 120 random graphs x 4 sources, path+tc bound==magic");
+
+    int iter;
+    for (iter = 0; iter < 120; iter++) {
+        dl_db *db;
+        char suffix[32];
+        int N = 6 + (int)(iter % 10);         /* 6..15 nodes */
+        int M = 15 + (int)((iter * 5) % 45);  /* 15..59 edges */
+        uint32_t *edges;
+        int ei;
+        uint32_t sources[4];
+        int si;
+
+        snprintf(suffix, sizeof(suffix), "mp_%d", iter);
+        setup_db(&db, suffix);
+
+        edges = malloc((size_t)M * 2 * sizeof(uint32_t));
+        for (ei = 0; ei < M; ei++) {
+            edges[ei*2]     = rng_rand((uint32_t)N) + 1;
+            edges[ei*2 + 1] = rng_rand((uint32_t)N) + 1;
+        }
+        load_rows(db, "edge", 2, edges, M, suffix);
+        free(edges);
+
+        load_rpath_tc_rules(db);   /* recursive path + recursive tc */
+        assert(dl_compile(db) == 0);
+
+        for (si = 0; si < 4; si++) {
+            sources[si] = rng_rand((uint32_t)(N + 2)) + 1;
+            if (!cmp_bound_magic_rel(db, "path", sources[si])) {
+                printf("  iter %d source %u mismatch\n", iter, sources[si]);
+                FAIL("multipred property test failed");
+                teardown_db(db, suffix);
+                return;
+            }
+        }
+        teardown_db(db, suffix);
+    }
+    PASS();
+}
+
 /* ─── Main ────────────────────────────────────────────────────────────── */
 
 int main(void)
@@ -828,6 +1142,12 @@ int main(void)
     test_t11_no_mutation();
     test_t12_no_compile();
     test_t13_property();
+    test_t14_multipred_path_tc();
+    test_t15_three_pred_chain();
+    test_t16_nonrecursive_goal_recursive_dep();
+    test_t17_reject_mutual_recursion();
+    test_t18_reject_multiple_adornments();
+    test_t19_multipred_property();
 
     printf("\n%d tests run, %d failed\n", tests_run, tests_failed);
     return tests_failed ? 1 : 0;

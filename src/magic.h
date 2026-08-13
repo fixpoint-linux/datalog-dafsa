@@ -1,16 +1,20 @@
 /*
- * magic.h — Magic-sets transformation (M8 v2 first slice)
+ * magic.h — Magic-sets transformation (M8 v2 multi-predicate slice)
  *
  * Pure AST→AST adornment rewrite.  magic_transform() takes the retained
  * AST (db->ast_rules) plus a leading-prefix-bound goal and synthesizes an
  * adorned + magic program that, when compiled and run against a scoped
  * clone of the EDB, materializes only the reachable IDB slice.
  *
- * First slice (conservative): a single IDB predicate (the goal), self
- * recursion through the SAME adornment, EDB bodies, equality, leading
- * prefix 1<=k<arity.  Negation, aggregates, k==0, multi-predicate
- * dependencies and recursive calls needing a different adornment are all
- * REJECTED with a clear reason (never silently mis-evaluated).
+ * Multi-predicate slice (conservative): the goal IDB predicate's dependency
+ * closure is an ACYCLIC DAG of IDB predicates (per-predicate self-recursion
+ * through ONE consistent adornment allowed).  Each reachable predicate gets
+ * exactly one adornment (worklist propagation from the goal's bound args);
+ * adorned + magic rules are synthesized for every reachable predicate.
+ * Negation, aggregates, k==0, cross-predicate mutual recursion, multiple
+ * distinct adornments for one predicate, and recursive calls needing a
+ * different adornment are all REJECTED with a clear reason (never silently
+ * mis-evaluated).
  *
  * No dl_db access: the transform works purely on the AST + an interner
  * (the interner is reserved for future adornment decisions; constants are
