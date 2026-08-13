@@ -26,6 +26,8 @@
 #include <string.h>
 #include <assert.h>
 #include <stdint.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 static int tests_run = 0;
 static int tests_failed = 0;
@@ -927,9 +929,9 @@ static void test_t15_three_pred_chain(void)
     setup_db(&db, "t15");
     load_rows(db, "edge", 2, e, 7, "t15");
     assert(dl_load_rules(db,
-        "r3(X,Y):-r2(X,Y).\n"
+        "r1(X,Y):-edge(X,Y).\n"
         "r2(X,Y):-r1(X,Y).\n"
-        "r1(X,Y):-edge(X,Y).\n") == 0);
+        "r3(X,Y):-r2(X,Y).\n") == 0);
     assert(dl_compile(db) == 0);
 
     for (i = 0; i < 3; i++) {
@@ -983,8 +985,8 @@ static void test_t16_nonrecursive_goal_recursive_dep(void)
         setup_db(&db, "t16b");
         load_rows(db, "edge", 2, e2, 3, "t16b");
         assert(dl_load_rules(db,
-            "p(X,Y):-edge(X,Y),q(X,Y).\n"
-            "q(X,Y):-edge(X,Y).\n") == 0);
+            "q(X,Y):-edge(X,Y).\n"
+            "p(X,Y):-edge(X,Y),q(X,Y).\n") == 0);
         assert(dl_compile(db) == 0);
         if (!cmp_bound_magic_rel(db, "p", 1)) {
             FAIL("T16b bb-adorned dependency mismatch");
@@ -1122,6 +1124,443 @@ static void test_t19_multipred_property(void)
     PASS();
 }
 
+/* ─── T20-T28: non-leading adornments (fb/bfb) ────────────────────────── */
+
+/* Filter a materialized tuple_set on the bound positions of `adorn`:
+ * for each position i where adorn[i]=='b', keep rows with row[i]==vals[b].
+ * Ground-truth oracle for the non-leading magic tests. */
+static int tset_filter_adorn(const tuple_set *src, const char *adorn,
+                             const uint32_t *vals, uint8_t nvals,
+                             tuple_set *dst)
+{
+    long i;
+    uint8_t j, b;
+    (void)nvals;
+    memset(dst, 0, sizeof(*dst));
+    dst->arity = src->arity;
+    for (i = 0; i < src->count; i++) {
+        const uint32_t *row = src->data + (size_t)i * (size_t)src->arity;
+        int match = 1;
+        b = 0;
+        for (j = 0; j < src->arity; j++) {
+            if (adorn[j] == 'b') {
+                if (row[j] != vals[b]) { match = 0; break; }
+                b++;
+            }
+        }
+        if (!match) continue;
+        if (dst->count >= dst->cap) {
+            long nc = dst->cap ? dst->cap * 2 : 256;
+            uint32_t *nd = realloc(dst->data,
+                (size_t)nc * (size_t)dst->arity * sizeof(uint32_t));
+            if (!nd) return -1;
+            dst->data = nd;
+            dst->cap = nc;
+        }
+        memcpy(dst->data + (size_t)dst->count * (size_t)dst->arity,
+               row, (size_t)dst->arity * sizeof(uint32_t));
+        dst->count++;
+    }
+    return 0;
+}
+
+/* Compare dl_query_magic_adorn against the ground-truth filter of the full
+ * materialization (dl_query + tset_filter_adorn).  Returns 1 iff equal. */
+static int cmp_adorn_magic(dl_db *db, const char *rel, const char *adorn,
+                           const uint32_t *vals, uint8_t nvals)
+{
+    tuple_set full, ground, rm;
+    long nq, nm;
+    int eq;
+
+    memset(&full, 0, sizeof(full));
+    memset(&ground, 0, sizeof(ground));
+    memset(&rm, 0, sizeof(rm));
+
+    nq = dl_query(db, rel, tset_cb, &full);
+    if (nq < 0) { tset_free(&full); tset_free(&ground); tset_free(&rm); return 0; }
+    if (tset_filter_adorn(&full, adorn, vals, nvals, &ground) != 0) {
+        tset_free(&full); tset_free(&ground); tset_free(&rm); return 0;
+    }
+    nm = dl_query_magic_adorn(db, rel, adorn, vals, nvals, tset_cb, &rm);
+    if (nm < 0) { tset_free(&full); tset_free(&ground); tset_free(&rm); return 0; }
+    if ((long)ground.count != nm) {
+        tset_free(&full); tset_free(&ground); tset_free(&rm); return 0;
+    }
+    eq = tset_sorted_eq(&ground, &rm);
+    tset_free(&full);
+    tset_free(&ground);
+    tset_free(&rm);
+    return eq;
+}
+
+/* Run dl_query_magic_adorn capturing stderr into `out`.  Returns the call's
+ * result (or -99 if the capture fd setup failed). */
+static long qm_capture_stderr(dl_db *db, const char *goal, const char *adorn,
+                              const uint32_t *vals, uint8_t nvals,
+                              char *out, size_t outsz)
+{
+    const char *path = "build-tmp/m8_stderr_capture.txt";
+    int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    int saved = dup(2);
+    long rc;
+    tuple_set r;
+    FILE *f;
+    size_t n;
+
+    if (out) out[0] = '\0';
+    if (fd < 0 || saved < 0) {
+        if (fd >= 0) close(fd);
+        if (saved >= 0) close(saved);
+        return -99;
+    }
+
+    memset(&r, 0, sizeof(r));
+    fflush(stderr);
+    fflush(stdout);
+    dup2(fd, 2);
+    rc = dl_query_magic_adorn(db, goal, adorn, vals, nvals, tset_cb, &r);
+    tset_free(&r);
+    fflush(stderr);
+    dup2(saved, 2);
+    close(saved);
+    close(fd);
+
+    if (!out) return rc;
+    f = fopen(path, "r");
+    if (!f) return rc;
+    n = fread(out, 1, outsz - 1, f);
+    out[n] = '\0';
+    fclose(f);
+    return rc;
+}
+
+/* ─── T20: fb on 2-arity EDB ───────────────────────────────────────────── */
+
+static void test_t20_fb_edb(void)
+{
+    dl_db *db;
+    uint32_t e[] = {1,42, 2,42, 3,7, 1,7, 9,42};
+    uint32_t vals[1] = { 42 };
+
+    TEST("T20: fb on 2-arity EDB (edge) — non-leading filter");
+
+    setup_db(&db, "t20");
+    load_rows(db, "edge", 2, e, 5, "t20");
+
+    if (!cmp_adorn_magic(db, "edge", "fb", vals, 1)) {
+        FAIL("T20 fb EDB mismatch");
+        teardown_db(db, "t20");
+        return;
+    }
+    {
+        tuple_set r;
+        memset(&r, 0, sizeof(r));
+        long n = dl_query_magic_adorn(db, "edge", "fb", vals, 1, tset_cb, &r);
+        if (n != 3 || r.count != 3) {  /* edge(*,42) = {1,2,9} */
+            FAIL("T20 expected 3 rows (cols[1]==42)");
+            tset_free(&r);
+            teardown_db(db, "t20");
+            return;
+        }
+        tset_free(&r);
+    }
+    PASS();
+    teardown_db(db, "t20");
+}
+
+/* ─── T21: fbf on 3-arity IDB path3 ────────────────────────────────────── */
+
+static void test_t21_fbf_path3(void)
+{
+    dl_db *db;
+    uint32_t e[] = {1,42, 42,3, 42,5, 1,7, 7,3};
+    uint32_t vals[1] = { 42 };
+
+    TEST("T21: fbf on 3-arity IDB path3 — middle position bound");
+
+    setup_db(&db, "t21");
+    load_rows(db, "edge", 2, e, 5, "t21");
+    assert(dl_load_rules(db, "path3(X,Y,Z):-edge(X,Y),edge(Y,Z).\n") == 0);
+    assert(dl_compile(db) == 0);
+
+    /* Bind ONLY the middle position (Y=42): adorn "fbf", vals=[42]. */
+    if (!cmp_adorn_magic(db, "path3", "fbf", vals, 1)) {
+        FAIL("T21 fbf path3 mismatch");
+        teardown_db(db, "t21");
+        return;
+    }
+    PASS();
+    teardown_db(db, "t21");
+}
+
+/* ─── T22: REJECT non-leading self-recursion ───────────────────────────── */
+
+static void test_t22_reject_nonlead_selfrec(void)
+{
+    dl_db *db;
+    uint32_t e[] = {1,2, 2,3, 3,4};
+    uint32_t vals[1] = { 42 };
+    char errbuf[1024];
+    long rc;
+
+    TEST("T22: non-leading self-recursive tc(X,42) → reject (different adornment)");
+
+    setup_db(&db, "t22");
+    load_rows(db, "edge", 2, e, 3, "t22");
+    load_tc_rules(db);
+    assert(dl_compile(db) == 0);
+
+    rc = qm_capture_stderr(db, "tc", "fb", vals, 1, errbuf, sizeof(errbuf));
+
+    if (rc != -1) {
+        printf("  (rc=%ld)\n", rc);
+        FAIL("T22 non-leading self-recursion not rejected");
+        teardown_db(db, "t22");
+        return;
+    }
+    if (strstr(errbuf, "recursive call to 'tc' needs adornment 'bb'") == NULL) {
+        printf("  (stderr: %s)\n", errbuf);
+        FAIL("T22 stderr missing different-adornment recursion message");
+        teardown_db(db, "t22");
+        return;
+    }
+    PASS();
+    teardown_db(db, "t22");
+}
+
+/* ─── T23: multi-predicate p^fb → q^fb closure ─────────────────────────── */
+
+static void test_t23_multipred_fb(void)
+{
+    dl_db *db;
+    uint32_t e[] = {1,42, 2,42, 3,7, 9,42};
+    uint32_t vals[1] = { 42 };
+
+    TEST("T23: p^fb propagates to q^fb (multi-predicate non-leading closure)");
+
+    setup_db(&db, "t23");
+    load_rows(db, "edge", 2, e, 4, "t23");
+    assert(dl_load_rules(db,
+        "p(X,Y):-q(X,Y).\n"
+        "q(X,Y):-edge(X,Y).\n") == 0);
+    assert(dl_compile(db) == 0);
+
+    if (!cmp_adorn_magic(db, "p", "fb", vals, 1)) {
+        FAIL("T23 p^fb/q^fb mismatch");
+        teardown_db(db, "t23");
+        return;
+    }
+    PASS();
+    teardown_db(db, "t23");
+}
+
+/* ─── T24: all-f adorn routes to dl_query ──────────────────────────────── */
+
+static void test_t24_allf_route(void)
+{
+    dl_db *db;
+    uint32_t e[] = {1,2, 2,3, 3,4};
+
+    TEST("T24: all-f adorn (ff, nvals=0) routes to dl_query");
+
+    setup_db(&db, "t24");
+    load_rows(db, "edge", 2, e, 3, "t24");
+    load_tc_rules(db);
+    assert(dl_compile(db) == 0);
+
+    {
+        tuple_set rq, rm;
+        memset(&rq, 0, sizeof(rq));
+        memset(&rm, 0, sizeof(rm));
+        long nq = dl_query(db, "tc", tset_cb, &rq);
+        long nm = dl_query_magic_adorn(db, "tc", "ff", NULL, 0, tset_cb, &rm);
+        if (nq < 0 || nm < 0 || nq != nm || !tset_sorted_eq(&rq, &rm)) {
+            FAIL("T24 all-f adorn != dl_query");
+            tset_free(&rq); tset_free(&rm);
+            teardown_db(db, "t24");
+            return;
+        }
+        tset_free(&rq); tset_free(&rm);
+    }
+    PASS();
+    teardown_db(db, "t24");
+}
+
+/* ─── T25: REJECT nvals/count mismatch ─────────────────────────────────── */
+
+static void test_t25_reject_nvals_mismatch(void)
+{
+    dl_db *db;
+    uint32_t e[] = {1,2, 2,3};
+    uint32_t vals[2] = { 1, 42 };
+
+    TEST("T25: adorn 'fb' (1 b) with nvals=2 → reject");
+
+    setup_db(&db, "t25");
+    load_rows(db, "edge", 2, e, 2, "t25");
+    load_tc_rules(db);
+    assert(dl_compile(db) == 0);
+
+    {
+        tuple_set r;
+        memset(&r, 0, sizeof(r));
+        if (dl_query_magic_adorn(db, "tc", "fb", vals, 2, tset_cb, &r) != -1) {
+            FAIL("T25 nvals/count mismatch not rejected");
+            tset_free(&r);
+            teardown_db(db, "t25");
+            return;
+        }
+        tset_free(&r);
+    }
+    PASS();
+    teardown_db(db, "t25");
+}
+
+/* ─── T26: REJECT length mismatch ──────────────────────────────────────── */
+
+static void test_t26_reject_length_mismatch(void)
+{
+    dl_db *db;
+    uint32_t e[] = {1,2, 2,3};
+    uint32_t vals[2] = { 1, 42 };
+
+    TEST("T26: adorn 'fbf' for arity-2 goal → reject");
+
+    setup_db(&db, "t26");
+    load_rows(db, "edge", 2, e, 2, "t26");
+    load_tc_rules(db);
+    assert(dl_compile(db) == 0);
+
+    {
+        tuple_set r;
+        memset(&r, 0, sizeof(r));
+        if (dl_query_magic_adorn(db, "tc", "fbf", vals, 2, tset_cb, &r) != -1) {
+            FAIL("T26 length mismatch not rejected");
+            tset_free(&r);
+            teardown_db(db, "t26");
+            return;
+        }
+        tset_free(&r);
+    }
+    PASS();
+    teardown_db(db, "t26");
+}
+
+/* ─── T27: no-mutation under dl_query_magic_adorn ──────────────────────── */
+
+static void test_t27_no_mutation_adorn(void)
+{
+    dl_db *db;
+    uint32_t e[] = {1,2, 2,3, 3,4, 5,6};
+    size_t nrels_before;
+    int n_perms_before;
+    int n_crules_before;
+    uint32_t snap_before;
+    int dirty_before;
+    uint32_t id1, id2, id3;
+
+    TEST("T27: dl_query_magic_adorn leaves db byte-identical");
+
+    setup_db(&db, "t27");
+    load_rows(db, "edge", 2, e, 4, "t27");
+    load_tc_rules(db);
+    assert(dl_compile(db) == 0);
+
+    id1 = dl_intern_str(db, "m8sentinel_alpha");
+    id2 = dl_intern_str(db, "m8sentinel_beta");
+    assert(id2 == id1 + 1);
+
+    nrels_before  = db->nrels;
+    n_perms_before = db->n_perms;
+    n_crules_before = db->n_crules;
+    snap_before   = db->snap_version;
+    dirty_before  = db->fixpoint_dirty;
+
+    {
+        tuple_set rm;
+        uint32_t vals[1] = { 1 };
+        memset(&rm, 0, sizeof(rm));
+        long nm = dl_query_magic_adorn(db, "tc", "bf", vals, 1, tset_cb, &rm);
+        (void)nm;
+        assert(nm >= 0);
+        tset_free(&rm);
+    }
+
+    id3 = dl_intern_str(db, "m8sentinel_gamma");
+    if (id3 != id2 + 1) {
+        FAIL("interner mutated during dl_query_magic_adorn");
+        teardown_db(db, "t27");
+        return;
+    }
+
+    if (db->nrels != nrels_before ||
+        db->n_perms != n_perms_before ||
+        db->n_crules != n_crules_before ||
+        db->snap_version != snap_before ||
+        db->fixpoint_dirty != dirty_before) {
+        FAIL("db field mutated during dl_query_magic_adorn");
+        teardown_db(db, "t27");
+        return;
+    }
+
+    if (!cmp_bound_magic(db, 1) || !cmp_bound_magic(db, 5)) {
+        FAIL("post-adorn bound query inconsistent");
+        teardown_db(db, "t27");
+        return;
+    }
+
+    PASS();
+    teardown_db(db, "t27");
+}
+
+/* ─── T28: property test on non-recursive 2-hop path2 ──────────────────── */
+
+static void test_t28_path2_property(void)
+{
+    TEST("T28: property — 150 random graphs x 5 targets, path2 fb==full-filter");
+
+    int iter;
+    for (iter = 0; iter < 150; iter++) {
+        dl_db *db;
+        char suffix[32];
+        int N = 8 + (int)(iter % 12);         /* 8..19 nodes */
+        int M = 20 + (int)((iter * 7) % 60);  /* 20..79 edges */
+        uint32_t *edges;
+        int ei;
+        uint32_t targets[5];
+        int ti;
+
+        snprintf(suffix, sizeof(suffix), "p2_%d", iter);
+        setup_db(&db, suffix);
+
+        edges = malloc((size_t)M * 2 * sizeof(uint32_t));
+        for (ei = 0; ei < M; ei++) {
+            edges[ei*2]     = rng_rand((uint32_t)N) + 1;
+            edges[ei*2 + 1] = rng_rand((uint32_t)N) + 1;
+        }
+        load_rows(db, "edge", 2, edges, M, suffix);
+        free(edges);
+
+        assert(dl_load_rules(db, "path2(X,Y):-edge(X,Z),edge(Z,Y).\n") == 0);
+        assert(dl_compile(db) == 0);
+
+        for (ti = 0; ti < 5; ti++) {
+            uint32_t vals[1];
+            targets[ti] = rng_rand((uint32_t)(N + 2)) + 1;
+            vals[0] = targets[ti];
+            if (!cmp_adorn_magic(db, "path2", "fb", vals, 1)) {
+                printf("  iter %d target %u mismatch\n", iter, targets[ti]);
+                FAIL("T28 path2 property test failed");
+                teardown_db(db, suffix);
+                return;
+            }
+        }
+        teardown_db(db, suffix);
+    }
+    PASS();
+}
+
 /* ─── Main ────────────────────────────────────────────────────────────── */
 
 int main(void)
@@ -1148,6 +1587,15 @@ int main(void)
     test_t17_reject_mutual_recursion();
     test_t18_reject_multiple_adornments();
     test_t19_multipred_property();
+    test_t20_fb_edb();
+    test_t21_fbf_path3();
+    test_t22_reject_nonlead_selfrec();
+    test_t23_multipred_fb();
+    test_t24_allf_route();
+    test_t25_reject_nvals_mismatch();
+    test_t26_reject_length_mismatch();
+    test_t27_no_mutation_adorn();
+    test_t28_path2_property();
 
     printf("\n%d tests run, %d failed\n", tests_run, tests_failed);
     return tests_failed ? 1 : 0;

@@ -1110,12 +1110,76 @@ static int ast_has_head(dl_db *db, const char *pred)
     return 0;
 }
 
+/* ─── M8: per-position filter adapter (full-scan + filter) ─────────────── */
+
+/* Adapter turning a dl_tuple_cb into a rel_enum_cb that applies a per-position
+ * adornment filter: for each position i where adorn[i]=='b', require
+ * cols[i]==vals[b] (b = running bound-position counter).  Used to post-filter
+ * the fully materialized adorned-goal (or EDB) relation after the scoped
+ * fixpoint, since rel_prefix only supports LEADING-prefix binding and cannot
+ * express fb/bfb.  Kept inline in dl.c (not relation.h) — small, magic-only. */
+typedef struct {
+    dl_tuple_cb user_cb;
+    void       *user;
+    uint8_t     arity;
+    char        adorn[9];
+    uint32_t    vals[8];
+    long        matched;   /* count of tuples that passed the filter */
+} magic_filter_ctx;
+
+static int magic_filter_cb(const uint32_t *cols, uint8_t arity, void *user)
+{
+    magic_filter_ctx *ctx = (magic_filter_ctx *)user;
+    uint8_t i, b = 0;
+    (void)arity;
+    for (i = 0; i < ctx->arity; i++) {
+        if (ctx->adorn[i] == 'b') {
+            if (cols[i] != ctx->vals[b]) return 0;
+            b++;
+        }
+    }
+    ctx->matched++;
+    return ctx->user_cb(cols, ctx->arity, ctx->user);
+}
+
 long dl_query_magic(dl_db *db, const char *goal_rel,
                     const uint32_t *leading, uint8_t k,
                     dl_tuple_cb cb, void *user)
 {
     int goal_idx;
     uint8_t goal_arity;
+    char adorn[9];
+    uint8_t i;
+
+    if (!db || !goal_rel || !cb) return -1;
+
+    /* Resolve goal + validate k (mirrors the old leading/k entry checks). */
+    goal_idx = find_rel(db, goal_rel);
+    if (goal_idx < 0) return -1;
+    goal_arity = rel_arity(db->rels[goal_idx].rel);
+    if (k > goal_arity) return -1;
+
+    /* k==0 → route to dl_query (full materialization). */
+    if (k == 0)
+        return dl_query(db, goal_rel, cb, user);
+
+    /* Synthesize the leading-prefix adornment and route to the new API. */
+    for (i = 0; i < k; i++) adorn[i] = 'b';
+    for (i = k; i < goal_arity; i++) adorn[i] = 'f';
+    adorn[goal_arity] = '\0';
+
+    return dl_query_magic_adorn(db, goal_rel, adorn, leading, k, cb, user);
+}
+
+long dl_query_magic_adorn(dl_db *db, const char *goal_rel,
+                          const char *adorn, const uint32_t *vals, uint8_t nvals,
+                          dl_tuple_cb cb, void *user)
+{
+    int goal_idx;
+    uint8_t goal_arity;
+    size_t alen;
+    size_t xi;
+    int nb = 0;
     magic_program prog;
     char reject[256];
     dl_db edb;
@@ -1125,38 +1189,72 @@ long dl_query_magic(dl_db *db, const char *goal_rel,
     int d;
     long result = -1;
 
-    if (!db || !goal_rel || !cb) return -1;
+    if (!db || !goal_rel || !adorn || !cb) return -1;
 
     /* 1. Validate + resolve goal. */
     goal_idx = find_rel(db, goal_rel);
     if (goal_idx < 0) return -1;
     goal_arity = rel_arity(db->rels[goal_idx].rel);
-    if (k > goal_arity) return -1;
 
-    /* k==0 → route to dl_query (full materialization; plan Decision 8). */
-    if (k == 0)
+    /* 2. Validate the adornment: length == arity, chars in {b,f},
+     *    nvals == count_b(adorn). */
+    alen = strlen(adorn);
+    if (alen != goal_arity) {
+        fprintf(stderr, "dl_query_magic: adornment length %zu != goal arity %u\n",
+                alen, goal_arity);
+        return -1;
+    }
+    for (xi = 0; xi < alen; xi++) {
+        if (adorn[xi] != 'b' && adorn[xi] != 'f') {
+            fprintf(stderr, "dl_query_magic: bad adornment char '%c'\n",
+                    adorn[xi]);
+            return -1;
+        }
+        if (adorn[xi] == 'b') nb++;
+    }
+    if (nb != (int)nvals) {
+        fprintf(stderr, "dl_query_magic: nvals=%u != count_b(adorn)=%d\n",
+                nvals, nb);
+        return -1;
+    }
+
+    /* All-free adorn → route to dl_query (full materialization). */
+    if (nvals == 0)
         return dl_query(db, goal_rel, cb, user);
 
-    /* EDB goal (not a rule head) → magic degenerates to a prefix lookup. */
-    if (!ast_has_head(db, goal_rel))
-        return dl_query_bound(db, goal_rel, leading, k, cb, user);
+    /* EDB goal (not a rule head) → direct full-scan + per-position filter. */
+    if (!ast_has_head(db, goal_rel)) {
+        magic_filter_ctx ctx;
+        memset(&ctx, 0, sizeof(ctx));
+        ctx.user_cb = cb;
+        ctx.user = user;
+        ctx.arity = goal_arity;
+        memcpy(ctx.adorn, adorn, alen);
+        ctx.adorn[alen] = '\0';
+        memcpy(ctx.vals, vals, (size_t)nvals * sizeof(uint32_t));
+        if (rel_prefix(db->rels[goal_idx].rel, NULL, 0,
+                       magic_filter_cb, &ctx) < 0)
+            return -1;
+        return ctx.matched;
+    }
 
     if (db->n_ast_rules <= 0) return -1;  /* no retained AST (shouldn't happen) */
 
-    /* 2. Clone (Option C). */
+    /* 3. Clone (Option C). */
     eval_db_clone(db, &edb);
     n_aliased = edb.nrels;
     memset(&prog, 0, sizeof(prog));
 
-    /* 3. Transform. */
-    if (magic_transform((const rule *const *)db->ast_rules, db->n_ast_rules,
-                        goal_rel, goal_arity, leading, k, db->ir, &prog,
-                        reject, sizeof(reject)) != 0) {
+    /* 4. Transform. */
+    if (magic_transform_adorn((const rule *const *)db->ast_rules,
+                              db->n_ast_rules, goal_rel, goal_arity,
+                              adorn, vals, nvals, db->ir, &prog,
+                              reject, sizeof(reject)) != 0) {
         fprintf(stderr, "dl_query_magic: rejected: %s\n", reject);
         goto out_free_edb;
     }
 
-    /* 4. Pre-declare ALL head relations (adorned + magic) in-memory, so
+    /* 5. Pre-declare ALL head relations (adorned + magic) in-memory, so
      * compile_rules' dl_declare_relation branch is never reached. */
     for (d = 0; d < prog.n_decls; d++) {
         if (eval_db_declare_inmem(&edb, prog.decls[d].name,
@@ -1168,7 +1266,8 @@ long dl_query_magic(dl_db *db, const char *goal_rel,
         }
     }
 
-    /* 5. Seed the magic goal relation with the bound leading args. */
+    /* 6. Seed the magic goal relation with the bound values (nvals columns,
+     *    packed in left-to-right bound-position order). */
     {
         char magic_goal[64];
         int m_idx;
@@ -1179,16 +1278,16 @@ long dl_query_magic(dl_db *db, const char *goal_rel,
             goto out_free_edb;
         }
         m_idx = find_rel(&edb, magic_goal);
-        if (m_idx < 0 || rel_arity(edb.rels[m_idx].rel) != k) {
+        if (m_idx < 0 || rel_arity(edb.rels[m_idx].rel) != nvals) {
             fprintf(stderr, "dl_query_magic: internal: magic goal '%s' "
                     "missing/arity-mismatch\n", magic_goal);
             magic_program_free(&prog);
             goto out_free_edb;
         }
-        rel_add(edb.rels[m_idx].rel, leading);
+        rel_add(edb.rels[m_idx].rel, vals);
     }
 
-    /* 6. Compile the adorned + magic program against the clone. */
+    /* 7. Compile the adorned + magic program against the clone. */
     if (compile_rules(&edb, prog.rules, prog.n_rules,
                       &magic_crules, &n_magic) != 0) {
         fprintf(stderr, "dl_query_magic: compile of adorned program failed\n");
@@ -1207,23 +1306,35 @@ long dl_query_magic(dl_db *db, const char *goal_rel,
         goto out_free_crules;
     }
 
-    /* 7. Scoped fixpoint. */
+    /* 8. Scoped fixpoint. */
     if (vm_execute(&edb, magic_crules, n_magic) != 0) {
         fprintf(stderr, "dl_query_magic: scoped fixpoint failed\n");
         magic_program_free(&prog);
         goto out_free_crules;
     }
 
-    /* 8. Stream: re-apply the leading/k prefix filter on the adorned goal. */
+    /* 9. Stream: full-scan + per-position filter on the adorned goal. */
     {
         int a_idx = find_rel(&edb, prog.adorned_goal);
+        magic_filter_ctx ctx;
         if (a_idx < 0) {
             fprintf(stderr, "dl_query_magic: internal: adorned goal '%s' "
                     "missing\n", prog.adorned_goal);
             magic_program_free(&prog);
             goto out_free_crules;
         }
-        result = rel_prefix(edb.rels[a_idx].rel, leading, k, cb, user);
+        memset(&ctx, 0, sizeof(ctx));
+        ctx.user_cb = cb;
+        ctx.user = user;
+        ctx.arity = goal_arity;
+        memcpy(ctx.adorn, adorn, alen);
+        ctx.adorn[alen] = '\0';
+        memcpy(ctx.vals, vals, (size_t)nvals * sizeof(uint32_t));
+        if (rel_prefix(edb.rels[a_idx].rel, NULL, 0,
+                       magic_filter_cb, &ctx) < 0)
+            result = -1;
+        else
+            result = ctx.matched;
     }
 
     magic_program_free(&prog);

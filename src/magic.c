@@ -496,6 +496,87 @@ static int walk_rule_adorns(const rule *R, const char *alpha,
     return 0;
 }
 
+/* ─── Rule ordering for single-pass non-recursive evaluation ──────────── */
+
+/* The VM (vm.c: eval_nonrecursive) evaluates a non-recursive stratum in a
+ * SINGLE PASS over its rules in emit order — it does not do a fixpoint or a
+ * topological sort.  The synthesized magic program is a dependency DAG
+ * (magic seeds propagate goal→leaf, adorned relations propagate leaf→goal),
+ * so emitting rules in goal-first order leaves a dependent's adorned relation
+ * empty (e.g. p^fb :- magic_p^fb, q^fb emitted before q^fb is populated).
+ *
+ * Fix: topologically sort the synthesized rules so every rule's dependencies
+ * (body atoms whose predicate is itself a rule head) are emitted first.
+ * Self-references are ignored — recursion is handled by the compiler's
+ * stratum/SCC machinery, not by emit order.  Cross-predicate cycles are
+ * already REJECTED, so the graph is a DAG. */
+static void topo_sort_rules(rule_vec *v)
+{
+    int n = v->n;
+    int i, j, k;
+    unsigned char **adj;
+    int *indeg;
+    int *q;
+    rule **sorted;
+    int sorted_n = 0;
+    int qh = 0, qt = 0;
+
+    if (n <= 1) return;
+
+    adj = calloc((size_t)n, sizeof(unsigned char *));
+    indeg = calloc((size_t)n, sizeof(int));
+    q = malloc((size_t)n * sizeof(int));
+    if (!adj || !indeg || !q) goto out_early;
+    for (i = 0; i < n; i++) {
+        adj[i] = calloc((size_t)n, sizeof(unsigned char));
+        if (!adj[i]) goto out_free_adj;
+    }
+
+    /* Edge r1 -> r2 when r1's head predicate appears in r2's body. */
+    for (i = 0; i < n; i++) {
+        const rule *r2 = v->v[i];
+        for (j = 0; j < r2->nbody; j++) {
+            const char *bp = r2->body[j]->pred;
+            if (!bp) continue;
+            for (k = 0; k < n; k++) {
+                if (k == i) continue;  /* ignore self-reference */
+                if (strcmp(v->v[k]->head->pred, bp) == 0 && !adj[k][i]) {
+                    adj[k][i] = 1;
+                    indeg[i]++;
+                }
+            }
+        }
+    }
+
+    /* Kahn's algorithm. */
+    for (i = 0; i < n; i++)
+        if (indeg[i] == 0) q[qt++] = i;
+    sorted = malloc((size_t)n * sizeof(rule *));
+    if (!sorted) goto out_free_adj;
+    while (qh < qt) {
+        int u = q[qh++];
+        sorted[sorted_n++] = v->v[u];
+        for (i = 0; i < n; i++) {
+            if (adj[u][i] && --indeg[i] == 0)
+                q[qt++] = i;
+        }
+    }
+
+    /* Reorder only on a complete sort (a cycle — which the mutual-recursion
+     * REJECT already rules out — would leave sorted_n < n; keep order then). */
+    if (sorted_n == n) {
+        for (i = 0; i < n; i++) v->v[i] = sorted[i];
+    }
+    free(sorted);
+
+out_free_adj:
+    for (i = 0; i < n; i++) free(adj[i]);
+    free(adj);
+out_early:
+    free(indeg);
+    free(q);
+}
+
 /* ─── The transformation ──────────────────────────────────────────────── */
 
 int magic_transform(const rule *const *ast_rules, int n_ast,
@@ -503,6 +584,39 @@ int magic_transform(const rule *const *ast_rules, int n_ast,
                     const uint32_t *leading, uint8_t k,
                     interner *ir, magic_program *out,
                     char *reject_reason, size_t reject_sz)
+{
+    /* Leading-prefix shorthand: synthesize adorn = "b"*k + "f"*(arity-k) and
+     * route to the general transform.  Guard the args that affect the local
+     * adorn[] buffer (goal_arity ≤ 8, k ≤ goal_arity); everything else is
+     * validated inside magic_transform_adorn. */
+    char adorn[9];
+    if (reject_reason && reject_sz > 0) reject_reason[0] = '\0';
+    if (goal_arity > 8) {
+        if (reject_reason && reject_sz > 0)
+            snprintf(reject_reason, reject_sz,
+                     "goal arity %u out of range 1..8", goal_arity);
+        memset(out, 0, sizeof(*out));
+        return -1;
+    }
+    if (k > goal_arity) {
+        if (reject_reason && reject_sz > 0)
+            snprintf(reject_reason, reject_sz, "k=%u exceeds goal arity %u",
+                     k, goal_arity);
+        memset(out, 0, sizeof(*out));
+        return -1;
+    }
+    make_adornment(adorn, goal_arity, k);
+    return magic_transform_adorn(ast_rules, n_ast, goal_pred, goal_arity,
+                                 adorn, leading, k, ir, out,
+                                 reject_reason, reject_sz);
+}
+
+int magic_transform_adorn(const rule *const *ast_rules, int n_ast,
+                          const char *goal_pred, uint8_t goal_arity,
+                          const char *adorn, const uint32_t *vals,
+                          uint8_t nvals,
+                          interner *ir, magic_program *out,
+                          char *reject_reason, size_t reject_sz)
 {
     pa_vec    adorns   = {0, 0, 0};
     edge_vec  edges    = {0, 0, 0};
@@ -513,7 +627,7 @@ int magic_transform(const rule *const *ast_rules, int n_ast,
     int       i, j;
 
     (void)ir;
-    (void)leading;
+    (void)vals;
 
     memset(out, 0, sizeof(*out));
     if (reject_reason && reject_sz > 0) reject_reason[0] = '\0';
@@ -526,11 +640,26 @@ int magic_transform(const rule *const *ast_rules, int n_ast,
 
     if (!ast_rules || n_ast <= 0) REJECT("no rules loaded");
     if (!goal_pred) REJECT("null goal predicate");
+    if (!adorn) REJECT("null goal adornment");
     if (goal_arity == 0 || goal_arity > 8)
         REJECT("goal arity %u out of range 1..8", goal_arity);
-    if (k == 0) REJECT("k==0 not supported (route to dl_query)");
-    if (k > goal_arity)
-        REJECT("k=%u exceeds goal arity %u", k, goal_arity);
+    {
+        size_t alen = strlen(adorn);
+        size_t xi;
+        int nb = 0;
+        if (alen != goal_arity)
+            REJECT("adornment length %zu != goal arity %u", alen, goal_arity);
+        for (xi = 0; xi < alen; xi++) {
+            if (adorn[xi] != 'b' && adorn[xi] != 'f')
+                REJECT("adornment char '%c' (not 'b'/'f')", adorn[xi]);
+            if (adorn[xi] == 'b') nb++;
+        }
+        if (nvals == 0) REJECT("nvals==0 not supported (route to dl_query)");
+        if (nvals > goal_arity)
+            REJECT("nvals=%u exceeds goal arity %u", nvals, goal_arity);
+        if (nb != (int)nvals)
+            REJECT("nvals=%u != count_b(adorn)=%d", nvals, nb);
+    }
 
     /* ── Collect the IDB head set (with natural arity) ── */
     for (i = 0; i < n_ast; i++) {
@@ -546,7 +675,8 @@ int magic_transform(const rule *const *ast_rules, int n_ast,
         REJECT("goal '%s' is not a rule head (EDB goal: use prefix lookup)",
                goal_pred);
 
-    make_adornment(adorns.v[goal_idx].adorn, goal_arity, k);
+    snprintf(adorns.v[goal_idx].adorn, sizeof(adorns.v[goal_idx].adorn),
+             "%s", adorn);
     adorns.v[goal_idx].assigned = 1;
     if (set_pred_names(&adorns.v[goal_idx]) != 0)
         REJECT("adorned predicate name for '%s' too long", goal_pred);
@@ -731,6 +861,11 @@ int magic_transform(const rule *const *ast_rules, int n_ast,
         if (dv_push(&decls, P->magic_name, nb) != 0)
             REJECT("out of memory");
     }
+
+    /* Topological order so the VM's single-pass non-recursive evaluation
+     * populates dependencies before dependents (goal->leaf magic, leaf->goal
+     * adorned).  Recursive strata are unaffected (compiler strata handle them). */
+    topo_sort_rules(&modrules);
 
     out->rules = modrules.v;
     out->n_rules = modrules.n;

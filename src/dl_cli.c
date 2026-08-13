@@ -93,7 +93,7 @@ static void usage(const char *prog)
         "  %s [-d <dir>] lookup <rel> <val> [<val> ...]\n"
         "  %s [-d <dir>] prefix <rel> [<val> ...]\n"
         "  %s [-d <dir>] query '<rule>' | <file.dl> <goal-rel>\n"
-        "  %s [-d <dir>] qmagic '<rule>' | <file.dl> <goal-rel> <val> [<val> ...]\n"
+        "  %s [-d <dir>] qmagic '<rule>' | <file.dl> <goal-rel> [-a <adorn>] <val> [<val> ...]\n"
         "  %s [-d <dir>] publish\n"
         "  %s [-d <dir>] bound <rel> <val> [<val> ...]\n"
         "  %s [-d <dir>] pattern <rel> '<regex>'\n"
@@ -310,9 +310,10 @@ int main(int argc, char **argv)
     } else if (strcmp(cmd, "qmagic") == 0) {
         const char *source;
         const char *goal_rel;
+        const char *adorn = NULL;
         char *source_buf = NULL;
-        uint32_t leading[8];
-        uint8_t k;
+        uint32_t vals[8];
+        uint8_t nvals;
         long n;
 
         if (argp >= argc) usage(argv[0]);
@@ -320,6 +321,14 @@ int main(int argc, char **argv)
 
         if (argp >= argc) usage(argv[0]);
         goal_rel = argv[argp++];
+
+        /* Optional -a <adorn>: arbitrary-adornment form (e.g. "fb" binds
+         * position 1).  Without it, the legacy leading-prefix form is used. */
+        if (argp < argc && strcmp(argv[argp], "-a") == 0) {
+            argp++;
+            if (argp >= argc) usage(argv[0]);
+            adorn = argv[argp++];
+        }
 
         /* Check if source is a file path */
         {
@@ -340,10 +349,10 @@ int main(int argc, char **argv)
             }
         }
 
-        k = 0;
-        while (argp < argc && k < 8) {
-            leading[k] = cli_parse_value(db, argv[argp]);
-            k++;
+        nvals = 0;
+        while (argp < argc && nvals < 8) {
+            vals[nvals] = cli_parse_value(db, argv[argp]);
+            nvals++;
             argp++;
         }
 
@@ -355,7 +364,11 @@ int main(int argc, char **argv)
         }
         free(source_buf);
 
-        n = dl_query_magic(db, goal_rel, leading, k, print_tuple, db);
+        if (adorn)
+            n = dl_query_magic_adorn(db, goal_rel, adorn, vals, nvals,
+                                     print_tuple, db);
+        else
+            n = dl_query_magic(db, goal_rel, vals, nvals, print_tuple, db);
         if (n < 0) {
             fprintf(stderr, "dl: magic query failed\n");
             dl_close(db);

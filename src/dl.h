@@ -133,6 +133,41 @@ long dl_query_magic(dl_db *db, const char *goal_rel,
                     const uint32_t *leading, uint8_t k,
                     dl_tuple_cb cb, void *user);
 
+/* Magic-sets bound query with an ARBITRARY adornment (M8, non-leading slice).
+ *
+ * Binds the goal relation on an arbitrary subset of positions described by
+ * `adorn`: a NUL-terminated string of exactly goal_arity chars, each 'b'
+ * (bound) or 'f' (free) — e.g. "fb" binds position 1 of an arity-2 goal,
+ * "bfb" binds position 1 of an arity-3 goal.  `vals` holds the bound values
+ * packed in left-to-right bound-position order (exactly matching the 'b'
+ * positions of `adorn`); `nvals` is their count.
+ *
+ * Invariant: the result is byte-for-byte identical to filtering the full
+ * materialization of the goal (dl_query) on the bound positions.  Returns
+ * tuple count, or -1 on error (never silently mis-evaluated).
+ *
+ * Semantics / rejection list (all return -1):
+ *   - NULL db / goal_rel / adorn / cb.
+ *   - goal_rel not found in db.
+ *   - strlen(adorn) != goal arity.
+ *   - adorn contains chars other than 'b' / 'f'.
+ *   - nvals != count of 'b' in adorn.
+ *   - nvals == 0 (all-free adorn): ROUTES to dl_query — no bound args.
+ *   - goal_rel is an EDB relation (not a rule head): ROUTES to a direct
+ *     full-scan + per-position filter (no transform).
+ *   - the same conservative magic-transform rejects as dl_query_magic
+ *     (negation, aggregates, cross-predicate mutual recursion, multiple
+ *     distinct adornments, a recursive call needing a different adornment,
+ *     MAX_RELS overflow) — including the non-leading self-recursion trap:
+ *     tc(X,42) with adorn "fb" on the canonical TC rules is REJECTED (the
+ *     recursive call needs "bb").
+ *
+ * dl_query_magic (leading/k) is a shorthand shim that synthesizes
+ * adorn = "b"*k ++ "f"*(arity-k) and routes here. */
+long dl_query_magic_adorn(dl_db *db, const char *goal_rel,
+                          const char *adorn, const uint32_t *vals, uint8_t nvals,
+                          dl_tuple_cb cb, void *user);
+
 /* ─── Regex pattern query ─────────────────────────────────────────────── */
 
 /* Forward declaration (full struct in regexwalk.h) */
