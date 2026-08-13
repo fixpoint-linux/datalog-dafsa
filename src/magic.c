@@ -1,11 +1,20 @@
 /*
  * magic.c — Magic-sets AST→AST adornment rewrite (M8 v2 multi-predicate slice,
- *           v3 SIPS body-reordering slice, v4 negation+aggregate slice)
+ *           v3 SIPS body-reordering slice, v4 negation+aggregate slice,
+ *           v5 adornment-closure fixpoint slice)
  *
  * SIPS slice: a deterministic greedy body-atom permutation is computed once
- * per rule at transform time (sips_body_order) and shared CONSISTENTLY between
- * the adornment walk (walk_rule_adorns) and the synthesis loops — the cached
- * permutation is the single source of truth, never recomputed in synthesis.
+ * per (rule, variant) pair at transform time (sips_body_order) and shared
+ * CONSISTENTLY between the adornment walk (compute_betas) and the synthesis
+ * loops — the cached permutation is the single source of truth, never
+ * recomputed in synthesis.
+ *
+ * Adornment-closure slice: one predicate may carry MULTIPLE distinct
+ * adornments (e.g. tc^bf AND tc^bb).  Each (predicate, adornment) pair is a
+ * distinct VARIANT with its own adorned + magic relation pair.  Phase B is a
+ * fixpoint: pop a variant, walk every rule of its predicate under that
+ * variant's adornment, and create a new variant for every body IDB atom's
+ * computed adornment until no new (predicate, adornment) pair appears.
  *
  * Pure transformation: no dl_db access.  Reads the retained AST (a const
  * array of rule*) and synthesizes a fresh adorned + magic program.
@@ -15,16 +24,12 @@
  * the program can be freed with rule_free() (parser.h) and compiled by the
  * untouched compile_rules().
  *
- * Multi-predicate slice: the goal IDB predicate's dependency closure is an
- * ACYCLIC DAG of IDB predicates (per-predicate self-recursion allowed).
- * Each reachable predicate P gets EXACTLY ONE adornment, derived by worklist
- * propagation from the goal's bound leading args.  For each adorned
- * predicate (P,alpha) we synthesize:
+ * For each adorned variant (P,alpha) we synthesize:
  *   (a) adorned rule          P__alpha(...) :- magic_P__alpha(bound head), body'
- *   (b) self-recursion magic  (body IDB atom Q == P):
+ *   (b) self-recursion magic  (body IDB atom Q == P under beta == alpha):
  *       magic_P__alpha(bound args) :- magic_P__alpha(head bound), prefix'
- *   (c) dependency-seed magic (body IDB atom Q != P):
- *       magic_Q__gamma(bound args) :- magic_P__alpha(head bound), prefix'
+ *   (c) dependency-seed magic (body IDB atom Q != P, or beta != alpha):
+ *       magic_Q__beta(bound args) :- magic_P__alpha(head bound), prefix'
  *
  * Negation / aggregates are SUPPORTED under a conservative soundness
  * boundary (never silently mis-evaluate):
@@ -45,8 +50,7 @@
  *   - aggregate in a rule with an adorned-closure body atom (see above)
  *   - k == 0 (caller routes to dl_query)
  *   - cross-predicate mutual recursion (predicate dep-graph SCC size > 1)
- *   - multiple distinct adornments for one predicate
- *   - a recursive call needing a different adornment (non-leading adornment)
+ *   - adornment-closure blow-up (> MAX_ADORN_VARIANTS variants)
  *   - MAX_RELS budget overflow / adorned-predicate name collision
  */
 #include "magic.h"
@@ -277,20 +281,15 @@ static void atom_adornment(const atom *A, const name_set *bound, char *beta)
     beta[A->nargs] = '\0';
 }
 
-/* ─── Per-predicate adornment table ───────────────────────────────────── */
+/* ─── IDB predicate table (name + arity) ──────────────────────────────── */
+/* Distinct from the variant table: this is the set of rule-head predicates,
+ * used for the dep graph, the SCC check, and the EDB-vs-IDB distinction in
+ * SIPS ordering. */
 
-typedef struct {
-    char    pred[64];        /* original predicate name */
-    uint8_t arity;           /* natural arity */
-    char    adorn[9];        /* assigned adornment (empty until assigned) */
-    int     assigned;        /* 1 once the worklist assigns an adornment */
-    char    adorned_name[64];/* "<pred>__<adorn>" */
-    char    magic_name[64];  /* "magic_<pred>__<adorn>" */
-} pred_adorn;
+typedef struct { char pred[64]; uint8_t arity; } pred_info;
+typedef struct { pred_info *v; int n, cap; } pred_vec;
 
-typedef struct { pred_adorn *v; int n, cap; } pa_vec;
-
-static int pa_find(const pa_vec *v, const char *pred)
+static int pred_find(const pred_vec *v, const char *pred)
 {
     int i;
     if (!pred) return -1;
@@ -299,13 +298,13 @@ static int pa_find(const pa_vec *v, const char *pred)
     return -1;
 }
 
-static int pa_push(pa_vec *v, const char *pred, uint8_t arity)
+static int pred_push(pred_vec *v, const char *pred, uint8_t arity)
 {
-    pred_adorn *nv;
-    if (pa_find(v, pred) >= 0) return 0;
+    pred_info *nv;
+    if (pred_find(v, pred) >= 0) return 0;
     if (v->n >= v->cap) {
         int nc = v->cap ? v->cap * 2 : 8;
-        nv = realloc(v->v, (size_t)nc * sizeof(pred_adorn));
+        nv = realloc(v->v, (size_t)nc * sizeof(pred_info));
         if (!nv) return -1;
         v->v = nv; v->cap = nc;
     }
@@ -316,8 +315,27 @@ static int pa_push(pa_vec *v, const char *pred, uint8_t arity)
     return 0;
 }
 
+/* ─── Adornment-variant multimap (predicate, adornment) → names ────────── */
+
+/* Closure blow-up cap: the adornment lattice of one predicate is bounded by
+ * 2^arity <= 2^MAX_ARITY = 256; this caps the TOTAL variant count across all
+ * predicates.  A program exceeding it is pathological (never silently
+ * mis-evaluated). */
+#define MAX_ADORN_VARIANTS 64
+
+typedef struct {
+    char    pred[64];        /* original predicate name */
+    uint8_t arity;           /* natural arity */
+    char    adorn[9];        /* this variant's adornment */
+    char    adorned_name[80];/* "<pred>__<adorn>" */
+    char    magic_name[86];  /* "magic_<pred>__<adorn>" */
+    int     is_goal_variant; /* 1 if this is the goal's user-requested variant */
+} pred_adorn_variant;
+
+typedef struct { pred_adorn_variant *v; int n, cap; } pa_vec;
+
 /* Fill in the derived adorned/magic predicate names; -1 on overflow. */
-static int set_pred_names(pred_adorn *p)
+static int set_pred_names(pred_adorn_variant *p)
 {
     if (snprintf(p->adorned_name, sizeof(p->adorned_name), "%s__%s",
                  p->pred, p->adorn) >= (int)sizeof(p->adorned_name))
@@ -328,18 +346,69 @@ static int set_pred_names(pred_adorn *p)
     return 0;
 }
 
-/* Adorned name for a body atom, or its own pred if it's an EDB atom, a
- * negated atom, or an aggregate atom.  NEGATED ATOMS MUST NEVER BE RENAMED:
+/* Exact (pred, adorn) pair lookup → index, or -1.  Doubles as the
+ * "goal variant" lookup (the goal's user-requested variant is the entry
+ * seeded from the user's adornment string). */
+static int pa_find(const pa_vec *v, const char *pred, const char *adorn)
+{
+    int i;
+    if (!pred || !adorn) return -1;
+    for (i = 0; i < v->n; i++)
+        if (strcmp(v->v[i].pred, pred) == 0 &&
+            strcmp(v->v[i].adorn, adorn) == 0)
+            return i;
+    return -1;
+}
+
+/* 1 if the predicate has ANY assigned variant (i.e. is in the closure). */
+static int pa_find_any(const pa_vec *v, const char *pred)
+{
+    int i;
+    if (!pred) return 0;
+    for (i = 0; i < v->n; i++)
+        if (strcmp(v->v[i].pred, pred) == 0) return 1;
+    return 0;
+}
+
+/* Add a (pred, adorn) variant (dedup on the pair); returns its index, or -1
+ * on allocation/name-overflow failure.  Idempotent: returning the existing
+ * index lets the fixpoint re-discover a pair harmlessly. */
+static int pa_push(pa_vec *v, const char *pred, uint8_t arity, const char *adorn)
+{
+    pred_adorn_variant *nv;
+    int qi = pa_find(v, pred, adorn);
+    if (qi >= 0) return qi;
+    if (v->n >= v->cap) {
+        int nc = v->cap ? v->cap * 2 : 8;
+        nv = realloc(v->v, (size_t)nc * sizeof(pred_adorn_variant));
+        if (!nv) return -1;
+        v->v = nv; v->cap = nc;
+    }
+    memset(&v->v[v->n], 0, sizeof(v->v[v->n]));
+    snprintf(v->v[v->n].pred, sizeof(v->v[v->n].pred), "%s", pred);
+    v->v[v->n].arity = arity;
+    snprintf(v->v[v->n].adorn, sizeof(v->v[v->n].adorn), "%s", adorn);
+    if (set_pred_names(&v->v[v->n]) != 0) return -1;
+    return v->n++;
+}
+
+/* Adorned name for a body atom, or its own pred if it has no variant (EDB
+ * atom, negated atom, aggregate atom).  NEGATED ATOMS MUST NEVER BE RENAMED:
  * negation tests the FULL materialization of its predicate, never a
  * magic-seeded slice.  (A negated closure-IDB atom is REJECTED upstream; a
  * negated EDB or non-closure-IDB atom keeps its original predicate.)  An
- * aggregate atom's `pred` is its result variable name, never a relation. */
-static const char *renamed_pred(const atom *A, const pa_vec *adorns)
+ * aggregate atom's `pred` is its result variable name, never a relation.
+ * `beta` is the SPECIFIC adornment recorded for this atom during the walk;
+ * the rename must target that variant exactly, not any variant of A->pred. */
+static const char *renamed_pred(const atom *A, const char *beta,
+                                const pa_vec *adorns)
 {
     int qi;
+    if (!A) return NULL;
     if (A->negated || A->aggregate) return A->pred;
-    qi = pa_find(adorns, A->pred);
-    if (qi < 0 || !adorns->v[qi].assigned) return A->pred;
+    if (!beta || beta[0] == '\0') return A->pred;
+    qi = pa_find(adorns, A->pred, beta);
+    if (qi < 0) return A->pred;   /* defensive: EDB atom / no such variant */
     return adorns->v[qi].adorned_name;
 }
 
@@ -488,7 +557,7 @@ static int sips_atom_better(int score, int n_new, int edb, int idx,
  * to bound (a negated atom only consumes bindings; an aggregate's result var
  * is consumed by the head, not by later body atoms). */
 static int sips_body_order(const rule *R, const char *alpha,
-                           const pa_vec *adorns, int *body_order_out,
+                           const pred_vec *preds, int *body_order_out,
                            char *err, size_t errsz)
 {
     name_set bound = {0, 0, 0};
@@ -554,7 +623,7 @@ static int sips_body_order(const rule *R, const char *alpha,
                  * variable arg is bound (n_new == 0, i.e. score == nargs).
                  * Until then they are deferred. */
                 if (nonprop && n_new > 0) continue;
-                edb = (pa_find(adorns, A->pred) < 0);
+                edb = (pred_find(preds, A->pred) < 0);
                 if (best < 0 ||
                     sips_atom_better(score, n_new, edb, i,
                                      best_score, best_new, best_edb, best)) {
@@ -597,28 +666,83 @@ oom:
     return -1;
 }
 
-/* ─── Bound-set walk (adornment propagation) ──────────────────────────── */
+/* ─── Per-(rule, variant) SIPS cache ──────────────────────────────────── */
+/* One permutation per (rule_idx, variant_idx): the single source of truth
+ * shared by the fixpoint walk (Phase B) and the synthesis loops (Phase C).
+ * With multi-adornment the SIPS order depends on the head's adornment, so a
+ * per-rule cache is insufficient — different variants of one predicate may
+ * order a rule's body differently and thus assign different body-atom
+ * adornments. */
 
-/* Walk R's body left-to-right under head adornment `alpha`, maintaining the
- * SIPS bound-variable set and assigning/checking each IDB body atom's
- * adornment in `adorns`.  Newly-assigned predicates are appended to the
- * worklist queue (queue/qt).  On conflict, writes *err and returns -1. */
-static int walk_rule_adorns(const rule *R, const char *alpha,
-                            pa_vec *adorns, int *queue, int *qt,
-                            int *body_order, char *err, size_t errsz)
+typedef struct { int rule_idx; int variant_idx; int *order; } sips_entry;
+typedef struct { sips_entry *v; int n, cap; } sips_cache;
+
+static int *sips_get(sips_cache *sc, int rule_idx, int variant_idx,
+                     const rule *R, const char *alpha, const pred_vec *preds,
+                     char *err, size_t errsz)
+{
+    int i, *ord;
+    for (i = 0; i < sc->n; i++)
+        if (sc->v[i].rule_idx == rule_idx && sc->v[i].variant_idx == variant_idx)
+            return sc->v[i].order;
+    if (sc->n >= sc->cap) {
+        int nc = sc->cap ? sc->cap * 2 : 8;
+        sips_entry *nv = realloc(sc->v, (size_t)nc * sizeof(sips_entry));
+        if (!nv) {
+            if (err && errsz > 0) snprintf(err, errsz, "out of memory");
+            return NULL;
+        }
+        sc->v = nv; sc->cap = nc;
+    }
+    ord = malloc((size_t)(R->nbody > 0 ? R->nbody : 1) * sizeof(int));
+    if (!ord) {
+        if (err && errsz > 0) snprintf(err, errsz, "out of memory");
+        return NULL;
+    }
+    if (sips_body_order(R, alpha, preds, ord, err, errsz) != 0) {
+        free(ord);
+        return NULL;
+    }
+    sc->v[sc->n].rule_idx = rule_idx;
+    sc->v[sc->n].variant_idx = variant_idx;
+    sc->v[sc->n].order = ord;
+    sc->n++;
+    return ord;
+}
+
+static void sips_cache_free(sips_cache *sc)
+{
+    int i;
+    for (i = 0; i < sc->n; i++) free(sc->v[i].order);
+    free(sc->v);
+}
+
+/* ─── Bound-set walk (adornment capture) ───────────────────────────────── */
+
+/* Walk R's body in SIPS order under head adornment `alpha`, maintaining the
+ * SIPS bound-variable set, and fill betas[j] (indexed by ORIGINAL body
+ * position j) with each positive IDB atom's adornment, "" for every other
+ * atom (equality, negated, aggregate, EDB).  The bound-set propagation
+ * exactly mirrors sips_body_order (equalities propagate; positive atoms
+ * propagate all their var args; negated/aggregate atoms propagate nothing),
+ * so betas are the single source of truth for BOTH variant discovery (Phase
+ * B) and synthesis renaming (Phase C).  Returns 0 / -1 (OOM, err set). */
+static int compute_betas(const rule *R, const char *alpha,
+                         const pred_vec *preds, const int *body_order,
+                         char (*betas)[9], char *err, size_t errsz)
 {
     name_set bound = {0, 0, 0};
     int j, a;
 
+    for (j = 0; j < R->nbody; j++) betas[j][0] = '\0';
+
     for (j = 0; j < R->head->nargs; j++)
         if (alpha[j] == 'b' && R->head->args[j]->kind == TOK_VAR)
-            ns_add(&bound, R->head->args[j]->text);
+            if (ns_add(&bound, R->head->args[j]->text) != 0) goto oom;
 
-    /* Iterate the body in the cached SIPS order (NULL => identity). */
     for (j = 0; j < R->nbody; j++) {
         const atom *A = R->body[body_order ? body_order[j] : j];
-        char beta[9];
-        int qi;
+        int bi = body_order ? body_order[j] : j;
         if (!A) continue;
 
         if (A->pred && strcmp(A->pred, "=") == 0) {
@@ -630,60 +754,33 @@ static int walk_rule_adorns(const rule *R, const char *alpha,
                 const char *a1 = A->args[1]->text;
                 int b0 = ns_contains(&bound, a0);
                 int b1 = ns_contains(&bound, a1);
-                if (b0 && !b1) ns_add(&bound, a1);
-                else if (b1 && !b0) ns_add(&bound, a0);
+                if (b0 && !b1) { if (ns_add(&bound, a1) != 0) goto oom; }
+                else if (b1 && !b0) { if (ns_add(&bound, a0) != 0) goto oom; }
             }
             continue;
         }
 
         /* Negated and aggregate atoms neither propagate adornment nor add
-         * vars to bound: a negated atom only CONSUMES bindings (SIPS
-         * schedules it only once all its var args are bound), and an
-         * aggregate reads a full group whose result var is consumed by the
-         * head, not by later body atoms.  The negation/aggregate soundness
-         * REJECTs are enforced in a post-pass after the worklist completes
-         * (see Phase B) so they are independent of rule/atom ordering. */
+         * vars to bound (SIPS schedules them only once all their var args
+         * are bound).  The negation/aggregate soundness REJECTs are enforced
+         * in a post-pass after the fixpoint (see Phase B) so they are
+         * independent of rule/atom ordering. */
         if (A->negated || A->aggregate) continue;
 
-        qi = pa_find(adorns, A->pred);
-        if (qi >= 0) {
-            atom_adornment(A, &bound, beta);
-            if (adorns->v[qi].assigned) {
-                if (strcmp(beta, adorns->v[qi].adorn) != 0) {
-                    if (strcmp(A->pred, R->head->pred) == 0)
-                        snprintf(err, errsz,
-                            "recursive call to '%s' needs adornment '%s' "
-                            "(head is '%s') not supported",
-                            A->pred, beta, adorns->v[qi].adorn);
-                    else
-                        snprintf(err, errsz,
-                            "predicate '%s' called with adornment '%s' "
-                            "(already '%s') not supported",
-                            A->pred, beta, adorns->v[qi].adorn);
-                    free(bound.v);
-                    return -1;
-                }
-            } else {
-                snprintf(adorns->v[qi].adorn, sizeof(adorns->v[qi].adorn),
-                         "%s", beta);
-                adorns->v[qi].assigned = 1;
-                if (set_pred_names(&adorns->v[qi]) != 0) {
-                    snprintf(err, errsz,
-                             "adorned predicate name for '%s' too long",
-                             A->pred);
-                    free(bound.v);
-                    return -1;
-                }
-                queue[(*qt)++] = qi;
-            }
-        }
+        if (A->pred && pred_find(preds, A->pred) >= 0)
+            atom_adornment(A, &bound, betas[bi]);
 
         for (a = 0; a < A->nargs; a++)
             if (A->args[a]->kind == TOK_VAR)
-                ns_add(&bound, A->args[a]->text);
+                if (ns_add(&bound, A->args[a]->text) != 0) goto oom;
     }
     free(bound.v);
     return 0;
+
+oom:
+    if (err && errsz > 0) snprintf(err, errsz, "out of memory");
+    free(bound.v);
+    return -1;
 }
 
 /* ─── Rule ordering for single-pass non-recursive evaluation ──────────── */
@@ -771,7 +868,7 @@ out_early:
 
 int magic_transform(const rule *const *ast_rules, int n_ast,
                     const char *goal_pred, uint8_t goal_arity,
-                    const uint32_t *leading, uint8_t k,
+                    const uint32_t *leading, uint8_t k, size_t src_nrels,
                     interner *ir, magic_program *out,
                     char *reject_reason, size_t reject_sz)
 {
@@ -797,25 +894,26 @@ int magic_transform(const rule *const *ast_rules, int n_ast,
     }
     make_adornment(adorn, goal_arity, k);
     return magic_transform_adorn(ast_rules, n_ast, goal_pred, goal_arity,
-                                 adorn, leading, k, ir, out,
+                                 adorn, leading, k, src_nrels, ir, out,
                                  reject_reason, reject_sz);
 }
 
 int magic_transform_adorn(const rule *const *ast_rules, int n_ast,
                           const char *goal_pred, uint8_t goal_arity,
                           const char *adorn, const uint32_t *vals,
-                          uint8_t nvals,
+                          uint8_t nvals, size_t src_nrels,
                           interner *ir, magic_program *out,
                           char *reject_reason, size_t reject_sz)
 {
-    pa_vec    adorns   = {0, 0, 0};
-    edge_vec  edges    = {0, 0, 0};
-    rule_vec  modrules = {0, 0, 0};
-    decl_vec  decls    = {0, 0, 0};
-    int      *queue    = NULL;
-    int     **body_orders = NULL;   /* per-rule SIPS permutation cache */
-    int       goal_idx = -1;
-    int       i, j;
+    pred_vec   preds    = {0, 0, 0};
+    pa_vec     adorns   = {0, 0, 0};
+    edge_vec   edges    = {0, 0, 0};
+    rule_vec   modrules = {0, 0, 0};
+    decl_vec   decls    = {0, 0, 0};
+    sips_cache sips     = {0, 0, 0};
+    int       *queue    = NULL;
+    int        goal_vi  = -1;   /* index of the goal's user-requested variant */
+    int        i, j;
 
     (void)ir;
     (void)vals;
@@ -856,34 +954,34 @@ int magic_transform_adorn(const rule *const *ast_rules, int n_ast,
     for (i = 0; i < n_ast; i++) {
         const rule *r = ast_rules[i];
         if (!r || !r->head || !r->head->pred) continue;
-        if (pa_push(&adorns, r->head->pred, (uint8_t)r->head->nargs) != 0)
+        if (pred_push(&preds, r->head->pred, (uint8_t)r->head->nargs) != 0)
             REJECT("out of memory");
     }
 
     /* The goal must be an IDB predicate (EDB goals degenerate to prefix). */
-    goal_idx = pa_find(&adorns, goal_pred);
-    if (goal_idx < 0)
+    if (pred_find(&preds, goal_pred) < 0)
         REJECT("goal '%s' is not a rule head (EDB goal: use prefix lookup)",
                goal_pred);
 
-    snprintf(adorns.v[goal_idx].adorn, sizeof(adorns.v[goal_idx].adorn),
-             "%s", adorn);
-    adorns.v[goal_idx].assigned = 1;
-    if (set_pred_names(&adorns.v[goal_idx]) != 0)
+    /* Seed the goal's user-requested variant (decision 4: this is the ONLY
+     * relation the result stream in dl.c reads). */
+    goal_vi = pa_push(&adorns, goal_pred, goal_arity, adorn);
+    if (goal_vi < 0)
         REJECT("adorned predicate name for '%s' too long", goal_pred);
+    adorns.v[goal_vi].is_goal_variant = 1;
 
     /* ── Phase A: predicate dependency graph (body IDB -> head) ── */
     for (i = 0; i < n_ast; i++) {
         const rule *r = ast_rules[i];
         int hi;
         if (!r || !r->head || !r->head->pred) continue;
-        hi = pa_find(&adorns, r->head->pred);
+        hi = pred_find(&preds, r->head->pred);
         for (j = 0; j < r->nbody; j++) {
             const atom *A = r->body[j];
             int bi;
             if (!A || !A->pred) continue;
             if (strcmp(A->pred, "=") == 0) continue;
-            bi = pa_find(&adorns, A->pred);
+            bi = pred_find(&preds, A->pred);
             if (bi >= 0)               /* IDB body atom → edge bi -> hi */
                 if (ev_push(&edges, bi, hi) != 0) REJECT("out of memory");
         }
@@ -891,7 +989,7 @@ int magic_transform_adorn(const rule *const *ast_rules, int n_ast,
 
     /* Reject cross-predicate mutual recursion (SCC size > 1). */
     {
-        int s = dep_has_multi_node_scc(adorns.n, &edges);
+        int s = dep_has_multi_node_scc(preds.n, &edges);
         if (s < 0) REJECT("out of memory");
         if (s > 0)
             REJECT("cross-predicate mutual recursion (dependency cycle "
@@ -900,36 +998,66 @@ int magic_transform_adorn(const rule *const *ast_rules, int n_ast,
     free(edges.v);
     edges.v = NULL;
 
-    /* ── Phase B: worklist adornment propagation ── */
-    queue = malloc((size_t)adorns.n * sizeof(int));
+    /* ── Phase B: adornment-closure fixpoint ──
+     * Pop a variant (P,alpha) from the worklist; for every rule R with head
+     * P, compute the SIPS order and per-atom betas under alpha; for each
+     * positive IDB body atom A with beta != "", create the variant
+     * (A.pred, beta) if absent and push it.  Terminates because the variant
+     * set is bounded by the finite adornment lattice; capped by
+     * MAX_ADORN_VARIANTS to reject pathological blow-up. */
+    queue = malloc((size_t)MAX_ADORN_VARIANTS * sizeof(int));
     if (!queue) REJECT("out of memory");
-    body_orders = calloc((size_t)n_ast, sizeof(int *));
-    if (!body_orders) REJECT("out of memory");
     {
         int qh = 0, qt = 0;
-        char ppred[64], pal[9];
-        queue[qt++] = goal_idx;
+        char pal[9];
+        queue[qt++] = goal_vi;
         while (qh < qt) {
-            int pi = queue[qh++];
-            snprintf(ppred, sizeof(ppred), "%s", adorns.v[pi].pred);
-            snprintf(pal, sizeof(pal), "%s", adorns.v[pi].adorn);
+            int vi = queue[qh++];
+            const pred_adorn_variant *V = &adorns.v[vi];
+            snprintf(pal, sizeof(pal), "%s", V->adorn);
             for (i = 0; i < n_ast; i++) {
                 const rule *R = ast_rules[i];
+                int *ord;
+                char (*betas)[9];
+                int a;
                 if (!R || !R->head || !R->head->pred) continue;
-                if (strcmp(R->head->pred, ppred) != 0) continue;
-                if (!body_orders[i]) {
-                    body_orders[i] = malloc((size_t)R->nbody * sizeof(int));
-                    if (!body_orders[i]) REJECT("out of memory");
+                if (strcmp(R->head->pred, V->pred) != 0) continue;
+                ord = sips_get(&sips, i, vi, R, pal, &preds,
+                               reject_reason, reject_sz);
+                if (!ord) goto fail;
+                betas = calloc((size_t)(R->nbody > 0 ? R->nbody : 1),
+                               sizeof(char[9]));
+                if (!betas) REJECT("out of memory");
+                if (compute_betas(R, pal, &preds, ord, betas,
+                                  reject_reason, reject_sz) != 0) {
+                    free(betas);
+                    goto fail;
                 }
-                /* Compute the SIPS order ONCE and share it with the walk
-                 * (and later with synthesis).  Never recomputed. */
-                if (sips_body_order(R, pal, &adorns, body_orders[i],
-                                    reject_reason, reject_sz) != 0)
-                    goto fail;
-                if (walk_rule_adorns(R, pal, &adorns, queue, &qt,
-                                     body_orders[i],
-                                     reject_reason, reject_sz) != 0)
-                    goto fail;
+                for (a = 0; a < R->nbody; a++) {
+                    const atom *A = R->body[a];
+                    int nvi;
+                    if (betas[a][0] == '\0') continue;
+                    if (!A || !A->pred || strcmp(A->pred, "=") == 0) continue;
+                    if (A->negated || A->aggregate) continue;  /* defensive */
+                    nvi = pa_find(&adorns, A->pred, betas[a]);
+                    if (nvi < 0) {
+                        nvi = pa_push(&adorns, A->pred, (uint8_t)A->nargs,
+                                      betas[a]);
+                        if (nvi < 0) {
+                            free(betas);
+                            REJECT("adorned predicate name for '%s' too long",
+                                   A->pred);
+                        }
+                        if (adorns.n > MAX_ADORN_VARIANTS) {
+                            free(betas);
+                            REJECT("adornment closure exceeds %d variants "
+                                   "(predicate lattice blow-up)",
+                                   MAX_ADORN_VARIANTS);
+                        }
+                        queue[qt++] = nvi;
+                    }
+                }
+                free(betas);
             }
         }
     }
@@ -949,16 +1077,14 @@ int magic_transform_adorn(const rule *const *ast_rules, int n_ast,
      *       REJECT (over-conservative; see header doc). */
     for (i = 0; i < n_ast; i++) {
         const rule *R = ast_rules[i];
-        int hi, jj;
+        int jj;
         if (!R || !R->head || !R->head->pred) continue;
-        hi = pa_find(&adorns, R->head->pred);
-        if (hi < 0 || !adorns.v[hi].assigned) continue;  /* unreachable rule */
+        if (!pa_find_any(&adorns, R->head->pred)) continue;  /* unreachable */
         for (jj = 0; jj < R->nbody; jj++) {
             const atom *A = R->body[jj];
             if (!A || !A->pred) continue;
             if (A->negated) {
-                int qi = pa_find(&adorns, A->pred);
-                if (qi >= 0 && adorns.v[qi].assigned)
+                if (pa_find_any(&adorns, A->pred))
                     REJECT("negation on adorned-closure predicate '%s' "
                            "not supported", A->pred);
             } else if (A->aggregate) {
@@ -968,33 +1094,27 @@ int magic_transform_adorn(const rule *const *ast_rules, int n_ast,
                     if (!B || !B->pred) continue;
                     if (B->negated || B->aggregate) continue;
                     if (strcmp(B->pred, "=") == 0) continue;
-                    {
-                        int qi = pa_find(&adorns, B->pred);
-                        if (qi >= 0 && adorns.v[qi].assigned)
-                            REJECT("aggregate in rule with adorned-closure "
-                                   "body atom '%s' not supported", B->pred);
-                    }
+                    if (pa_find_any(&adorns, B->pred))
+                        REJECT("aggregate in rule with adorned-closure "
+                               "body atom '%s' not supported", B->pred);
                 }
             }
         }
     }
 
-    /* ── MAX_RELS budget: 2 fresh rels per adorned predicate ── */
+    /* ── MAX_RELS budget: src_nrels aliased + 2 fresh rels per variant ── */
     {
-        int n_adorned = 0;
-        for (i = 0; i < adorns.n; i++)
-            if (adorns.v[i].assigned) n_adorned++;
-        if (2 * n_adorned > MAX_RELS)
-            REJECT("adorned closure needs %d relations (2 x %d predicates) "
-                   "exceeding MAX_RELS=%d", 2 * n_adorned, n_adorned,
-                   MAX_RELS);
+        size_t total = src_nrels + 2 * (size_t)adorns.n;
+        if (total > MAX_RELS)
+            REJECT("adorned closure needs %zu aliased + %d fresh relations "
+                   "(%d variants x 2) = %zu total, exceeding MAX_RELS=%d",
+                   src_nrels, 2 * adorns.n, adorns.n, total, MAX_RELS);
     }
 
     /* ── Phase C: per-(P,alpha) synthesis of all 3 rule classes ── */
     for (i = 0; i < adorns.n; i++) {
-        const pred_adorn *P = &adorns.v[i];
+        const pred_adorn_variant *P = &adorns.v[i];
         int r;
-        if (!P->assigned) continue;
 
         for (r = 0; r < n_ast; r++) {
             const rule *R = ast_rules[r];
@@ -1002,31 +1122,46 @@ int magic_transform_adorn(const rule *const *ast_rules, int n_ast,
             atom **mbody;
             rule *mr;
             int *ord;
+            char (*betas)[9];
             int total;
 
             if (!R || !R->head || !R->head->pred) continue;
             if (strcmp(R->head->pred, P->pred) != 0) continue;
 
-            /* The cached SIPS permutation — the SAME one the adornment walk
-             * used.  Single source of truth; never recomputed here.  NULL =>
-             * identity (defensive, for unreachable rules). */
-            ord = body_orders ? body_orders[r] : NULL;
+            /* The cached SIPS permutation — the SAME one the fixpoint walk
+             * used for this (rule, variant).  Single source of truth. */
+            ord = sips_get(&sips, r, i, R, P->adorn, &preds,
+                           reject_reason, reject_sz);
+            if (!ord) goto fail;
+            betas = calloc((size_t)(R->nbody > 0 ? R->nbody : 1),
+                           sizeof(char[9]));
+            if (!betas) REJECT("out of memory");
+            if (compute_betas(R, P->adorn, &preds, ord, betas,
+                              reject_reason, reject_sz) != 0) {
+                free(betas);
+                goto fail;
+            }
 
             /* (a) adorned rule: P^a :- magic_P^a(bound head), body' */
             guard = build_bound_atom(R->head, P->magic_name, P->adorn);
-            if (!guard) REJECT("out of memory");
+            if (!guard) { free(betas); REJECT("out of memory"); }
             total = 1 + R->nbody;
             mbody = calloc((size_t)total, sizeof(atom *));
-            if (!mbody) { atom_free_local(guard); REJECT("out of memory"); }
+            if (!mbody) { atom_free_local(guard); free(betas); REJECT("out of memory"); }
             mbody[0] = guard;
             for (j = 0; j < R->nbody; j++) {
                 int bj = ord ? ord[j] : j;
                 mbody[1 + j] = atom_copy(R->body[bj],
-                                         renamed_pred(R->body[bj], &adorns));
-                if (!mbody[1 + j]) { atoms_free(mbody, 1 + j); REJECT("out of memory"); }
+                                         renamed_pred(R->body[bj], betas[bj],
+                                                      &adorns));
+                if (!mbody[1 + j]) {
+                    free(betas);
+                    atoms_free(mbody, 1 + j);
+                    REJECT("out of memory");
+                }
             }
             mhead = atom_copy(R->head, P->adorned_name);
-            if (!mhead) { atoms_free(mbody, total); REJECT("out of memory"); }
+            if (!mhead) { free(betas); atoms_free(mbody, total); REJECT("out of memory"); }
             /* Propagate the source rule's negation/aggregate flags so the
              * synthesized rule is self-consistent (the compiler re-derives
              * them from body atoms, but rule_free and future consumers rely
@@ -1035,18 +1170,22 @@ int magic_transform_adorn(const rule *const *ast_rules, int n_ast,
                            R->has_aggregate);
             if (!mr) {
                 atom_free_local(mhead);
+                free(betas);
                 atoms_free(mbody, total);
                 REJECT("out of memory");
             }
             if (rv_push(&modrules, mr) != 0) {
+                free(betas);
                 rule_free(mr);
                 REJECT("out of memory");
             }
 
             /* (b)/(c) magic rules for each IDB body atom (self-recursion
-             * when Q==P, dependency-seed when Q!=P — same shape). */
+             * when Q==P && beta==alpha, dependency-seed otherwise — same
+             * shape; the target magic is keyed on the atom's recorded beta). */
             for (j = 0; j < R->nbody; j++) {
                 const atom *A = R->body[ord ? ord[j] : j];
+                int aorig = ord ? ord[j] : j;
                 atom **mgbody;
                 atom *mghead;
                 rule *mgr;
@@ -1059,22 +1198,26 @@ int magic_transform_adorn(const rule *const *ast_rules, int n_ast,
                  * closure-IDB atom is REJECTED in the post-pass), and an
                  * aggregate atom's `pred` is its result variable name. */
                 if (A->negated || A->aggregate) continue;
-                qi = pa_find(&adorns, A->pred);
-                if (qi < 0) continue;   /* EDB body atom: no magic rule */
-                if (!adorns.v[qi].assigned) continue;  /* defensive */
+                if (betas[aorig][0] == '\0') continue;   /* EDB body atom */
+                qi = pa_find(&adorns, A->pred, betas[aorig]);
+                if (qi < 0) continue;   /* defensive: no such variant */
 
+                /* The SPECIFIC variant A was called under (decision 10/T2),
+                 * not "any variant of A->pred". */
                 target_magic = adorns.v[qi].magic_name;
                 target_adorn = adorns.v[qi].adorn;
 
                 mghead = build_bound_atom(A, target_magic, target_adorn);
-                if (!mghead) REJECT("out of memory");
+                if (!mghead) { free(betas); REJECT("out of memory"); }
 
                 total2 = 1 + j;   /* magic guard + prefix atoms A0..A_{j-1} */
                 mgbody = calloc((size_t)total2, sizeof(atom *));
-                if (!mgbody) { atom_free_local(mghead); REJECT("out of memory"); }
+                if (!mgbody) { atom_free_local(mghead); free(betas); REJECT("out of memory"); }
                 mgbody[0] = build_bound_atom(R->head, P->magic_name, P->adorn);
                 if (!mgbody[0]) {
-                    atom_free_local(mghead); free(mgbody);
+                    atom_free_local(mghead);
+                    free(mgbody);
+                    free(betas);
                     REJECT("out of memory");
                 }
                 mg_neg = 0; mg_agg = 0;
@@ -1085,10 +1228,12 @@ int magic_transform_adorn(const rule *const *ast_rules, int n_ast,
                     if (B->negated) mg_neg = 1;
                     if (B->aggregate) mg_agg = 1;
                     mgbody[1 + jj] = atom_copy(B,
-                                               renamed_pred(B, &adorns));
+                                               renamed_pred(B, betas[bjj],
+                                                            &adorns));
                     if (!mgbody[1 + jj]) {
                         atom_free_local(mghead);
                         atoms_free(mgbody, 1 + jj);
+                        free(betas);
                         REJECT("out of memory");
                     }
                 }
@@ -1099,23 +1244,24 @@ int magic_transform_adorn(const rule *const *ast_rules, int n_ast,
                 if (!mgr) {
                     atom_free_local(mghead);
                     atoms_free(mgbody, total2);
+                    free(betas);
                     REJECT("out of memory");
                 }
                 if (rv_push(&modrules, mgr) != 0) {
                     rule_free(mgr);
+                    free(betas);
                     REJECT("out of memory");
                 }
             }
+            free(betas);
         }
     }
 
-    /* ── Phase D: decls — 2 per adorned predicate ── */
+    /* ── Phase D: decls — 2 per variant ── */
     for (i = 0; i < adorns.n; i++) {
-        const pred_adorn *P = &adorns.v[i];
+        const pred_adorn_variant *P = &adorns.v[i];
         uint8_t nb = 0;
-        size_t alen;
-        if (!P->assigned) continue;
-        alen = strlen(P->adorn);
+        size_t alen = strlen(P->adorn);
         for (j = 0; j < (int)alen; j++)
             if (P->adorn[j] == 'b') nb++;
 
@@ -1140,27 +1286,23 @@ int magic_transform_adorn(const rule *const *ast_rules, int n_ast,
     out->n_rules = modrules.n;
     out->decls = decls.v;
     out->n_decls = decls.n;
+    /* The goal's output relation is its USER-requested variant specifically
+     * (decision 4), not any variant of the goal predicate. */
     snprintf(out->adorned_goal, sizeof(out->adorned_goal), "%s",
-             adorns.v[goal_idx].adorned_name);
+             adorns.v[goal_vi].adorned_name);
     out->goal_arity = goal_arity;
 
+    free(preds.v);
     free(adorns.v);
-    {
-        int x;
-        for (x = 0; x < n_ast; x++) free(body_orders[x]);
-        free(body_orders);
-    }
+    sips_cache_free(&sips);
     return 0;
 
 fail:
     free(queue);
     free(edges.v);
+    free(preds.v);
     free(adorns.v);
-    if (body_orders) {
-        int x;
-        for (x = 0; x < n_ast; x++) free(body_orders[x]);
-        free(body_orders);
-    }
+    sips_cache_free(&sips);
     {
         int x;
         for (x = 0; x < modrules.n; x++) rule_free(modrules.v[x]);

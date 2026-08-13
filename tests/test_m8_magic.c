@@ -21,6 +21,11 @@
  *   T34-T38 negation + aggregates: negated non-closure IDB, sum/min/max over
  *           EDB, REJECT negated closure IDB, REJECT aggregate over closure,
  *           negated-EDB property test
+ *   T18/T39-T42 adornment-closure fixpoint: multiple distinct adornments of
+ *           one predicate (p^bf AND p^bb AND p^fb) are ACCEPTED and each
+ *           synthesized as a distinct relation; recursion can spawn a new
+ *           variant (tc^bf → tc^bb); blow-up (> MAX_ADORN_VARIANTS) REJECTED;
+ *           property test for a predicate referenced under two bound patterns
  *
  * Regression: full `make test` (224 existing tests) still passes.
  */
@@ -1044,19 +1049,20 @@ static void test_t17_reject_mutual_recursion(void)
     teardown_db(db, "t17");
 }
 
-/* ─── T18: REJECT multiple distinct adornments ────────────────────────── */
+/* ─── T18: multiple distinct adornments (accept + correct) ─────────────── */
 
-static void test_t18_reject_multiple_adornments(void)
+static void test_t18_multiple_adornments(void)
 {
     dl_db *db;
     uint32_t e[] = {1,2, 2,3};
     tuple_set r;
     uint32_t leading[1] = {1};
 
-    TEST("T18: multiple distinct adornments (p bf, q calls p bb) → -1");
+    TEST("T18: multiple distinct adornments (p bf, q calls p bb)");
 
-    /* 18a: the plan's literal example — note it also contains a p<->q
-     * cycle, so it is rejected by the mutual-recursion check first. */
+    /* 18a: the plan's literal example — it contains a p<->q CYCLE, so it is
+     * rejected by the predicate-level mutual-recursion check FIRST, before
+     * any adornment work (precondition for 18b's acceptance). */
     setup_db(&db, "t18a");
     load_rows(db, "edge", 2, e, 2, "t18a");
     assert(dl_load_rules(db,
@@ -1065,7 +1071,7 @@ static void test_t18_reject_multiple_adornments(void)
         "q(X):-edge(X,Y),p(X,Y).\n") == 0);
     memset(&r, 0, sizeof(r));
     if (dl_query_magic(db, "p", leading, 1, tset_cb, &r) != -1) {
-        FAIL("multiple adornments not rejected");
+        FAIL("T18a mutual recursion not rejected");
         tset_free(&r);
         teardown_db(db, "t18a");
         return;
@@ -1076,7 +1082,10 @@ static void test_t18_reject_multiple_adornments(void)
     /* 18b: a PURE acyclic multiple-adornment case (no mutual recursion):
      * goal r calls p with adorn bf, and also calls s, whose rule calls p
      * with adorn bb (both args bound via edge).  r->p and r->s->p form a
-     * DAG, so the conflict is genuinely the distinct-adornment reject. */
+     * DAG.  p therefore carries TWO distinct adornments (p^bf, p^bb) and is
+     * now ACCEPTED via the closure fixpoint (both variants synthesized).
+     * Ground truth: p={(1,2),(2,3)}, s={(1,2),(2,3)}, r={(1,2),(2,3)};
+     * bound query r(1,Y) → {(1,2)}. */
     setup_db(&db, "t18b");
     load_rows(db, "edge", 2, e, 2, "t18b");
     assert(dl_load_rules(db,
@@ -1084,16 +1093,179 @@ static void test_t18_reject_multiple_adornments(void)
         "r(X,Y):-s(X,Y).\n"
         "s(X,Y):-edge(X,Y),p(X,Y).\n"
         "p(X,Y):-edge(X,Y).\n") == 0);
-    memset(&r, 0, sizeof(r));
-    if (dl_query_magic(db, "r", leading, 1, tset_cb, &r) != -1) {
-        FAIL("pure multiple adornments not rejected");
-        tset_free(&r);
+    assert(dl_compile(db) == 0);
+    if (!cmp_bound_magic_rel(db, "r", 1)) {
+        FAIL("T18b multiple adornments (p^bf from r, p^bb from s) mismatch");
         teardown_db(db, "t18b");
+        return;
+    }
+    PASS();
+    teardown_db(db, "t18b");
+}
+
+/* ─── T39: three distinct adornments of one predicate ──────────────────── */
+
+static void test_t39_three_variants(void)
+{
+    dl_db *db;
+    uint32_t e[] = {1,2, 2,3, 3,4, 10,20, 20,30};
+    uint32_t sources[3] = {1, 2, 10};
+    int i;
+
+    TEST("T39: 3 distinct adornments of p (bf, bb, fb) — accept & correct");
+
+    setup_db(&db, "t39");
+    load_rows(db, "edge", 2, e, 5, "t39");
+    assert(dl_load_rules(db,
+        "r(X,Y):-p(X,Y).\n"
+        "r(X,Y):-q(X,Y).\n"
+        "q(X,Y):-edge(X,Y),p(X,Y).\n"
+        "r(X,Y):-t(X,Y).\n"
+        "t(X,Y):-edge(X,Z),p(Y,Z).\n"
+        "p(X,Y):-edge(X,Y).\n") == 0);
+    assert(dl_compile(db) == 0);
+
+    /* p is called under three distinct adornments:
+     *   p^bf (r's first rule: X bound, Y free),
+     *   p^bb (q: edge binds Y, so X,Y bound),
+     *   p^fb (t: edge binds Z, so p's 2nd arg bound, 1st free). */
+    for (i = 0; i < 3; i++) {
+        if (!cmp_bound_magic_rel(db, "r", sources[i])) {
+            printf("  source %u mismatch\n", sources[i]);
+            FAIL("T39 3-variant mismatch");
+            teardown_db(db, "t39");
+            return;
+        }
+    }
+    PASS();
+    teardown_db(db, "t39");
+}
+
+/* ─── T40: recursion spawning a new variant (tc^bf → tc^bb) ────────────── */
+
+static void test_t40_recursion_spawns_variant(void)
+{
+    dl_db *db;
+    uint32_t e[] = {1,2, 2,1, 1,3, 3,4};
+    uint32_t sources[3] = {1, 2, 99};
+    int i;
+
+    TEST("T40: recursion spawns a variant (tc^bf rule → tc^bb) — accept & correct");
+
+    setup_db(&db, "t40");
+    load_rows(db, "edge", 2, e, 4, "t40");
+    /* The recursive rule tc(X,Y):-edge(X,Z),edge(Y,Z),tc(Z,Y) calls tc(Z,Y)
+     * with BOTH args bound under head tc^bf (SIPS orders edge(Y,Z) before
+     * tc(Z,Y), binding Y via the tie-break EDB-before-IDB), so the closure
+     * fixpoint spawns a second variant tc^bb alongside tc^bf. */
+    assert(dl_load_rules(db,
+        "tc(X,Y):-edge(X,Y).\n"
+        "tc(X,Y):-edge(X,Z),edge(Y,Z),tc(Z,Y).\n") == 0);
+    assert(dl_compile(db) == 0);
+
+    for (i = 0; i < 3; i++) {
+        if (!cmp_bound_magic_rel(db, "tc", sources[i])) {
+            printf("  source %u mismatch\n", sources[i]);
+            FAIL("T40 recursion-spawned-variant mismatch");
+            teardown_db(db, "t40");
+            return;
+        }
+    }
+    PASS();
+    teardown_db(db, "t40");
+}
+
+/* ─── T41: REJECT adornment-closure blow-up ────────────────────────────── */
+
+static void test_t41_adornment_blowup(void)
+{
+    dl_db *db;
+    uint32_t e[] = {1,2};
+    tuple_set r;
+    uint32_t leading[1] = {1};
+    char rules[16384];
+    int N = 40;   /* g + a1..a40: a2..a40 each get 2 variants → ~80 total */
+    int off = 0;
+    int i;
+
+    TEST("T41: adornment-closure blow-up (> MAX_ADORN_VARIANTS) → -1");
+
+    setup_db(&db, "t41");
+    load_rows(db, "edge", 2, e, 1, "t41");
+
+    off += snprintf(rules + off, sizeof(rules) - (size_t)off,
+                    "g(X,Y):-a1(X,Y).\n");
+    for (i = 1; i < N; i++) {
+        off += snprintf(rules + off, sizeof(rules) - (size_t)off,
+                        "a%d(X,Y):-edge(X,Y),a%d(X,Y).\n", i, i + 1);
+        off += snprintf(rules + off, sizeof(rules) - (size_t)off,
+                        "a%d(X,Y):-a%d(X,Y).\n", i, i + 1);
+    }
+    off += snprintf(rules + off, sizeof(rules) - (size_t)off,
+                    "a%d(X,Y):-edge(X,Y).\n", N);
+    assert(off < (int)sizeof(rules));
+    assert(dl_load_rules(db, rules) == 0);
+
+    memset(&r, 0, sizeof(r));
+    if (dl_query_magic(db, "g", leading, 1, tset_cb, &r) != -1) {
+        FAIL("T41 adornment blow-up not rejected");
+        tset_free(&r);
+        teardown_db(db, "t41");
         return;
     }
     tset_free(&r);
     PASS();
-    teardown_db(db, "t18b");
+    teardown_db(db, "t41");
+}
+
+/* ─── T42: property — one predicate under two bound patterns ───────────── */
+
+static void test_t42_two_adorn_property(void)
+{
+    TEST("T42: property — 100 graphs x 3 sources, two-adornment p bound==magic");
+
+    int iter;
+    for (iter = 0; iter < 100; iter++) {
+        dl_db *db;
+        char suffix[32];
+        int N = 8 + (int)(iter % 12);         /* 8..19 nodes */
+        int M = 20 + (int)((iter * 7) % 60);  /* 20..79 edges */
+        uint32_t *edges;
+        int ei, si;
+        uint32_t sources[3];
+
+        snprintf(suffix, sizeof(suffix), "ta_%d", iter);
+        setup_db(&db, suffix);
+
+        edges = malloc((size_t)M * 2 * sizeof(uint32_t));
+        for (ei = 0; ei < M; ei++) {
+            edges[ei*2]     = rng_rand((uint32_t)N) + 1;
+            edges[ei*2 + 1] = rng_rand((uint32_t)N) + 1;
+        }
+        load_rows(db, "edge", 2, edges, M, suffix);
+        free(edges);
+
+        /* p is referenced under two bound patterns: p^bf (r's first rule)
+         * and p^bb (s's rule, where edge binds Y). */
+        assert(dl_load_rules(db,
+            "r(X,Y):-p(X,Y).\n"
+            "r(X,Y):-s(X,Y).\n"
+            "s(X,Y):-edge(X,Y),p(X,Y).\n"
+            "p(X,Y):-edge(X,Y).\n") == 0);
+        assert(dl_compile(db) == 0);
+
+        for (si = 0; si < 3; si++) {
+            sources[si] = rng_rand((uint32_t)(N + 2)) + 1;
+            if (!cmp_bound_magic_rel(db, "r", sources[si])) {
+                printf("  iter %d source %u mismatch\n", iter, sources[si]);
+                FAIL("T42 two-adornment property test failed");
+                teardown_db(db, suffix);
+                return;
+            }
+        }
+        teardown_db(db, suffix);
+    }
+    PASS();
 }
 
 /* ─── T19: extended multi-predicate property test ─────────────────────── */
@@ -1935,7 +2107,7 @@ int main(void)
     test_t15_three_pred_chain();
     test_t16_nonrecursive_goal_recursive_dep();
     test_t17_reject_mutual_recursion();
-    test_t18_reject_multiple_adornments();
+    test_t18_multiple_adornments();
     test_t19_multipred_property();
     test_t20_fb_edb();
     test_t21_fbf_path3();
@@ -1956,6 +2128,10 @@ int main(void)
     test_t36_reject_negated_closure_idb();
     test_t37_reject_aggregate_over_closure();
     test_t38_negated_edb_property();
+    test_t39_three_variants();
+    test_t40_recursion_spawns_variant();
+    test_t41_adornment_blowup();
+    test_t42_two_adorn_property();
 
     printf("\n%d tests run, %d failed\n", tests_run, tests_failed);
     return tests_failed ? 1 : 0;

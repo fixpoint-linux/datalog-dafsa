@@ -123,9 +123,9 @@ long dl_query_bound(dl_db *db, const char *goal_rel,
  *   - k == 0: routes to dl_query (full materialization) — no bound args.
  *   - goal_rel is an EDB relation (not a rule head): degenerates to a
  *     plain prefix lookup (equivalent to dl_query_bound).
- *   - programs using negation, aggregates, multi-predicate dependencies or
- *     a recursive call needing a different adornment are REJECTED with a
- *     diagnostic and return -1 (never silently mis-evaluated).
+ *   - programs using negation, aggregates, or cross-predicate mutual
+ *     recursion are REJECTED with a diagnostic and return -1 (never silently
+ *     mis-evaluated).
  *
  * NOTE: reads db->rels[].rel without a lock — safe only when no concurrent
  * publish is in flight (documented single-writer / multi-reader model). */
@@ -156,11 +156,11 @@ long dl_query_magic(dl_db *db, const char *goal_rel,
  *   - goal_rel is an EDB relation (not a rule head): ROUTES to a direct
  *     full-scan + per-position filter (no transform).
  *   - the same conservative magic-transform rejects as dl_query_magic
- *     (negation, aggregates, cross-predicate mutual recursion, multiple
- *     distinct adornments, a recursive call needing a different adornment,
- *     MAX_RELS overflow) — including the non-leading self-recursion trap:
- *     tc(X,42) with adorn "fb" on the canonical TC rules is REJECTED (the
- *     recursive call needs "bb").
+ *     (negation on an adorned-closure predicate, aggregates over one,
+ *     cross-predicate mutual recursion, adornment-closure blow-up,
+ *     MAX_RELS overflow).  Multiple distinct adornments of one predicate
+ *     (e.g. tc^bf and tc^bb) are now SUPPORTED via the adornment-closure
+ *     fixpoint; each is a distinct relation.
  *
  * dl_query_magic (leading/k) is a shorthand shim that synthesizes
  * adorn = "b"*k ++ "f"*(arity-k) and routes here. */

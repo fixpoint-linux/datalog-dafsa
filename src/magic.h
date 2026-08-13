@@ -8,13 +8,14 @@
  *
  * Multi-predicate slice (conservative): the goal IDB predicate's dependency
  * closure is an ACYCLIC DAG of IDB predicates (per-predicate self-recursion
- * through ONE consistent adornment allowed).  Each reachable predicate gets
- * exactly one adornment (worklist propagation from the goal's bound args);
- * adorned + magic rules are synthesized for every reachable predicate.
- * Negation, aggregates, k==0, cross-predicate mutual recursion, multiple
- * distinct adornments for one predicate, and recursive calls needing a
- * different adornment are all REJECTED with a clear reason (never silently
- * mis-evaluated).
+ * allowed).  The adornment closure is computed to a FIXPOINT: each reachable
+ * (predicate, adornment) pair is a distinct VARIANT, and one predicate may
+ * legitimately carry MULTIPLE distinct adornments (e.g. tc^bf AND tc^bb),
+ * each synthesized as its own adorned + magic relation pair.  The goal's
+ * query output is exactly the user-requested variant.  Negation, aggregates,
+ * k==0, cross-predicate mutual recursion, and adornment-closure blow-up
+ * (> MAX_ADORN_VARIANTS variants) are REJECTED with a clear reason (never
+ * silently mis-evaluated).
  *
  * No dl_db access: the transform works purely on the AST + an interner
  * (the interner is reserved for future adornment decisions; constants are
@@ -74,7 +75,7 @@ typedef struct {
 int  magic_transform_adorn(const rule *const *ast_rules, int n_ast,
                            const char *goal_pred, uint8_t goal_arity,
                            const char *adorn, const uint32_t *vals,
-                           uint8_t nvals,
+                           uint8_t nvals, size_t src_nrels,
                            interner *ir, magic_program *out,
                            char *reject_reason, size_t reject_sz);
 
@@ -84,7 +85,7 @@ int  magic_transform_adorn(const rule *const *ast_rules, int n_ast,
  */
 int  magic_transform(const rule *const *ast_rules, int n_ast,
                      const char *goal_pred, uint8_t goal_arity,
-                     const uint32_t *leading, uint8_t k,
+                     const uint32_t *leading, uint8_t k, size_t src_nrels,
                      interner *ir, magic_program *out,
                      char *reject_reason, size_t reject_sz);
 

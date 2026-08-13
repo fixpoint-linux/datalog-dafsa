@@ -1267,7 +1267,7 @@ long dl_query_magic_adorn(dl_db *db, const char *goal_rel,
     /* 4. Transform. */
     if (magic_transform_adorn((const rule *const *)db->ast_rules,
                               db->n_ast_rules, goal_rel, goal_arity,
-                              adorn, vals, nvals, db->ir, &prog,
+                              adorn, vals, nvals, db->nrels, db->ir, &prog,
                               reject, sizeof(reject)) != 0) {
         fprintf(stderr, "dl_query_magic: rejected: %s\n", reject);
         goto out_free_edb;
