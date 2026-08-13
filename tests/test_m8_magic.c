@@ -9,12 +9,15 @@
  *           no-out-edges)
  *   T7      equality in body (Z=W alias) — accepted, still equivalent
  *   T8      multi-rule same head
- *   T9      conservative REJECTS (negation, aggregate, different-adornment,
- *           non-leading adornment) → dl_query_magic returns -1
+ *   T9      conservative REJECTS (negation, aggregate) → dl_query_magic -1;
+ *           SIPS now ACCEPTS the different-adornment (T9c) and non-leading
+ *           (T9d) recursive shapes — verified against ground truth
  *   T10     k==0 routes to dl_query
  *   T11     no-mutation: db fields + interner byte-identical before/after
  *   T12     magic works WITHOUT a prior dl_compile (scoped re-eval from EDB)
  *   T13     property test: 200 random graphs x 5 sources, bound vs magic
+ *   T29-T33 SIPS body-reordering: suboptimal order, multi-pred reorder,
+ *           equality-heavy, TC-FB positive, order-independence property
  *
  * Regression: full `make test` (224 existing tests) still passes.
  */
@@ -26,8 +29,6 @@
 #include <string.h>
 #include <assert.h>
 #include <stdint.h>
-#include <unistd.h>
-#include <fcntl.h>
 
 static int tests_run = 0;
 static int tests_failed = 0;
@@ -524,7 +525,7 @@ static void test_t9_rejections(void)
 {
     dl_db *db;
 
-    TEST("T9: negation/aggregate/different-adornment/non-leading → -1");
+    TEST("T9: negation/aggregate reject; different-adornment/non-leading accept");
 
     /* negation */
     {
@@ -565,48 +566,54 @@ static void test_t9_rejections(void)
         tset_free(&r);
         teardown_db(db, "t9b");
     }
-    /* recursive call needing different adornment (bb) */
+    /* recursive call that under left-to-right needed a DIFFERENT adornment
+     * (bb); SIPS reorders edge(X,Z) before tc(Z,Y) so the recursive call gets
+     * bf == head.  ACCEPTED — verify against ground truth. */
     {
-        uint32_t e[] = {1, 2, 2, 3};
-        uint32_t nd[] = {1, 2, 3};
-        tuple_set r;
-        uint32_t leading[1] = { 1 };
+        uint32_t e[] = {1, 2, 2, 3, 3, 4};
+        uint32_t nd[] = {1, 2, 3, 4};
+        uint32_t sources[3] = {1, 2, 99};
+        int si;
         setup_db(&db, "t9c");
-        load_rows(db, "edge", 2, e, 2, "t9c");
-        load_rows(db, "node", 1, nd, 3, "t9c");
+        load_rows(db, "edge", 2, e, 3, "t9c");
+        load_rows(db, "node", 1, nd, 4, "t9c");
         assert(dl_load_rules(db,
             "tc(X,Y):-edge(X,Y).\n"
             "tc(X,Y):-edge(X,Z),node(Y),tc(Z,Y).\n") == 0);
-        memset(&r, 0, sizeof(r));
-        if (dl_query_magic(db, "tc", leading, 1, tset_cb, &r) != -1) {
-            FAIL("different-adornment recursive call not rejected");
-            tset_free(&r);
-            teardown_db(db, "t9c");
-            return;
+        assert(dl_compile(db) == 0);
+        for (si = 0; si < 3; si++) {
+            if (!cmp_bound_magic(db, sources[si])) {
+                printf("  source %u mismatch\n", sources[si]);
+                FAIL("T9c SIPS-accepted bound vs magic mismatch");
+                teardown_db(db, "t9c");
+                return;
+            }
         }
-        tset_free(&r);
         teardown_db(db, "t9c");
     }
-    /* non-leading adornment (fb) on the recursive call */
+    /* non-leading adornment (fb) on the recursive call — user wrote node(Y),
+     * tc(Z,Y), edge(X,Z) in the "bad" order; SIPS reorders edge first so
+     * tc(Z,Y) gets bf == head.  ACCEPTED — verify against ground truth. */
     {
-        uint32_t e[] = {1, 2, 2, 3};
-        uint32_t nd[] = {1, 2, 3};
-        tuple_set r;
-        uint32_t leading[1] = { 1 };
+        uint32_t e[] = {1, 2, 2, 3, 3, 4};
+        uint32_t nd[] = {1, 2, 3, 4};
+        uint32_t sources[3] = {1, 2, 99};
+        int si;
         setup_db(&db, "t9d");
-        load_rows(db, "edge", 2, e, 2, "t9d");
-        load_rows(db, "node", 1, nd, 3, "t9d");
+        load_rows(db, "edge", 2, e, 3, "t9d");
+        load_rows(db, "node", 1, nd, 4, "t9d");
         assert(dl_load_rules(db,
             "tc(X,Y):-edge(X,Y).\n"
             "tc(X,Y):-node(Y),tc(Z,Y),edge(X,Z).\n") == 0);
-        memset(&r, 0, sizeof(r));
-        if (dl_query_magic(db, "tc", leading, 1, tset_cb, &r) != -1) {
-            FAIL("non-leading adornment recursive call not rejected");
-            tset_free(&r);
-            teardown_db(db, "t9d");
-            return;
+        assert(dl_compile(db) == 0);
+        for (si = 0; si < 3; si++) {
+            if (!cmp_bound_magic(db, sources[si])) {
+                printf("  source %u mismatch\n", sources[si]);
+                FAIL("T9d SIPS-accepted bound vs magic mismatch");
+                teardown_db(db, "t9d");
+                return;
+            }
         }
-        tset_free(&r);
         teardown_db(db, "t9d");
     }
     PASS();
@@ -1194,47 +1201,6 @@ static int cmp_adorn_magic(dl_db *db, const char *rel, const char *adorn,
     return eq;
 }
 
-/* Run dl_query_magic_adorn capturing stderr into `out`.  Returns the call's
- * result (or -99 if the capture fd setup failed). */
-static long qm_capture_stderr(dl_db *db, const char *goal, const char *adorn,
-                              const uint32_t *vals, uint8_t nvals,
-                              char *out, size_t outsz)
-{
-    const char *path = "build-tmp/m8_stderr_capture.txt";
-    int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
-    int saved = dup(2);
-    long rc;
-    tuple_set r;
-    FILE *f;
-    size_t n;
-
-    if (out) out[0] = '\0';
-    if (fd < 0 || saved < 0) {
-        if (fd >= 0) close(fd);
-        if (saved >= 0) close(saved);
-        return -99;
-    }
-
-    memset(&r, 0, sizeof(r));
-    fflush(stderr);
-    fflush(stdout);
-    dup2(fd, 2);
-    rc = dl_query_magic_adorn(db, goal, adorn, vals, nvals, tset_cb, &r);
-    tset_free(&r);
-    fflush(stderr);
-    dup2(saved, 2);
-    close(saved);
-    close(fd);
-
-    if (!out) return rc;
-    f = fopen(path, "r");
-    if (!f) return rc;
-    n = fread(out, 1, outsz - 1, f);
-    out[n] = '\0';
-    fclose(f);
-    return rc;
-}
-
 /* ─── T20: fb on 2-arity EDB ───────────────────────────────────────────── */
 
 static void test_t20_fb_edb(void)
@@ -1294,36 +1260,30 @@ static void test_t21_fbf_path3(void)
     teardown_db(db, "t21");
 }
 
-/* ─── T22: REJECT non-leading self-recursion ───────────────────────────── */
+/* ─── T22: SIPS accepts non-leading self-recursion (fb) ────────────────── */
 
-static void test_t22_reject_nonlead_selfrec(void)
+static void test_t22_fb_selfrec_positive(void)
 {
     dl_db *db;
-    uint32_t e[] = {1,2, 2,3, 3,4};
-    uint32_t vals[1] = { 42 };
-    char errbuf[1024];
-    long rc;
+    uint32_t e[] = {1,2, 2,3, 3,4, 4,5, 1,5};
+    uint32_t targets[4] = {2, 4, 5, 42};
+    int ti;
 
-    TEST("T22: non-leading self-recursive tc(X,42) → reject (different adornment)");
+    TEST("T22: non-leading self-recursive tc(*,k) — SIPS accepts & correct");
 
     setup_db(&db, "t22");
-    load_rows(db, "edge", 2, e, 3, "t22");
+    load_rows(db, "edge", 2, e, 5, "t22");
     load_tc_rules(db);
     assert(dl_compile(db) == 0);
 
-    rc = qm_capture_stderr(db, "tc", "fb", vals, 1, errbuf, sizeof(errbuf));
-
-    if (rc != -1) {
-        printf("  (rc=%ld)\n", rc);
-        FAIL("T22 non-leading self-recursion not rejected");
-        teardown_db(db, "t22");
-        return;
-    }
-    if (strstr(errbuf, "recursive call to 'tc' needs adornment 'bb'") == NULL) {
-        printf("  (stderr: %s)\n", errbuf);
-        FAIL("T22 stderr missing different-adornment recursion message");
-        teardown_db(db, "t22");
-        return;
+    for (ti = 0; ti < 4; ti++) {
+        uint32_t vals[1] = { targets[ti] };
+        if (!cmp_adorn_magic(db, "tc", "fb", vals, 1)) {
+            printf("  target %u mismatch\n", targets[ti]);
+            FAIL("T22 fb magic != full-filter");
+            teardown_db(db, "t22");
+            return;
+        }
     }
     PASS();
     teardown_db(db, "t22");
@@ -1561,6 +1521,192 @@ static void test_t28_path2_property(void)
     PASS();
 }
 
+/* ─── T29: suboptimal user order (tc before edge) — SIPS reorders ──────── */
+
+static void test_t29_suboptimal_order(void)
+{
+    dl_db *db;
+    uint32_t e[] = {1,2, 2,3, 3,4, 4,5, 1,5, 10,11, 11,12};
+    uint32_t sources[3] = {1, 10, 99};
+    int i;
+
+    TEST("T29: suboptimal order path(X,Y):-tc(Z,Y),edge(X,Z) — SIPS correct");
+
+    setup_db(&db, "t29");
+    load_rows(db, "edge", 2, e, 7, "t29");
+    assert(dl_load_rules(db,
+        "tc(X,Y):-edge(X,Y).\n"
+        "tc(X,Y):-edge(X,Z),tc(Z,Y).\n"
+        "path(X,Y):-tc(Z,Y),edge(X,Z).\n") == 0);
+    assert(dl_compile(db) == 0);
+
+    for (i = 0; i < 3; i++) {
+        if (!cmp_bound_magic_rel(db, "path", sources[i])) {
+            printf("  source %u mismatch\n", sources[i]);
+            FAIL("T29 suboptimal order bound vs magic mismatch");
+            teardown_db(db, "t29");
+            return;
+        }
+    }
+    PASS();
+    teardown_db(db, "t29");
+}
+
+/* ─── T30: multi-predicate reorder changes the dependent's adornment ───── */
+
+static void test_t30_multipred_reorder(void)
+{
+    dl_db *db;
+    uint32_t e[] = {1,2, 2,3, 3,4, 10,11, 11,12};
+    uint32_t sources[3] = {1, 10, 99};
+    int i;
+
+    TEST("T30: r:-p; p recursive (bad order) — SIPS reorders, correct");
+
+    setup_db(&db, "t30");
+    load_rows(db, "edge", 2, e, 5, "t30");
+    assert(dl_load_rules(db,
+        "r(X,Y):-p(X,Y).\n"
+        "p(X,Y):-edge(X,Y).\n"
+        "p(X,Y):-p(Z,Y),edge(X,Z).\n") == 0);
+    assert(dl_compile(db) == 0);
+
+    for (i = 0; i < 3; i++) {
+        if (!cmp_bound_magic_rel(db, "r", sources[i])) {
+            printf("  source %u mismatch\n", sources[i]);
+            FAIL("T30 multipred reorder bound vs magic mismatch");
+            teardown_db(db, "t30");
+            return;
+        }
+    }
+    PASS();
+    teardown_db(db, "t30");
+}
+
+/* ─── T31: equality-heavy chain (two equalities) ───────────────────────── */
+
+static void test_t31_equality_heavy(void)
+{
+    dl_db *db;
+    uint32_t e[] = {1,2, 2,3, 3,4, 4,5, 10,11};
+    uint32_t sources[3] = {1, 2, 99};
+    int i;
+
+    TEST("T31: equality-heavy tc(X,Y):-edge(X,Z),Z=W,W=V,tc(V,Y)");
+
+    setup_db(&db, "t31");
+    load_rows(db, "edge", 2, e, 5, "t31");
+    assert(dl_load_rules(db,
+        "tc(X,Y):-edge(X,Y).\n"
+        "tc(X,Y):-edge(X,Z),Z=W,W=V,tc(V,Y).\n") == 0);
+    assert(dl_compile(db) == 0);
+
+    for (i = 0; i < 3; i++) {
+        if (!cmp_bound_magic(db, sources[i])) {
+            printf("  source %u mismatch\n", sources[i]);
+            FAIL("T31 equality-heavy bound vs magic mismatch");
+            teardown_db(db, "t31");
+            return;
+        }
+    }
+    PASS();
+    teardown_db(db, "t31");
+}
+
+/* ─── T32: TC-FB positive (formerly-T22 shape, richer graph) ───────────── */
+
+static void test_t32_tc_fb_positive(void)
+{
+    dl_db *db;
+    uint32_t e[] = {1,2, 2,3, 3,1, 1,4, 4,5, 10,11, 11,10};
+    uint32_t targets[3] = {1, 5, 42};
+    int ti;
+
+    TEST("T32: TC-FB (fb) for several targets — SIPS accepts & correct");
+
+    setup_db(&db, "t32");
+    load_rows(db, "edge", 2, e, 7, "t32");
+    load_tc_rules(db);
+    assert(dl_compile(db) == 0);
+
+    for (ti = 0; ti < 3; ti++) {
+        uint32_t vals[1] = { targets[ti] };
+        if (!cmp_adorn_magic(db, "tc", "fb", vals, 1)) {
+            printf("  target %u mismatch\n", targets[ti]);
+            FAIL("T32 fb magic != full-filter");
+            teardown_db(db, "t32");
+            return;
+        }
+    }
+    PASS();
+    teardown_db(db, "t32");
+}
+
+/* ─── T33: body-order independence property test ───────────────────────── */
+
+static void test_t33_order_independence(void)
+{
+    TEST("T33: property — 100 graphs x 3 sources, body-order invariance");
+
+    int iter;
+    for (iter = 0; iter < 100; iter++) {
+        dl_db *dba, *dbb;
+        char sa[32], sb[32];
+        int N = 8 + (int)(iter % 12);         /* 8..19 nodes */
+        int M = 20 + (int)((iter * 7) % 60);  /* 20..79 edges */
+        uint32_t *edges;
+        int ei, si;
+
+        snprintf(sa, sizeof(sa), "oi_a_%d", iter);
+        snprintf(sb, sizeof(sb), "oi_b_%d", iter);
+        setup_db(&dba, sa);
+        setup_db(&dbb, sb);
+
+        edges = malloc((size_t)M * 2 * sizeof(uint32_t));
+        for (ei = 0; ei < M; ei++) {
+            edges[ei*2]     = rng_rand((uint32_t)N) + 1;
+            edges[ei*2 + 1] = rng_rand((uint32_t)N) + 1;
+        }
+        load_rows(dba, "edge", 2, edges, M, sa);
+        load_rows(dbb, "edge", 2, edges, M, sb);
+        free(edges);
+
+        assert(dl_load_rules(dba,
+            "tc(X,Y):-edge(X,Y).\n"
+            "tc(X,Y):-edge(X,Z),tc(Z,Y).\n") == 0);
+        assert(dl_load_rules(dbb,
+            "tc(X,Y):-edge(X,Y).\n"
+            "tc(X,Y):-tc(Z,Y),edge(X,Z).\n") == 0);
+        assert(dl_compile(dba) == 0);
+        assert(dl_compile(dbb) == 0);
+
+        for (si = 0; si < 3; si++) {
+            uint32_t src = rng_rand((uint32_t)(N + 2)) + 1;
+            uint32_t leading[1];
+            tuple_set ra, rb;
+            long na, nb;
+            leading[0] = src;
+            memset(&ra, 0, sizeof(ra));
+            memset(&rb, 0, sizeof(rb));
+            na = dl_query_magic(dba, "tc", leading, 1, tset_cb, &ra);
+            nb = dl_query_magic(dbb, "tc", leading, 1, tset_cb, &rb);
+            if (na < 0 || nb < 0 || na != nb || !tset_sorted_eq(&ra, &rb)) {
+                printf("  iter %d src %u mismatch (a=%ld b=%ld)\n",
+                       iter, src, na, nb);
+                FAIL("T33 order-independence mismatch");
+                tset_free(&ra); tset_free(&rb);
+                teardown_db(dba, sa);
+                teardown_db(dbb, sb);
+                return;
+            }
+            tset_free(&ra); tset_free(&rb);
+        }
+        teardown_db(dba, sa);
+        teardown_db(dbb, sb);
+    }
+    PASS();
+}
+
 /* ─── Main ────────────────────────────────────────────────────────────── */
 
 int main(void)
@@ -1589,13 +1735,18 @@ int main(void)
     test_t19_multipred_property();
     test_t20_fb_edb();
     test_t21_fbf_path3();
-    test_t22_reject_nonlead_selfrec();
+    test_t22_fb_selfrec_positive();
     test_t23_multipred_fb();
     test_t24_allf_route();
     test_t25_reject_nvals_mismatch();
     test_t26_reject_length_mismatch();
     test_t27_no_mutation_adorn();
     test_t28_path2_property();
+    test_t29_suboptimal_order();
+    test_t30_multipred_reorder();
+    test_t31_equality_heavy();
+    test_t32_tc_fb_positive();
+    test_t33_order_independence();
 
     printf("\n%d tests run, %d failed\n", tests_run, tests_failed);
     return tests_failed ? 1 : 0;

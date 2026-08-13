@@ -1,5 +1,11 @@
 /*
- * magic.c — Magic-sets AST→AST adornment rewrite (M8 v2 multi-predicate slice)
+ * magic.c — Magic-sets AST→AST adornment rewrite (M8 v2 multi-predicate slice,
+ *           v3 SIPS body-reordering slice)
+ *
+ * SIPS slice: a deterministic greedy body-atom permutation is computed once
+ * per rule at transform time (sips_body_order) and shared CONSISTENTLY between
+ * the adornment walk (walk_rule_adorns) and the synthesis loops — the cached
+ * permutation is the single source of truth, never recomputed in synthesis.
  *
  * Pure transformation: no dl_db access.  Reads the retained AST (a const
  * array of rule*) and synthesizes a fresh adorned + magic program.
@@ -411,6 +417,152 @@ out:
     return rc;
 }
 
+/* ─── SIPS body ordering (deterministic greedy) ───────────────────────── */
+
+/* Score a non-equality body atom: `score` = #bound var args + #constant args;
+ * `n_new` = #var args not yet bound.  Constants (TOK_INT/TOK_IDENT) contribute
+ * to the score but are NEVER added to the bound set (they do not propagate). */
+static void sips_atom_score(const atom *A, const name_set *bound,
+                            int *score, int *n_new)
+{
+    int j, s = 0, nn = 0;
+    for (j = 0; j < A->nargs; j++) {
+        const token *t = A->args[j];
+        if (t->kind == TOK_VAR) {
+            if (ns_contains(bound, t->text)) s++;
+            else nn++;
+        } else if (t->kind == TOK_INT || t->kind == TOK_IDENT) {
+            s++;
+        }
+    }
+    *score = s;
+    *n_new = nn;
+}
+
+/* Strictly-better candidate, lexicographic and total (no partial comparator):
+ *   (score desc), then zero-new-vars first, then EDB before IDB, then lowest
+ *   ORIGINAL body index (the stable tie-break key). */
+static int sips_atom_better(int score, int n_new, int edb, int idx,
+                            int b_score, int b_new, int b_edb, int b_idx)
+{
+    if (score != b_score) return score > b_score;
+    {
+        int z = (n_new == 0), bz = (b_new == 0);
+        if (z != bz) return z > bz;
+    }
+    if (edb != b_edb) return edb > b_edb;
+    return idx < b_idx;
+}
+
+/* Compute a deterministic greedy SIPS permutation of [0..R->nbody) into
+ * body_order_out (pre-sized R->nbody).  Returns 0 on success, -1 on allocation
+ * failure.  Greedy loop: (1) fire any equality ("=", 2 var args) with one side
+ * already bound — place it next and propagate the other side; (2) else pick the
+ * best-scoring non-equality atom and add its vars to bound; (3) re-sweep
+ * equalities.  Aggregates/negated atoms are skipped defensively (they are
+ * rejected earlier in the worklist, before this is consumed). */
+static int sips_body_order(const rule *R, const char *alpha,
+                           const pa_vec *adorns, int *body_order_out,
+                           char *err, size_t errsz)
+{
+    name_set bound = {0, 0, 0};
+    unsigned char *placed = NULL;
+    int n = R->nbody;
+    int out_n = 0;
+    int j;
+
+    if (n <= 0) return 0;   /* parser never emits this; defensive */
+
+    placed = calloc((size_t)n, sizeof(unsigned char));
+    if (!placed) {
+        if (err && errsz > 0) snprintf(err, errsz, "out of memory");
+        return -1;
+    }
+
+    /* Init bound from head 'b'-position TOK_VAR args (constants don't
+     * propagate — they're positional). */
+    for (j = 0; j < R->head->nargs; j++)
+        if (alpha[j] == 'b' && R->head->args[j]->kind == TOK_VAR)
+            if (ns_add(&bound, R->head->args[j]->text) != 0)
+                goto oom;
+
+    while (out_n < n) {
+        int i, fired = 0;
+
+        /* (1) Fire any equality with one side already bound. */
+        for (i = 0; i < n; i++) {
+            const atom *A = R->body[i];
+            if (placed[i] || !A || !A->pred) continue;
+            if (strcmp(A->pred, "=") != 0) continue;
+            if (A->nargs == 2 &&
+                A->args[0]->kind == TOK_VAR &&
+                A->args[1]->kind == TOK_VAR) {
+                int b0 = ns_contains(&bound, A->args[0]->text);
+                int b1 = ns_contains(&bound, A->args[1]->text);
+                if (b0 || b1) {
+                    if (b0 && !b1) {
+                        if (ns_add(&bound, A->args[1]->text) != 0) goto oom;
+                    } else if (b1 && !b0) {
+                        if (ns_add(&bound, A->args[0]->text) != 0) goto oom;
+                    }
+                    body_order_out[out_n++] = i;
+                    placed[i] = 1;
+                    fired = 1;
+                }
+            }
+        }
+        if (fired) continue;  /* re-sweep: propagation may enable another '=' */
+
+        /* (2) Score remaining non-equality atoms; pick the best. */
+        {
+            int best = -1, best_score = 0, best_new = 0, best_edb = 0;
+            for (i = 0; i < n; i++) {
+                const atom *A = R->body[i];
+                int score, n_new, edb;
+                if (placed[i] || !A || !A->pred) continue;
+                if (strcmp(A->pred, "=") == 0) continue;  /* none fireable now */
+                if (A->aggregate || A->negated) continue; /* rejected earlier */
+                sips_atom_score(A, &bound, &score, &n_new);
+                edb = (pa_find(adorns, A->pred) < 0);
+                if (best < 0 ||
+                    sips_atom_better(score, n_new, edb, i,
+                                     best_score, best_new, best_edb, best)) {
+                    best = i;
+                    best_score = score;
+                    best_new = n_new;
+                    best_edb = edb;
+                }
+            }
+            if (best >= 0) {
+                const atom *A = R->body[best];
+                body_order_out[out_n++] = best;
+                placed[best] = 1;
+                for (j = 0; j < A->nargs; j++)
+                    if (A->args[j]->kind == TOK_VAR)
+                        if (ns_add(&bound, A->args[j]->text) != 0) goto oom;
+                continue;
+            }
+        }
+
+        /* (3) Defensive fallback: nothing fireable (e.g. an equality with
+         * neither side bound and no other atom left).  Place the remainder in
+         * original order to guarantee termination. */
+        for (i = 0; i < n; i++)
+            if (!placed[i]) body_order_out[out_n++] = i;
+        break;
+    }
+
+    free(placed);
+    free(bound.v);
+    return 0;
+
+oom:
+    if (err && errsz > 0) snprintf(err, errsz, "out of memory");
+    free(placed);
+    free(bound.v);
+    return -1;
+}
+
 /* ─── Bound-set walk (adornment propagation) ──────────────────────────── */
 
 /* Walk R's body left-to-right under head adornment `alpha`, maintaining the
@@ -419,7 +571,7 @@ out:
  * worklist queue (queue/qt).  On conflict, writes *err and returns -1. */
 static int walk_rule_adorns(const rule *R, const char *alpha,
                             pa_vec *adorns, int *queue, int *qt,
-                            char *err, size_t errsz)
+                            int *body_order, char *err, size_t errsz)
 {
     name_set bound = {0, 0, 0};
     int j, a;
@@ -428,8 +580,9 @@ static int walk_rule_adorns(const rule *R, const char *alpha,
         if (alpha[j] == 'b' && R->head->args[j]->kind == TOK_VAR)
             ns_add(&bound, R->head->args[j]->text);
 
+    /* Iterate the body in the cached SIPS order (NULL => identity). */
     for (j = 0; j < R->nbody; j++) {
-        const atom *A = R->body[j];
+        const atom *A = R->body[body_order ? body_order[j] : j];
         char beta[9];
         int qi;
         if (!A) continue;
@@ -623,6 +776,7 @@ int magic_transform_adorn(const rule *const *ast_rules, int n_ast,
     rule_vec  modrules = {0, 0, 0};
     decl_vec  decls    = {0, 0, 0};
     int      *queue    = NULL;
+    int     **body_orders = NULL;   /* per-rule SIPS permutation cache */
     int       goal_idx = -1;
     int       i, j;
 
@@ -712,6 +866,8 @@ int magic_transform_adorn(const rule *const *ast_rules, int n_ast,
     /* ── Phase B: worklist adornment propagation ── */
     queue = malloc((size_t)adorns.n * sizeof(int));
     if (!queue) REJECT("out of memory");
+    body_orders = calloc((size_t)n_ast, sizeof(int *));
+    if (!body_orders) REJECT("out of memory");
     {
         int qh = 0, qt = 0;
         char ppred[64], pal[9];
@@ -728,7 +884,17 @@ int magic_transform_adorn(const rule *const *ast_rules, int n_ast,
                     REJECT("negation in rule for '%s' not supported", ppred);
                 if (R->has_aggregate)
                     REJECT("aggregate in rule for '%s' not supported", ppred);
+                if (!body_orders[i]) {
+                    body_orders[i] = malloc((size_t)R->nbody * sizeof(int));
+                    if (!body_orders[i]) REJECT("out of memory");
+                }
+                /* Compute the SIPS order ONCE and share it with the walk
+                 * (and later with synthesis).  Never recomputed. */
+                if (sips_body_order(R, pal, &adorns, body_orders[i],
+                                    reject_reason, reject_sz) != 0)
+                    goto fail;
                 if (walk_rule_adorns(R, pal, &adorns, queue, &qt,
+                                     body_orders[i],
                                      reject_reason, reject_sz) != 0)
                     goto fail;
             }
@@ -759,10 +925,16 @@ int magic_transform_adorn(const rule *const *ast_rules, int n_ast,
             atom *guard, *mhead;
             atom **mbody;
             rule *mr;
+            int *ord;
             int total;
 
             if (!R || !R->head || !R->head->pred) continue;
             if (strcmp(R->head->pred, P->pred) != 0) continue;
+
+            /* The cached SIPS permutation — the SAME one the adornment walk
+             * used.  Single source of truth; never recomputed here.  NULL =>
+             * identity (defensive, for unreachable rules). */
+            ord = body_orders ? body_orders[r] : NULL;
 
             /* (a) adorned rule: P^a :- magic_P^a(bound head), body' */
             guard = build_bound_atom(R->head, P->magic_name, P->adorn);
@@ -772,8 +944,9 @@ int magic_transform_adorn(const rule *const *ast_rules, int n_ast,
             if (!mbody) { atom_free_local(guard); REJECT("out of memory"); }
             mbody[0] = guard;
             for (j = 0; j < R->nbody; j++) {
-                mbody[1 + j] = atom_copy(R->body[j],
-                                         renamed_pred(R->body[j], &adorns));
+                int bj = ord ? ord[j] : j;
+                mbody[1 + j] = atom_copy(R->body[bj],
+                                         renamed_pred(R->body[bj], &adorns));
                 if (!mbody[1 + j]) { atoms_free(mbody, 1 + j); REJECT("out of memory"); }
             }
             mhead = atom_copy(R->head, P->adorned_name);
@@ -792,7 +965,7 @@ int magic_transform_adorn(const rule *const *ast_rules, int n_ast,
             /* (b)/(c) magic rules for each IDB body atom (self-recursion
              * when Q==P, dependency-seed when Q!=P — same shape). */
             for (j = 0; j < R->nbody; j++) {
-                const atom *A = R->body[j];
+                const atom *A = R->body[ord ? ord[j] : j];
                 atom **mgbody;
                 atom *mghead;
                 rule *mgr;
@@ -818,8 +991,9 @@ int magic_transform_adorn(const rule *const *ast_rules, int n_ast,
                     REJECT("out of memory");
                 }
                 for (jj = 0; jj < j; jj++) {
-                    mgbody[1 + jj] = atom_copy(R->body[jj],
-                                               renamed_pred(R->body[jj], &adorns));
+                    int bjj = ord ? ord[jj] : jj;
+                    mgbody[1 + jj] = atom_copy(R->body[bjj],
+                                               renamed_pred(R->body[bjj], &adorns));
                     if (!mgbody[1 + jj]) {
                         atom_free_local(mghead);
                         atoms_free(mgbody, 1 + jj);
@@ -876,12 +1050,22 @@ int magic_transform_adorn(const rule *const *ast_rules, int n_ast,
     out->goal_arity = goal_arity;
 
     free(adorns.v);
+    {
+        int x;
+        for (x = 0; x < n_ast; x++) free(body_orders[x]);
+        free(body_orders);
+    }
     return 0;
 
 fail:
     free(queue);
     free(edges.v);
     free(adorns.v);
+    if (body_orders) {
+        int x;
+        for (x = 0; x < n_ast; x++) free(body_orders[x]);
+        free(body_orders);
+    }
     {
         int x;
         for (x = 0; x < modrules.n; x++) rule_free(modrules.v[x]);
