@@ -1009,17 +1009,33 @@ static int cand_cb(const uint32_t *cols, uint8_t arity, void *user)
 
 static int eval_nonrecursive(dl_db *db, compiled_rule **rules, int n)
 {
-    int i;
-    for (i = 0; i < n; i++) {
-        long m = exec_rule(db, rules[i], NULL, 0,
-                           0 /* commit */, NULL, NULL);
-        if (m < 0) return -1;
-        (void)m;
-        /* M6: IDB DAFSA was populated — mark perms dirty and rebuild
-         * so subsequent rules (even within the same stratum) see fresh
-         * perm indices for non-leading joins. */
-        permindex_mark_dirty(db, rules[i]->head_rel_id);
-        if (permindex_build_dirty(db) != 0) return -1;
+    /* Non-recursive rules must be evaluated to a fixpoint, not a single
+     * pass in emit order: a rule chain like r3:-r2; r2:-r1; r1:-edge is
+     * only fully materialized if a later-emitted producer has already run.
+     * The compiler does not guarantee dependency-first emit order, so loop
+     * the whole stratum until a full pass adds no new tuples.  Non-recursive
+     * rules form a DAG, so this converges in at most n passes. */
+    int pass;
+    for (pass = 0; pass <= n; pass++) {
+        long added = 0;
+        int i;
+        int changed = 0;
+        for (i = 0; i < n; i++) {
+            long m = exec_rule(db, rules[i], NULL, 0,
+                               0 /* commit */, NULL, NULL);
+            if (m < 0) return -1;
+            added += m;
+            if (m > 0) changed = 1;
+            /* M6: IDB DAFSA was populated — mark perms dirty and rebuild
+             * so subsequent rules (even within the same stratum) see fresh
+             * perm indices for non-leading joins. */
+            if (m > 0) {
+                permindex_mark_dirty(db, rules[i]->head_rel_id);
+                if (permindex_build_dirty(db) != 0) return -1;
+            }
+        }
+        if (!changed) break;  /* fixpoint reached */
+        (void)added;
     }
     return 0;
 }
