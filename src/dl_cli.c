@@ -93,11 +93,12 @@ static void usage(const char *prog)
         "  %s [-d <dir>] lookup <rel> <val> [<val> ...]\n"
         "  %s [-d <dir>] prefix <rel> [<val> ...]\n"
         "  %s [-d <dir>] query '<rule>' | <file.dl> <goal-rel>\n"
+        "  %s [-d <dir>] qmagic '<rule>' | <file.dl> <goal-rel> <val> [<val> ...]\n"
         "  %s [-d <dir>] publish\n"
         "  %s [-d <dir>] bound <rel> <val> [<val> ...]\n"
         "  %s [-d <dir>] pattern <rel> '<regex>'\n"
         "Values: bare integer -> raw u32; anything else -> interned string\n",
-        prog, prog, prog, prog, prog, prog, prog);
+        prog, prog, prog, prog, prog, prog, prog, prog);
     exit(1);
 }
 
@@ -300,6 +301,63 @@ int main(int argc, char **argv)
         n = dl_query(db, goal_rel, print_tuple, db);
         if (n < 0) {
             fprintf(stderr, "dl: query failed\n");
+            dl_close(db);
+            return 1;
+        }
+        if (n == 0)
+            printf("(no results)\n");
+
+    } else if (strcmp(cmd, "qmagic") == 0) {
+        const char *source;
+        const char *goal_rel;
+        char *source_buf = NULL;
+        uint32_t leading[8];
+        uint8_t k;
+        long n;
+
+        if (argp >= argc) usage(argv[0]);
+        source = argv[argp++];
+
+        if (argp >= argc) usage(argv[0]);
+        goal_rel = argv[argp++];
+
+        /* Check if source is a file path */
+        {
+            FILE *f = fopen(source, "r");
+            if (f) {
+                fseek(f, 0, SEEK_END);
+                long sz = ftell(f);
+                fseek(f, 0, SEEK_SET);
+                if (sz > 0 && sz < 1024 * 1024) {
+                    source_buf = malloc((size_t)sz + 1);
+                    if (source_buf) {
+                        size_t nr = fread(source_buf, 1, (size_t)sz, f);
+                        source_buf[nr] = '\0';
+                        source = source_buf;
+                    }
+                }
+                fclose(f);
+            }
+        }
+
+        k = 0;
+        while (argp < argc && k < 8) {
+            leading[k] = cli_parse_value(db, argv[argp]);
+            k++;
+            argp++;
+        }
+
+        if (dl_load_rules(db, source) != 0) {
+            fprintf(stderr, "dl: failed to parse/compile rules\n");
+            free(source_buf);
+            dl_close(db);
+            return 1;
+        }
+        free(source_buf);
+
+        n = dl_query_magic(db, goal_rel, leading, k, print_tuple, db);
+        if (n < 0) {
+            fprintf(stderr, "dl: magic query failed\n");
             dl_close(db);
             return 1;
         }

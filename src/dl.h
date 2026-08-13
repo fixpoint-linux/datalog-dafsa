@@ -109,6 +109,30 @@ long dl_query_bound(dl_db *db, const char *goal_rel,
                     const uint32_t *leading, uint8_t k,
                     dl_tuple_cb cb, void *user);
 
+/* Magic-sets bound query (M8, opt-in, first slice).
+ *
+ * Re-evaluates a SCOPED fixpoint seeded by the bound leading args
+ * leading[0..k-1], materializing only the reachable IDB slice, streaming
+ * the result, and leaving `db` completely unmutated.
+ *
+ * Invariant: the result is byte-for-byte identical to
+ * dl_query_bound(db, goal_rel, leading, k, cb, user) over the fully
+ * materialized goal relation.  Returns tuple count, or -1 on error.
+ *
+ * Semantics of edge cases:
+ *   - k == 0: routes to dl_query (full materialization) — no bound args.
+ *   - goal_rel is an EDB relation (not a rule head): degenerates to a
+ *     plain prefix lookup (equivalent to dl_query_bound).
+ *   - programs using negation, aggregates, multi-predicate dependencies or
+ *     a recursive call needing a different adornment are REJECTED with a
+ *     diagnostic and return -1 (never silently mis-evaluated).
+ *
+ * NOTE: reads db->rels[].rel without a lock — safe only when no concurrent
+ * publish is in flight (documented single-writer / multi-reader model). */
+long dl_query_magic(dl_db *db, const char *goal_rel,
+                    const uint32_t *leading, uint8_t k,
+                    dl_tuple_cb cb, void *user);
+
 /* ─── Regex pattern query ─────────────────────────────────────────────── */
 
 /* Forward declaration (full struct in regexwalk.h) */

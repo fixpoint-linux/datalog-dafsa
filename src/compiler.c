@@ -150,6 +150,8 @@ static int compute_strata(dl_db *db, rule **rules, int n_rules,
 {
     size_t nrels = db_rel_count(db);
     int *stratum;
+    int *comp = NULL;   /* M8: SCC id per relation (Kosaraju root), kept for
+                           the strict-stratification pass */
     int i, changed, iteration;
     size_t ri;
 
@@ -226,7 +228,6 @@ static int compute_strata(dl_db *db, rule **rules, int n_rules,
         int **adj = NULL, **rev_adj = NULL;
         int *adj_cap = NULL, *rev_cap = NULL;
         int *visited = NULL, *order = NULL;
-        int *comp = NULL;
         int order_n = 0;
 
         if (!out_deg) { free(self_loop); free(edges); free(stratum); return -1; }
@@ -380,7 +381,7 @@ static int compute_strata(dl_db *db, rule **rules, int n_rules,
         free(adj); free(rev_adj);
         free(adj_cap); free(rev_cap);
         free(out_deg); free(rev_deg);
-        free(visited); free(order); free(comp);
+        free(visited); free(order);
     }
 
     /* ── Strict stratification for non-recursive SCC dependents ──── */
@@ -404,12 +405,21 @@ static int compute_strata(dl_db *db, rule **rules, int n_rules,
                     needed = from_s + 1;
                     if (needed > 1000000) needed = 1000000;
                 } else if (out_recursive[edges[i].from]
-                           && !out_recursive[edges[i].to]) {
-                    /* Positive edge from a recursive SCC to a
-                     * NON-recursive dependent: require strict
-                     * inequality so the dependent is evaluated
-                     * in a later stratum, after the fixpoint
-                     * completes. */
+                           && comp
+                           && comp[edges[i].from] != comp[edges[i].to]) {
+                    /* Positive edge from a recursive SCC to a predicate in
+                     * a DIFFERENT SCC.  This covers two cases:
+                     *   1. recursive -> NON-recursive dependent (original
+                     *      M2.1 fix): the dependent needs the source's full
+                     *      fixpoint, so it must be in a later stratum.
+                     *   2. recursive -> recursive CHAINED dependent (M8
+                     *      magic-sets: tc^bf depends on magic_tc^bf, both
+                     *      recursive, distinct SCCs).  Same requirement.
+                     *      Previously only case 1 was handled, so chained
+                     *      recursive predicates were silently mis-evaluated
+                     *      (the semi-naive loop only exposes an SCC's idb to
+                     *      its own rules, so a same-stratum dependent reads a
+                     *      stale relation). */
                     needed = from_s + 1;
                     if (needed > 1000000) needed = 1000000;
                 } else {
@@ -425,6 +435,9 @@ static int compute_strata(dl_db *db, rule **rules, int n_rules,
             iter2++;
         } while (changed && iter2 < 10000);
     }
+
+    free(comp);
+    comp = NULL;
 
     /* Check for unstratifiable (after both fixpoint passes) */
     for (i = 0; i < n_edges; i++) {

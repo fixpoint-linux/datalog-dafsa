@@ -33,7 +33,8 @@ LIB_OBJS = src/intern.o \
            src/regexwalk.o \
            src/permindex.o \
            src/util.o \
-           src/dl.o
+           src/dl.o \
+           src/magic.o
 
 # Combined object list used for static links (tests, CLI).
 ALL_OBJS = $(VENDOR_OBJS) $(LIB_OBJS)
@@ -109,6 +110,9 @@ tests/test_m6_deep_review: tests/test_m6_deep_review.c $(ALL_OBJS)
 tests/test_m7: tests/test_m7.c $(ALL_OBJS)
 	$(CC) $(CFLAGS) $(INC) -static -o $@ tests/test_m7.c $(ALL_OBJS)
 
+tests/test_m8_magic: tests/test_m8_magic.c $(ALL_OBJS)
+	$(CC) $(CFLAGS) $(INC) -static -o $@ tests/test_m8_magic.c $(ALL_OBJS)
+
 tests/bench: tests/bench.c $(ALL_OBJS)
 	$(CC) $(CFLAGS) $(INC) -static -o $@ tests/bench.c $(ALL_OBJS)
 
@@ -116,7 +120,7 @@ bench: tests/bench
 	@echo "=== Running demonstration benchmark ==="
 	LD_LIBRARY_PATH=. ./tests/bench
 
-test: tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4 tests/test_m4_review tests/test_bulk tests/test_m5 tests/test_m5_review tests/test_m6 tests/test_m6_review tests/test_m6_deep_review tests/test_m7 dl build-tmp
+test: tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4 tests/test_m4_review tests/test_bulk tests/test_m5 tests/test_m5_review tests/test_m6 tests/test_m6_review tests/test_m6_deep_review tests/test_m7 tests/test_m8_magic dl build-tmp
 	@echo "=== Running M0 unit tests ==="
 	LD_LIBRARY_PATH=. ./tests/test_m0
 	@echo ""
@@ -156,6 +160,9 @@ test: tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4 test
 	@echo "=== Running M7 durability tests ==="
 	LD_LIBRARY_PATH=. ./tests/test_m7
 	@echo ""
+	@echo "=== Running M8 magic-sets tests ==="
+	LD_LIBRARY_PATH=. ./tests/test_m8_magic
+	@echo ""
 	@echo "=== Running CLI smoke test ==="
 	@sh tests/smoke.sh
 
@@ -175,5 +182,5 @@ clean:
 	rm -f tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4 \
 	      tests/test_m4_review tests/test_m5 tests/test_m5_review tests/test_m6 \
 	      tests/test_m6_review tests/test_bulk \
-	      tests/test_m6_deep_review tests/test_m7 tests/bench
+	      tests/test_m6_deep_review tests/test_m7 tests/test_m8_magic tests/bench
 	rm -rf /tmp/dl-test-db build-tmp/smoke build-tmp/m1

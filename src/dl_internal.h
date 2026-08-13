@@ -65,6 +65,11 @@ struct dl_db {
     /* M6: permutation indices */
     perm_index_entry  perms[MAX_PERMS];
     int               n_perms;
+
+    /* M8: retained rule AST (deep-copied in dl_load_rules; freed in
+     * dl_close).  Used by the magic-sets transform (dl_query_magic). */
+    rule            **ast_rules;
+    int               n_ast_rules;
 };
 
 #endif /* DL_INTERNAL_H */

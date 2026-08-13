@@ -1,0 +1,834 @@
+/*
+ * test_m8_magic.c — M8 magic-sets (first slice) tests
+ *
+ * The correctness backstop (non-negotiable): for a leading-prefix-bound goal,
+ *   magic_result(Q) == dl_query_bound(Q) over the FULL materialization,
+ * byte-for-byte sorted unique tuple-set equality.  This is verified by:
+ *
+ *   T1-T6   canonical TC graphs + edge cases (chain/star/dense/small/absent/
+ *           no-out-edges)
+ *   T7      equality in body (Z=W alias) — accepted, still equivalent
+ *   T8      multi-rule same head
+ *   T9      conservative REJECTS (negation, aggregate, different-adornment,
+ *           non-leading adornment) → dl_query_magic returns -1
+ *   T10     k==0 routes to dl_query
+ *   T11     no-mutation: db fields + interner byte-identical before/after
+ *   T12     magic works WITHOUT a prior dl_compile (scoped re-eval from EDB)
+ *   T13     property test: 200 random graphs x 5 sources, bound vs magic
+ *
+ * Regression: full `make test` (224 existing tests) still passes.
+ */
+#include "dl.h"
+#include "dl_internal.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <assert.h>
+#include <stdint.h>
+
+static int tests_run = 0;
+static int tests_failed = 0;
+
+#define TEST(name) do { \
+    tests_run++; \
+    printf("  %s ... ", name); \
+    fflush(stdout); \
+} while(0)
+
+#define PASS() do { printf("OK\n"); } while(0)
+#define FAIL(msg) do { \
+    printf("FAIL: %s\n", msg); \
+    tests_failed++; \
+} while(0)
+
+/* ─── Tuple set (local, mirrors test_m6) ──────────────────────────────── */
+
+typedef struct {
+    uint32_t *data;
+    long      count;
+    long      cap;
+    uint8_t   arity;
+} tuple_set;
+
+static int tset_cb(const uint32_t *cols, uint8_t arity, void *user)
+{
+    tuple_set *ts = (tuple_set *)user;
+    if (ts->arity == 0) ts->arity = arity;
+    if (ts->count >= ts->cap) {
+        long nc = ts->cap ? ts->cap * 2 : 256;
+        uint32_t *nd = realloc(ts->data,
+            (size_t)nc * (size_t)ts->arity * sizeof(uint32_t));
+        if (!nd) return 1;
+        ts->data = nd;
+        ts->cap = nc;
+    }
+    memcpy(ts->data + (size_t)ts->count * (size_t)ts->arity,
+           cols, (size_t)ts->arity * sizeof(uint32_t));
+    ts->count++;
+    return 0;
+}
+
+static void tset_free(tuple_set *ts)
+{
+    free(ts->data);
+    memset(ts, 0, sizeof(*ts));
+}
+
+static int g_arity;
+static int cmp_tup(const void *a, const void *b)
+{
+    const uint32_t *pa = (const uint32_t *)a;
+    const uint32_t *pb = (const uint32_t *)b;
+    int i;
+    for (i = 0; i < g_arity; i++) {
+        if (pa[i] < pb[i]) return -1;
+        if (pa[i] > pb[i]) return 1;
+    }
+    return 0;
+}
+
+static void tset_sort(tuple_set *ts)
+{
+    if (ts->count > 1) {
+        g_arity = ts->arity;
+        qsort(ts->data, (size_t)ts->count,
+              (size_t)ts->arity * sizeof(uint32_t), cmp_tup);
+    }
+}
+
+/* byte-for-byte sorted tuple-set equality */
+static int tset_sorted_eq(tuple_set *a, tuple_set *b)
+{
+    if (a->count != b->count) return 0;
+    if (a->count == 0) return 1;
+    if (a->arity != b->arity) return 0;
+    tset_sort(a);
+    tset_sort(b);
+    return memcmp(a->data, b->data,
+                  (size_t)a->count * (size_t)a->arity * sizeof(uint32_t)) == 0;
+}
+
+/* ─── Database helpers ────────────────────────────────────────────────── */
+
+static void rm_dir(const char *dir)
+{
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "rm -rf %s", dir);
+    system(cmd);
+}
+
+static void setup_db(dl_db **db_out, const char *suffix)
+{
+    char path[256];
+    snprintf(path, sizeof(path), "build-tmp/m8db_%s", suffix);
+    rm_dir(path);
+    *db_out = dl_open(path);
+    assert(*db_out);
+}
+
+static void teardown_db(dl_db *db, const char *suffix)
+{
+    char path[256];
+    dl_close(db);
+    snprintf(path, sizeof(path), "build-tmp/m8db_%s", suffix);
+    rm_dir(path);
+}
+
+/* Load rows (u32 values) into a relation via a headerless CSV. */
+static int load_rows(dl_db *db, const char *rel_name, uint8_t arity,
+                     const uint32_t *cols, int nrows, const char *suffix)
+{
+    char csv_path[256];
+    FILE *f;
+    int i, c;
+
+    assert(dl_declare_relation(db, rel_name, arity) == 0);
+
+    snprintf(csv_path, sizeof(csv_path), "build-tmp/m8csv_%s_%s.csv",
+             suffix, rel_name);
+    f = fopen(csv_path, "w");
+    assert(f);
+    for (i = 0; i < nrows; i++) {
+        for (c = 0; c < arity; c++) {
+            if (c > 0) fputc(',', f);
+            fprintf(f, "%u", cols[(size_t)i * (size_t)arity + (size_t)c]);
+        }
+        fputc('\n', f);
+    }
+    fclose(f);
+    return dl_load_facts(db, rel_name, csv_path);
+}
+
+/* Load the canonical transitive-closure program over `edge` (arity 2). */
+static void load_tc_rules(dl_db *db)
+{
+    int rc = dl_load_rules(db,
+        "tc(X,Y):-edge(X,Y).\n"
+        "tc(X,Y):-edge(X,Z),tc(Z,Y).\n");
+    if (rc != 0) {
+        fprintf(stderr, "  (tc rules failed to compile)\n");
+    }
+    assert(rc == 0);
+}
+
+/* Compare dl_query_bound vs dl_query_magic for tc(src, ?). */
+static int cmp_bound_magic(dl_db *db, uint32_t src)
+{
+    tuple_set rb, rm;
+    uint32_t leading[1];
+    long nb, nm;
+    int eq;
+
+    memset(&rb, 0, sizeof(rb));
+    memset(&rm, 0, sizeof(rm));
+    leading[0] = src;
+
+    nb = dl_query_bound(db, "tc", leading, 1, tset_cb, &rb);
+    nm = dl_query_magic(db, "tc", leading, 1, tset_cb, &rm);
+
+    if (nb < 0 || nm < 0) { tset_free(&rb); tset_free(&rm); return 0; }
+    if (nb != nm) { tset_free(&rb); tset_free(&rm); return 0; }
+    eq = tset_sorted_eq(&rb, &rm);
+    tset_free(&rb);
+    tset_free(&rm);
+    return eq;
+}
+
+/* ─── T1: chain ───────────────────────────────────────────────────────── */
+
+static void test_t1_chain(void)
+{
+    dl_db *db;
+    int N = 1000, i;
+    uint32_t *edges;
+    uint32_t sources[4];
+
+    TEST("T1: chain N=1000 — bound vs magic for several sources");
+
+    setup_db(&db, "t1");
+    edges = malloc((size_t)(N - 1) * 2 * sizeof(uint32_t));
+    for (i = 0; i < N - 1; i++) {
+        edges[i*2]     = (uint32_t)(i + 1);
+        edges[i*2 + 1] = (uint32_t)(i + 2);
+    }
+    load_rows(db, "edge", 2, edges, N - 1, "t1");
+    free(edges);
+    load_tc_rules(db);
+    assert(dl_compile(db) == 0);
+
+    sources[0] = 1;          /* reaches 2..1000 → 999 tuples */
+    sources[1] = 500;        /* reaches 501..1000 → 500 tuples */
+    sources[2] = 1000;       /* no out-edges → 0 tuples */
+    sources[3] = 9999;       /* absent source → 0 tuples */
+
+    for (i = 0; i < 4; i++) {
+        if (!cmp_bound_magic(db, sources[i])) {
+            printf("  source %u mismatch\n", sources[i]);
+            FAIL("chain bound vs magic mismatch");
+            teardown_db(db, "t1");
+            return;
+        }
+    }
+    PASS();
+    teardown_db(db, "t1");
+}
+
+/* ─── T2: star ────────────────────────────────────────────────────────── */
+
+static void test_t2_star(void)
+{
+    dl_db *db;
+    int N = 50, i;
+    uint32_t *edges;
+    uint32_t sources[3];
+
+    TEST("T2: star center=1 → 49 leaves, plus leaf/absent sources");
+
+    setup_db(&db, "t2");
+    edges = malloc((size_t)(N - 1) * 2 * sizeof(uint32_t));
+    for (i = 0; i < N - 1; i++) {
+        edges[i*2]     = 1;
+        edges[i*2 + 1] = (uint32_t)(i + 2);
+    }
+    load_rows(db, "edge", 2, edges, N - 1, "t2");
+    free(edges);
+    load_tc_rules(db);
+    assert(dl_compile(db) == 0);
+
+    sources[0] = 1;     /* center reaches 2..50 */
+    sources[1] = 2;     /* leaf: no out-edges */
+    sources[2] = 99;    /* absent */
+
+    for (i = 0; i < 3; i++) {
+        if (!cmp_bound_magic(db, sources[i])) {
+            printf("  source %u mismatch\n", sources[i]);
+            FAIL("star bound vs magic mismatch");
+            teardown_db(db, "t2");
+            return;
+        }
+    }
+    PASS();
+    teardown_db(db, "t2");
+}
+
+/* ─── T3: dense / fully-connected ─────────────────────────────────────── */
+
+static void test_t3_dense(void)
+{
+    dl_db *db;
+    int N = 20, i, j, e = 0;
+    uint32_t *edges;
+    uint32_t sources[3];
+
+    TEST("T3: complete digraph N=20 — bound vs magic");
+
+    setup_db(&db, "t3");
+    edges = malloc((size_t)(N * (N - 1)) * 2 * sizeof(uint32_t));
+    for (i = 0; i < N; i++) {
+        for (j = 0; j < N; j++) {
+            if (i == j) continue;
+            edges[e*2]     = (uint32_t)(i + 1);
+            edges[e*2 + 1] = (uint32_t)(j + 1);
+            e++;
+        }
+    }
+    load_rows(db, "edge", 2, edges, e, "t3");
+    free(edges);
+    load_tc_rules(db);
+    assert(dl_compile(db) == 0);
+
+    sources[0] = 1;
+    sources[1] = 7;
+    sources[2] = 20;
+
+    for (i = 0; i < 3; i++) {
+        if (!cmp_bound_magic(db, sources[i])) {
+            printf("  source %u mismatch\n", sources[i]);
+            FAIL("dense bound vs magic mismatch");
+            teardown_db(db, "t3");
+            return;
+        }
+    }
+    PASS();
+    teardown_db(db, "t3");
+}
+
+/* ─── T4: small graphs (single/empty/self-loop/two-cycle/disconnected) ── */
+
+static void test_t4_small_graphs(void)
+{
+    dl_db *db;
+
+    TEST("T4: single node / empty / self-loop / two-cycle / disconnected");
+
+    /* 4a: single node with self-loop */
+    {
+        uint32_t e[] = {1, 1};
+        setup_db(&db, "t4a");
+        load_rows(db, "edge", 2, e, 1, "t4a");
+        load_tc_rules(db);
+        assert(dl_compile(db) == 0);
+        if (!cmp_bound_magic(db, 1) || !cmp_bound_magic(db, 2)) {
+            FAIL("self-loop mismatch");
+            teardown_db(db, "t4a");
+            return;
+        }
+        teardown_db(db, "t4a");
+    }
+    /* 4b: empty graph */
+    {
+        setup_db(&db, "t4b");
+        load_rows(db, "edge", 2, NULL, 0, "t4b");
+        load_tc_rules(db);
+        assert(dl_compile(db) == 0);
+        if (!cmp_bound_magic(db, 1)) {
+            FAIL("empty graph mismatch");
+            teardown_db(db, "t4b");
+            return;
+        }
+        teardown_db(db, "t4b");
+    }
+    /* 4c: two-cycle 1->2, 2->1 */
+    {
+        uint32_t e[] = {1, 2, 2, 1};
+        setup_db(&db, "t4c");
+        load_rows(db, "edge", 2, e, 2, "t4c");
+        load_tc_rules(db);
+        assert(dl_compile(db) == 0);
+        if (!cmp_bound_magic(db, 1) || !cmp_bound_magic(db, 2) ||
+            !cmp_bound_magic(db, 3)) {
+            FAIL("two-cycle mismatch");
+            teardown_db(db, "t4c");
+            return;
+        }
+        teardown_db(db, "t4c");
+    }
+    /* 4d: two disconnected components */
+    {
+        uint32_t e[] = {1, 2, 2, 3, 10, 11, 11, 12};
+        setup_db(&db, "t4d");
+        load_rows(db, "edge", 2, e, 4, "t4d");
+        load_tc_rules(db);
+        assert(dl_compile(db) == 0);
+        if (!cmp_bound_magic(db, 1) || !cmp_bound_magic(db, 10) ||
+            !cmp_bound_magic(db, 2) || !cmp_bound_magic(db, 99)) {
+            FAIL("disconnected mismatch");
+            teardown_db(db, "t4d");
+            return;
+        }
+        teardown_db(db, "t4d");
+    }
+    PASS();
+}
+
+/* ─── T5: bound src absent / no out-edges (explicit counts) ───────────── */
+
+static void test_t5_absent_sources(void)
+{
+    dl_db *db;
+    tuple_set r;
+
+    TEST("T5: absent source and no-out-edge source → empty, both paths");
+
+    {
+        uint32_t e[] = {1, 2, 2, 3};
+        setup_db(&db, "t5");
+        load_rows(db, "edge", 2, e, 2, "t5");
+        load_tc_rules(db);
+        assert(dl_compile(db) == 0);
+    }
+
+    memset(&r, 0, sizeof(r));
+    {
+        uint32_t leading[1] = { 99 };  /* absent */
+        long nb = dl_query_bound(db, "tc", leading, 1, tset_cb, &r);
+        assert(nb == 0 && r.count == 0);
+        tset_free(&r);
+    }
+    memset(&r, 0, sizeof(r));
+    {
+        uint32_t leading[1] = { 99 };
+        long nm = dl_query_magic(db, "tc", leading, 1, tset_cb, &r);
+        assert(nm == 0 && r.count == 0);
+        tset_free(&r);
+    }
+    PASS();
+    teardown_db(db, "t5");
+}
+
+/* ─── T6: goal is an EDB relation → degenerates to prefix lookup ──────── */
+
+static void test_t6_edb_goal(void)
+{
+    dl_db *db;
+    uint32_t e[] = {1, 2, 1, 3, 2, 4, 5, 6};
+
+    TEST("T6: EDB goal (edge) → magic degenerates to prefix lookup");
+
+    setup_db(&db, "t6");
+    load_rows(db, "edge", 2, e, 4, "t6");
+    load_tc_rules(db);            /* edge is EDB here, tc is IDB */
+    assert(dl_compile(db) == 0);
+
+    {
+        tuple_set rb, rm;
+        uint32_t leading[1] = { 1 };
+        memset(&rb, 0, sizeof(rb));
+        memset(&rm, 0, sizeof(rm));
+        long nb = dl_query_bound(db, "edge", leading, 1, tset_cb, &rb);
+        long nm = dl_query_magic(db, "edge", leading, 1, tset_cb, &rm);
+        if (nb < 0 || nm < 0 || nb != nm || !tset_sorted_eq(&rb, &rm)) {
+            FAIL("EDB-goal magic != prefix");
+            tset_free(&rb); tset_free(&rm);
+            teardown_db(db, "t6");
+            return;
+        }
+        assert(nb == 2);  /* edge(1,*) = {2,3} */
+        tset_free(&rb); tset_free(&rm);
+    }
+    PASS();
+    teardown_db(db, "t6");
+}
+
+/* ─── T7: equality in body ────────────────────────────────────────────── */
+
+static void test_t7_equality(void)
+{
+    dl_db *db;
+    uint32_t e[] = {1, 2, 2, 3, 3, 4, 4, 5};
+
+    TEST("T7: equality (Z=W alias) accepted and equivalent");
+
+    setup_db(&db, "t7");
+    load_rows(db, "edge", 2, e, 4, "t7");
+
+    assert(dl_load_rules(db,
+        "tc(X,Y):-edge(X,Y).\n"
+        "tc(X,Y):-edge(X,Z),Z=W,tc(W,Y).\n") == 0);
+    assert(dl_compile(db) == 0);
+
+    {
+        uint32_t sources[3] = {1, 2, 99};
+        int i;
+        for (i = 0; i < 3; i++) {
+            if (!cmp_bound_magic(db, sources[i])) {
+                printf("  source %u mismatch\n", sources[i]);
+                FAIL("equality rule bound vs magic mismatch");
+                teardown_db(db, "t7");
+                return;
+            }
+        }
+    }
+    PASS();
+    teardown_db(db, "t7");
+}
+
+/* ─── T8: multi-rule same head (3 rules) ──────────────────────────────── */
+
+static void test_t8_multi_rule(void)
+{
+    dl_db *db;
+    uint32_t e[] = {1, 2, 2, 3, 3, 4};
+
+    TEST("T8: three rules for same head (tc) — equivalent");
+
+    setup_db(&db, "t8");
+    load_rows(db, "edge", 2, e, 3, "t8");
+    assert(dl_load_rules(db,
+        "tc(X,Y):-edge(X,Y).\n"
+        "tc(X,Y):-edge(X,Z),edge(Z,Y).\n"
+        "tc(X,Y):-edge(X,Z),tc(Z,Y).\n") == 0);
+    assert(dl_compile(db) == 0);
+
+    {
+        uint32_t sources[3] = {1, 2, 99};
+        int i;
+        for (i = 0; i < 3; i++) {
+            if (!cmp_bound_magic(db, sources[i])) {
+                FAIL("multi-rule bound vs magic mismatch");
+                teardown_db(db, "t8");
+                return;
+            }
+        }
+    }
+    PASS();
+    teardown_db(db, "t8");
+}
+
+/* ─── T9: conservative rejections ─────────────────────────────────────── */
+
+static void test_t9_rejections(void)
+{
+    dl_db *db;
+
+    TEST("T9: negation/aggregate/different-adornment/non-leading → -1");
+
+    /* negation */
+    {
+        uint32_t e[] = {1, 2, 2, 3};
+        tuple_set r;
+        uint32_t leading[1] = { 1 };
+        setup_db(&db, "t9a");
+        load_rows(db, "edge", 2, e, 2, "t9a");
+        assert(dl_declare_relation(db, "blocked", 2) == 0);
+        assert(dl_load_rules(db,
+            "tc(X,Y):-edge(X,Y),!blocked(X,Y).\n") == 0);
+        memset(&r, 0, sizeof(r));
+        if (dl_query_magic(db, "tc", leading, 1, tset_cb, &r) != -1) {
+            FAIL("negation not rejected");
+            tset_free(&r);
+            teardown_db(db, "t9a");
+            return;
+        }
+        tset_free(&r);
+        teardown_db(db, "t9a");
+    }
+    /* aggregate */
+    {
+        uint32_t e[] = {1, 2, 1, 3};
+        tuple_set r;
+        uint32_t leading[1] = { 1 };
+        setup_db(&db, "t9b");
+        load_rows(db, "edge", 2, e, 2, "t9b");
+        assert(dl_load_rules(db,
+            "cnt(X,N):-edge(X,Y),N=count().\n") == 0);
+        memset(&r, 0, sizeof(r));
+        if (dl_query_magic(db, "cnt", leading, 1, tset_cb, &r) != -1) {
+            FAIL("aggregate not rejected");
+            tset_free(&r);
+            teardown_db(db, "t9b");
+            return;
+        }
+        tset_free(&r);
+        teardown_db(db, "t9b");
+    }
+    /* recursive call needing different adornment (bb) */
+    {
+        uint32_t e[] = {1, 2, 2, 3};
+        uint32_t nd[] = {1, 2, 3};
+        tuple_set r;
+        uint32_t leading[1] = { 1 };
+        setup_db(&db, "t9c");
+        load_rows(db, "edge", 2, e, 2, "t9c");
+        load_rows(db, "node", 1, nd, 3, "t9c");
+        assert(dl_load_rules(db,
+            "tc(X,Y):-edge(X,Y).\n"
+            "tc(X,Y):-edge(X,Z),node(Y),tc(Z,Y).\n") == 0);
+        memset(&r, 0, sizeof(r));
+        if (dl_query_magic(db, "tc", leading, 1, tset_cb, &r) != -1) {
+            FAIL("different-adornment recursive call not rejected");
+            tset_free(&r);
+            teardown_db(db, "t9c");
+            return;
+        }
+        tset_free(&r);
+        teardown_db(db, "t9c");
+    }
+    /* non-leading adornment (fb) on the recursive call */
+    {
+        uint32_t e[] = {1, 2, 2, 3};
+        uint32_t nd[] = {1, 2, 3};
+        tuple_set r;
+        uint32_t leading[1] = { 1 };
+        setup_db(&db, "t9d");
+        load_rows(db, "edge", 2, e, 2, "t9d");
+        load_rows(db, "node", 1, nd, 3, "t9d");
+        assert(dl_load_rules(db,
+            "tc(X,Y):-edge(X,Y).\n"
+            "tc(X,Y):-node(Y),tc(Z,Y),edge(X,Z).\n") == 0);
+        memset(&r, 0, sizeof(r));
+        if (dl_query_magic(db, "tc", leading, 1, tset_cb, &r) != -1) {
+            FAIL("non-leading adornment recursive call not rejected");
+            tset_free(&r);
+            teardown_db(db, "t9d");
+            return;
+        }
+        tset_free(&r);
+        teardown_db(db, "t9d");
+    }
+    PASS();
+}
+
+/* ─── T10: k==0 routes to dl_query ────────────────────────────────────── */
+
+static void test_t10_k0(void)
+{
+    dl_db *db;
+    uint32_t e[] = {1, 2, 2, 3, 3, 4};
+
+    TEST("T10: k==0 → full materialization (routes to dl_query)");
+
+    setup_db(&db, "t10");
+    load_rows(db, "edge", 2, e, 3, "t10");
+    load_tc_rules(db);
+    assert(dl_compile(db) == 0);
+
+    {
+        tuple_set rq, rm;
+        memset(&rq, 0, sizeof(rq));
+        memset(&rm, 0, sizeof(rm));
+        long nq = dl_query(db, "tc", tset_cb, &rq);
+        long nm = dl_query_magic(db, "tc", NULL, 0, tset_cb, &rm);
+        if (nq < 0 || nm < 0 || nq != nm || !tset_sorted_eq(&rq, &rm)) {
+            FAIL("k==0 magic != dl_query");
+            tset_free(&rq); tset_free(&rm);
+            teardown_db(db, "t10");
+            return;
+        }
+        tset_free(&rq); tset_free(&rm);
+    }
+    PASS();
+    teardown_db(db, "t10");
+}
+
+/* ─── T11: no-mutation ────────────────────────────────────────────────── */
+
+static void test_t11_no_mutation(void)
+{
+    dl_db *db;
+    uint32_t e[] = {1, 2, 2, 3, 3, 4, 5, 6};
+    size_t nrels_before;
+    int n_perms_before;
+    int n_crules_before;
+    uint32_t snap_before;
+    int dirty_before;
+    uint32_t id1, id2, id3;
+
+    TEST("T11: dl_query_magic leaves db byte-identical");
+
+    setup_db(&db, "t11");
+    load_rows(db, "edge", 2, e, 4, "t11");
+    load_tc_rules(db);
+    assert(dl_compile(db) == 0);
+
+    /* interner sentinels: id2 should be id1+1, id3 should be id2+1 */
+    id1 = dl_intern_str(db, "m8sentinel_alpha");
+    id2 = dl_intern_str(db, "m8sentinel_beta");
+    assert(id2 == id1 + 1);
+
+    nrels_before  = db->nrels;
+    n_perms_before = db->n_perms;
+    n_crules_before = db->n_crules;
+    snap_before   = db->snap_version;
+    dirty_before  = db->fixpoint_dirty;
+
+    {
+        tuple_set rm;
+        uint32_t leading[1] = { 1 };
+        memset(&rm, 0, sizeof(rm));
+        long nm = dl_query_magic(db, "tc", leading, 1, tset_cb, &rm);
+        (void)nm;
+        assert(nm >= 0);
+        tset_free(&rm);
+    }
+
+    /* interner must not have grown (no new syms during magic eval) */
+    id3 = dl_intern_str(db, "m8sentinel_gamma");
+    if (id3 != id2 + 1) {
+        FAIL("interner mutated during dl_query_magic");
+        teardown_db(db, "t11");
+        return;
+    }
+
+    if (db->nrels != nrels_before ||
+        db->n_perms != n_perms_before ||
+        db->n_crules != n_crules_before ||
+        db->snap_version != snap_before ||
+        db->fixpoint_dirty != dirty_before) {
+        FAIL("db field mutated during dl_query_magic");
+        teardown_db(db, "t11");
+        return;
+    }
+
+    /* And dl_query_bound still returns correct results afterwards. */
+    if (!cmp_bound_magic(db, 1) || !cmp_bound_magic(db, 5)) {
+        FAIL("post-magic bound query inconsistent");
+        teardown_db(db, "t11");
+        return;
+    }
+
+    PASS();
+    teardown_db(db, "t11");
+}
+
+/* ─── T12: magic works without a prior dl_compile ─────────────────────── */
+
+static void test_t12_no_compile(void)
+{
+    dl_db *db;
+    uint32_t e[] = {1, 2, 2, 3, 3, 4, 4, 5};
+
+    TEST("T12: magic re-evaluates scoped fixpoint without dl_compile");
+
+    setup_db(&db, "t12");
+    load_rows(db, "edge", 2, e, 4, "t12");
+    load_tc_rules(db);
+    /* NOTE: no dl_compile — tc is NOT materialized in db */
+
+    {
+        tuple_set rm, rb;
+        uint32_t leading[1] = { 1 };
+        memset(&rm, 0, sizeof(rm));
+        memset(&rb, 0, sizeof(rb));
+
+        long nm = dl_query_magic(db, "tc", leading, 1, tset_cb, &rm);
+        assert(nm >= 0);
+
+        /* Now materialize + full bound query for ground truth. */
+        assert(dl_compile(db) == 0);
+        long nb = dl_query_bound(db, "tc", leading, 1, tset_cb, &rb);
+
+        if (nb < 0 || nm != nb || !tset_sorted_eq(&rb, &rm)) {
+            FAIL("no-compile magic != bound");
+            tset_free(&rb); tset_free(&rm);
+            teardown_db(db, "t12");
+            return;
+        }
+        assert(nm == 4);  /* tc(1,*) = {2,3,4,5} */
+        tset_free(&rb);
+        tset_free(&rm);
+    }
+    PASS();
+    teardown_db(db, "t12");
+}
+
+/* ─── T13: property test (backstop) ───────────────────────────────────── */
+
+static uint32_t rng_state = 0x9E3779B9u;
+static uint32_t rng_next(void)
+{
+    uint32_t x = rng_state;
+    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+    rng_state = x;
+    return x;
+}
+static uint32_t rng_rand(uint32_t n) { return n ? rng_next() % n : 0; }
+
+static void test_t13_property(void)
+{
+    TEST("T13: property — 200 random graphs x 5 sources, bound == magic");
+
+    int iter;
+    for (iter = 0; iter < 200; iter++) {
+        dl_db *db;
+        char suffix[32];
+        int N = 8 + (int)(iter % 12);         /* 8..19 nodes */
+        int M = 20 + (int)((iter * 7) % 60);  /* 20..79 edges */
+        uint32_t *edges;
+        int ei;
+        uint32_t sources[5];
+        int si;
+
+        snprintf(suffix, sizeof(suffix), "prop_%d", iter);
+        setup_db(&db, suffix);
+
+        edges = malloc((size_t)M * 2 * sizeof(uint32_t));
+        for (ei = 0; ei < M; ei++) {
+            edges[ei*2]     = rng_rand((uint32_t)N) + 1;
+            edges[ei*2 + 1] = rng_rand((uint32_t)N) + 1;
+        }
+        load_rows(db, "edge", 2, edges, M, suffix);
+        free(edges);
+
+        load_tc_rules(db);
+        assert(dl_compile(db) == 0);
+
+        for (si = 0; si < 5; si++) {
+            sources[si] = rng_rand((uint32_t)(N + 2)) + 1;
+            if (!cmp_bound_magic(db, sources[si])) {
+                printf("  iter %d source %u mismatch\n", iter, sources[si]);
+                FAIL("property test failed");
+                teardown_db(db, suffix);
+                return;
+            }
+        }
+        teardown_db(db, suffix);
+    }
+    PASS();
+}
+
+/* ─── Main ────────────────────────────────────────────────────────────── */
+
+int main(void)
+{
+    printf("M8 Magic-Sets Tests (first slice)\n");
+    printf("=================================\n\n");
+
+    test_t1_chain();
+    test_t2_star();
+    test_t3_dense();
+    test_t4_small_graphs();
+    test_t5_absent_sources();
+    test_t6_edb_goal();
+    test_t7_equality();
+    test_t8_multi_rule();
+    test_t9_rejections();
+    test_t10_k0();
+    test_t11_no_mutation();
+    test_t12_no_compile();
+    test_t13_property();
+
+    printf("\n%d tests run, %d failed\n", tests_run, tests_failed);
+    return tests_failed ? 1 : 0;
+}

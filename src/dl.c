@@ -20,6 +20,7 @@
 #include "regexwalk.h"
 #include "tupleset.h"
 #include "permindex.h"
+#include "magic.h"
 #include "util.h"
 
 #include <stdlib.h>
@@ -122,6 +123,10 @@ dl_db *dl_open2(const char *dir, int *err_out)
     memset(db->vcache, 0, sizeof(db->vcache));
     db->fault_hook = NULL;
     db->fault_user = NULL;
+
+    /* M8: retained rule AST (empty until dl_load_rules) */
+    db->ast_rules = NULL;
+    db->n_ast_rules = 0;
 
     /* Load or create interner */
     {
@@ -235,6 +240,13 @@ void dl_close(dl_db *db)
         free(db->crules);
     }
 
+    /* M8: free retained rule AST */
+    if (db->ast_rules) {
+        for (i = 0; i < (size_t)db->n_ast_rules; i++)
+            rule_free(db->ast_rules[i]);
+        free(db->ast_rules);
+    }
+
     intern_free(db->ir);
     free(db->dir);
 
@@ -277,6 +289,16 @@ int dl_declare_relation(dl_db *db, const char *name, uint8_t arity)
     if (!db || !name) return -1;
     if (arity == 0 || arity > 8) return -1;
     if (db->nrels >= MAX_RELS) return -1;
+
+    /* M8: scoped-eval clones have dir==NULL.  A declaration on such a db
+     * means a missed head relation slipped through the transform — fail
+     * LOUDLY (return -1) instead of dereferencing NULL in make_path. */
+    if (!db->dir) {
+        fprintf(stderr, "error: dl_declare_relation('%s') on a filesystem-less "
+                "eval clone — transform must pre-declare all head relations\n",
+                name);
+        return -1;
+    }
 
     /* M6: reject reserved permutation index names */
     if (is_reserved_pi_name(name)) {
@@ -738,6 +760,94 @@ long dl_prefix(dl_db *db, const char *rel_name,
 
 /* ─── Rule loading & compilation (M1) ──────────────────────────────────── */
 
+/* ─── M8: AST deep-copy — retain rules for the magic-sets transform ───── */
+/*
+ * dl_load_rules frees the parsed AST after compiling (rule_free loop).  The
+ * magic-sets transform needs that AST at query time, so we deep-copy it into
+ * db->ast_rules BEFORE the free loop.  A shallow copy is a use-after-free /
+ * silent-wrong-answer hazard: every owned string (pred, args[i]->text,
+ * pattern, agg_op->text) must be duplicated, mirroring parser.c's
+ * allocation discipline exactly (strdup for text, calloc'd atom/rule).
+ */
+
+static token *ast_tok_clone(const token *t)
+{
+    token *n = calloc(1, sizeof(*n));
+    if (!n) return NULL;
+    n->kind = t->kind;
+    n->ival = t->ival;
+    if (t->text) {
+        n->text = strdup(t->text);
+        if (!n->text) { free(n); return NULL; }
+    }
+    return n;
+}
+
+static atom *ast_atom_clone(const atom *a)
+{
+    atom *n = calloc(1, sizeof(*n));
+    int i;
+    if (!n) return NULL;
+    n->pred = a->pred ? strdup(a->pred) : NULL;
+    n->negated = a->negated;
+    n->aggregate = a->aggregate;
+    if (a->pattern) {
+        n->pattern = strdup(a->pattern);
+        if (!n->pattern) goto fail;
+    }
+    if (a->agg_op) {
+        n->agg_op = ast_tok_clone(a->agg_op);
+        if (!n->agg_op) goto fail;
+    }
+    if (a->nargs > 0) {
+        n->args = calloc((size_t)a->nargs, sizeof(token *));
+        if (!n->args) goto fail;
+        n->nargs = a->nargs;
+        for (i = 0; i < a->nargs; i++) {
+            n->args[i] = ast_tok_clone(a->args[i]);
+            if (!n->args[i]) goto fail;
+        }
+    }
+    return n;
+fail:
+    {
+        /* Mirror parser.c atom_free (static) for partial cleanup */
+        int j;
+        free(n->pred);
+        free(n->pattern);
+        if (n->args) {
+            for (j = 0; j < n->nargs; j++) {
+                if (n->args[j]) { free(n->args[j]->text); free(n->args[j]); }
+            }
+            free(n->args);
+        }
+        if (n->agg_op) { free(n->agg_op->text); free(n->agg_op); }
+        free(n);
+    }
+    return NULL;
+}
+
+static rule *ast_rule_clone(const rule *r)
+{
+    rule *n = calloc(1, sizeof(*n));
+    int i;
+    if (!n) return NULL;
+    n->has_negation = r->has_negation;
+    n->has_aggregate = r->has_aggregate;
+    n->head = ast_atom_clone(r->head);
+    if (!n->head) { free(n); return NULL; }
+    if (r->nbody > 0) {
+        n->body = calloc((size_t)r->nbody, sizeof(atom *));
+        if (!n->body) { rule_free(n); return NULL; }
+        n->nbody = r->nbody;
+        for (i = 0; i < r->nbody; i++) {
+            n->body[i] = ast_atom_clone(r->body[i]);
+            if (!n->body[i]) { rule_free(n); return NULL; }
+        }
+    }
+    return n;
+}
+
 int dl_load_rules(dl_db *db, const char *dl_source)
 {
     parser *p;
@@ -762,6 +872,57 @@ int dl_load_rules(dl_db *db, const char *dl_source)
         free(rules);
         parse_free(p);
         return -1;
+    }
+
+    /* M8: retain a DEEP copy of the rule AST for the magic-sets transform.
+     * Done before the parser AST is freed and before db->crules is mutated,
+     * so a failure here leaves db untouched. */
+    {
+        int i;
+        rule **cloned = calloc((size_t)n_rules, sizeof(rule *));
+        if (!cloned) {
+            for (i = 0; i < n_compiled; i++) compiled_rule_free(new_crules[i]);
+            free(new_crules);
+            for (i = 0; i < n_rules; i++) rule_free(rules[i]);
+            free(rules);
+            parse_free(p);
+            return -1;
+        }
+        for (i = 0; i < n_rules; i++) {
+            cloned[i] = ast_rule_clone(rules[i]);
+            if (!cloned[i]) break;
+        }
+        if (i < n_rules) {
+            int j;
+            for (j = 0; j < i; j++) rule_free(cloned[j]);
+            free(cloned);
+            for (j = 0; j < n_compiled; j++) compiled_rule_free(new_crules[j]);
+            free(new_crules);
+            for (j = 0; j < n_rules; j++) rule_free(rules[j]);
+            free(rules);
+            parse_free(p);
+            return -1;
+        }
+        {
+            rule **na = realloc(db->ast_rules,
+                (size_t)(db->n_ast_rules + n_rules) * sizeof(rule *));
+            if (!na) {
+                int j;
+                for (j = 0; j < n_rules; j++) rule_free(cloned[j]);
+                free(cloned);
+                for (j = 0; j < n_compiled; j++) compiled_rule_free(new_crules[j]);
+                free(new_crules);
+                for (j = 0; j < n_rules; j++) rule_free(rules[j]);
+                free(rules);
+                parse_free(p);
+                return -1;
+            }
+            memcpy(na + db->n_ast_rules, cloned,
+                   (size_t)n_rules * sizeof(rule *));
+            free(cloned);
+            db->ast_rules = na;
+            db->n_ast_rules += n_rules;
+        }
     }
 
     /* Append compiled rules to db's list */
@@ -859,6 +1020,222 @@ long dl_query_bound(dl_db *db, const char *goal_rel,
         if (idx < 0) return -1;
         return rel_prefix(db->rels[idx].rel, leading, k, cb, user);
     }
+}
+
+/* ─── M8: magic-sets bound query (scoped re-eval, clone-and-scope) ─────── */
+
+/*
+ * Clone-and-scope (plan §6 Option C): build an eval-only dl_db that
+ *   - shallow-aliases every EDB relation pointer from src->rels (read-only:
+ *     the transform never emits an EDB head, so the VM only reads them),
+ *   - gets fresh in-memory rel_create() for the magic/adorned IDB relations
+ *     (declared by dl_query_magic before compile_rules),
+ *   - aliases the interner (read-mostly; constants are already interned so
+ *     no new syms are added),
+ *   - has dir==NULL, n_perms==0, no vcache, no lock, snap_version==0 so the
+ *     VM can never touch the filesystem.
+ *
+ * n_aliased (out) = number of borrowed rels (== src->nrels); the fresh rels
+ * are appended after them.  eval_db_free needs that boundary to avoid freeing
+ * the borrowed EDB relations/names.
+ */
+static int eval_db_clone(dl_db *src, dl_db *out)
+{
+    size_t i;
+    memset(out, 0, sizeof(*out));
+    out->dir = NULL;
+    out->ir = src->ir;
+    out->lock_fd = -1;
+    for (i = 0; i < src->nrels; i++) {
+        out->rels[i].name = src->rels[i].name;  /* borrowed — not owned */
+        out->rels[i].rel  = src->rels[i].rel;   /* borrowed — not owned */
+    }
+    out->nrels = src->nrels;
+    out->n_perms = 0;
+    return 0;
+}
+
+static void eval_db_free(dl_db *edb, size_t n_aliased)
+{
+    size_t i;
+    if (!edb) return;
+
+    /* Free compiled magic rules (if any were attached). */
+    if (edb->crules) {
+        for (i = 0; i < (size_t)edb->n_crules; i++)
+            compiled_rule_free(edb->crules[i]);
+        free(edb->crules);
+    }
+
+    /* Free fresh perm indices (never built from a file). */
+    permindex_free_all(edb);
+
+    /* Free only the fresh relations + their names (indices >= n_aliased).
+     * The first n_aliased rels/names are borrowed from src — do NOT free. */
+    for (i = n_aliased; i < edb->nrels; i++) {
+        rel_free(edb->rels[i].rel);
+        free(edb->rels[i].name);
+    }
+
+    /* ir is borrowed from src; dir is NULL; no intern_save, no rel_compact.
+     * The dl_db struct itself is owned by the caller (stack-allocated). */
+}
+
+/* Pre-declare one relation into the clone using rel_create (in-memory only,
+ * no DAFSA/WAL files).  Returns the index, or -1 on error. */
+static int eval_db_declare_inmem(dl_db *edb, const char *name, uint8_t arity)
+{
+    relation *rel;
+    if (edb->nrels >= MAX_RELS) return -1;
+    if (find_rel(edb, name) >= 0) return -1;  /* name collision */
+    rel = rel_create(arity);
+    if (!rel) return -1;
+    edb->rels[edb->nrels].name = strdup(name);
+    if (!edb->rels[edb->nrels].name) { rel_free(rel); return -1; }
+    edb->rels[edb->nrels].rel = rel;
+    edb->nrels++;
+    return 0;
+}
+
+/* Is goal_rel a rule head (i.e. IDB) in the retained AST? */
+static int ast_has_head(dl_db *db, const char *pred)
+{
+    int i;
+    for (i = 0; i < db->n_ast_rules; i++) {
+        const rule *r = db->ast_rules[i];
+        if (r && r->head && r->head->pred &&
+            strcmp(r->head->pred, pred) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+long dl_query_magic(dl_db *db, const char *goal_rel,
+                    const uint32_t *leading, uint8_t k,
+                    dl_tuple_cb cb, void *user)
+{
+    int goal_idx;
+    uint8_t goal_arity;
+    magic_program prog;
+    char reject[256];
+    dl_db edb;
+    compiled_rule **magic_crules = NULL;
+    int n_magic = 0;
+    size_t n_aliased;
+    int d;
+    long result = -1;
+
+    if (!db || !goal_rel || !cb) return -1;
+
+    /* 1. Validate + resolve goal. */
+    goal_idx = find_rel(db, goal_rel);
+    if (goal_idx < 0) return -1;
+    goal_arity = rel_arity(db->rels[goal_idx].rel);
+    if (k > goal_arity) return -1;
+
+    /* k==0 → route to dl_query (full materialization; plan Decision 8). */
+    if (k == 0)
+        return dl_query(db, goal_rel, cb, user);
+
+    /* EDB goal (not a rule head) → magic degenerates to a prefix lookup. */
+    if (!ast_has_head(db, goal_rel))
+        return dl_query_bound(db, goal_rel, leading, k, cb, user);
+
+    if (db->n_ast_rules <= 0) return -1;  /* no retained AST (shouldn't happen) */
+
+    /* 2. Clone (Option C). */
+    eval_db_clone(db, &edb);
+    n_aliased = edb.nrels;
+    memset(&prog, 0, sizeof(prog));
+
+    /* 3. Transform. */
+    if (magic_transform((const rule *const *)db->ast_rules, db->n_ast_rules,
+                        goal_rel, goal_arity, leading, k, db->ir, &prog,
+                        reject, sizeof(reject)) != 0) {
+        fprintf(stderr, "dl_query_magic: rejected: %s\n", reject);
+        goto out_free_edb;
+    }
+
+    /* 4. Pre-declare ALL head relations (adorned + magic) in-memory, so
+     * compile_rules' dl_declare_relation branch is never reached. */
+    for (d = 0; d < prog.n_decls; d++) {
+        if (eval_db_declare_inmem(&edb, prog.decls[d].name,
+                                  prog.decls[d].arity) != 0) {
+            fprintf(stderr, "dl_query_magic: cannot pre-declare '%s'\n",
+                    prog.decls[d].name);
+            magic_program_free(&prog);
+            goto out_free_edb;
+        }
+    }
+
+    /* 5. Seed the magic goal relation with the bound leading args. */
+    {
+        char magic_goal[64];
+        int m_idx;
+        if (snprintf(magic_goal, sizeof(magic_goal), "magic_%s",
+                     prog.adorned_goal) >= (int)sizeof(magic_goal)) {
+            fprintf(stderr, "dl_query_magic: magic goal name too long\n");
+            magic_program_free(&prog);
+            goto out_free_edb;
+        }
+        m_idx = find_rel(&edb, magic_goal);
+        if (m_idx < 0 || rel_arity(edb.rels[m_idx].rel) != k) {
+            fprintf(stderr, "dl_query_magic: internal: magic goal '%s' "
+                    "missing/arity-mismatch\n", magic_goal);
+            magic_program_free(&prog);
+            goto out_free_edb;
+        }
+        rel_add(edb.rels[m_idx].rel, leading);
+    }
+
+    /* 6. Compile the adorned + magic program against the clone. */
+    if (compile_rules(&edb, prog.rules, prog.n_rules,
+                      &magic_crules, &n_magic) != 0) {
+        fprintf(stderr, "dl_query_magic: compile of adorned program failed\n");
+        magic_program_free(&prog);
+        goto out_free_edb;
+    }
+
+    /* Filesystem-trap backstop: compile_rules must NOT have declared any
+     * relation (dir==NULL would have made dl_declare_relation fail, so if it
+     * reached here, nrels is still exactly src->nrels + n_decls). */
+    if (edb.dir != NULL ||
+        edb.nrels != n_aliased + (size_t)prog.n_decls) {
+        fprintf(stderr, "dl_query_magic: internal error: compile_rules grew "
+                "the eval clone's relation table (missed head relation)\n");
+        magic_program_free(&prog);
+        goto out_free_crules;
+    }
+
+    /* 7. Scoped fixpoint. */
+    if (vm_execute(&edb, magic_crules, n_magic) != 0) {
+        fprintf(stderr, "dl_query_magic: scoped fixpoint failed\n");
+        magic_program_free(&prog);
+        goto out_free_crules;
+    }
+
+    /* 8. Stream: re-apply the leading/k prefix filter on the adorned goal. */
+    {
+        int a_idx = find_rel(&edb, prog.adorned_goal);
+        if (a_idx < 0) {
+            fprintf(stderr, "dl_query_magic: internal: adorned goal '%s' "
+                    "missing\n", prog.adorned_goal);
+            magic_program_free(&prog);
+            goto out_free_crules;
+        }
+        result = rel_prefix(edb.rels[a_idx].rel, leading, k, cb, user);
+    }
+
+    magic_program_free(&prog);
+out_free_crules:
+    {
+        int i;
+        for (i = 0; i < n_magic; i++) compiled_rule_free(magic_crules[i]);
+        free(magic_crules);
+    }
+out_free_edb:
+    eval_db_free(&edb, n_aliased);
+    return result;
 }
 
 /* ─── M4: snapshot publish ─────────────────────────────────────────────── */
