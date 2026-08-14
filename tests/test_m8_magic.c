@@ -1268,6 +1268,287 @@ static void test_t42_two_adorn_property(void)
     PASS();
 }
 
+/* ─── T43: multi-recursive-atom fixpoint correctness ────────────────────
+ * Adversarial regression guard for the semi-naive fixpoint when a rule has
+ * TWO OR MORE recursive body atoms.  In that case the full-idb override for
+ * a non-delta recursive atom is passed to OP_LOOKUP/OP_LOOKUP_PERM, which
+ * run ts_prefix (a binary search requiring sorted data) on an idb that is
+ * deliberately NOT re-sorted during the loop (see vm.c rollover note).  The
+ * delta firings carry completeness, so results must still be correct.  These
+ * rules are under-covered by the rest of the suite (most TC tests use a
+ * single recursive atom).  Guards against a latent silent-wrong-answer if the
+ * redundant-accelerator assumption ever breaks. */
+
+/* Least-fixpoint oracle for the 2-recursive-atom rule
+ *   tc(X,Y):-edge(X,Y).  tc(X,Y):-tc(X,Z),tc(Z,Y).   (transitive closure) */
+static void oracle_tc2(const tuple_set *edge, tuple_set *out)
+{
+    tuple_set p = {0};
+    long i, j;
+    uint8_t ar = 2;
+    /* seed from edge */
+    for (i = 0; i < edge->count; i++) {
+        if (p.count >= p.cap) {
+            long nc = p.cap ? p.cap * 2 : 256;
+            uint32_t *nd = realloc(p.data, (size_t)nc * ar * sizeof(uint32_t));
+            if (!nd) { free(p.data); memset(&p, 0, sizeof(p)); return; }
+            p.data = nd; p.cap = nc;
+        }
+        memcpy(p.data + (size_t)p.count * ar, edge->data + (size_t)i * ar,
+               (size_t)ar * sizeof(uint32_t));
+        p.count++;
+    }
+    p.arity = ar;
+    /* fixpoint */
+    for (;;) {
+        int changed = 0;
+        for (i = 0; i < p.count; i++) {
+            uint32_t x = p.data[i*2], z = p.data[i*2+1];
+            for (j = 0; j < p.count; j++) {
+                if (p.data[j*2] != z) continue;
+                uint32_t y = p.data[j*2+1];
+                /* check (x,y) present */
+                int found = 0, k;
+                for (k = 0; k < (int)p.count; k++)
+                    if (p.data[k*2]==x && p.data[k*2+1]==y) { found = 1; break; }
+                if (!found) {
+                    if (p.count >= p.cap) {
+                        long nc = p.cap * 2;
+                        uint32_t *nd = realloc(p.data,(size_t)nc*ar*sizeof(uint32_t));
+                        if (!nd) { free(p.data); memset(&p,0,sizeof(p)); return; }
+                        p.data = nd; p.cap = nc;
+                    }
+                    p.data[p.count*2]=x; p.data[p.count*2+1]=y; p.count++;
+                    changed = 1;
+                }
+            }
+        }
+        if (!changed) break;
+    }
+    *out = p;
+}
+
+/* Compare dl_query (full materialization, the recursive fixpoint path) of a
+ * multi-recursive-atom rule against a hand-computed oracle tuple set. */
+static int cmp_full_materialization(dl_db *db, const char *rel,
+                                    const tuple_set *oracle)
+{
+    tuple_set got = {0};
+    long n = dl_query(db, rel, tset_cb, &got);
+    int eq;
+    if (n < 0) { tset_free(&got); return 0; }
+    eq = tset_sorted_eq(&got, (tuple_set *)oracle);
+    tset_free(&got);
+    return eq;
+}
+
+static void test_t43_multirecursive_fixpoint(void)
+{
+    dl_db *db;
+    tuple_set edge = {0}, oracle = {0};
+
+    TEST("T43: multi-recursive-atom fixpoint correctness (adversarial)");
+
+    /* 43a: canonical 2-recursive-atom TC — tc(X,Y):-tc(X,Z),tc(Z,Y).
+     * Graph with a cycle to force multiple fixpoint iterations and an
+     * unsorted idb during later iterations. */
+    {
+        uint32_t e[] = {1,2, 2,3, 3,1, 3,4, 4,5, 5,6, 10,11, 11,12, 12,10};
+        long nrows = 9;
+        setup_db(&db, "t43a");
+        load_rows(db, "edge", 2, e, (int)nrows, "t43a");
+        /* build oracle directly from the edges array */
+        edge.count = 0; edge.cap = 0; edge.data = NULL; edge.arity = 0;
+        {
+            int i;
+            for (i = 0; i < (int)nrows; i++) {
+                if (edge.count >= edge.cap) {
+                    long nc = edge.cap ? edge.cap*2 : 32;
+                    uint32_t *nd = realloc(edge.data,(size_t)nc*2*sizeof(uint32_t));
+                    if (!nd) { FAIL("t43a oom"); teardown_db(db,"t43a"); return; }
+                    edge.data = nd; edge.cap = nc;
+                }
+                edge.data[edge.count*2]=e[i*2]; edge.data[edge.count*2+1]=e[i*2+1];
+                edge.count++;
+            }
+            edge.arity = 2;
+        }
+        oracle_tc2(&edge, &oracle);
+        assert(dl_load_rules(db,
+            "tc(X,Y):-edge(X,Y).\n"
+            "tc(X,Y):-tc(X,Z),tc(Z,Y).\n") == 0);
+        assert(dl_compile(db) == 0);
+        if (!cmp_full_materialization(db, "tc", &oracle)) {
+            printf("  2-recursive-atom TC full materialization mismatch\n");
+            FAIL("T43a 2-recursive-atom TC fixpoint");
+            teardown_db(db, "t43a"); tset_free(&edge); tset_free(&oracle);
+            return;
+        }
+        /* also check magic == bound (uses the same fixpoint path internally) */
+        if (!cmp_bound_magic_rel(db, "tc", 1) ||
+            !cmp_bound_magic_rel(db, "tc", 3) ||
+            !cmp_bound_magic_rel(db, "tc", 99)) {
+            printf("  2-recursive-atom TC bound/magic mismatch\n");
+            FAIL("T43a 2-recursive-atom TC magic");
+            teardown_db(db, "t43a"); tset_free(&edge); tset_free(&oracle);
+            return;
+        }
+        teardown_db(db, "t43a");
+    }
+
+    /* 43b: non-redundant 2-recursive-atom rule with an EDB connector:
+     *   p(X,Y):-e(X,Y).  p(X,Y):-p(X,Z),conn(Z,W),p(W,Y).
+     * The two delta-firings are NOT redundant, so both must be correct.
+     * Oracle: least fixpoint of the same rules, computed in C. */
+    {
+        uint32_t e[]  = {1,2, 2,3, 3,4, 1,5};
+        uint32_t c[]  = {2,3, 3,4, 1,2};
+        long n_e = 4, n_c = 3;
+        /* build oracle: p seeded by e; iterate p(X,Z),conn(Z,W),p(W,Y) */
+        tuple_set p = {0}, conn = {0};
+        int i;
+        setup_db(&db, "t43b");
+        load_rows(db, "e", 2, e, (int)n_e, "t43b");
+        load_rows(db, "conn", 2, c, (int)n_c, "t43b");
+        /* seed p from e */
+        for (i = 0; i < (int)n_e; i++) {
+            if (p.count >= p.cap) {
+                long nc = p.cap ? p.cap*2 : 32;
+                uint32_t *nd = realloc(p.data,(size_t)nc*2*sizeof(uint32_t));
+                if (!nd) { FAIL("t43b oom"); teardown_db(db,"t43b");
+                           tset_free(&edge); tset_free(&oracle); return; }
+                p.data = nd; p.cap = nc;
+            }
+            p.data[p.count*2]=e[i*2]; p.data[p.count*2+1]=e[i*2+1];
+            p.count++;
+        }
+        p.arity = 2;
+        for (i = 0; i < (int)n_c; i++) {
+            if (conn.count >= conn.cap) {
+                long nc = conn.cap ? conn.cap*2 : 32;
+                uint32_t *nd = realloc(conn.data,(size_t)nc*2*sizeof(uint32_t));
+                if (!nd) { FAIL("t43b oom"); teardown_db(db,"t43b");
+                           tset_free(&edge); tset_free(&oracle); tset_free(&p);
+                           return; }
+                conn.data = nd; conn.cap = nc;
+            }
+            conn.data[conn.count*2]=c[i*2]; conn.data[conn.count*2+1]=c[i*2+1];
+            conn.count++;
+        }
+        conn.arity = 2;
+        /* fixpoint */
+        for (;;) {
+            int changed = 0, ii, jj, kk;
+            for (ii = 0; ii < (int)p.count; ii++) {
+                uint32_t x = p.data[ii*2], z = p.data[ii*2+1];
+                for (jj = 0; jj < (int)conn.count; jj++) {
+                    if (conn.data[jj*2] != z) continue;
+                    uint32_t w = conn.data[jj*2+1];
+                    for (kk = 0; kk < (int)p.count; kk++) {
+                        if (p.data[kk*2] != w) continue;
+                        uint32_t y = p.data[kk*2+1];
+                        int found = 0, f;
+                        for (f = 0; f < (int)p.count; f++)
+                            if (p.data[f*2]==x && p.data[f*2+1]==y){found=1;break;}
+                        if (!found) {
+                            if (p.count >= p.cap) {
+                                long nc = p.cap*2;
+                                uint32_t *nd=realloc(p.data,(size_t)nc*2*sizeof(uint32_t));
+                                if (!nd) { free(p.data); teardown_db(db,"t43b");
+                                    tset_free(&edge); tset_free(&oracle); return; }
+                                p.data = nd; p.cap = nc;
+                            }
+                            p.data[p.count*2]=x; p.data[p.count*2+1]=y; p.count++;
+                            changed = 1;
+                        }
+                    }
+                }
+            }
+            if (!changed) break;
+        }
+        assert(dl_load_rules(db,
+            "p(X,Y):-e(X,Y).\n"
+            "p(X,Y):-p(X,Z),conn(Z,W),p(W,Y).\n") == 0);
+        assert(dl_compile(db) == 0);
+        if (!cmp_full_materialization(db, "p", &p)) {
+            printf("  non-redundant 2-rec-atom rule mismatch\n");
+            FAIL("T43b non-redundant 2-recursive-atom fixpoint");
+            teardown_db(db, "t43b"); tset_free(&edge); tset_free(&oracle);
+            free(p.data);
+            return;
+        }
+        teardown_db(db, "t43b"); free(p.data); free(conn.data);
+    }
+
+    /* 43c: 3-recursive-atom chain — r(X,Y):-r(X,A),e(A,B),r(B,Y). */
+    {
+        uint32_t e[] = {1,2, 2,3, 3,4, 4,5, 1,6, 6,7};
+        long n_e = 6;
+        /* build oracle: r(X,Y):-e(X,Y).  r(X,Y):-r(X,A),e(A,B),r(B,Y). */
+        tuple_set p = {0};
+        int i;
+        setup_db(&db, "t43c");
+        load_rows(db, "e", 2, e, (int)n_e, "t43c");
+        for (i = 0; i < (int)n_e; i++) {
+            if (p.count >= p.cap) {
+                long nc = p.cap ? p.cap*2 : 32;
+                uint32_t *nd = realloc(p.data,(size_t)nc*2*sizeof(uint32_t));
+                if (!nd) { FAIL("t43c oom"); teardown_db(db,"t43c");
+                           tset_free(&edge); tset_free(&oracle); return; }
+                p.data = nd; p.cap = nc;
+            }
+            p.data[p.count*2]=e[i*2]; p.data[p.count*2+1]=e[i*2+1];
+            p.count++;
+        }
+        p.arity = 2;
+        for (;;) {
+            int changed = 0, ii, jj, kk;
+            for (ii = 0; ii < (int)p.count; ii++) {
+                uint32_t x = p.data[ii*2], a = p.data[ii*2+1];
+                for (jj = 0; jj < (int)n_e; jj++) {
+                    if (e[jj*2] != a) continue;
+                    uint32_t b = e[jj*2+1];
+                    for (kk = 0; kk < (int)p.count; kk++) {
+                        if (p.data[kk*2] != b) continue;
+                        uint32_t y = p.data[kk*2+1];
+                        int found = 0, f;
+                        for (f = 0; f < (int)p.count; f++)
+                            if (p.data[f*2]==x && p.data[f*2+1]==y){found=1;break;}
+                        if (!found) {
+                            if (p.count >= p.cap) {
+                                long nc = p.cap*2;
+                                uint32_t *nd=realloc(p.data,(size_t)nc*2*sizeof(uint32_t));
+                                if (!nd) { free(p.data); teardown_db(db,"t43c");
+                                    tset_free(&edge); tset_free(&oracle); return; }
+                                p.data = nd; p.cap = nc;
+                            }
+                            p.data[p.count*2]=x; p.data[p.count*2+1]=y; p.count++;
+                            changed = 1;
+                        }
+                    }
+                }
+            }
+            if (!changed) break;
+        }
+        assert(dl_load_rules(db,
+            "r(X,Y):-e(X,Y).\n"
+            "r(X,Y):-r(X,A),e(A,B),r(B,Y).\n") == 0);
+        assert(dl_compile(db) == 0);
+        if (!cmp_full_materialization(db, "r", &p)) {
+            printf("  3-recursive-atom chain mismatch\n");
+            FAIL("T43c 3-recursive-atom fixpoint");
+            teardown_db(db, "t43c"); tset_free(&edge); tset_free(&oracle);
+            free(p.data);
+            return;
+        }
+        teardown_db(db, "t43c"); free(p.data);
+    }
+
+    tset_free(&edge);
+    tset_free(&oracle);
+    PASS();
+}
+
 /* ─── T19: extended multi-predicate property test ─────────────────────── */
 
 static void test_t19_multipred_property(void)
@@ -2132,6 +2413,7 @@ int main(void)
     test_t40_recursion_spawns_variant();
     test_t41_adornment_blowup();
     test_t42_two_adorn_property();
+    test_t43_multirecursive_fixpoint();
 
     printf("\n%d tests run, %d failed\n", tests_run, tests_failed);
     return tests_failed ? 1 : 0;

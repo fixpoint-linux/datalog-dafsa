@@ -1071,6 +1071,34 @@ static int eval_stratum_recursive(dl_db *db, compiled_rule **rules, int n)
     if (nr == 0)
         return eval_nonrecursive(db, rules, n);
 
+    /* ── 1b. Decide whether the full-idb override must be kept sorted ──
+     * A non-delta OP_LOOKUP recursive body atom is evaluated via ts_prefix
+     * (binary search, requires SORTED data) over the full-idb override.  idb
+     * is grown via ts_add during the loop (unsorted tail).  If a rule has
+     * TWO OR MORE plain-OP_LOOKUP recursive atoms (e.g. magic-sets'
+     * tc__bf(X,Y):-magic_tc__bf(X),tc__bf(X,Z),tc__bf(Z,Y) — the magic guard
+     * binds X so BOTH tc atoms are leading-bound OP_LOOKUP), then every delta
+     * firing leaves at least one OP_LOOKUP atom on the unsorted idb, so
+     * ts_prefix silently misses tuples (silent wrong answer).  OP_SCAN is
+     * order-independent and OP_LOOKUP_PERM reads a per-iteration re-sorted
+     * shadow, so they never need this.  We therefore re-sort idb each
+     * iteration ONLY when such a rule exists, preserving the M2 perf win
+     * (idb left unsorted) for the common single-recursive-atom /
+     * OP_SCAN-first shapes. */
+    int need_idb_sort = 0;
+    for (i = 0; i < n; i++) {
+        compiled_rule *cr = rules[i];
+        int n_lookup = 0, ii;
+        if (!cr->is_recursive) continue;
+        for (ii = 0; ii < cr->n_instrs; ii++) {
+            const vm_instr *in = &cr->instrs[ii];
+            if (in->op != OP_LOOKUP) continue;
+            if (rp_idx[in->a] < 0) continue;  /* not a recursive body atom */
+            n_lookup++;
+        }
+        if (n_lookup >= 2) { need_idb_sort = 1; break; }
+    }
+
     /* ── 2. Allocate IDB and delta tuple_sets ──────────────────────── */
     typedef struct {
         int        rel_id;
@@ -1332,6 +1360,13 @@ static int eval_stratum_recursive(dl_db *db, compiled_rule **rules, int n)
             /* M6: rebuild perm shadows from current (post-rollover) idb */
             REBUILD_PERM_SHADOWS();
 
+            /* Keep idb sorted for non-delta OP_LOOKUP ts_prefix lookups when
+             * the stratum has a rule with ≥2 plain-OP_LOOKUP recursive atoms
+             * (see the need_idb_sort decision above). */
+            if (need_idb_sort) {
+                for (i = 0; i < nr; i++) ts_sort(&rd[i].idb);
+            }
+
             /* Reset next_delta for this iteration */
             for (i = 0; i < nr; i++)
                 ts_reset(&rd[i].next_delta);
@@ -1399,7 +1434,16 @@ static int eval_stratum_recursive(dl_db *db, compiled_rule **rules, int n)
                             overrides[n_ov].ts = &rd[bdi].delta;
                             overrides[n_ov].perm_id = -1;
                         } else {
-                            /* Full IDB */
+                            /* Full IDB.  rd[jbdi].idb is kept sorted when the
+                             * stratum has a rule with ≥2 plain-OP_LOOKUP
+                             * recursive atoms (see need_idb_sort above), so the
+                             * ts_prefix binary search in OP_LOOKUP is correct.
+                             * For the common shapes idb stays unsorted, which is
+                             * safe: OP_SCAN is order-independent, OP_LOOKUP_PERM
+                             * reads a per-iteration re-sorted shadow, and a single
+                             * OP_LOOKUP atom is always the delta (never the
+                             * non-delta override).  Do NOT unconditionally re-sort
+                             * idb here — that was the M2 perf bottleneck. */
                             overrides[n_ov].body_idx = (int)jin->body_idx;
                             overrides[n_ov].ts = &rd[jbdi].idb;
                             overrides[n_ov].perm_id = -1;
@@ -1448,14 +1492,16 @@ static int eval_stratum_recursive(dl_db *db, compiled_rule **rules, int n)
                     }
                     (void)n_out;
 
-                    /* Add new tuples to idb and next_delta */
+                    /* Add new tuples to next_delta only.  idb is FROZEN during
+                     * the firing sub-loop so that every non-delta OP_LOOKUP
+                     * ts_prefix read (binary search) stays on sorted data; new
+                     * tuples are merged into idb at rollover. */
                     {
                         long ci;
                         for (ci = 0; ci < cand.count; ci++) {
                             const uint32_t *t = cand.data +
                                 ci * cand.arity;
                             if (!ts_contains(&rd[hdi].idb, t)) {
-                                ts_add(&rd[hdi].idb, t);
                                 ts_add(&rd[hdi].next_delta, t);
                             }
                         }
@@ -1481,6 +1527,16 @@ static int eval_stratum_recursive(dl_db *db, compiled_rule **rules, int n)
             for (i = 0; i < nr; i++) {
                 if (rd[i].next_delta.count > 0) {
                     ts_sort(&rd[i].next_delta);
+                    /* Merge the iteration's new tuples into idb.  They are
+                     * appended unsorted; the top-of-iteration ts_sort (when
+                     * need_idb_sort) re-sorts before the next firing round. */
+                    {
+                        long ci;
+                        for (ci = 0; ci < rd[i].next_delta.count; ci++) {
+                            ts_add(&rd[i].idb,
+                                   rd[i].next_delta.data + ci * rd[i].arity);
+                        }
+                    }
                     /* Swap delta and next_delta */
                     {
                         tuple_set tmp = rd[i].delta;
@@ -1494,9 +1550,9 @@ static int eval_stratum_recursive(dl_db *db, compiled_rule **rules, int n)
                     memset(&rd[i].delta, 0, sizeof(rd[i].delta));
                     rd[i].delta.arity = rd[i].arity;
                 }
-                /* Note: idb is NOT sorted here — it's only used via
-                 * ts_contains/ts_add (hash, O(1)) during the fixpoint.
-                 * Sorting 125K tuples 500× was the bottleneck. */
+                /* Note: idb is NOT sorted here in the rollover — when needed it
+                 * is re-sorted at the TOP of each iteration (see need_idb_sort).
+                 * idb is otherwise only grown via ts_contains/ts_add (hash, O(1)). */
             }
         }
     }
