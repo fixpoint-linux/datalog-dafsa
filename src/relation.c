@@ -32,7 +32,8 @@
 #define MAX_KEY_LEN (MAX_ARITY * 4 + 1)  /* 33 */
 
 struct relation {
-    dafsa     *d;
+    dafsa     *d;         /* VIEW = base ∪ derived; all reads enumerate this */
+    dafsa     *base;      /* BASE = durable EDB facts; base == d for EDB-only */
     uint8_t    arity;
     dafsa_wal *wal;       /* M7: per-relation WAL handle, or NULL */
     char      *wal_path;  /* M7: path to WAL file (owned) */
@@ -91,6 +92,7 @@ relation *rel_create(uint8_t arity)
     rel->d = dafsa_create();
     if (!rel->d) { free(rel); return NULL; }
 
+    rel->base = rel->d;   /* EDB-only: base aliases view */
     rel->arity = arity;
     return rel;
 }
@@ -111,6 +113,7 @@ relation *rel_open(const char *path, uint8_t arity)
         if (!rel->d) { free(rel); return NULL; }
     }
 
+    rel->base = rel->d;   /* EDB-only: base aliases view */
     rel->arity = arity;
     return rel;
 }
@@ -121,9 +124,16 @@ int rel_save(const relation *rel, const char *path)
     return dafsa_save(rel->d, path);
 }
 
+int rel_save_base(const relation *rel, const char *path)
+{
+    if (!rel || !path) return -1;
+    return dafsa_save(rel->base, path);
+}
+
 void rel_free(relation *rel)
 {
     if (!rel) return;
+    if (rel->base != rel->d) dafsa_free(rel->base);
     dafsa_free(rel->d);
     if (rel->wal) dafsa_wal_close(rel->wal);
     free(rel->wal_path);
@@ -137,37 +147,67 @@ uint8_t rel_arity(const relation *rel)
 
 /* ─── Fact operations ─────────────────────────────────────────────────── */
 
-int rel_add(relation *rel, const uint32_t *cols)
+static int rel_add_d(relation *rel, dafsa *d, const uint32_t *cols)
 {
     unsigned char key[MAX_KEY_LEN];
     size_t key_len;
 
-    if (!rel || !cols) return -1;
+    if (!rel || !d || !cols) return -1;
 
     key_len = encode_key(key, cols, rel->arity);
-    return dafsa_add_n(rel->d, key, key_len);
+    return dafsa_add_n(d, key, key_len);
+}
+
+int rel_add(relation *rel, const uint32_t *cols)
+{
+    return rel_add_d(rel, rel ? rel->d : NULL, cols);
+}
+
+int rel_add_base(relation *rel, const uint32_t *cols)
+{
+    return rel_add_d(rel, rel ? rel->base : NULL, cols);
+}
+
+static int rel_exact_d(const relation *rel, const dafsa *d, const uint32_t *cols)
+{
+    unsigned char key[MAX_KEY_LEN];
+    size_t key_len;
+
+    if (!rel || !d || !cols) return 0;
+
+    key_len = encode_key(key, cols, rel->arity);
+    return dafsa_lookup_n(d, key, key_len);
 }
 
 int rel_exact(const relation *rel, const uint32_t *cols)
 {
-    unsigned char key[MAX_KEY_LEN];
-    size_t key_len;
-
-    if (!rel || !cols) return 0;
-
-    key_len = encode_key(key, cols, rel->arity);
-    return dafsa_lookup_n(rel->d, key, key_len);
+    return rel_exact_d(rel, rel ? rel->d : NULL, cols);
 }
 
-int rel_delete(relation *rel, const uint32_t *cols)
+int rel_exact_base(const relation *rel, const uint32_t *cols)
+{
+    return rel_exact_d(rel, rel ? rel->base : NULL, cols);
+}
+
+static int rel_delete_d(relation *rel, dafsa *d, const uint32_t *cols)
 {
     unsigned char key[MAX_KEY_LEN];
     size_t key_len;
 
-    if (!rel || !cols) return -1;
+    if (!rel || !d || !cols) return -1;
 
     key_len = encode_key(key, cols, rel->arity);
-    return dafsa_delete_n(rel->d, key, key_len);
+    return dafsa_delete_n(d, key, key_len);
+}
+
+int rel_delete(relation *rel, const uint32_t *cols)
+{
+    return rel_delete_d(rel, rel ? rel->d : NULL, cols);
+}
+
+int rel_delete_base(relation *rel, const uint32_t *cols)
+{
+    return rel_delete_d(rel, rel ? rel->base : NULL, cols);
 }
 
 /* ─── Prefix enumeration ──────────────────────────────────────────────── */
@@ -225,21 +265,21 @@ static int prefix_dfs(const dafsa *d, unsigned int state,
     return 0;
 }
 
-long rel_prefix(const relation *rel,
-                const uint32_t *leading, uint8_t k,
-                rel_enum_cb cb, void *user)
+static long rel_prefix_d(const relation *rel, const dafsa *d,
+                         const uint32_t *leading, uint8_t k,
+                         rel_enum_cb cb, void *user)
 {
     unsigned int current;
     unsigned char buf[MAX_KEY_LEN];
     struct prefix_ctx ctx;
     uint8_t i;
 
-    if (!rel || !cb) return -1;
+    if (!rel || !d || !cb) return -1;
     if (k > rel->arity) return -1;
     if (k > 0 && !leading) return -1;
 
     /* Walk the k*4 prefix bytes */
-    current = rel->d->initial;
+    current = d->initial;
     for (i = 0; i < k; i++) {
         unsigned char col_be[4];
         int tr;
@@ -254,9 +294,9 @@ long rel_prefix(const relation *rel,
         }
 
         for (int b = 0; b < 4; b++) {
-            tr = trans_find(&rel->d->states[current], col_be[b]);
+            tr = trans_find(&d->states[current], col_be[b]);
             if (tr < 0) return 0;  /* prefix not found */
-            current = trans_arr_c(&rel->d->states[current])[tr].target;
+            current = trans_arr_c(&d->states[current])[tr].target;
         }
     }
 
@@ -268,8 +308,22 @@ long rel_prefix(const relation *rel,
     ctx.user    = user;
     ctx.count   = 0;
 
-    prefix_dfs(rel->d, current, buf, 0, &ctx);
+    prefix_dfs(d, current, buf, 0, &ctx);
     return ctx.count;
+}
+
+long rel_prefix(const relation *rel,
+                const uint32_t *leading, uint8_t k,
+                rel_enum_cb cb, void *user)
+{
+    return rel_prefix_d(rel, rel ? rel->d : NULL, leading, k, cb, user);
+}
+
+long rel_prefix_base(const relation *rel,
+                     const uint32_t *leading, uint8_t k,
+                     rel_enum_cb cb, void *user)
+{
+    return rel_prefix_d(rel, rel ? rel->base : NULL, leading, k, cb, user);
 }
 
 /* ─── Bulk build from tuple set ──────────────────────────────────────── */
@@ -284,66 +338,129 @@ int ts_sink_cb(const uint32_t *cols, uint8_t arity, void *user)
     return (ts_add(ts, cols) < 0) ? -1 : 0;
 }
 
-int rel_build_from_tupleset(relation *rel, const struct tuple_set *ts)
+/* Build a fresh minimal DAFSA from a SORTED, DEDUPLICATED tuple_set.
+ * Returns NULL on error/OOM. */
+static dafsa *dafsa_build_from_ts(const struct tuple_set *ts, uint8_t arity)
 {
     unsigned char **keys = NULL;
     size_t        *lens = NULL;
     dafsa         *new_d = NULL;
     long           n;
-    int            ret = -1;
-
-    if (!rel || !ts) return -1;
-    if (ts->arity != rel->arity) return -1;
+    long           i;
 
     n = ts->count;
+    if (n == 0)
+        return dafsa_create();
 
-    if (n == 0) {
-        /* Empty set: just reset to an empty DAFSA */
-        dafsa *empty = dafsa_create();
-        if (!empty) return -1;
-        dafsa_free(rel->d);
-        rel->d = empty;
-        return 0;
-    }
-
-    /* Build keys[] and lens[] arrays from the sorted tuple_set.
-     * Each key is 4*arity+1 bytes: u32BE columns + trailing \0. */
     keys = calloc((size_t)n, sizeof(unsigned char *));
     lens = calloc((size_t)n, sizeof(size_t));
     if (!keys || !lens) goto out;
 
-    {
-        long i;
-        for (i = 0; i < n; i++) {
-            const uint32_t *cols = ts->data + (size_t)i * ts->arity;
-            unsigned char *key = malloc(MAX_KEY_LEN);
-            if (!key) goto out;
-            keys[i] = key;
-            lens[i] = encode_key(key, cols, ts->arity);
-        }
+    for (i = 0; i < n; i++) {
+        const uint32_t *cols = ts->data + (size_t)i * ts->arity;
+        unsigned char *key = malloc(MAX_KEY_LEN);
+        if (!key) goto out;
+        keys[i] = key;
+        lens[i] = encode_key(key, cols, arity);
     }
 
     new_d = dafsa_build_sorted((const unsigned char *const *)keys,
                                (const size_t *)lens, (size_t)n);
-    if (!new_d) goto out;
-
-    /* Swap: free old DAFSA, install new one */
-    dafsa_free(rel->d);
-    rel->d = new_d;
-    new_d = NULL;  /* prevent double-free */
-    ret = 0;
 
 out:
     if (keys) {
-        long i;
         for (i = 0; i < n; i++)
             free(keys[i]);
         free(keys);
     }
     free(lens);
-    /* new_d is only non-NULL on failure — discard */
-    dafsa_free(new_d);
-    return ret;
+    return new_d;
+}
+
+int rel_build_from_tupleset(relation *rel, const struct tuple_set *ts)
+{
+    dafsa *new_d;
+    int    aliased;
+
+    if (!rel || !ts) return -1;
+    if (ts->arity != rel->arity) return -1;
+
+    new_d = dafsa_build_from_ts(ts, rel->arity);
+    if (!new_d) return -1;
+
+    aliased = (rel->base == rel->d);
+    dafsa_free(rel->d);
+    rel->d = new_d;
+    if (aliased) rel->base = rel->d;   /* keep base aliased for EDB rels */
+    return 0;
+}
+
+int rel_build_base_from_tupleset(relation *rel, const struct tuple_set *ts)
+{
+    dafsa *new_b;
+    int    aliased;
+
+    if (!rel || !ts) return -1;
+    if (ts->arity != rel->arity) return -1;
+
+    new_b = dafsa_build_from_ts(ts, rel->arity);
+    if (!new_b) return -1;
+
+    aliased = (rel->base == rel->d);
+    dafsa_free(rel->base);
+    rel->base = new_b;
+    if (aliased) rel->d = rel->base;   /* keep view aliased for EDB rels */
+    return 0;
+}
+
+/* Copy the facts of `src` into a fresh minimal DAFSA (via enumeration +
+ * bulk build). */
+static dafsa *dafsa_copy_from(const relation *rel, const dafsa *src)
+{
+    tuple_set ts;
+    dafsa *out = NULL;
+
+    if (!rel || !src) return NULL;
+    if (ts_init(&ts, rel->arity) != 0) return NULL;
+    if (rel_prefix_d(rel, src, NULL, 0, ts_sink_cb, &ts) < 0) {
+        ts_free(&ts);
+        return NULL;
+    }
+    ts_sort(&ts);
+    out = dafsa_build_from_ts(&ts, rel->arity);
+    ts_free(&ts);
+    return out;
+}
+
+/* ─── Base/view partition (IVM Slice 0) ────────────────────────────────── */
+
+int rel_is_idb(const relation *rel)
+{
+    return rel ? (rel->base != rel->d) : 0;
+}
+
+int rel_reset_view(relation *rel)
+{
+    if (!rel) return -1;
+
+    if (rel->base == rel->d) {
+        /* First evaluation as a derived relation: SPLIT base from view.
+         * At this point the view holds only base facts (no derivation has
+         * run yet), so base = copy of view, and view already == base. */
+        dafsa *nb = dafsa_copy_from(rel, rel->d);
+        if (!nb) return -1;
+        rel->base = nb;
+        return 0;
+    }
+
+    /* Already split: drop stale derived facts — view = copy of base. */
+    {
+        dafsa *nv = dafsa_copy_from(rel, rel->base);
+        if (!nv) return -1;
+        dafsa_free(rel->d);
+        rel->d = nv;
+    }
+    return 0;
 }
 
 /* ─── WAL operations (M7) ──────────────────────────────────────────────── */
@@ -365,10 +482,10 @@ static int wal_replay_cb(uint8_t op, const unsigned char *key,
     if (ctx->ok != 0) return 0;  /* already failed, skip */
 
     if (op == DAFSA_WAL_OP_ADD) {
-        rc = dafsa_add_n(ctx->rel->d, key, key_len);
+        rc = dafsa_add_n(ctx->rel->base, key, key_len);
         if (rc < 0) ctx->ok = -1;
     } else if (op == DAFSA_WAL_OP_DEL) {
-        rc = dafsa_delete_n(ctx->rel->d, key, key_len);
+        rc = dafsa_delete_n(ctx->rel->base, key, key_len);
         if (rc < 0) ctx->ok = -1;
     }
     return 0;
@@ -431,8 +548,10 @@ int rel_compact(relation *rel, const char *dafsa_path)
 {
     if (!rel || !rel->wal || !dafsa_path) return -1;
 
-    /* 1. Save DAFSA atomically (dafsa_save already does tmp+fsync+rename+dir-fsync) */
-    if (dafsa_save(rel->d, dafsa_path) != 0) return -1;
+    /* 1. Save the BASE DAFSA atomically (WAL records are base-only ops, so
+     * the base DAFSA is their durable home; dafsa_save already does
+     * tmp+fsync+rename+dir-fsync). */
+    if (dafsa_save(rel->base, dafsa_path) != 0) return -1;
 
     /* 2. ftruncate WAL to 16 bytes (header-only) and fsync */
     if (ftruncate(rel->wal->fd, 16) != 0) return -1;
@@ -454,8 +573,8 @@ uint64_t rel_wal_size(const relation *rel)
 uint64_t rel_dafsa_size(const relation *rel)
 {
     dafsa_stats_out st;
-    if (!rel || !rel->d) return 0;
-    dafsa_stats(rel->d, &st);
+    if (!rel || !rel->base) return 0;
+    dafsa_stats(rel->base, &st);
     /* Return a rough byte estimate based on state/transition counts.
      * This is used for the 25% compaction threshold. */
     uint64_t est = (uint64_t)st.n_states_reachable * 64ULL  /* ~64B per State */
@@ -481,6 +600,7 @@ relation *rel_open_writable(const char *dafsa_path, const char *wal_path,
         rel->d = dafsa_create();
         if (!rel->d) { free(rel); return NULL; }
     }
+    rel->base = rel->d;   /* EDB-only: base aliases view */
     rel->arity = arity;
 
     /* Open WAL (rw) — auto-repairs torn tail */
@@ -503,6 +623,69 @@ relation *rel_open_writable(const char *dafsa_path, const char *wal_path,
         }
         /* Compact immediately: save DAFSA + truncate WAL */
         if (rel_compact(rel, dafsa_path) != 0) {
+            rel_free(rel);
+            return NULL;
+        }
+    }
+
+    return rel;
+}
+
+/* Open a rule-head (IDB) relation: base and view are SEPARATE DAFSAs.
+ * WAL replays into base only; the view is left as-is (re-derived later by
+ * the VM). */
+relation *rel_open_writable_idb(const char *base_path, const char *dafsa_path,
+                                const char *wal_path, uint8_t arity)
+{
+    relation *rel;
+    int wal_exists = 0;
+
+    if (arity == 0 || arity > MAX_ARITY) return NULL;
+
+    rel = calloc(1, sizeof(*rel));
+    if (!rel) return NULL;
+
+    /* Load base DAFSA */
+    rel->base = dafsa_load(base_path);
+    if (!rel->base) {
+        rel->base = dafsa_create();
+        if (!rel->base) { free(rel); return NULL; }
+    }
+
+    /* Load view DAFSA (base ∪ derived, as last materialized) */
+    rel->d = dafsa_load(dafsa_path);
+    if (!rel->d) {
+        rel->d = dafsa_create();
+        if (!rel->d) { dafsa_free(rel->base); free(rel); return NULL; }
+    }
+    rel->arity = arity;
+
+    /* Open WAL (rw) — auto-repairs torn tail */
+    {
+        struct stat st;
+        wal_exists = (stat(wal_path, &st) == 0 && st.st_size > 16);
+    }
+
+    rel->wal = dafsa_wal_open_rw(wal_path);
+    if (!rel->wal) {
+        dafsa_free(rel->d); dafsa_free(rel->base); free(rel);
+        return NULL;
+    }
+
+    rel->wal_path = strdup(wal_path);
+    if (!rel->wal_path) {
+        dafsa_wal_close(rel->wal);
+        dafsa_free(rel->d); dafsa_free(rel->base); free(rel);
+        return NULL;
+    }
+
+    /* Replay WAL into BASE and compact immediately. */
+    if (wal_exists) {
+        if (rel_wal_replay_into(rel) != 0) {
+            rel_free(rel);
+            return NULL;
+        }
+        if (rel_compact(rel, base_path) != 0) {
             rel_free(rel);
             return NULL;
         }

@@ -1839,6 +1839,32 @@ int vm_execute(dl_db *db, compiled_rule **rules, int n_rules)
 
     if (!db || !rules || n_rules <= 0) return 0;
 
+    /* IVM Slice 0 (deletion-correctness): before re-evaluating, reset every
+     * rule-head relation's VIEW to a copy of its BASE, dropping any stale
+     * derived tuples from a prior evaluation.  Without this the evaluator is
+     * ADD-ONLY: a deleted base fact would leave its previously-derived
+     * tuples in the view and the fixpoint would re-union them.  The first
+     * reset for a freshly-declared head also SPLITs base off from the view
+     * (rel_reset_view), so subsequent base writes no longer alias the view. */
+    {
+        uint8_t seen[MAX_RELS];
+        memset(seen, 0, sizeof(seen));
+        for (i = 0; i < n_rules; i++) {
+            uint8_t hid = rules[i]->head_rel_id;
+            relation *r;
+            if (hid >= MAX_RELS) return -1;
+            if (seen[hid]) continue;
+            seen[hid] = 1;
+            r = db_rel(db, hid);
+            if (!r) return -1;
+            if (rel_reset_view(r) != 0) return -1;
+            /* IVM Slice 0: the view DAFSA was just replaced — mark perms dirty
+             * so the permindex_build_dirty below rebuilds them from the fresh
+             * copy-of-base view, not the stale OLD-view perm DAFSAs. */
+            permindex_mark_dirty(db, hid);
+        }
+    }
+
     /* M6: build dirty permutation indices before evaluation */
     if (permindex_build_dirty(db) != 0) return -1;
 

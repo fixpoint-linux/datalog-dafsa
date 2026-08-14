@@ -783,6 +783,21 @@ static int compute_strata(dl_db *db, rule **rules, int n_rules,
      * for recursive heads) silently discards Q's output during the
      * fixpoint, and Q is only ever evaluated during the seed phase —
      * before the recursive fixpoint completes. */
+
+    /* Seed recursion from ALREADY-COMPILED rules.  Rules may be loaded in
+     * several dl_load_rules batches; a later batch's non-recursive rule that
+     * depends on an EARLIER batch's recursive predicate sees no self-loop in
+     * its own edge set, so the SCC pass above would not mark that predicate
+     * recursive and the strict-stratification bump below would never fire.
+     * With the IVM base/view reset, evaluating such a dependent in the same
+     * stratum would read the recursive head BEFORE it is (re-)materialized —
+     * a silent wrong answer.  Carry recursion across batches. */
+    for (i = 0; i < db->n_crules; i++) {
+        compiled_rule *pcr = db->crules[i];
+        if (pcr->is_recursive && pcr->head_rel_id < (uint8_t)nrels)
+            out_recursive[pcr->head_rel_id] = 1;
+    }
+
     {
         int changed, iter2 = 0;
         do {

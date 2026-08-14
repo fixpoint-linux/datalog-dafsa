@@ -42,6 +42,11 @@ extern int vm_nomaterialize;
 extern int vm_export_relid;
 extern tuple_set *vm_export_ts;
 
+/* Forward decls (defined in the Schema section below). */
+static int  dl_declare_relation_kind(dl_db *db, const char *name,
+                                     uint8_t arity, int is_idb);
+static void write_rels_txt(dl_db *db);
+
 /* ─── Internal helpers ────────────────────────────────────────────────── */
 
 /* Find a relation by name, return index or -1 */
@@ -155,7 +160,10 @@ dl_db *dl_open2(const char *dir, int *err_out)
         }
     }
 
-    /* Load existing relations from metadata file */
+    /* Load existing relations from metadata file.  Read the WHOLE file into
+     * a temporary array BEFORE declaring any relation: declaring rewrites
+     * rels.txt, so declaring inside the read loop would truncate the file
+     * mid-read and silently drop relations. */
     rels_path = make_path(db, "rels", ".txt");
     if (rels_path) {
         rf = fopen(rels_path, "r");
@@ -163,21 +171,39 @@ dl_db *dl_open2(const char *dir, int *err_out)
             char *line = NULL;
             size_t cap = 0;
             ssize_t len;
-            while ((len = getline(&line, &cap, rf)) > 0) {
+            char rel_names[MAX_RELS][256];
+            uint8_t rel_arities[MAX_RELS];
+            uint8_t rel_idb[MAX_RELS];
+            size_t n_meta = 0;
+
+            while ((len = getline(&line, &cap, rf)) > 0 && n_meta < MAX_RELS) {
                 char *colon;
                 if (len > 0 && line[len-1] == '\n') line[--len] = '\0';
                 if (len > 0 && line[len-1] == '\r') line[--len] = '\0';
                 colon = strchr(line, ':');
                 if (colon) {
                     *colon = '\0';
-                    int arity = atoi(colon + 1);
-                    if (arity >= 1 && arity <= 8 && db->nrels < MAX_RELS) {
-                        dl_declare_relation(db, line, (uint8_t)arity);
+                    char *rest = colon + 1;
+                    int arity = atoi(rest);
+                    int is_idb = 0;
+                    char *colon2 = strchr(rest, ':');
+                    if (colon2 && strcmp(colon2 + 1, "idb") == 0) is_idb = 1;
+                    if (arity >= 1 && arity <= 8 && line[0] != '\0') {
+                        snprintf(rel_names[n_meta], sizeof(rel_names[n_meta]),
+                                 "%s", line);
+                        rel_arities[n_meta] = (uint8_t)arity;
+                        rel_idb[n_meta] = (uint8_t)is_idb;
+                        n_meta++;
                     }
                 }
             }
             free(line);
             fclose(rf);
+
+            for (size_t mi = 0; mi < n_meta; mi++) {
+                dl_declare_relation_kind(db, rel_names[mi],
+                                         rel_arities[mi], rel_idb[mi]);
+            }
         }
         free(rels_path);
     }
@@ -211,28 +237,32 @@ void dl_close(dl_db *db)
         free(rev_path);
     }
 
-    /* M7: compact each relation (save DAFSA + truncate WAL) then save */
+    /* M7/IVM: compact each relation's BASE (save + truncate WAL).  Rule-head
+     * (IDB) relations additionally persist their VIEW to <name>.dafsa>. */
     for (i = 0; i < db->nrels; i++) {
-        char *path = make_path(db, db->rels[i].name, ".dafsa");
-        if (path) {
-            rel_compact(db->rels[i].rel, path);
-            free(path);
+        char *path;
+        if (rel_is_idb(db->rels[i].rel)) {
+            path = make_path(db, db->rels[i].name, ".base.dafsa");
+            if (path) {
+                rel_compact(db->rels[i].rel, path);
+                free(path);
+            }
+            path = make_path(db, db->rels[i].name, ".dafsa");
+            if (path) {
+                rel_save(db->rels[i].rel, path);
+                free(path);
+            }
+        } else {
+            path = make_path(db, db->rels[i].name, ".dafsa");
+            if (path) {
+                rel_compact(db->rels[i].rel, path);
+                free(path);
+            }
         }
     }
 
-    /* Save relation metadata (name:arity per line) while names/rels are alive */
-    {
-        char *rels_path = make_path(db, "rels", ".txt");
-        FILE *rf;
-        if (rels_path && (rf = fopen(rels_path, "w"))) {
-            for (i = 0; i < db->nrels; i++) {
-                fprintf(rf, "%s:%d\n", db->rels[i].name,
-                        (int)rel_arity(db->rels[i].rel));
-            }
-            fclose(rf);
-        }
-        free(rels_path);
-    }
+    /* Save relation metadata (name:arity:edb|idb) while names/rels are alive */
+    write_rels_txt(db);
 
     /* Now free relations and their names */
     for (i = 0; i < db->nrels; i++) {
@@ -287,7 +317,32 @@ static int is_reserved_pi_name(const char *name)
     return 1;
 }
 
-int dl_declare_relation(dl_db *db, const char *name, uint8_t arity)
+/* Persist relation metadata (name:arity:edb|idb per line).  The edb|idb
+ * flag records whether the relation is a rule head whose base facts live in
+ * <name>.base.dafsa (idb) or a pure-EDB relation with a single <name>.dafsa
+ * (base == view). */
+static void write_rels_txt(dl_db *db)
+{
+    char *rels_path = make_path(db, "rels", ".txt");
+    FILE *rf;
+    size_t i;
+
+    if (!rels_path) return;
+    rf = fopen(rels_path, "w");
+    if (rf) {
+        for (i = 0; i < db->nrels; i++) {
+            fprintf(rf, "%s:%d:%s\n", db->rels[i].name,
+                    (int)rel_arity(db->rels[i].rel),
+                    rel_is_idb(db->rels[i].rel) ? "idb" : "edb");
+        }
+        fclose(rf);
+    }
+    free(rels_path);
+}
+
+/* Declare a relation, optionally as a rule head (is_idb). */
+static int dl_declare_relation_kind(dl_db *db, const char *name,
+                                    uint8_t arity, int is_idb)
 {
     int idx;
     char *path;
@@ -326,16 +381,22 @@ int dl_declare_relation(dl_db *db, const char *name, uint8_t arity)
     /* Try to load existing DAFSA with WAL, or create new */
     {
         char *wal_path;
+        char *base_path;
         path = make_path(db, name, ".dafsa");
         wal_path = make_path(db, name, ".wal");
-        if (!path || !wal_path) {
-            free(path); free(wal_path);
+        base_path = is_idb ? make_path(db, name, ".base.dafsa") : NULL;
+        if (!path || !wal_path || (is_idb && !base_path)) {
+            free(path); free(wal_path); free(base_path);
             return -1;
         }
 
-        rel = rel_open_writable(path, wal_path, arity);
+        if (is_idb)
+            rel = rel_open_writable_idb(base_path, path, wal_path, arity);
+        else
+            rel = rel_open_writable(path, wal_path, arity);
         free(path);
         free(wal_path);
+        free(base_path);
         if (!rel) return -1;
     }
 
@@ -352,21 +413,14 @@ int dl_declare_relation(dl_db *db, const char *name, uint8_t arity)
     /* M7: persist relation metadata immediately so crash-recovery works.
      * Without this, a process that declares a relation and adds facts
      * before crashing would lose the relation declaration on reopen. */
-    {
-        char *rels_path = make_path(db, "rels", ".txt");
-        FILE *rf;
-        if (rels_path && (rf = fopen(rels_path, "w"))) {
-            size_t j;
-            for (j = 0; j < db->nrels; j++) {
-                fprintf(rf, "%s:%d\n", db->rels[j].name,
-                        (int)rel_arity(db->rels[j].rel));
-            }
-            fclose(rf);
-        }
-        free(rels_path);
-    }
+    write_rels_txt(db);
 
     return 0;
+}
+
+int dl_declare_relation(dl_db *db, const char *name, uint8_t arity)
+{
+    return dl_declare_relation_kind(db, name, arity, 0);
 }
 
 /* ─── CSV parser ──────────────────────────────────────────────────────── */
@@ -460,10 +514,10 @@ int dl_load_facts(dl_db *db, const char *rel_name, const char *csv_path)
         return -1;
     }
 
-    /* If the relation already had facts (e.g. loaded from disk on open),
+    /* If the relation already had BASE facts (e.g. loaded from disk on open),
      * union them into ts so we rebuild the combined set. */
-    if (rel_prefix(db->rels[idx].rel, NULL, 0,
-                   ts_sink_cb, &ts) < 0) {
+    if (rel_prefix_base(db->rels[idx].rel, NULL, 0,
+                        ts_sink_cb, &ts) < 0) {
         ts_free(&ts);
         fclose(f);
         return -1;
@@ -533,7 +587,7 @@ int dl_load_facts(dl_db *db, const char *rel_name, const char *csv_path)
     /* Sort and bulk-build the DAFSA */
     ts_sort(&ts);
 
-    if (rel_build_from_tupleset(db->rels[idx].rel, &ts) != 0) {
+    if (rel_build_base_from_tupleset(db->rels[idx].rel, &ts) != 0) {
         ts_free(&ts);
         return -1;
     }
@@ -556,11 +610,13 @@ int dl_load_facts(dl_db *db, const char *rel_name, const char *csv_path)
         free(rev_path);
     }
 
-    /* Auto-save relation DAFSA after load */
+    /* Auto-save the relation's BASE DAFSA after load */
     {
-        char *path = make_path(db, rel_name, ".dafsa");
+        char *path = rel_is_idb(db->rels[idx].rel)
+                   ? make_path(db, rel_name, ".base.dafsa")
+                   : make_path(db, rel_name, ".dafsa");
         if (path) {
-            rel_save(db->rels[idx].rel, path);
+            rel_save_base(db->rels[idx].rel, path);
             free(path);
         }
     }
@@ -652,25 +708,27 @@ int dl_add_fact(dl_db *db, const char *rel_name,
         free(rev_path);
     }
 
-    /* 2. Duplicate check: if already present, skip WAL (SHOULD-FIX).
-     * A duplicate fact is already durable, so no WAL record needed. */
-    if (rel_exact(db->rels[idx].rel, cols))
+    /* 2. Duplicate check against BASE: if already present, skip WAL
+     * (SHOULD-FIX). A duplicate base fact is already durable. */
+    if (rel_exact_base(db->rels[idx].rel, cols))
         return 0;
 
     /* 3. WAL-append ADD + sync (durable before in-memory commit) */
     if (rel_wal_append_add(db->rels[idx].rel, key, (uint32_t)key_len) != 0)
         return -1;
 
-    /* 4. In-memory add */
-    rc = rel_add(db->rels[idx].rel, cols);
+    /* 4. In-memory add to BASE */
+    rc = rel_add_base(db->rels[idx].rel, cols);
     if (rc < 0) return -1;
 
-    /* 5. Check compaction threshold: WAL > 25% of DAFSA estimate? */
+    /* 5. Check compaction threshold: WAL > 25% of BASE estimate? */
     {
         uint64_t wal_sz = rel_wal_size(db->rels[idx].rel);
         uint64_t dafsa_sz = rel_dafsa_size(db->rels[idx].rel);
         if (dafsa_sz > 0 && wal_sz > dafsa_sz / 4) {
-            char *path = make_path(db, rel_name, ".dafsa");
+            char *path = rel_is_idb(db->rels[idx].rel)
+                       ? make_path(db, rel_name, ".base.dafsa")
+                       : make_path(db, rel_name, ".dafsa");
             if (path) {
                 rel_compact(db->rels[idx].rel, path);
                 free(path);
@@ -701,17 +759,17 @@ int dl_delete_fact(dl_db *db, const char *rel_name,
 
     if (encode_fact_key(key, &key_len, cols, arity) != 0) return -1;
 
-    /* 1. Absent check: if not present, skip WAL (SHOULD-FIX).
+    /* 1. Absent check against BASE: if not present, skip WAL (SHOULD-FIX).
      * No interner save needed — deletes don't create new syms. */
-    if (!rel_exact(db->rels[idx].rel, cols))
+    if (!rel_exact_base(db->rels[idx].rel, cols))
         return 0;
 
     /* 2. WAL-append DEL + sync (durable before in-memory commit) */
     if (rel_wal_append_del(db->rels[idx].rel, key, (uint32_t)key_len) != 0)
         return -1;
 
-    /* 3. In-memory delete */
-    rc = rel_delete(db->rels[idx].rel, cols);
+    /* 3. In-memory delete from BASE */
+    rc = rel_delete_base(db->rels[idx].rel, cols);
     if (rc < 0) return -1;
 
     /* M4: facts changed, mark fixpoint dirty */
@@ -1513,7 +1571,8 @@ int dl_publish_snapshot(dl_db *db)
             char rel_path[4096];
             uint8_t arity = rel_arity(db->rels[i].rel);
 
-            fprintf(mf, "%s:%d\n", db->rels[i].name, (int)arity);
+            fprintf(mf, "%s:%d:%s\n", db->rels[i].name, (int)arity,
+                    rel_is_idb(db->rels[i].rel) ? "idb" : "edb");
 
             snprintf(rel_path, sizeof(rel_path), "%s/%s.dafsa",
                      tmp_dir, db->rels[i].name);
