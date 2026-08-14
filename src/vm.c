@@ -1226,7 +1226,8 @@ static int eval_nonrecursive(dl_db *db, compiled_rule **rules, int n)
 
 #define FIXPOINT_ERROR_BOUND 10000000
 
-static int eval_stratum_recursive(dl_db *db, compiled_rule **rules, int n)
+static int eval_stratum_recursive(dl_db *db, compiled_rule **rules, int n,
+                                  int ivm)
 {
     int i, ri;
     int rp[64], nr = 0;  /* recursive head relation ids */
@@ -1414,6 +1415,19 @@ static int eval_stratum_recursive(dl_db *db, compiled_rule **rules, int n)
             } \
         } \
     } while(0)
+
+    /* IVM Slice 2: seed idb from the CURRENT VIEW (base ∪ prior derived) so
+     * the semi-naive fixpoint starts from the already-materialized state and
+     * only re-derives what the new base delta adds.  The full re-eval path
+     * (ivm==0) leaves idb empty here — the base-rule seed below fills it. */
+    if (ivm) {
+        for (i = 0; i < nr; i++) {
+            relation *rel = (relation *)db_rel(db, rd[i].rel_id);
+            if (rel)
+                rel_prefix(rel, NULL, 0, ts_sink_cb, &rd[i].idb);
+        }
+    }
+
     /* Non-recursive rules → commit to DAFSA (M1 path).
      * Recursive rules → collect into idb/delta via dry=1 (keep DAFSA
      *   empty so the final materialize step is a fast bulk build). */
@@ -1445,7 +1459,7 @@ static int eval_stratum_recursive(dl_db *db, compiled_rule **rules, int n)
                 free(rd);
                 return -1;
             }
-        } else {
+        } else if (!ivm) {
             /* Recursive rule: collect base tuples into idb/delta */
             int hri = cr->head_rel_id;
             int hdi = rp_idx[hri];
@@ -1489,6 +1503,81 @@ static int eval_stratum_recursive(dl_db *db, compiled_rule **rules, int n)
                 }
             }
             ts_free(&seed);
+        } else {
+            /* IVM Slice 2: seed DELTA from the pending insert deltas on the
+             * rule's BASE (non-recursive-head) body atoms.  Each changed base
+             * atom is joined as the delta (semi-naive single-step) against the
+             * full current view — recursive atoms read the DAFSA, which still
+             * holds the prior fixpoint (= idb), and the other base atoms read
+             * the post-insert DAFSA — producing exactly the new head tuples
+             * the added base facts can derive.  idb was seeded from the
+             * current view above, so only these genuinely-new tuples enter the
+             * delta. */
+            int hri = cr->head_rel_id;
+            int hdi = rp_idx[hri];
+            int ii;
+
+            for (ii = 0; ii < cr->n_instrs; ii++) {
+                const vm_instr *in = &cr->instrs[ii];
+                int br;
+                vm_override ov[1];
+                tuple_set cand;
+                cand_ctx ctx;
+                long n_out;
+                long ci;
+
+                /* Only override-compatible base-atom opcodes with a pending
+                 * +delta.  Recursive atoms (rp_idx >= 0) and relations without
+                 * a pending delta are left to read the DAFSA. */
+                if (in->op != OP_SCAN && in->op != OP_LOOKUP) continue;
+                br = (int)in->a;
+                if (br < 0 || br >= MAX_RELS) continue;
+                if (rp_idx[br] >= 0) continue;        /* recursive atom */
+                if (br >= (int)db->nrels) continue;
+                if (!db->delta_pending[br]) continue;
+                if (db->delta_pending[br]->count == 0) continue;
+
+                ov[0].body_idx = (int)in->body_idx;
+                ov[0].ts       = db->delta_pending[br];
+                ov[0].perm_id  = -1;
+
+                if (ts_init(&cand, rd[hdi].arity) != 0) {
+                    for (ri = 0; ri < nr; ri++) {
+                        ts_free(&rd[ri].idb);
+                        ts_free(&rd[ri].delta);
+                        ts_free(&rd[ri].next_delta);
+                    }
+                    free(rd);
+                    return -1;
+                }
+                ctx.ts = &cand;
+
+                n_out = exec_rule(db, cr, ov, 1,
+                                  1 /* dry */, cand_cb, &ctx);
+                if (n_out < 0) {
+                    ts_free(&cand);
+                    for (ri = 0; ri < nr; ri++) {
+                        ts_free(&rd[ri].idb);
+                        ts_free(&rd[ri].delta);
+                        ts_free(&rd[ri].next_delta);
+                    }
+                    free(rd);
+                    return -1;
+                }
+
+                /* New head tuples (not already in idb) enter BOTH idb (so the
+                 * final materialize includes them) and delta (so the fixpoint
+                 * loop propagates them transitively) — mirroring the full-mode
+                 * base-rule seed. */
+                for (ci = 0; ci < cand.count; ci++) {
+                    const uint32_t *t = cand.data + ci * cand.arity;
+                    if (!ts_contains(&rd[hdi].idb, t)) {
+                        ts_add(&rd[hdi].idb, t);
+                        ts_add(&rd[hdi].delta, t);
+                    }
+                }
+                ts_free(&cand);
+            }
         }
     }
 
@@ -1833,7 +1922,8 @@ static int eval_stratum_recursive(dl_db *db, compiled_rule **rules, int n)
 
 /* ─── vm_execute ──────────────────────────────────────────────────────── */
 
-int vm_execute(dl_db *db, compiled_rule **rules, int n_rules)
+static int vm_execute_mode(dl_db *db, compiled_rule **rules, int n_rules,
+                           int ivm)
 {
     int i, s, max_stratum;
 
@@ -1845,8 +1935,12 @@ int vm_execute(dl_db *db, compiled_rule **rules, int n_rules)
      * ADD-ONLY: a deleted base fact would leave its previously-derived
      * tuples in the view and the fixpoint would re-union them.  The first
      * reset for a freshly-declared head also SPLITs base off from the view
-     * (rel_reset_view), so subsequent base writes no longer alias the view. */
-    {
+     * (rel_reset_view), so subsequent base writes no longer alias the view.
+     *
+     * IVM Slice 2: the insert-only incremental path (ivm==1) SKIPS this reset
+     * — the prior derived view is preserved and ADDED to by the delta-seeded
+     * semi-naive fixpoint (correct for monotone insert-only recursion). */
+    if (!ivm) {
         uint8_t seen[MAX_RELS];
         memset(seen, 0, sizeof(seen));
         for (i = 0; i < n_rules; i++) {
@@ -1908,12 +2002,29 @@ int vm_execute(dl_db *db, compiled_rule **rules, int n_rules)
             compiled_rule *strat_rules[256];
             for (i = 0; i < sc; i++)
                 strat_rules[i] = rules[sr[i]];
-            if (eval_stratum_recursive(db, strat_rules, sc) != 0)
+            if (eval_stratum_recursive(db, strat_rules, sc, ivm) != 0)
                 return -1;
         }
     }
 
     return 0;
+}
+
+int vm_execute(dl_db *db, compiled_rule **rules, int n_rules)
+{
+    return vm_execute_mode(db, rules, n_rules, 0);
+}
+
+int vm_execute_ivm(dl_db *db)
+{
+    int i;
+    if (!db) return -1;
+    /* Sort pending deltas so the OP_LOOKUP override's ts_prefix binary search
+     * sees sorted data (deltas are captured in insertion order, unsorted). */
+    for (i = 0; i < MAX_RELS; i++)
+        if (db->delta_pending[i] && db->delta_pending[i]->count > 0)
+            ts_sort(db->delta_pending[i]);
+    return vm_execute_mode(db, db->crules, db->n_crules, 1);
 }
 
 /* ─── vm_query ─────────────────────────────────────────────────────────── */
@@ -1936,19 +2047,28 @@ long vm_query(dl_db *db, compiled_rule **rules, int n_rules,
     return 0;
 }
 
-/* ─── IVM Slice 1: insert-only incremental maintenance ─────────────────── */
+/* ─── IVM Slice 1/2: insert-only incremental maintenance ──────────────── */
 /*
- * Insert-only incremental maintenance for NON-RECURSIVE, NEGATION-FREE,
- * AGGREGATE-FREE rules.  A +delta on relation R is propagated through every
- * dependent rule whose body reads R, by seeding the rule's body join with the
- * delta as the changed body atom (the existing exec_rule override mechanism —
- * semi-naive single-step).  New head tuples are committed to the head view via
- * exec_rule's commit mode and recursively propagated through the head's
- * dependents (non-recursive rules form a DAG, so this terminates).
+ * Insert-only incremental maintenance.  Two paths, chosen by the publish
+ * dispatch on whether the program contains recursive rules:
+ *
+ *   NON-RECURSIVE (Slice 1): a +delta on relation R is propagated through
+ *     every dependent rule whose body reads R by seeding the body join with
+ *     the delta as the changed body atom (exec_rule override — semi-naive
+ *     single-step).  New head tuples are committed to the head view and
+ *     recursively propagated through dependents (a DAG, so it terminates).
+ *
+ *   RECURSIVE (Slice 2): the stratified evaluator runs WITHOUT resetting the
+ *     rule-head views, and each recursive stratum seeds its semi-naive
+ *     fixpoint with the CURRENT VIEW (idb) + the new base facts derived from
+ *     the pending insert deltas (delta).  The prior view is preserved and
+ *     added to; the fixpoint is confluent and the prior view is a subset of
+ *     the final result (INSERT-only / monotone), so it converges to the same
+ *     view as a full from-scratch re-eval.
  *
  * Correctness is preserved BY CONSTRUCTION: any change outside this class
  * (delete, bulk load, rule load, base fact into a rule-head, or a rule with
- * recursion / negation / aggregates / OP_WALK / OP_LOOKUP_PERM) sets
+ * negation / aggregates / OP_WALK / OP_LOOKUP_PERM / OP_HASH_JOIN) sets
  * db->full_reeval_pending and the publish path runs the FULL fixpoint (the
  * now-correct oracle).  We never propagate when in doubt.
  *
@@ -1959,27 +2079,75 @@ long vm_query(dl_db *db, compiled_rule **rules, int n_rules,
  *     delta would be silently dropped.  Excluded by vm_ivm_eligible.
  *   - OP_LOOKUP_PERM override: expects a PERMUTED-order shadow; our deltas
  *     are in original column order — a silent wrong answer.  Excluded.
- *   - OP_NEG_CHECK / aggregates / recursion: excluded.
+ *   - OP_HASH_JOIN reads the DAFSA view (stale during the recursive fixpoint
+ *     in the no-reset IVM path) — a silent wrong answer.  Excluded
+ *     (defensive; the compiler does not currently emit it).
+ *   - OP_NEG_CHECK / aggregates: excluded.
  */
 
 int vm_ivm_eligible(dl_db *db)
 {
-    int i;
+    int i, k;
+    uint8_t is_rule_head[MAX_RELS];
+    uint8_t is_rec_head[MAX_RELS];
+    int     rec_stratum[MAX_RELS];
+
     if (!db) return 0;
+
+    memset(is_rule_head, 0, sizeof(is_rule_head));
+    memset(is_rec_head, 0, sizeof(is_rec_head));
+    for (i = 0; i < MAX_RELS; i++) rec_stratum[i] = -1;
 
     for (i = 0; i < db->n_crules; i++) {
         const compiled_rule *cr = db->crules[i];
-        int k;
-        if (cr->is_recursive)  return 0;
+        uint8_t hid = cr->head_rel_id;
+        if (hid >= MAX_RELS) continue;
+        is_rule_head[hid] = 1;
+        if (cr->is_recursive) {
+            is_rec_head[hid] = 1;
+            rec_stratum[hid] = cr->stratum;
+        }
+    }
+
+    for (i = 0; i < db->n_crules; i++) {
+        const compiled_rule *cr = db->crules[i];
         if (cr->has_aggregate) return 0;
         for (k = 0; k < cr->n_instrs; k++) {
             uint8_t op = cr->instrs[k].op;
             if (op == OP_NEG_CHECK)   return 0;
             if (op == OP_WALK)        return 0;
             if (op == OP_LOOKUP_PERM) return 0;
+            if (op == OP_HASH_JOIN)   return 0;
+
+            /* Slice 2 recursive-delta restriction: a RECURSIVE rule's base
+             * body atom that reads a RULE-HEAD relation (rather than pure EDB
+             * or its own recursive SCC) cannot be tracked by delta_pending —
+             * rule-head re-derivation produces no per-insert delta.  Such a
+             * program (a non-recursive head or a chained recursive SCC feeding
+             * this SCC) must fall back to full re-eval: never silently
+             * mis-evaluate. */
+            if (!cr->is_recursive) continue;
+            if (op != OP_SCAN && op != OP_LOOKUP) continue;
+            {
+                int R = (int)cr->instrs[k].a;
+                if (R < 0 || R >= MAX_RELS) continue;
+                if (!is_rule_head[R]) continue;             /* pure EDB */
+                if (is_rec_head[R] && rec_stratum[R] == cr->stratum)
+                    continue;                               /* same SCC */
+                return 0;
+            }
         }
     }
     return 1;
+}
+
+int vm_has_recursive(dl_db *db)
+{
+    int i;
+    if (!db) return 0;
+    for (i = 0; i < db->n_crules; i++)
+        if (db->crules[i]->is_recursive) return 1;
+    return 0;
 }
 
 void vm_clear_deltas(dl_db *db)

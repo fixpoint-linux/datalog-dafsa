@@ -28,13 +28,22 @@ int vm_execute(dl_db *db, compiled_rule **rules, int n_rules);
 long vm_query(dl_db *db, compiled_rule **rules, int n_rules,
               const char *goal_rel, dl_tuple_cb cb, void *user);
 
-/* ─── IVM Slice 1: insert-only incremental maintenance ────────────────── */
+/* ─── IVM Slice 1/2: insert-only incremental maintenance ──────────────── */
 
-/* 1 if EVERY compiled rule is IVM-insert-eligible (non-recursive,
- * negation-free, aggregate-free, and every positive body atom compiles to an
- * override-compatible opcode — OP_SCAN/OP_LOOKUP).  Returns 0 if any rule
- * needs the full-fixpoint path (the correctness floor). */
+/* 1 if EVERY compiled rule is IVM-insert-eligible: negation-free,
+ * aggregate-free, and every positive body atom compiles to an
+ * override-compatible opcode (OP_SCAN/OP_LOOKUP).  Recursive rules are now
+ * ALLOWED — they are maintained by the delta-seeded semi-naive fixpoint
+ * (vm_execute_ivm), not the non-recursive worklist.  Returns 0 if any rule
+ * needs the full-fixpoint path (the correctness floor): negation, aggregates,
+ * OP_WALK, OP_LOOKUP_PERM, OP_HASH_JOIN, or a recursive rule whose base body
+ * atom reads a rule-head relation (a non-recursive head or a chained recursive
+ * SCC feeding this SCC — its re-derived tuples have no per-insert delta). */
 int vm_ivm_eligible(dl_db *db);
+
+/* 1 if ANY compiled rule is recursive (routes the publish path to the
+ * delta-seeded semi-naive fixpoint instead of the non-recursive worklist). */
+int vm_has_recursive(dl_db *db);
 
 /* Propagate db->delta_pending insert deltas through the dependent rules,
  * maintaining derived views incrementally (semi-naive single-step via the
@@ -50,5 +59,16 @@ int vm_propagate_deltas(dl_db *db);
 /* Free all pending delta tuple_sets (used after a full re-eval consumes the
  * pending changes, and on dl_close). */
 void vm_clear_deltas(dl_db *db);
+
+/* Incremental maintenance for a program that CONTAINS recursive rules.  Runs
+ * the stratified evaluator WITHOUT resetting rule-head views — the prior
+ * derived state is preserved and ADDED to — seeding each recursive stratum's
+ * semi-naive fixpoint with the current view (idb) + the pending insert deltas
+ * (delta) so only the changed facts re-derive.  READS (does not free)
+ * db->delta_pending; the caller clears them after.  Returns 0 on success,
+ * -1 on error.
+ *
+ * PRECONDITION: vm_ivm_eligible(db) == 1 and vm_has_recursive(db) == 1. */
+int vm_execute_ivm(dl_db *db);
 
 #endif

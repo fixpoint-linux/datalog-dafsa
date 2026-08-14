@@ -1596,6 +1596,19 @@ int dl_publish_snapshot(dl_db *db)
             if (vm_execute(db, db->crules, db->n_crules) != 0)
                 return -1;
             vm_clear_deltas(db);   /* full re-eval consumed pending changes */
+        } else if (vm_has_recursive(db)) {
+            /* IVM Slice 2: recursive insert IVM — seed the semi-naive fixpoint
+             * with the current view + the pending insert deltas (never reset
+             * the view on this path). */
+            if (vm_execute_ivm(db) != 0) {
+                /* The view may be partially updated and the delta seed did not
+                 * converge cleanly.  Force a full re-eval on the next publish
+                 * (never leave a silently-incomplete recursive view). */
+                db->full_reeval_pending = 1;
+                vm_clear_deltas(db);
+                return -1;
+            }
+            vm_clear_deltas(db);   /* delta seed consumed the pending changes */
         } else if (vm_propagate_deltas(db) != 0) {
             /* Propagation failed part-way (OOM): the view may be partially
              * updated and delta_pending was cleared.  Force a full re-eval

@@ -20,6 +20,7 @@
  */
 
 #include "dl.h"
+#include "vm.h"   /* vm_ivm_eligible — assert the recursive ruleset is eligible */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -758,11 +759,368 @@ static void test_insert_mixed_head_fallback(void)
     PASS();
 }
 
+/* ─── IVM Slice 2: recursive insert-only incremental maintenance ──────── */
+
+#define REC_RULES \
+    "tc(X,Y):-edge(X,Y).\n" \
+    "tc(X,Z):-edge(X,Y),tc(Y,Z).\n" \
+    "anc(X,Y):-parent(X,Y).\n" \
+    "anc(X,Z):-parent(X,Y),anc(Y,Z).\n"
+
+static const char *REC_EDB[2] = {"edge", "parent"};
+
+/* Compare the in-memory view of every relation across two databases for the
+ * recursive ruleset (edge/parent + tc/anc, all arity 2). */
+static int compare_rec_views(dl_db *ivm, dl_db *oracle)
+{
+    const char *rels[] = {"edge", "parent", "tc", "anc"};
+    int i;
+    for (i = 0; i < 4; i++) {
+        tuple_set ta, tb;
+        query_set_prefix(ivm, rels[i], &ta);
+        query_set_prefix(oracle, rels[i], &tb);
+        if (!sets_equal(&ta, &tb)) {
+            printf("  %s: IVM %ld rows vs oracle %ld rows\n",
+                   rels[i], ta.count, tb.count);
+            long j;
+            for (j = 0; j < ta.count; j++)
+                printf("    ivm (%u,%u)\n", ta.data[j*2], ta.data[j*2+1]);
+            for (j = 0; j < tb.count; j++)
+                printf("    ora (%u,%u)\n", tb.data[j*2], tb.data[j*2+1]);
+            tset_free(&ta); tset_free(&tb);
+            return 0;
+        }
+        tset_free(&ta); tset_free(&tb);
+    }
+    return 1;
+}
+
+/* ─── T8: deterministic recursive insert IVM (incremental tc closure) ──── */
+
+static void test_recursive_insert_ivm_deterministic(void)
+{
+    dl_db *db;
+    tuple_set ts;
+
+    TEST("T8: recursive insert IVM — incremental tc over a path graph");
+
+    setup_db(&db, "t8");
+
+    assert(dl_declare_relation(db, "edge", 2) == 0);
+    assert(dl_load_rules(db,
+        "tc(X,Y):-edge(X,Y).\n"
+        "tc(X,Z):-edge(X,Y),tc(Y,Z).\n") == 0);
+    assert(vm_ivm_eligible(db) == 1);  /* recursion is now IVM-eligible */
+    assert(dl_compile(db) == 0);
+
+    /* Insert the path 1->2->3->4->5 one edge at a time.  The closure of a
+     * chain of k edges is C(k+1,2) pairs, so a one-step-only IVM (that fails
+     * to run the fixpoint to convergence) would under-count at k>=3. */
+    {
+        uint32_t e12[2] = {1,2}, e23[2] = {2,3}, e34[2] = {3,4}, e45[2] = {4,5};
+        uint32_t *edges[4] = {e12, e23, e34, e45};
+        long expected[4] = {1, 3, 6, 10};
+        int i;
+        for (i = 0; i < 4; i++) {
+            assert(dl_add_fact(db, "edge", edges[i], 2) == 1);
+            assert(dl_publish_snapshot(db) == 0);
+            query_set_prefix(db, "tc", &ts);
+            if (ts.count != expected[i] || ts.arity != 2) {
+                printf("  after insert %d: tc got %ld rows, expected %ld\n",
+                       i, ts.count, expected[i]);
+                tset_free(&ts); teardown_db(db, "t8");
+                FAIL("T8: wrong tc closure size");
+                return;
+            }
+            tset_free(&ts);
+        }
+    }
+
+    /* Batched insert: two edges in one publish must extend the closure to the
+     * full 7-node path (C(7,2)=21) — the delta seed must handle multiple new
+     * base facts arriving together. */
+    {
+        uint32_t e56[2] = {5,6}, e67[2] = {6,7};
+        assert(dl_add_fact(db, "edge", e56, 2) == 1);
+        assert(dl_add_fact(db, "edge", e67, 2) == 1);
+    }
+    assert(dl_publish_snapshot(db) == 0);
+
+    query_set_prefix(db, "tc", &ts);
+    if (ts.count != 21 || ts.arity != 2) {
+        printf("  batched: tc got %ld rows, expected 21\n", ts.count);
+        tset_free(&ts); teardown_db(db, "t8");
+        FAIL("T8: batched insert produced wrong tc closure");
+        return;
+    }
+    {
+        uint32_t t14[2] = {1,4}, t17[2] = {1,7}, t26[2] = {2,6};
+        if (!tset_has(&ts, t14) || !tset_has(&ts, t17) || !tset_has(&ts, t26)) {
+            printf("  missing multi-step closure tuples\n");
+            tset_free(&ts); teardown_db(db, "t8");
+            FAIL("T8: missing multi-step closure tuples");
+            return;
+        }
+    }
+    tset_free(&ts);
+
+    teardown_db(db, "t8");
+    PASS();
+}
+
+/* ─── T9: recursive insert IVM equivalence-oracle property ─────────────── */
+
+static void test_recursive_ivm_property(void)
+{
+    dl_db *ivm_db, *oracle_db;
+    int iter, i;
+
+    TEST("T9: recursive insert IVM — seeded random property vs full re-eval");
+
+    setup_db(&ivm_db, "t9ivm");
+    setup_db(&oracle_db, "t9ora");
+
+    for (i = 0; i < 2; i++) {
+        assert(dl_declare_relation(ivm_db, REC_EDB[i], 2) == 0);
+        assert(dl_declare_relation(oracle_db, REC_EDB[i], 2) == 0);
+    }
+    assert(dl_load_rules(ivm_db, REC_RULES) == 0);
+    assert(dl_load_rules(oracle_db, REC_RULES) == 0);
+    assert(vm_ivm_eligible(ivm_db) == 1);   /* tc + anc are IVM-eligible */
+    assert(dl_compile(ivm_db) == 0);
+    assert(dl_compile(oracle_db) == 0);
+
+    prng_state = 0xBEEF1234u;
+
+    for (iter = 0; iter < 120; iter++) {
+        int rel = (int)(prng_next() % 2);
+        uint32_t cols[2] = { prng_next() % 8, prng_next() % 8 };
+        int rc;
+
+        rc = dl_add_fact(ivm_db, REC_EDB[rel], cols, 2);
+        if (rc < 0) { printf("  IVM dl_add_fact error\n"); goto fail_prop; }
+        rc = dl_add_fact(oracle_db, REC_EDB[rel], cols, 2);
+        if (rc < 0) { printf("  oracle dl_add_fact error\n"); goto fail_prop; }
+
+        /* IVM: delta-seeded fixpoint on publish.  Oracle: full re-eval. */
+        if (dl_publish_snapshot(ivm_db) != 0) {
+            printf("  publish failed at iter %d\n", iter);
+            goto fail_prop;
+        }
+        if (dl_compile(oracle_db) != 0) {
+            printf("  oracle compile failed at iter %d\n", iter);
+            goto fail_prop;
+        }
+
+        if (!compare_rec_views(ivm_db, oracle_db)) {
+            printf("  divergence at iter %d (rel %s, +(%u,%u))\n",
+                   iter, REC_EDB[rel], cols[0], cols[1]);
+            goto fail_prop;
+        }
+    }
+
+    teardown_db(ivm_db, "t9ivm");
+    teardown_db(oracle_db, "t9ora");
+    PASS();
+    return;
+
+fail_prop:
+    teardown_db(ivm_db, "t9ivm");
+    teardown_db(oracle_db, "t9ora");
+    FAIL("T9: recursive IVM views diverged from full re-eval oracle");
+}
+
+/* ─── T10: recursive + negation safety net (falls back to full re-eval) ── */
+
+static void test_recursive_negation_fallback(void)
+{
+    dl_db *db;
+    tuple_set ts;
+
+    TEST("T10: recursive + negation is ineligible -> full re-eval");
+
+    setup_db(&db, "t10");
+
+    assert(dl_declare_relation(db, "edge", 2) == 0);
+    assert(dl_declare_relation(db, "blocked", 2) == 0);
+    assert(dl_load_rules(db,
+        "tc(X,Y):-edge(X,Y).\n"
+        "tc(X,Z):-edge(X,Y),tc(Y,Z).\n"
+        "ok(X,Y):-tc(X,Y),!blocked(X,Y).\n") == 0);
+
+    /* The negated body atom makes the program ineligible for delta
+     * propagation — inserts must fall back to the full re-eval fixpoint. */
+    assert(vm_ivm_eligible(db) == 0);
+    assert(dl_compile(db) == 0);
+
+    {
+        uint32_t e12[2] = {1,2}, e23[2] = {2,3}, b13[2] = {1,3};
+        assert(dl_add_fact(db, "edge", e12, 2) == 1);
+        assert(dl_add_fact(db, "edge", e23, 2) == 1);
+        assert(dl_add_fact(db, "blocked", b13, 2) == 1);
+    }
+    assert(dl_publish_snapshot(db) == 0);
+
+    /* tc = {(1,2),(2,3),(1,3)}; ok = tc \ blocked = {(1,2),(2,3)}. */
+    query_set_prefix(db, "tc", &ts);
+    if (ts.count != 3 || ts.arity != 2) {
+        printf("  tc got %ld rows, expected 3\n", ts.count);
+        tset_free(&ts); teardown_db(db, "t10");
+        FAIL("T10: wrong tc after full re-eval fallback");
+        return;
+    }
+    tset_free(&ts);
+
+    query_set_prefix(db, "ok", &ts);
+    if (ts.count != 2 || ts.arity != 2) {
+        printf("  ok got %ld rows, expected 2\n", ts.count);
+        tset_free(&ts); teardown_db(db, "t10");
+        FAIL("T10: wrong ok after full re-eval fallback");
+        return;
+    }
+    {
+        uint32_t b13[2] = {1,3};
+        if (tset_has(&ts, b13)) {
+            printf("  ok wrongly contains blocked (1,3)\n");
+            tset_free(&ts); teardown_db(db, "t10");
+            FAIL("T10: negation not applied");
+            return;
+        }
+    }
+    tset_free(&ts);
+
+    teardown_db(db, "t10");
+    PASS();
+}
+
+/* ─── T11: mutual recursion (multi-head SCC) insert IVM ────────────────── */
+
+static void test_mutual_recursion_insert_ivm(void)
+{
+    dl_db *db;
+    tuple_set ts;
+    int i;
+
+    TEST("T11: mutual recursion insert IVM — even/odd over succ");
+
+    setup_db(&db, "t11");
+
+    /* EDB-only seed: zero(0) is the exit rule's base; succ chains 0..10. */
+    {
+        uint32_t zero = 0;
+        load_rows(db, "t11", "zero", 1, &zero, 1);
+    }
+    {
+        uint32_t succ[20];
+        for (i = 0; i < 10; i++) { succ[i*2] = (uint32_t)i; succ[i*2+1] = (uint32_t)(i+1); }
+        load_rows(db, "t11", "succ", 2, succ, 10);
+    }
+
+    assert(dl_load_rules(db,
+        "even(X):-zero(X).\n"
+        "even(X):-succ(Y,X),odd(Y).\n"
+        "odd(X):-succ(Y,X),even(Y).\n") == 0);
+    assert(vm_ivm_eligible(db) == 1);
+    assert(dl_compile(db) == 0);
+
+    /* Baseline: even={0,2,4,6,8,10}, odd={1,3,5,7,9}. */
+    query_set_prefix(db, "even", &ts);
+    if (ts.count != 6) {
+        printf("  baseline even got %ld rows, expected 6\n", ts.count);
+        tset_free(&ts); teardown_db(db, "t11");
+        FAIL("T11: wrong baseline even");
+        return;
+    }
+    tset_free(&ts);
+
+    /* Insert succ(10,11): only odd(11) is newly derivable (11 is odd). */
+    {
+        uint32_t s10[2] = {10, 11};
+        assert(dl_add_fact(db, "succ", s10, 2) == 1);
+    }
+    assert(dl_publish_snapshot(db) == 0);
+
+    query_set_prefix(db, "even", &ts);
+    if (ts.count != 6) {
+        printf("  after insert even got %ld rows, expected 6\n", ts.count);
+        tset_free(&ts); teardown_db(db, "t11");
+        FAIL("T11: even changed on odd-only insert");
+        return;
+    }
+    tset_free(&ts);
+
+    query_set_prefix(db, "odd", &ts);
+    if (ts.count != 6 || !tset_has(&ts, (uint32_t[]){11})) {
+        printf("  after insert odd got %ld rows, expected 6 incl. odd(11)\n", ts.count);
+        tset_free(&ts); teardown_db(db, "t11");
+        FAIL("T11: odd(11) missing after succ(10,11)");
+        return;
+    }
+    tset_free(&ts);
+
+    teardown_db(db, "t11");
+    PASS();
+}
+
+/* ─── T12: non-recursive head feeding recursion -> full re-eval fallback ── */
+
+static void test_nonrecursive_head_feeds_recursion_fallback(void)
+{
+    dl_db *db;
+    tuple_set ts;
+
+    TEST("T12: non-recursive head feeding recursion is ineligible -> full re-eval");
+
+    setup_db(&db, "t12");
+
+    assert(dl_declare_relation(db, "edge", 2) == 0);
+    assert(dl_load_rules(db,
+        "helper(X,Y):-edge(X,Y).\n"
+        "tc(X,Y):-helper(X,Y).\n"
+        "tc(X,Z):-helper(X,Y),tc(Y,Z).\n") == 0);
+
+    /* tc's base atom reads `helper` (a non-recursive rule head) — the delta
+     * seed cannot track helper's re-derived tuples (no per-insert delta for a
+     * rule head), so this program is ineligible and inserts must fall back to
+     * the full re-eval fixpoint (never silently mis-evaluate). */
+    assert(vm_ivm_eligible(db) == 0);
+    assert(dl_compile(db) == 0);
+
+    {
+        uint32_t e12[2] = {1,2}, e23[2] = {2,3};
+        assert(dl_add_fact(db, "edge", e12, 2) == 1);
+        assert(dl_add_fact(db, "edge", e23, 2) == 1);
+    }
+    assert(dl_publish_snapshot(db) == 0);
+
+    /* helper = {(1,2),(2,3)}; tc = helper ∪ {(1,3)} = 3 rows. */
+    query_set_prefix(db, "tc", &ts);
+    if (ts.count != 3 || ts.arity != 2) {
+        printf("  tc got %ld rows, expected 3\n", ts.count);
+        tset_free(&ts); teardown_db(db, "t12");
+        FAIL("T12: wrong tc after full re-eval fallback");
+        return;
+    }
+    {
+        uint32_t t13[2] = {1,3};
+        if (!tset_has(&ts, t13)) {
+            printf("  missing tc(1,3)\n");
+            tset_free(&ts); teardown_db(db, "t12");
+            FAIL("T12: missing tc(1,3)");
+            return;
+        }
+    }
+    tset_free(&ts);
+
+    teardown_db(db, "t12");
+    PASS();
+}
+
 /* ─── Main ────────────────────────────────────────────────────────────── */
 
 int main(void)
 {
-    printf("IVM Slice 0/1 correctness + IVM equivalence-oracle tests\n");
+    printf("IVM Slice 0/1/2 correctness + IVM equivalence-oracle tests\n");
     printf("=======================================================\n\n");
 
     test_tc_delete();
@@ -772,6 +1130,11 @@ int main(void)
     test_insert_ivm_deterministic();
     test_insert_ivm_property();
     test_insert_mixed_head_fallback();
+    test_recursive_insert_ivm_deterministic();
+    test_recursive_ivm_property();
+    test_recursive_negation_fallback();
+    test_mutual_recursion_insert_ivm();
+    test_nonrecursive_head_feeds_recursion_fallback();
 
     printf("\n%d tests run, %d failed\n", tests_run, tests_failed);
     return tests_failed ? 1 : 0;
