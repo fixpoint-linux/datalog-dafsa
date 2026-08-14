@@ -70,6 +70,20 @@ struct dl_db {
      * dl_close).  Used by the magic-sets transform (dl_query_magic). */
     rule            **ast_rules;
     int               n_ast_rules;
+
+    /* IVM Slice 1: insert-only incremental maintenance state.
+     *   full_reeval_pending — 1 forces the next publish/compile to run the
+     *     FULL fixpoint (the correct oracle) instead of delta propagation.
+     *     Set on ANY change outside the IVM-insert class: deletion, bulk
+     *     load, rule load, a base fact into a rule-head relation, or a rule
+     *     that is recursive / negated / aggregate / pattern-walk / perm-join.
+     *   delta_pending[i] — pending +delta tuple_set for relation i, captured
+     *     at dl_add_fact after the in-memory base commit.  NULL when empty.
+     *     Insert-only: only +tuples; deletes never land here. */
+    int                full_reeval_pending;
+    struct tuple_set  *delta_pending[MAX_RELS];  /* struct tuple_set forward-
+                                                    declared in relation.h;
+                                                    full def in tupleset.h */
 };
 
 #endif /* DL_INTERNAL_H */

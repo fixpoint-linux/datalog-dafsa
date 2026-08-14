@@ -92,6 +92,16 @@ static void query_set(dl_db *db, const char *rel, tuple_set *out)
     dl_query(db, rel, tset_cb, out);
 }
 
+/* dl_prefix reads the IN-MEMORY view unconditionally (dl_query switches to
+ * the mmap'd snapshot once one is published).  The equivalence oracle compares
+ * the IVM-maintained in-memory views against the oracle's in-memory views, so
+ * it must bypass the snapshot path. */
+static void query_set_prefix(dl_db *db, const char *rel, tuple_set *out)
+{
+    memset(out, 0, sizeof(*out));
+    dl_prefix(db, rel, NULL, 0, tset_cb, out);
+}
+
 /* ─── Helpers ─────────────────────────────────────────────────────────── */
 
 static void rm_dir(const char *dir)
@@ -445,17 +455,323 @@ static void test_reopen_rederive(void)
     PASS();
 }
 
+/* ─── IVM Slice 1: insert-only incremental maintenance ─────────────────── */
+/*
+ * A fixed supported ruleset (non-recursive, negation-free, aggregate-free
+ * join/projection DAG):
+ *
+ *   p(X,Z) :- edge(X,Z).
+ *   p(X,Z) :- edge(X,Y), mid(Y,Z).
+ *   q(X,W) :- p(X,Y), tail(Y,W).
+ *   q(X,W) :- edge(X,Y), end(Y,W).
+ *   r(X,V) :- q(X,U), fin(U,V).
+ *
+ * Every body atom compiles to OP_SCAN or OP_LOOKUP (leading-shared-column
+ * join), so the whole program is IVM-insert-eligible: inserts propagate
+ * through the DAG instead of triggering a full re-eval.
+ */
+#define IVM_RULES \
+    "p(X,Z):-edge(X,Z).\n" \
+    "p(X,Z):-edge(X,Y),mid(Y,Z).\n" \
+    "q(X,W):-p(X,Y),tail(Y,W).\n" \
+    "q(X,W):-edge(X,Y),end(Y,W).\n" \
+    "r(X,V):-q(X,U),fin(U,V).\n"
+
+static const char *IVM_EDB[5] = {"edge", "mid", "tail", "end", "fin"};
+
+/* Deterministic xorshift32 PRNG (fixed seed — reproducible under make test). */
+static uint32_t prng_state;
+static uint32_t prng_next(void)
+{
+    uint32_t x = prng_state;
+    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+    prng_state = x;
+    return x;
+}
+
+/* Assert relation `rel` contains EXACTLY the `nrows` arity-2 rows given. */
+static int check_rel2(dl_db *db, const char *rel,
+                      const uint32_t *rows, int nrows)
+{
+    tuple_set ts;
+    int i;
+    query_set_prefix(db, rel, &ts);
+    if (ts.count != nrows || ts.arity != 2) {
+        printf("  %s: got %ld rows (arity %d), expected %d\n",
+               rel, ts.count, ts.arity, nrows);
+        long j;
+        for (j = 0; j < ts.count; j++)
+            printf("    (%u,%u)\n", ts.data[j*2], ts.data[j*2+1]);
+        tset_free(&ts);
+        return 0;
+    }
+    for (i = 0; i < nrows; i++) {
+        if (!tset_has(&ts, &rows[(size_t)i * 2])) {
+            printf("  %s: missing (%u,%u)\n", rel, rows[(size_t)i*2],
+                   rows[(size_t)i*2 + 1]);
+            tset_free(&ts);
+            return 0;
+        }
+    }
+    tset_free(&ts);
+    return 1;
+}
+
+/* Set equality between two local tuple_sets (order-independent). */
+static int sets_equal(const tuple_set *a, const tuple_set *b)
+{
+    long i;
+    if (a->count != b->count || a->arity != b->arity) return 0;
+    for (i = 0; i < a->count; i++)
+        if (!tset_has(b, a->data + (size_t)i * a->arity)) return 0;
+    return 1;
+}
+
+/* Compare the in-memory view of every relation across two databases. */
+static int compare_all_views(dl_db *ivm, dl_db *oracle)
+{
+    const char *rels[] = {"edge", "mid", "tail", "end", "fin",
+                          "p", "q", "r"};
+    int i;
+    for (i = 0; i < 8; i++) {
+        tuple_set ta, tb;
+        query_set_prefix(ivm, rels[i], &ta);
+        query_set_prefix(oracle, rels[i], &tb);
+        if (!sets_equal(&ta, &tb)) {
+            printf("  %s: IVM %ld rows vs oracle %ld rows\n",
+                   rels[i], ta.count, tb.count);
+            long j;
+            for (j = 0; j < ta.count; j++)
+                printf("    ivm (%u,%u)\n", ta.data[j*2], ta.data[j*2+1]);
+            for (j = 0; j < tb.count; j++)
+                printf("    ora (%u,%u)\n", tb.data[j*2], tb.data[j*2+1]);
+            tset_free(&ta); tset_free(&tb);
+            return 0;
+        }
+        tset_free(&ta); tset_free(&tb);
+    }
+    return 1;
+}
+
+/* ─── T5: deterministic insert-only IVM (multi-level cascade + fan-out) ── */
+
+static void test_insert_ivm_deterministic(void)
+{
+    dl_db *db;
+
+    TEST("T5: insert-only IVM — deterministic cascade over the DAG");
+
+    setup_db(&db, "t5");
+
+    {
+        int i;
+        for (i = 0; i < 5; i++)
+            assert(dl_declare_relation(db, IVM_EDB[i], 2) == 0);
+    }
+    assert(dl_load_rules(db, IVM_RULES) == 0);
+    assert(dl_compile(db) == 0);
+
+    /* Milestone 1: build the whole cascade in one publish (batched deltas). */
+    {
+        uint32_t edge12[]  = {1,2};
+        uint32_t edge89[]  = {8,9};
+        uint32_t mid23[]   = {2,3};
+        uint32_t mid93[]   = {9,3};
+        uint32_t tail34[]  = {3,4};
+        uint32_t fin45[]   = {4,5};
+        uint32_t end27[]   = {2,7};
+
+        assert(dl_add_fact(db, "edge", edge12, 2) == 1);
+        assert(dl_add_fact(db, "mid",  mid23, 2) == 1);
+        assert(dl_add_fact(db, "tail", tail34, 2) == 1);
+        assert(dl_add_fact(db, "fin",  fin45, 2) == 1);
+        assert(dl_add_fact(db, "end",  end27, 2) == 1);
+        assert(dl_add_fact(db, "edge", edge89, 2) == 1);
+        assert(dl_add_fact(db, "mid",  mid93, 2) == 1);
+    }
+    assert(dl_publish_snapshot(db) == 0);
+
+    {
+        /* p = {(1,2),(1,3),(8,9),(8,3)} */
+        uint32_t p[] = {1,2, 1,3, 8,9, 8,3};
+        /* q = {(1,4),(1,7),(8,4)} */
+        uint32_t q[] = {1,4, 1,7, 8,4};
+        /* r = {(1,5),(8,5)} */
+        uint32_t r[] = {1,5, 8,5};
+        if (!check_rel2(db, "p", p, 4) ||
+            !check_rel2(db, "q", q, 3) ||
+            !check_rel2(db, "r", r, 2)) {
+            teardown_db(db, "t5");
+            FAIL("T5: milestone-1 cascade wrong");
+            return;
+        }
+    }
+
+    /* Milestone 2: a single incremental insert that triggers a fresh cascade
+     * through ALREADY-PRESENT downstream facts (mid/tail/fin are all present,
+     * so edge(10,11)+end(11,12) must derive p(10,11), q(10,12) — and NOT
+     * disturb the earlier tuples). */
+    {
+        uint32_t edge10[] = {10,11};
+        uint32_t end11[]  = {11,12};
+        assert(dl_add_fact(db, "edge", edge10, 2) == 1);
+        assert(dl_add_fact(db, "end",  end11, 2) == 1);
+    }
+    assert(dl_publish_snapshot(db) == 0);
+
+    {
+        uint32_t p[] = {1,2, 1,3, 8,9, 8,3, 10,11};
+        uint32_t q[] = {1,4, 1,7, 8,4, 10,12};
+        uint32_t r[] = {1,5, 8,5};
+        if (!check_rel2(db, "p", p, 5) ||
+            !check_rel2(db, "q", q, 4) ||
+            !check_rel2(db, "r", r, 2)) {
+            teardown_db(db, "t5");
+            FAIL("T5: milestone-2 incremental cascade wrong");
+            return;
+        }
+    }
+
+    teardown_db(db, "t5");
+    PASS();
+}
+
+/* ─── T6: equivalence-oracle property test (IVM vs full re-eval) ───────── */
+
+static void test_insert_ivm_property(void)
+{
+    dl_db *ivm_db, *oracle_db;
+    int iter, i;
+
+    TEST("T6: insert-only IVM — seeded random property vs full re-eval oracle");
+
+    setup_db(&ivm_db, "t6ivm");
+    setup_db(&oracle_db, "t6ora");
+
+    for (i = 0; i < 5; i++) {
+        assert(dl_declare_relation(ivm_db, IVM_EDB[i], 2) == 0);
+        assert(dl_declare_relation(oracle_db, IVM_EDB[i], 2) == 0);
+    }
+    assert(dl_load_rules(ivm_db, IVM_RULES) == 0);
+    assert(dl_load_rules(oracle_db, IVM_RULES) == 0);
+    assert(dl_compile(ivm_db) == 0);
+    assert(dl_compile(oracle_db) == 0);
+
+    prng_state = 0xC0FFEEu;
+
+    for (iter = 0; iter < 120; iter++) {
+        int rel = (int)(prng_next() % 5);
+        uint32_t cols[2] = { prng_next() % 8, prng_next() % 8 };
+        int rc;
+
+        /* Identical random insert into both databases. */
+        rc = dl_add_fact(ivm_db, IVM_EDB[rel], cols, 2);
+        if (rc < 0) { printf("  IVM dl_add_fact error\n"); goto fail_prop; }
+        rc = dl_add_fact(oracle_db, IVM_EDB[rel], cols, 2);
+        if (rc < 0) { printf("  oracle dl_add_fact error\n"); goto fail_prop; }
+
+        /* IVM: propagate on publish.  Oracle: full re-eval on compile. */
+        if (dl_publish_snapshot(ivm_db) != 0) {
+            printf("  publish failed at iter %d\n", iter);
+            goto fail_prop;
+        }
+        if (dl_compile(oracle_db) != 0) {
+            printf("  oracle compile failed at iter %d\n", iter);
+            goto fail_prop;
+        }
+
+        if (!compare_all_views(ivm_db, oracle_db)) {
+            printf("  divergence at iter %d (rel %s, +(%u,%u))\n",
+                   iter, IVM_EDB[rel], cols[0], cols[1]);
+            goto fail_prop;
+        }
+    }
+
+    teardown_db(ivm_db, "t6ivm");
+    teardown_db(oracle_db, "t6ora");
+    PASS();
+    return;
+
+fail_prop:
+    teardown_db(ivm_db, "t6ivm");
+    teardown_db(oracle_db, "t6ora");
+    FAIL("T6: IVM views diverged from full re-eval oracle");
+}
+
+/* ─── T7: mixed EDB+IDB insert falls back to full re-eval ──────────────── */
+
+static void test_insert_mixed_head_fallback(void)
+{
+    dl_db *db;
+    tuple_set ts;
+
+    TEST("T7: base fact into a rule-head relation -> full re-eval (mixed)");
+
+    setup_db(&db, "t7");
+
+    assert(dl_declare_relation(db, "a", 1) == 0);
+    {
+        uint32_t one = 1, two = 2;
+        assert(dl_add_fact(db, "a", &one, 1) == 1);
+        assert(dl_add_fact(db, "a", &two, 1) == 1);
+    }
+
+    assert(dl_load_rules(db, "r(X):-a(X).\n") == 0);
+    assert(dl_compile(db) == 0);
+
+    /* Adding a base fact DIRECTLY to a rule-head relation (r is derived from a)
+     * is the mixed EDB+IDB case: the fact must appear in r's view AND count as
+     * a new tuple in r.  It is outside the Slice 1 insert class, so it must
+     * set full_reeval_pending and re-derive via the full fixpoint — r must
+     * become {1,2,3}, NOT stay {1,2} (which a naive delta-only propagate
+     * would produce). */
+    {
+        uint32_t three = 3;
+        assert(dl_add_fact(db, "r", &three, 1) == 1);
+    }
+    assert(dl_publish_snapshot(db) == 0);
+
+    query_set_prefix(db, "r", &ts);
+    if (ts.count != 3 || ts.arity != 1) {
+        printf("  r got %ld rows, expected 3\n", ts.count);
+        long j;
+        for (j = 0; j < ts.count; j++) printf("    r(%u)\n", ts.data[j]);
+        tset_free(&ts); teardown_db(db, "t7");
+        FAIL("T7: mixed-head insert did not full re-eval");
+        return;
+    }
+    {
+        uint32_t v;
+        for (v = 1; v <= 3; v++) {
+            uint32_t row[1] = {v};
+            if (!tset_has(&ts, row)) {
+                printf("  r missing %u\n", v);
+                tset_free(&ts); teardown_db(db, "t7");
+                FAIL("T7: r missing value after mixed insert");
+                return;
+            }
+        }
+    }
+    tset_free(&ts);
+
+    teardown_db(db, "t7");
+    PASS();
+}
+
 /* ─── Main ────────────────────────────────────────────────────────────── */
 
 int main(void)
 {
-    printf("IVM Slice 0 deletion-correctness tests\n");
-    printf("=======================================\n\n");
+    printf("IVM Slice 0/1 correctness + IVM equivalence-oracle tests\n");
+    printf("=======================================================\n\n");
 
     test_tc_delete();
     test_aggregate_delete();
     test_evenodd_delete();
     test_reopen_rederive();
+    test_insert_ivm_deterministic();
+    test_insert_ivm_property();
+    test_insert_mixed_head_fallback();
 
     printf("\n%d tests run, %d failed\n", tests_run, tests_failed);
     return tests_failed ? 1 : 0;

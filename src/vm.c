@@ -1935,3 +1935,200 @@ long vm_query(dl_db *db, compiled_rule **rules, int n_rules,
     }
     return 0;
 }
+
+/* ─── IVM Slice 1: insert-only incremental maintenance ─────────────────── */
+/*
+ * Insert-only incremental maintenance for NON-RECURSIVE, NEGATION-FREE,
+ * AGGREGATE-FREE rules.  A +delta on relation R is propagated through every
+ * dependent rule whose body reads R, by seeding the rule's body join with the
+ * delta as the changed body atom (the existing exec_rule override mechanism —
+ * semi-naive single-step).  New head tuples are committed to the head view via
+ * exec_rule's commit mode and recursively propagated through the head's
+ * dependents (non-recursive rules form a DAG, so this terminates).
+ *
+ * Correctness is preserved BY CONSTRUCTION: any change outside this class
+ * (delete, bulk load, rule load, base fact into a rule-head, or a rule with
+ * recursion / negation / aggregates / OP_WALK / OP_LOOKUP_PERM) sets
+ * db->full_reeval_pending and the publish path runs the FULL fixpoint (the
+ * now-correct oracle).  We never propagate when in doubt.
+ *
+ * The override is valid only for OP_SCAN and OP_LOOKUP body atoms:
+ *   - OP_SCAN  override: enumerates the delta tuple_set verbatim.         OK.
+ *   - OP_LOOKUP override: ts_prefix on the delta (original column order). OK.
+ *   - OP_WALK  override: IGNORED (rel_pattern always scans the DAFSA) — the
+ *     delta would be silently dropped.  Excluded by vm_ivm_eligible.
+ *   - OP_LOOKUP_PERM override: expects a PERMUTED-order shadow; our deltas
+ *     are in original column order — a silent wrong answer.  Excluded.
+ *   - OP_NEG_CHECK / aggregates / recursion: excluded.
+ */
+
+int vm_ivm_eligible(dl_db *db)
+{
+    int i;
+    if (!db) return 0;
+
+    for (i = 0; i < db->n_crules; i++) {
+        const compiled_rule *cr = db->crules[i];
+        int k;
+        if (cr->is_recursive)  return 0;
+        if (cr->has_aggregate) return 0;
+        for (k = 0; k < cr->n_instrs; k++) {
+            uint8_t op = cr->instrs[k].op;
+            if (op == OP_NEG_CHECK)   return 0;
+            if (op == OP_WALK)        return 0;
+            if (op == OP_LOOKUP_PERM) return 0;
+        }
+    }
+    return 1;
+}
+
+void vm_clear_deltas(dl_db *db)
+{
+    int i;
+    if (!db) return;
+    for (i = 0; i < MAX_RELS; i++) {
+        if (db->delta_pending[i]) {
+            ts_free(db->delta_pending[i]);
+            free(db->delta_pending[i]);
+            db->delta_pending[i] = NULL;
+        }
+    }
+}
+
+/* Worklist entry: a pending +delta for one relation. */
+typedef struct {
+    int        rel_id;
+    tuple_set *ts;
+} ivm_work;
+
+/* Capture callback: each NEWLY-DERIVED head tuple (exec_rule commit mode calls
+ * cb only on rel_add()==1) is sunk into a tuple_set for the next wave. */
+typedef struct {
+    tuple_set *ts;
+    int        err;
+} ivm_capture;
+
+static int ivm_capture_cb(const uint32_t *cols, uint8_t arity, void *user)
+{
+    ivm_capture *cap = (ivm_capture *)user;
+    (void)arity;
+    if (cap->err) return 1;               /* already failed — stop */
+    if (ts_add(cap->ts, cols) < 0) { cap->err = -1; return 1; }
+    return 0;
+}
+
+int vm_propagate_deltas(dl_db *db)
+{
+    ivm_work  *queue = NULL;
+    size_t     qcap = 0, qn = 0, qh = 0;
+    int        i, rc = -1;
+
+    if (!db) return -1;
+
+    /* Seed the queue from pending base deltas, transferring ownership (the
+     * tuple_set structs are heap-allocated by the capture path in dl.c). */
+    for (i = 0; i < (int)db->nrels; i++) {
+        tuple_set *ts = db->delta_pending[i];
+        if (!ts) continue;
+        db->delta_pending[i] = NULL;      /* ownership moved to the queue */
+        if (ts->count == 0) {
+            ts_free(ts); free(ts);
+            continue;
+        }
+        ts_sort(ts);                      /* OP_LOOKUP override needs sorted */
+        if (qn == qcap) {
+            size_t nc = qcap ? qcap * 2 : 16;
+            ivm_work *nq = realloc(queue, nc * sizeof(ivm_work));
+            if (!nq) { ts_free(ts); free(ts); goto fail; }
+            queue = nq; qcap = nc;
+        }
+        queue[qn].rel_id = i;
+        queue[qn].ts = ts;
+        qn++;
+    }
+
+    while (qh < qn) {
+        ivm_work w = queue[qh++];
+        int ri;
+
+        for (ri = 0; ri < db->n_crules; ri++) {
+            compiled_rule *cr = db->crules[ri];
+            int k;
+
+            for (k = 0; k < cr->n_instrs; k++) {
+                const vm_instr *in = &cr->instrs[k];
+                uint8_t op = in->op;
+                vm_override ov[1];
+                ivm_capture cap;
+                tuple_set *head_ts;
+                relation  *hrel;
+                uint8_t    harity;
+                long       m;
+
+                /* Only body atoms reading w.rel_id via an override-compatible
+                 * opcode.  vm_ivm_eligible() guarantees no WALK/LOOKUP_PERM/
+                 * NEG_CHECK, but stay defensive: skip anything not SCAN/LOOKUP. */
+                if (op != OP_SCAN && op != OP_LOOKUP) continue;
+                if ((int)in->a != w.rel_id) continue;
+
+                hrel = db_rel(db, cr->head_rel_id);
+                if (!hrel) goto fail;
+                harity = rel_arity(hrel);
+
+                head_ts = malloc(sizeof(*head_ts));
+                if (!head_ts) goto fail;
+                if (ts_init(head_ts, harity) != 0) { free(head_ts); goto fail; }
+
+                ov[0].body_idx = (int)in->body_idx;
+                ov[0].ts       = w.ts;
+                ov[0].perm_id  = -1;
+
+                cap.ts  = head_ts;
+                cap.err = 0;
+
+                m = exec_rule(db, cr, ov, 1, 0 /* commit */,
+                              ivm_capture_cb, &cap);
+                if (m < 0 || cap.err) {
+                    ts_free(head_ts); free(head_ts);
+                    goto fail;
+                }
+
+                if (head_ts->count > 0) {
+                    /* Perm-index consistency (M6 silent-wrong-answer class):
+                     * the head view just grew — mark its perms dirty and
+                     * rebuild so dependent rules see fresh perm indices. */
+                    permindex_mark_dirty(db, cr->head_rel_id);
+                    if (permindex_build_dirty(db) != 0) {
+                        ts_free(head_ts); free(head_ts);
+                        goto fail;
+                    }
+                    ts_sort(head_ts);
+
+                    if (qn == qcap) {
+                        size_t nc = qcap ? qcap * 2 : 16;
+                        ivm_work *nq = realloc(queue, nc * sizeof(ivm_work));
+                        if (!nq) { ts_free(head_ts); free(head_ts); goto fail; }
+                        queue = nq; qcap = nc;
+                    }
+                    queue[qn].rel_id = cr->head_rel_id;
+                    queue[qn].ts = head_ts;
+                    qn++;
+                } else {
+                    ts_free(head_ts); free(head_ts);
+                }
+            }
+        }
+
+        ts_free(w.ts);
+        free(w.ts);
+    }
+
+    rc = 0;
+
+fail:
+    while (qh < qn) { ts_free(queue[qh].ts); free(queue[qh].ts); qh++; }
+    free(queue);
+    /* Free any delta_pending not yet seeded into the queue (OOM mid-seed). */
+    vm_clear_deltas(db);
+    return rc;
+}

@@ -227,6 +227,9 @@ void dl_close(dl_db *db)
     /* M6: free permutation indices */
     permindex_free_all(db);
 
+    /* IVM Slice 1: free any pending delta tuple_sets */
+    vm_clear_deltas(db);
+
     /* Save interner */
     {
         char *fwd_path = make_path(db, "symbols", ".dafsa");
@@ -621,6 +624,10 @@ int dl_load_facts(dl_db *db, const char *rel_name, const char *csv_path)
         }
     }
 
+    /* IVM Slice 1: bulk load bypasses dl_add_fact (no per-tuple delta), so a
+     * full re-eval is required at the next publish. */
+    db->full_reeval_pending = 1;
+
     /* M4: facts changed, mark fixpoint dirty */
     db->fixpoint_dirty = 1;
 
@@ -672,6 +679,32 @@ static int encode_fact_key(unsigned char *key, size_t *key_len,
     return 0;
 }
 
+/* IVM Slice 1: is rel_id a rule head (and therefore a derived view)? */
+static int ivm_rel_is_head(dl_db *db, int rel_id)
+{
+    int i;
+    for (i = 0; i < db->n_crules; i++)
+        if ((int)db->crules[i]->head_rel_id == rel_id) return 1;
+    return 0;
+}
+
+/* IVM Slice 1: append a +delta for rel_id to db->delta_pending (lazy-init).
+ * Returns 0 on success (added or duplicate), -1 on error. */
+static int ivm_capture_delta(dl_db *db, int rel_id,
+                             const uint32_t *cols, uint8_t arity)
+{
+    tuple_set *ts = db->delta_pending[rel_id];
+    int rc;
+    if (!ts) {
+        ts = malloc(sizeof(*ts));
+        if (!ts) return -1;
+        if (ts_init(ts, arity) != 0) { free(ts); return -1; }
+        db->delta_pending[rel_id] = ts;
+    }
+    rc = ts_add(ts, cols);
+    return (rc < 0) ? -1 : 0;
+}
+
 int dl_add_fact(dl_db *db, const char *rel_name,
                 const uint32_t *cols, uint8_t arity)
 {
@@ -720,6 +753,23 @@ int dl_add_fact(dl_db *db, const char *rel_name,
     /* 4. In-memory add to BASE */
     rc = rel_add_base(db->rels[idx].rel, cols);
     if (rc < 0) return -1;
+
+    /* 4a. IVM Slice 1: capture the insert delta (AFTER the in-memory commit,
+     * per the interner-before-WAL ordering note — no interner interaction
+     * here).  A base fact added to a RULE-HEAD relation is the mixed EDB+IDB
+     * case (the fact must appear in the view AND propagate) — out of the
+     * Slice 1 class, so force a full re-eval instead of a wrong propagate. */
+    if (rc == 1) {
+        if (ivm_rel_is_head(db, idx)) {
+            db->full_reeval_pending = 1;
+        } else if (ivm_capture_delta(db, idx, cols, arity) != 0) {
+            /* OOM capturing the delta: the base fact is already committed
+             * (base + WAL).  Fall back to a full re-eval at publish rather
+             * than leaving downstream derived views stale (never silently
+             * mis-evaluate). */
+            db->full_reeval_pending = 1;
+        }
+    }
 
     /* 5. Check compaction threshold: WAL > 25% of BASE estimate? */
     {
@@ -771,6 +821,10 @@ int dl_delete_fact(dl_db *db, const char *rel_name,
     /* 3. In-memory delete from BASE */
     rc = rel_delete_base(db->rels[idx].rel, cols);
     if (rc < 0) return -1;
+
+    /* IVM Slice 1: deletion is out of the insert-only class — force a full
+     * re-eval (the correctness floor; never wrongly propagate a delete). */
+    db->full_reeval_pending = 1;
 
     /* M4: facts changed, mark fixpoint dirty */
     db->fixpoint_dirty = 1;
@@ -1016,6 +1070,10 @@ int dl_load_rules(dl_db *db, const char *dl_source)
         db->n_crules = new_total;
     }
 
+    /* IVM Slice 1: the rule set changed — pending deltas can no longer be
+     * propagated against the old program, so force a full re-eval. */
+    db->full_reeval_pending = 1;
+
     /* M4: new rules loaded, mark fixpoint dirty */
     db->fixpoint_dirty = 1;
 
@@ -1038,8 +1096,12 @@ int dl_compile(dl_db *db)
     if (vm_execute(db, db->crules, db->n_crules) != 0)
         return -1;
 
-    /* M4: compilation successful, fixpoint is now clean */
+    /* M4: compilation successful, fixpoint is now clean.  IVM Slice 1: the
+     * full re-eval consumed every pending change — drop deltas + the
+     * full-reeval flag so subsequent inserts can propagate incrementally. */
     db->fixpoint_dirty = 0;
+    db->full_reeval_pending = 0;
+    vm_clear_deltas(db);
     return 0;
 }
 
@@ -1521,10 +1583,28 @@ int dl_publish_snapshot(dl_db *db)
 
     if (!db) return -1;
 
-    /* 1. Run VM if rules exist and fixpoint is dirty */
+    /* 1. Materialize derived views if rules exist and the fixpoint is dirty.
+     * IVM Slice 1: three-way dispatch —
+     *   full_reeval_pending OR an ineligible program  → FULL fixpoint (oracle)
+     *   else pending insert deltas + eligible program → delta propagation
+     *   else                                            → pure save
+     * Any change outside the IVM-insert class MUST have set
+     * full_reeval_pending (delete/bulk/rule-load/mixed-head), so we never
+     * wrongly propagate. */
     if (db->n_crules > 0 && db->fixpoint_dirty) {
-        if (vm_execute(db, db->crules, db->n_crules) != 0)
+        if (db->full_reeval_pending || !vm_ivm_eligible(db)) {
+            if (vm_execute(db, db->crules, db->n_crules) != 0)
+                return -1;
+            vm_clear_deltas(db);   /* full re-eval consumed pending changes */
+        } else if (vm_propagate_deltas(db) != 0) {
+            /* Propagation failed part-way (OOM): the view may be partially
+             * updated and delta_pending was cleared.  Force a full re-eval
+             * on the next publish instead of leaving a silently-incomplete
+             * view (never silently mis-evaluate). */
+            db->full_reeval_pending = 1;
             return -1;
+        }
+        db->full_reeval_pending = 0;
         db->fixpoint_dirty = 0;
     }
 
