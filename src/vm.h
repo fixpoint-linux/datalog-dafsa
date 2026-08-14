@@ -3,7 +3,8 @@
  *
  * Flat binding-table bytecode interpreter. Instructions:
  *   OP_SCAN, OP_LOOKUP, OP_EQ, OP_EQ_CONST, OP_PROJECT, OP_HALT,
- *   OP_NEG_CHECK.
+ *   OP_NEG_CHECK, OP_AGG_ACC, OP_AGG_EMIT, OP_WALK, OP_LOOKUP_PERM,
+ *   OP_HASH_JOIN, OP_CMP (M9 comparison), OP_ARITH (M9 arithmetic).
  *
  * M2: vm_execute performs stratified semi-naive fixpoint evaluation.
  * Rules are grouped by stratum; recursive strata iterate to fixpoint.

@@ -9,6 +9,19 @@
  * column mixes raw ints (e.g., 1) and interned symbols (e.g., 'a' →
  * some sym_id), they collide.  In M1, relations should keep each column
  * type-homogeneous (all ints or all symbols) to avoid this.
+ *
+ * M9 (arithmetic/comparison builtins) operates on the raw u32 interpretation
+ * (option (a), no type tag), exactly like OP_EQ and min/max/sum already do.
+ * Consequence of B6, documented here:
+ *   - an ordering comparison on a SYMBOL column compares sym_ids (a
+ *     well-defined total order, NOT lexicographic);
+ *   - arithmetic on a symbol column is MEANINGLESS.  Arithmetic expression
+ *     operands are restricted to TOK_VAR/TOK_INT at PARSE time (a
+ *     TOK_IDENT/TOK_STRING constant is rejected as a bad expression factor),
+ *     so no var-type inference is needed in M9 — there is no path that
+ *     feeds a symbol constant into OP_ARITH.
+ *   - `X != ident` is the one builtin form that interns a symbol constant and
+ *     compares sym_ids; it is supported and consistent with the above.
  */
 
 #include "compiler.h"
@@ -120,6 +133,183 @@ static int token_const(dl_db *db, const token *t, uint32_t *out)
         return 0;
     }
     return -1;
+}
+
+/* ─── M9: builtin atom classification + arithmetic lowering ──────────── */
+
+/* comparison atom: pred in {<,<=,>,>=,!=}, nargs==2 */
+static int is_comparison(const atom *a)
+{
+    if (!a || !a->pred) return 0;
+    return strcmp(a->pred, "<")  == 0 || strcmp(a->pred, "<=") == 0 ||
+           strcmp(a->pred, ">")  == 0 || strcmp(a->pred, ">=") == 0 ||
+           strcmp(a->pred, "!=") == 0;
+}
+
+/* arithmetic atom: `X = E` — pred "=" with an attached expr tree (nargs==1) */
+static int is_arith(const atom *a)
+{
+    return a && a->pred && strcmp(a->pred, "=") == 0 && a->arith != NULL;
+}
+
+/* equality atom: `X = Y` — pred "=" with nargs==2 and no expr tree */
+static int is_equality(const atom *a)
+{
+    return a && a->pred && strcmp(a->pred, "=") == 0 &&
+           a->nargs == 2 && a->arith == NULL;
+}
+
+/* any non-relational builtin (equality / comparison / arithmetic) */
+static int is_builtin_pred(const atom *a)
+{
+    return is_equality(a) || is_comparison(a) || is_arith(a);
+}
+
+/* comparison operator string -> OP_CMP imm code */
+static int cmp_op_code(const char *pred)
+{
+    if (!strcmp(pred, "<"))  return 0;
+    if (!strcmp(pred, "<=")) return 1;
+    if (!strcmp(pred, ">"))  return 2;
+    if (!strcmp(pred, ">=")) return 3;
+    return 4;  /* != */
+}
+
+/* arithmetic operator char -> OP_ARITH imm code */
+static int arith_op_code(char op)
+{
+    switch (op) {
+        case '+': return 0;
+        case '-': return 1;
+        case '*': return 2;
+        case '/': return 3;
+        default:  return 4;  /* % */
+    }
+}
+
+/* collect every variable in an expr tree into the var table (so v_find can
+ * resolve operand vars referenced only inside arithmetic) */
+static void collect_expr_vars(const expr *e, v_tab *vt)
+{
+    if (!e) return;
+    if (e->kind == EX_VAR) {
+        v_add(vt, e->var);
+    } else if (e->kind == EX_BINOP) {
+        collect_expr_vars(e->l, vt);
+        collect_expr_vars(e->r, vt);
+    }
+}
+
+/* does an expr tree contain a division/modulo by a literal 0? */
+static int expr_has_div0(const expr *e)
+{
+    if (!e) return 0;
+    if (e->kind == EX_BINOP) {
+        if ((e->op == '/' || e->op == '%') && e->r &&
+            e->r->kind == EX_INT && e->r->ival == 0)
+            return 1;
+        return expr_has_div0(e->l) || expr_has_div0(e->r);
+    }
+    return 0;
+}
+
+/* require every variable operand of an expr tree to be bound; returns 0 on
+ * the first unbound operand (with a diagnostic), 1 if all bound */
+static int expr_vars_bound(const expr *e, v_tab *vt, const int *bound_vars,
+                           const char *head_pred)
+{
+    if (!e) return 1;
+    if (e->kind == EX_VAR) {
+        int vi = v_find(vt, e->var);
+        if (vi < 0 || !bound_vars[vi]) {
+            fprintf(stderr,
+                "compile error: ungrounded arithmetic operand — variable "
+                "'%s' is not bound by a positive body atom (rule '%s')\n",
+                e->var, head_pred);
+            return 0;
+        }
+        return 1;
+    }
+    if (e->kind == EX_BINOP)
+        return expr_vars_bound(e->l, vt, bound_vars, head_pred) &&
+               expr_vars_bound(e->r, vt, bound_vars, head_pred);
+    return 1;
+}
+
+/* Lower an expr tree postorder into bytecode: EX_INT -> OP_EQ_CONST(__kN),
+ * EX_VAR -> its var slot, EX_BINOP -> OP_ARITH(lhs, rhs, fresh __tN temp).
+ * Returns the slot index holding the tree's value, or -1 on error. */
+static int lower_expr(dl_db *db, const expr *e, v_tab *vt, i_buf *ib,
+                      int *cc, int *tc, int body_idx)
+{
+    char cname[16];
+    int vi;
+    vm_instr *in;
+
+    if (!e) return -1;
+    switch (e->kind) {
+    case EX_INT:
+        snprintf(cname, sizeof(cname), "__k%d", (*cc)++);
+        vi = v_add(vt, cname);
+        if (vi < 0) return -1;
+        in = i_emit(ib);
+        if (!in) return -1;
+        in->op = OP_EQ_CONST;
+        in->a = vt->e[vi].slot;
+        in->imm = e->ival;
+        return (int)vt->e[vi].slot;
+    case EX_VAR: {
+        int v = v_find(vt, e->var);
+        return (v >= 0) ? (int)vt->e[v].slot : -1;
+    }
+    case EX_BINOP: {
+        int ls = lower_expr(db, e->l, vt, ib, cc, tc, body_idx);
+        int rs = lower_expr(db, e->r, vt, ib, cc, tc, body_idx);
+        if (ls < 0 || rs < 0) return -1;
+        snprintf(cname, sizeof(cname), "__t%d", (*tc)++);
+        vi = v_add(vt, cname);
+        if (vi < 0) return -1;
+        in = i_emit(ib);
+        if (!in) return -1;
+        in->op = OP_ARITH;
+        in->a = (uint8_t)ls;
+        in->b = (uint8_t)rs;
+        in->c = vt->e[vi].slot;
+        in->imm = (uint32_t)arith_op_code(e->op);
+        in->body_idx = (uint8_t)body_idx;
+        return (int)vt->e[vi].slot;
+    }
+    default:
+        return -1;
+    }
+}
+
+/* Resolve a comparison operand to a slot: variables use their var slot,
+ * constants (TOK_INT, or TOK_IDENT for `!=`) are materialized into a fresh
+ * __kN slot via OP_EQ_CONST.  Returns the slot, or -1 on error. */
+static int cmp_operand_slot(dl_db *db, const token *t, v_tab *vt, i_buf *ib,
+                            int *cc)
+{
+    if (t->kind == TOK_VAR) {
+        int vi = v_find(vt, t->text);
+        return (vi >= 0) ? (int)vt->e[vi].slot : -1;
+    }
+    {
+        char cname[16];
+        int vi;
+        uint32_t cv;
+        vm_instr *eq;
+        snprintf(cname, sizeof(cname), "__k%d", (*cc)++);
+        vi = v_add(vt, cname);
+        if (vi < 0) return -1;
+        if (token_const(db, t, &cv)) return -1;
+        eq = i_emit(ib);
+        if (!eq) return -1;
+        eq->op = OP_EQ_CONST;
+        eq->a = vt->e[vi].slot;
+        eq->imm = cv;
+        return (int)vt->e[vi].slot;
+    }
 }
 
 /* ─── Stratification ────────────────────────────────────────────────── */
@@ -474,6 +664,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
     v_tab vt; i_buf ib; compiled_rule *cr = NULL;
     int head_ri, *bri = NULL, bi, i, j;
     int cc = 0;  /* counter for unique constant slot names */
+    int tc = 0;  /* M9: counter for unique arithmetic temp slot names */
     int agg_body_idx = -1;
 
     v_init(&vt); i_init(&ib);
@@ -597,11 +788,12 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
     if (!bri) goto fail;
     for (bi = 0; bi < r->nbody; bi++) {
         atom *ba = r->body[bi];
-        /* equality and aggregate atoms are not relation references */
+        /* aggregates and builtins (equality/comparison/arithmetic) are not
+         * relation references */
         if (ba->aggregate) { bri[bi] = -1; continue; }
-        if (strcmp(ba->pred, "=") == 0) {
+        if (is_builtin_pred(ba)) {
             if (ba->negated) {
-                fprintf(stderr, "compile error: negated equality not supported "
+                fprintf(stderr, "compile error: negated builtin not supported "
                         "(rule '%s')\n", r->head->pred); goto fail;
             }
             bri[bi] = -1; continue;
@@ -624,6 +816,12 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
     for (i = 0; i < r->nbody; i++)
         for (j = 0; j < r->body[i]->nargs; j++)
             if (r->body[i]->args[j]->kind == TOK_VAR && v_add(&vt, r->body[i]->args[j]->text) < 0) goto fail;
+    /* M9: arithmetic operand vars referenced only inside an expr tree must
+     * also be in the var table (so v_find resolves them during safety checks
+     * and lowering). */
+    for (i = 0; i < r->nbody; i++)
+        if (is_arith(r->body[i]))
+            collect_expr_vars(r->body[i]->arith, &vt);
     if (agg) {
         /* aggregate result var and source var are vars like any other */
         if (v_add(&vt, agg->pred) < 0) goto fail;
@@ -642,14 +840,30 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
         for (bi = 0; bi < r->nbody; bi++) {
             atom *ba = r->body[bi];
             if (ba->aggregate) continue;          /* computed after body */
-            if (strcmp(ba->pred, "=") == 0) {
-                /* equality binds its vars like a positive atom */
-                for (j = 0; j < ba->nargs; j++) {
-                    if (ba->args[j]->kind == TOK_VAR) {
-                        int vi = v_find(&vt, ba->args[j]->text);
-                        if (vi >= 0) bound_vars[vi] = 1;
-                    }
+            if (is_equality(ba)) {
+                /* equality X = Y binds at most ONE new side (OP_EQ binds Y
+                 * from X when X is bound, and is a NO-OP when both are
+                 * unbound).  So propagate binding only when at least one side
+                 * is already bound — otherwise a later negated atom reading X
+                 * would silently run NEG_CHECK against the UNBOUND sentinel
+                 * (0xFFFFFFFF) instead of being rejected as unsafe. */
+                int vi0 = (ba->nargs >= 1 && ba->args[0]->kind == TOK_VAR)
+                              ? v_find(&vt, ba->args[0]->text) : -1;
+                int vi1 = (ba->nargs >= 2 && ba->args[1]->kind == TOK_VAR)
+                              ? v_find(&vt, ba->args[1]->text) : -1;
+                int b0 = (vi0 >= 0) && bound_vars[vi0];
+                int b1 = (vi1 >= 0) && bound_vars[vi1];
+                if (b0 || b1) {
+                    if (vi0 >= 0) bound_vars[vi0] = 1;
+                    if (vi1 >= 0) bound_vars[vi1] = 1;
                 }
+                continue;
+            }
+            if (is_arith(ba) || is_comparison(ba)) {
+                /* builtins execute AFTER the relational phase (NEG_CHECK runs
+                 * during it), so their vars are NOT bound for negation-safety
+                 * purposes — a negated atom cannot safely read an arithmetic
+                 * result var or a comparison operand. */
                 continue;
             }
             if (ba->negated) {
@@ -678,6 +892,91 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
         }
     }
 
+    /* ── 5b. M9 builtin-safety pass ──────────────────────────────── */
+    /* Bound-set model mirrors the runtime emission order: relational atoms
+     * all bind first (pre-seeded), then equality (runs before arithmetic),
+     * then arithmetic in body order, then comparisons.  An ungrounded
+     * comparison/arithmetic operand is rejected LOUDLY (never silently
+     * mis-evaluated). */
+    {
+        int bound_vars[256] = {0};
+
+        /* (a) seed from ALL positive RELATIONAL atoms (regardless of their
+         *     text position — they all execute before any builtin). */
+        for (bi = 0; bi < r->nbody; bi++) {
+            atom *ba = r->body[bi];
+            if (ba->negated || ba->aggregate || is_builtin_pred(ba)) continue;
+            for (j = 0; j < ba->nargs; j++)
+                if (ba->args[j]->kind == TOK_VAR) {
+                    int vi = v_find(&vt, ba->args[j]->text);
+                    if (vi >= 0) bound_vars[vi] = 1;
+                }
+        }
+        /* (b) equality propagation (equality runs before arithmetic).  An
+         * equality X = Y binds at most ONE new side: OP_EQ binds Y from X when
+         * X is already bound (or X from Y when Y is bound), and is a NO-OP when
+         * both are unbound.  So propagate binding only when at least one side
+         * is already bound — otherwise leave both unbound so a downstream
+         * arithmetic/comparison consumer is rejected as ungrounded instead of
+         * silently reading the UNBOUND sentinel (0xFFFFFFFF). */
+        for (bi = 0; bi < r->nbody; bi++) {
+            atom *ba = r->body[bi];
+            int vi0, vi1, b0, b1;
+            if (!is_equality(ba)) continue;
+            vi0 = (ba->nargs >= 1 && ba->args[0]->kind == TOK_VAR)
+                      ? v_find(&vt, ba->args[0]->text) : -1;
+            vi1 = (ba->nargs >= 2 && ba->args[1]->kind == TOK_VAR)
+                      ? v_find(&vt, ba->args[1]->text) : -1;
+            b0 = (vi0 >= 0) && bound_vars[vi0];
+            b1 = (vi1 >= 0) && bound_vars[vi1];
+            if (b0 || b1) {
+                if (vi0 >= 0) bound_vars[vi0] = 1;
+                if (vi1 >= 0) bound_vars[vi1] = 1;
+            }
+        }
+        /* (c) arithmetic in body order: require operands bound, then add the
+         *     result var (left-to-right dependency among arithmetic atoms). */
+        for (bi = 0; bi < r->nbody; bi++) {
+            atom *ba = r->body[bi];
+            if (!is_arith(ba)) continue;
+            if (!expr_vars_bound(ba->arith, &vt, bound_vars, r->head->pred))
+                goto fail;
+            if (ba->nargs >= 1 && ba->args[0]->kind == TOK_VAR) {
+                int vi = v_find(&vt, ba->args[0]->text);
+                if (vi >= 0) bound_vars[vi] = 1;
+            }
+        }
+        /* (d) comparisons: both operand vars must be bound (by a relational
+         *     atom, equality, or an earlier arithmetic result). */
+        for (bi = 0; bi < r->nbody; bi++) {
+            atom *ba = r->body[bi];
+            if (!is_comparison(ba)) continue;
+            for (j = 0; j < ba->nargs; j++) {
+                token *t = ba->args[j];
+                if (t->kind != TOK_VAR) continue;
+                int vi = v_find(&vt, t->text);
+                if (vi < 0 || !bound_vars[vi]) {
+                    fprintf(stderr,
+                        "compile error: ungrounded comparison — variable "
+                        "'%s' in comparison '%s' is not bound by a positive "
+                        "body atom (rule '%s')\n",
+                        t->text, ba->pred, r->head->pred);
+                    goto fail;
+                }
+            }
+        }
+    }
+
+    /* ── 5c. M9: reject division/modulo by a literal 0 at compile time. ── */
+    for (bi = 0; bi < r->nbody; bi++) {
+        atom *ba = r->body[bi];
+        if (is_arith(ba) && expr_has_div0(ba->arith)) {
+            fprintf(stderr, "compile error: division/modulo by literal 0 "
+                    "(rule '%s')\n", r->head->pred);
+            goto fail;
+        }
+    }
+
     /* ── 6. grounding ────────────────────────────────────────────── */
     for (i = 0; i < r->head->nargs; i++) {
         token *a = r->head->args[i];
@@ -685,6 +984,17 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
         /* aggregate result var is produced by the aggregate, so it is
          * grounded without appearing in a positive body atom */
         if (agg && !strcmp(a->text, agg->pred)) continue;
+        /* M9: an arithmetic result var is produced by OP_ARITH+OP_EQ, so it
+         * is grounded without appearing in a positive body atom (the same
+         * exemption as the aggregate result var). */
+        {
+            int ares = 0;
+            for (bi = 0; bi < r->nbody; bi++)
+                if (is_arith(r->body[bi]) && r->body[bi]->nargs >= 1 &&
+                    !strcmp(r->body[bi]->args[0]->text, a->text))
+                    { ares = 1; break; }
+            if (ares) continue;
+        }
         int ok = 0;
         for (bi = 0; bi < r->nbody && !ok; bi++)
             for (j = 0; j < r->body[bi]->nargs; j++)
@@ -704,7 +1014,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
         for (bi = 0; bi < r->nbody; bi++) {
             atom *ba = r->body[bi];
             if (ba->negated || ba->aggregate) continue;
-            if (strcmp(ba->pred, "=") == 0) continue;
+            if (is_builtin_pred(ba)) continue;
             first_pos = bi; break;
         }
         if (first_pos < 0) {
@@ -779,7 +1089,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
             atom *curr = r->body[bi];
 
             if (curr->aggregate) continue;          /* AGG_ACC emitted below */
-            if (strcmp(curr->pred, "=") == 0) continue; /* equality via OP_EQ above */
+            if (is_builtin_pred(curr)) continue; /* equality/arith/comparison via OP_EQ/OP_ARITH/OP_CMP below */
 
             if (curr->negated) {
                 vm_instr *neg = i_emit(&ib);
@@ -813,7 +1123,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
                 for (bp = 0; bp < bi; bp++) {
                     if (r->body[bp]->negated || r->body[bp]->aggregate) continue;
                     atom *p = r->body[bp];
-                    if (strcmp(p->pred, "=") == 0) continue;
+                    if (is_builtin_pred(p)) continue;
                     int q;
                     for (q = 0; q < p->nargs; q++)
                         if (p->args[q]->kind == TOK_VAR &&
@@ -977,8 +1287,8 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
     for (bi = 0; bi < r->nbody; bi++) {
         atom *ba = r->body[bi];
         if (ba->aggregate) continue;
-        if (strcmp(ba->pred, "=") != 0) continue;
-        if (ba->negated) continue;  /* negated equality already rejected */
+        if (!is_equality(ba)) continue;
+        if (ba->negated) continue;  /* negated builtin already rejected */
         int vi_l = v_find(&vt, ba->args[0]->text);
         int vi_r = v_find(&vt, ba->args[1]->text);
         if (vi_l < 0 || vi_r < 0) goto fail;
@@ -987,6 +1297,45 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
         eq->a = vt.e[vi_l].slot;
         eq->b = vt.e[vi_r].slot;
         eq->body_idx = (uint8_t)bi;
+    }
+
+    /* Arithmetic atoms (`X = E`) → OP_ARITH into a fresh temp, then
+     * OP_EQ(X, tmp).  The final OP_EQ reuses the bind-or-filter semantics, so
+     * a pre-bound X filters (never silently overwrites) and an unbound X is
+     * bound — both paths preserve the b_try never-overwrite invariant.
+     * Emitted in body order after equality (which runs first) and before
+     * comparisons (which may reference arithmetic results). */
+    for (bi = 0; bi < r->nbody; bi++) {
+        atom *ba = r->body[bi];
+        if (!is_arith(ba)) continue;
+        if (ba->negated) continue;  /* negated builtin already rejected */
+        int rs = lower_expr(db, ba->arith, &vt, &ib, &cc, &tc, bi);
+        if (rs < 0) goto fail;
+        int rvi = v_find(&vt, ba->args[0]->text);
+        if (rvi < 0) goto fail;
+        vm_instr *eq = i_emit(&ib);
+        eq->op = OP_EQ;
+        eq->a = vt.e[rvi].slot;
+        eq->b = (uint8_t)rs;
+        eq->body_idx = (uint8_t)bi;
+    }
+
+    /* Comparison atoms (`X <op> Y`) → OP_CMP.  Both operand slots are bound
+     * by now (compiler guarantees; constants were materialized by
+     * cmp_operand_slot's OP_EQ_CONST). */
+    for (bi = 0; bi < r->nbody; bi++) {
+        atom *ba = r->body[bi];
+        if (!is_comparison(ba)) continue;
+        if (ba->negated) continue;  /* negated builtin already rejected */
+        int ls = cmp_operand_slot(db, ba->args[0], &vt, &ib, &cc);
+        int rs = cmp_operand_slot(db, ba->args[1], &vt, &ib, &cc);
+        if (ls < 0 || rs < 0) goto fail;
+        vm_instr *c = i_emit(&ib);
+        c->op = OP_CMP;
+        c->a = (uint8_t)ls;
+        c->b = (uint8_t)rs;
+        c->imm = (uint32_t)cmp_op_code(ba->pred);
+        c->body_idx = (uint8_t)bi;
     }
 
     /* Aggregate: emit AGG_ACC to accumulate all body bindings into

@@ -12,7 +12,9 @@
  *
  * Structure:
  *   exec_rule()         — bytecode interpreter (opcodes: SCAN, LOOKUP,
- *                         EQ, EQ_CONST, PROJECT, NEG_CHECK, HALT)
+ *                         EQ, EQ_CONST, PROJECT, NEG_CHECK, HALT, AGG_ACC,
+ *                         AGG_EMIT, WALK, LOOKUP_PERM, HASH_JOIN,
+ *                         CMP, ARITH)
  *   eval_nonrecursive() — M1 path: one exec_rule per rule, commits to DAFSA
  *   eval_stratum_recursive() — semi-naive fixpoint using tuple_sets
  *   vm_execute()        — stratify + dispatch
@@ -860,6 +862,58 @@ static long exec_rule(dl_db *db, const compiled_rule *cr,
                 }
             } else {
                 b_try(&b, s, cv);
+            }
+            ip++;
+            break;
+        }
+
+        /* ── OP_CMP: comparison filter (M9) ─────────────────────────
+         * a=lhs slot, b=rhs slot, imm=cmp code 0=LT 1=LE 2=GT 3=GE 4=NE.
+         * Both operands MUST be bound (compiler guarantees); on false,
+         * backtrack. */
+        case OP_CMP: {
+            uint32_t av = b_get(&b, in->a), bv = b_get(&b, in->b);
+            int pass = 0;
+            switch (in->imm) {
+                case 0: pass = av <  bv; break;
+                case 1: pass = av <= bv; break;
+                case 2: pass = av >  bv; break;
+                case 3: pass = av >= bv; break;
+                case 4: pass = av != bv; break;
+                default: pass = 0; break;
+            }
+            if (!pass) {
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                break;
+            }
+            ip++;
+            break;
+        }
+
+        /* ── OP_ARITH: arithmetic bind (M9) ─────────────────────────
+         * a=lhs slot, b=rhs slot, c=result temp slot,
+         * imm=arith code 0=ADD 1=SUB 2=MUL 3=DIV 4=MOD.
+         * Result written via b_try (never overwrite an existing binding);
+         * DIV/MOD with rhs==0 backtracks (never a crash); u32 wrap-around. */
+        case OP_ARITH: {
+            uint32_t av = b_get(&b, in->a), bv = b_get(&b, in->b);
+            uint32_t r = 0;
+            int ok = 1;
+            switch (in->imm) {
+                case 0: r = av + bv; break;
+                case 1: r = av - bv; break;
+                case 2: r = av * bv; break;
+                case 3: if (bv == 0) ok = 0; else r = av / bv; break;
+                case 4: if (bv == 0) ok = 0; else r = av % bv; break;
+                default: ok = 0; break;
+            }
+            if (!ok) {
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                break;
+            }
+            if (!b_try(&b, in->c, r)) {
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                break;
             }
             ip++;
             break;

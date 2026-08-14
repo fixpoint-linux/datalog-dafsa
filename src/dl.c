@@ -806,6 +806,10 @@ static atom *ast_atom_clone(const atom *a)
         n->agg_op = ast_tok_clone(a->agg_op);
         if (!n->agg_op) goto fail;
     }
+    if (a->arith) {
+        n->arith = expr_clone(a->arith);
+        if (!n->arith) goto fail;
+    }
     if (a->nargs > 0) {
         n->args = calloc((size_t)a->nargs, sizeof(token *));
         if (!n->args) goto fail;
@@ -829,6 +833,7 @@ fail:
             free(n->args);
         }
         if (n->agg_op) { free(n->agg_op->text); free(n->agg_op); }
+        expr_free(n->arith);
         free(n);
     }
     return NULL;

@@ -143,10 +143,46 @@ static int lex(parser *p)
         t = tok_new(TOK_DOT, NULL, 0);
         s++;
     } else if (*s == '!') {
-        t = tok_new(TOK_NOT, NULL, 0);
-        s++;
+        if (*(s + 1) == '=') {
+            t = tok_new(TOK_NE, NULL, 0);
+            s += 2;
+        } else {
+            t = tok_new(TOK_NOT, NULL, 0);
+            s++;
+        }
     } else if (*s == '=') {
         t = tok_new(TOK_EQ, NULL, 0);
+        s++;
+    } else if (*s == '<') {
+        if (*(s + 1) == '=') {
+            t = tok_new(TOK_LE, NULL, 0);
+            s += 2;
+        } else {
+            t = tok_new(TOK_LT, NULL, 0);
+            s++;
+        }
+    } else if (*s == '>') {
+        if (*(s + 1) == '=') {
+            t = tok_new(TOK_GE, NULL, 0);
+            s += 2;
+        } else {
+            t = tok_new(TOK_GT, NULL, 0);
+            s++;
+        }
+    } else if (*s == '+') {
+        t = tok_new(TOK_PLUS, NULL, 0);
+        s++;
+    } else if (*s == '-') {
+        t = tok_new(TOK_MINUS, NULL, 0);
+        s++;
+    } else if (*s == '*') {
+        t = tok_new(TOK_STAR, NULL, 0);
+        s++;
+    } else if (*s == '/') {
+        t = tok_new(TOK_SLASH, NULL, 0);
+        s++;
+    } else if (*s == '%') {
+        t = tok_new(TOK_PERCENT, NULL, 0);
         s++;
     } else if (*s == '~') {
         t = tok_new(TOK_TILDE, NULL, 0);
@@ -288,6 +324,7 @@ static void atom_free(atom *a)
     /* For aggregate atoms agg_op is OWNED (not borrowed from args). */
     if (a->aggregate)
         tok_free(a->agg_op);
+    expr_free(a->arith);
     free(a);
 }
 
@@ -302,6 +339,47 @@ void rule_free(rule *r)
         free(r->body);
     }
     free(r);
+}
+
+/* ─── Arithmetic expression tree (M9) ─────────────────────────────────── */
+
+static expr *expr_new(expr_kind k)
+{
+    expr *e = calloc(1, sizeof(*e));
+    if (e) e->kind = k;
+    return e;
+}
+
+void expr_free(expr *e)
+{
+    if (!e) return;
+    free(e->var);
+    expr_free(e->l);
+    expr_free(e->r);
+    free(e);
+}
+
+expr *expr_clone(const expr *e)
+{
+    expr *n;
+    if (!e) return NULL;
+    n = expr_new(e->kind);
+    if (!n) return NULL;
+    n->ival = e->ival;
+    n->op   = e->op;
+    if (e->var) {
+        n->var = strdup(e->var);
+        if (!n->var) { expr_free(n); return NULL; }
+    }
+    if (e->l) {
+        n->l = expr_clone(e->l);
+        if (!n->l) { expr_free(n); return NULL; }
+    }
+    if (e->r) {
+        n->r = expr_clone(e->r);
+        if (!n->r) { expr_free(n); return NULL; }
+    }
+    return n;
 }
 
 /* ─── Recursive-descent parser ────────────────────────────────────────── */
@@ -419,8 +497,108 @@ static atom *parse_atom(parser *p)
     return a;
 }
 
+/* ─── Arithmetic expression parser (M9) ─────────────────────────────────
+ *
+ * Grammar (precedence climbing; * / % bind tighter than + -, all left-assoc):
+ *   E      := term (('+'|'-') term)*
+ *   term   := factor (('*'|'/'|'%') factor)*
+ *   factor := TOK_VAR | TOK_INT | '(' E ')'
+ *
+ * TOK_IDENT / TOK_STRING never reach here (rejected as a bad factor), which is
+ * the B6 arithmetic-on-symbol-constant reject (symbols have no numeric value).
+ */
+
+static expr *parse_factor(parser *p);
+static expr *parse_term(parser *p);
+
+static expr *parse_expr(parser *p)
+{
+    expr *l = parse_term(p);
+    token *t;
+    if (!l) return NULL;
+    while (1) {
+        t = peek(p);
+        if (t && (t->kind == TOK_PLUS || t->kind == TOK_MINUS)) {
+            char op = (t->kind == TOK_PLUS) ? '+' : '-';
+            expr *r, *n;
+            advance(p);
+            r = parse_term(p);
+            if (!r) { expr_free(l); return NULL; }
+            n = expr_new(EX_BINOP);
+            if (!n) { expr_free(l); expr_free(r); return NULL; }
+            n->op = op; n->l = l; n->r = r;
+            l = n;
+        } else {
+            break;
+        }
+    }
+    return l;
+}
+
+static expr *parse_term(parser *p)
+{
+    expr *l = parse_factor(p);
+    token *t;
+    if (!l) return NULL;
+    while (1) {
+        t = peek(p);
+        if (t && (t->kind == TOK_STAR || t->kind == TOK_SLASH ||
+                  t->kind == TOK_PERCENT)) {
+            char op = (t->kind == TOK_STAR) ? '*' :
+                      (t->kind == TOK_SLASH) ? '/' : '%';
+            expr *r, *n;
+            advance(p);
+            r = parse_factor(p);
+            if (!r) { expr_free(l); return NULL; }
+            n = expr_new(EX_BINOP);
+            if (!n) { expr_free(l); expr_free(r); return NULL; }
+            n->op = op; n->l = l; n->r = r;
+            l = n;
+        } else {
+            break;
+        }
+    }
+    return l;
+}
+
+static expr *parse_factor(parser *p)
+{
+    token *t = peek(p);
+    expr *e;
+
+    if (!t) {
+        fprintf(stderr, "parser: unexpected end of input in expression\n");
+        return NULL;
+    }
+    if (t->kind == TOK_VAR || t->kind == TOK_INT) {
+        advance(p);
+        e = expr_new((t->kind == TOK_VAR) ? EX_VAR : EX_INT);
+        if (!e) return NULL;
+        if (t->kind == TOK_VAR) {
+            e->var = strdup(t->text);
+            if (!e->var) { expr_free(e); return NULL; }
+        } else {
+            e->ival = t->ival;
+        }
+        return e;
+    }
+    if (t->kind == TOK_LPAREN) {
+        advance(p);
+        e = parse_expr(p);
+        if (!e) return NULL;
+        if (!expect(p, TOK_RPAREN)) { expr_free(e); return NULL; }
+        return e;
+    }
+    fprintf(stderr,
+            "parser: expected variable, integer, or '(' in arithmetic "
+            "expression, got kind %d\n", (int)t->kind);
+    return NULL;
+}
+
 /* Parse a body atom: [ ! ] atom, where the atom may also be an equality
- * (VAR = VAR) or an aggregate (VAR = count()/sum(X)/min(X)/max(X)). */
+ * (VAR = VAR), a comparison (VAR <op> VAR/INT), an aggregate
+ * (VAR = count()/sum(X)/min(X)/max(X)), or an arithmetic assignment
+ * (VAR = E). */
 static atom *parse_body_atom(parser *p)
 {
     int negated = 0;
@@ -433,13 +611,29 @@ static atom *parse_body_atom(parser *p)
     }
     after_not = p->cur;
 
-    /* Special forms: VAR = VAR (equality) or VAR = agg(args) (aggregate) */
+    /* Special forms:
+     *   VAR = VAR         equality
+     *   VAR = agg(args)   aggregate
+     *   VAR = E           arithmetic assignment (E is an expression)
+     *   VAR <op> operand  comparison (< <= > >=: VAR/INT; !=: also IDENT) */
     t = peek(p);
     if (t && t->kind == TOK_VAR) {
-        token *eq = peek_at(p, 1);
-        if (eq && eq->kind == TOK_EQ) {
+        token *op = peek_at(p, 1);
+        if (op && op->kind == TOK_EQ) {
             token *rhs = peek_at(p, 2);
+            /* `X = Y` is equality only if Y is NOT followed by an arithmetic
+             * operator — otherwise it is `X = <expr starting with Y>`. */
+            int is_simple_eq = 0;
             if (rhs && rhs->kind == TOK_VAR) {
+                token *after = peek_at(p, 3);
+                if (!(after && (after->kind == TOK_PLUS ||
+                                after->kind == TOK_MINUS ||
+                                after->kind == TOK_STAR ||
+                                after->kind == TOK_SLASH ||
+                                after->kind == TOK_PERCENT)))
+                    is_simple_eq = 1;
+            }
+            if (is_simple_eq) {
                 /* equality: VAR = VAR */
                 token *lv = advance(p);
                 advance(p);          /* = */
@@ -458,24 +652,24 @@ static atom *parse_body_atom(parser *p)
                 /* aggregate: VAR = agg ( [VAR] ) */
                 token *res = advance(p);   /* result var */
                 advance(p);                /* = */
-                token *op  = advance(p);   /* aggregate op token */
+                token *agop = advance(p);  /* aggregate op token */
                 if (!expect(p, TOK_LPAREN)) return NULL;
 
                 atom *a = atom_new();
                 if (!a) return NULL;
                 a->aggregate = 1;
                 a->pred = strdup(res->text);   /* result var name */
-                a->agg_op = tok_dup(op);
+                a->agg_op = tok_dup(agop);
                 a->negated = negated;
                 if (!a->pred || !a->agg_op) { atom_free(a); return NULL; }
 
-                if (!strcmp(op->text, "count")) {
+                if (!strcmp(agop->text, "count")) {
                     /* count() requires empty parens */
                     token *rp = peek(p);
                     if (!rp || rp->kind != TOK_RPAREN) {
                         fprintf(stderr,
                             "parser: 'count' requires no arguments near '%s'\n",
-                            op->text);
+                            agop->text);
                         atom_free(a); return NULL;
                     }
                     advance(p);
@@ -487,7 +681,7 @@ static atom *parse_body_atom(parser *p)
                     if (!src || src->kind != TOK_VAR) {
                         fprintf(stderr,
                             "parser: aggregate '%s' requires one variable argument near '%s'\n",
-                            op->text, op->text);
+                            agop->text, agop->text);
                         atom_free(a); return NULL;
                     }
                     advance(p);
@@ -498,7 +692,67 @@ static atom *parse_body_atom(parser *p)
                     a->nargs = 1;
                 }
                 return a;
+            } else if (rhs) {
+                /* arithmetic assignment: VAR = E */
+                token *res = advance(p);   /* result var */
+                advance(p);                /* = */
+                expr *e = parse_expr(p);
+                if (!e) return NULL;
+                atom *a = atom_new();
+                if (!a) { expr_free(e); return NULL; }
+                a->pred = strdup("=");
+                a->args = malloc(sizeof(token *));
+                if (!a->pred || !a->args) { expr_free(e); atom_free(a); return NULL; }
+                a->args[0] = tok_dup(res);
+                if (!a->args[0]) { expr_free(e); atom_free(a); return NULL; }
+                a->nargs = 1;
+                a->arith = e;
+                a->negated = negated;
+                return a;
             }
+            /* rhs == NULL (EOF after '=') → fall through to error path */
+        } else if (op && (op->kind == TOK_LT || op->kind == TOK_LE ||
+                          op->kind == TOK_GT || op->kind == TOK_GE ||
+                          op->kind == TOK_NE)) {
+            /* comparison: VAR <op> operand */
+            token *rhs = peek_at(p, 2);
+            if (rhs) {
+                const char *optext;
+                switch (op->kind) {
+                    case TOK_LT: optext = "<";  break;
+                    case TOK_LE: optext = "<="; break;
+                    case TOK_GT: optext = ">";  break;
+                    case TOK_GE: optext = ">="; break;
+                    default:     optext = "!="; break;
+                }
+                if (rhs->kind != TOK_VAR && rhs->kind != TOK_INT &&
+                    !(op->kind == TOK_NE && rhs->kind == TOK_IDENT)) {
+                    if (rhs->kind == TOK_IDENT)
+                        fprintf(stderr,
+                            "parser: symbol constant not allowed in ordering "
+                            "comparison '%s' (only in =/!=)\n", optext);
+                    else
+                        fprintf(stderr,
+                            "parser: expected variable or integer operand for "
+                            "comparison '%s', got kind %d\n",
+                            optext, (int)rhs->kind);
+                    return NULL;
+                }
+                token *lv = advance(p);
+                advance(p);          /* operator */
+                token *rv = advance(p);
+                atom *a = atom_new();
+                if (!a) return NULL;
+                a->pred = strdup(optext);
+                a->args = malloc(2 * sizeof(token *));
+                if (!a->pred || !a->args) { atom_free(a); return NULL; }
+                a->args[0] = tok_dup(lv);
+                a->args[1] = tok_dup(rv);
+                a->nargs = 2;
+                a->negated = negated;
+                return a;
+            }
+            /* rhs == NULL → fall through to error path */
         }
     }
 

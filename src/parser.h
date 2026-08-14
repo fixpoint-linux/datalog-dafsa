@@ -28,6 +28,16 @@ typedef enum {
     TOK_NOT,         /* ! */
     TOK_AGGREGATE,   /* count, sum, min, max */
     TOK_EQ,          /* = */
+    TOK_LT,          /* <  (M9 ordering comparison) */
+    TOK_LE,          /* <= */
+    TOK_GT,          /* >  */
+    TOK_GE,          /* >= */
+    TOK_NE,          /* != */
+    TOK_PLUS,        /* +  (M9 arithmetic) */
+    TOK_MINUS,       /* -  */
+    TOK_STAR,        /* *  */
+    TOK_SLASH,       /* /  */
+    TOK_PERCENT,     /* %  */
     TOK_TILDE,       /* ~ */
     TOK_STRING,      /* 'quoted string' — for regex patterns */
 } token_kind;
@@ -38,6 +48,24 @@ typedef struct {
     uint32_t   ival;       /* integer value (TOK_INT only) */
 } token;
 
+/* ─── Arithmetic expression tree (M9) ─────────────────────────────────── */
+
+typedef enum { EX_INT, EX_VAR, EX_BINOP } expr_kind;
+
+typedef struct expr {
+    expr_kind   kind;
+    uint32_t    ival;       /* EX_INT: literal value */
+    char       *var;        /* EX_VAR: owned variable name */
+    char        op;         /* EX_BINOP: '+', '-', '*', '/', '%' */
+    struct expr *l, *r;     /* EX_BINOP children */
+} expr;
+
+/* Deep-copy an expression tree (NULL in → NULL out). */
+expr *expr_clone(const expr *e);
+
+/* Free an expression tree (NULL-safe). */
+void  expr_free(expr *e);
+
 /* An atom: predicate(args...). args are tokens (TOK_IDENT/TOK_VAR/TOK_INT). */
 typedef struct {
     char   *pred;          /* predicate name */
@@ -47,6 +75,8 @@ typedef struct {
     int     aggregate;     /* 1 if aggregate (count/sum/min/max) */
     token  *agg_op;        /* aggregate operator token, NULL if not agg */
     char   *pattern;       /* M5: regex pattern string (from ~ '...'), or NULL */
+    expr   *arith;         /* M9: arithmetic expr tree for `X = E` atoms,
+                              NULL for every other atom kind */
 } atom;
 
 /* A rule: head :- body1, body2, ..., bodyN. */

@@ -32,6 +32,14 @@ typedef enum {
     OP_WALK      = 10,  /* M5: SCAN with regex pattern filter */
     OP_LOOKUP_PERM = 11, /* M6: permuted prefix lookup */
     OP_HASH_JOIN   = 12, /* M6: real in-frame hash join */
+    OP_CMP         = 13, /* M9: comparison filter — a=lhs slot, b=rhs slot,
+                             imm=cmp code 0=LT 1=LE 2=GT 3=GE 4=NE; both bound,
+                             false -> backtrack */
+    OP_ARITH       = 14, /* M9: arithmetic bind — a=lhs slot, b=rhs slot,
+                             c=result temp slot, imm=arith code
+                             0=ADD 1=SUB 2=MUL 3=DIV 4=MOD; result written via
+                             b_try (never overwrite); DIV/MOD rhs==0 -> backtrack;
+                             u32 wrap-around */
 } vm_opcode;
 
 typedef struct {

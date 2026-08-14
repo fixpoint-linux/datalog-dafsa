@@ -61,6 +61,27 @@
 #include <string.h>
 #include <stdio.h>
 
+/* ─── M9: builtin atom classification (mirror compiler.c) ─────────────── */
+
+static int is_comparison_atom(const atom *A)
+{
+    if (!A || !A->pred) return 0;
+    return strcmp(A->pred, "<")  == 0 || strcmp(A->pred, "<=") == 0 ||
+           strcmp(A->pred, ">")  == 0 || strcmp(A->pred, ">=") == 0 ||
+           strcmp(A->pred, "!=") == 0;
+}
+
+static int is_arith_atom(const atom *A)
+{
+    return A && A->pred && strcmp(A->pred, "=") == 0 && A->arith != NULL;
+}
+
+static int is_equality_atom(const atom *A)
+{
+    return A && A->pred && strcmp(A->pred, "=") == 0 &&
+           A->nargs == 2 && A->arith == NULL;
+}
+
 /* ─── Growable buffers ────────────────────────────────────────────────── */
 
 typedef struct { rule **v; int n, cap; } rule_vec;
@@ -122,6 +143,26 @@ static int ns_add(name_set *s, const char *n)
     return 0;
 }
 
+/* Count bound/unbound variable operands of an arithmetic expr tree (mirrors
+ * sips_atom_score's score/n_new semantics for arithmetic atoms). */
+static void expr_operand_vars(const expr *e, const name_set *bound,
+                              int *s, int *nn)
+{
+    if (!e) return;
+    switch (e->kind) {
+    case EX_VAR:
+        if (ns_contains(bound, e->var)) (*s)++;
+        else (*nn)++;
+        break;
+    case EX_BINOP:
+        expr_operand_vars(e->l, bound, s, nn);
+        expr_operand_vars(e->r, bound, s, nn);
+        break;
+    default:
+        break;
+    }
+}
+
 /* ─── AST allocation helpers (mirror parser.c discipline) ─────────────── */
 
 static token *tok_dup(const token *t)
@@ -153,6 +194,7 @@ static void atom_free_local(atom *a)
     if (a->aggregate) {
         if (a->agg_op) { free(a->agg_op->text); free(a->agg_op); }
     }
+    expr_free(a->arith);
     free(a);
 }
 
@@ -194,6 +236,10 @@ static atom *atom_copy(const atom *src, const char *new_pred)
     if (src->agg_op) {
         a->agg_op = tok_dup(src->agg_op);
         if (!a->agg_op) { atom_free_local(a); return NULL; }
+    }
+    if (src->arith) {
+        a->arith = expr_clone(src->arith);
+        if (!a->arith) { atom_free_local(a); return NULL; }
     }
     if (src->nargs > 0) {
         a->args = calloc((size_t)src->nargs, sizeof(token *));
@@ -551,11 +597,11 @@ static int sips_atom_better(int score, int n_new, int edb, int idx,
  * failure.  Greedy loop: (1) fire any equality ("=", 2 var args) with one side
  * already bound — place it next and propagate the other side; (2) else pick the
  * best-scoring non-equality atom and add its vars to bound; (3) re-sweep
- * equalities.  Negated and aggregate atoms are eligible only once ALL their
- * variable args are already bound (negation-safety enforced at the SIPS
- * level); when placed, they are zero-propagation — their vars are NOT added
- * to bound (a negated atom only consumes bindings; an aggregate's result var
- * is consumed by the head, not by later body atoms). */
+ * equalities.  Negated, aggregate, and comparison atoms are eligible only once
+ * ALL their variable args are already bound; when placed, they are
+ * zero-propagation — their vars are NOT added to bound.  Arithmetic atoms
+ * (`X = E`) are eligible once all operand vars are bound and PROPAGATE their
+ * result var to bound (mirroring positive atoms). */
 static int sips_body_order(const rule *R, const char *alpha,
                            const pred_vec *preds, int *body_order_out,
                            char *err, size_t errsz)
@@ -588,7 +634,7 @@ static int sips_body_order(const rule *R, const char *alpha,
         for (i = 0; i < n; i++) {
             const atom *A = R->body[i];
             if (placed[i] || !A || !A->pred) continue;
-            if (strcmp(A->pred, "=") != 0) continue;
+            if (!is_equality_atom(A)) continue;
             if (A->nargs == 2 &&
                 A->args[0]->kind == TOK_VAR &&
                 A->args[1]->kind == TOK_VAR) {
@@ -611,18 +657,31 @@ static int sips_body_order(const rule *R, const char *alpha,
         /* (2) Score remaining non-equality atoms; pick the best. */
         {
             int best = -1, best_score = 0, best_new = 0, best_edb = 0;
-            int best_nonprop = 0;   /* best atom is negated/aggregate */
+            int best_nonprop = 0;   /* best atom is negated/aggregate/cmp */
             for (i = 0; i < n; i++) {
                 const atom *A = R->body[i];
-                int score, n_new, edb, nonprop;
+                int score, n_new, edb, nonprop, is_ar, is_cp;
                 if (placed[i] || !A || !A->pred) continue;
-                if (strcmp(A->pred, "=") == 0) continue;  /* none fireable now */
-                nonprop = (A->aggregate || A->negated);
-                sips_atom_score(A, &bound, &score, &n_new);
-                /* Negated/aggregate atoms are eligible only when every
-                 * variable arg is bound (n_new == 0, i.e. score == nargs).
-                 * Until then they are deferred. */
-                if (nonprop && n_new > 0) continue;
+                if (is_equality_atom(A)) continue;  /* none fireable now */
+                is_ar = is_arith_atom(A);
+                is_cp = is_comparison_atom(A);
+                if (is_ar) {
+                    /* arithmetic: eligible once all operand vars bound;
+                     * score over operand vars; propagates its result var */
+                    expr_operand_vars(A->arith, &bound, &score, &n_new);
+                    nonprop = 0;
+                    if (n_new > 0) continue;   /* defer until operands bound */
+                } else if (is_cp) {
+                    /* comparison: zero-propagation; eligible only when every
+                     * variable operand is bound */
+                    sips_atom_score(A, &bound, &score, &n_new);
+                    nonprop = 1;
+                    if (n_new > 0) continue;   /* defer */
+                } else {
+                    nonprop = (A->aggregate || A->negated);
+                    sips_atom_score(A, &bound, &score, &n_new);
+                    if (nonprop && n_new > 0) continue;
+                }
                 edb = (pred_find(preds, A->pred) < 0);
                 if (best < 0 ||
                     sips_atom_better(score, n_new, edb, i,
@@ -638,7 +697,11 @@ static int sips_body_order(const rule *R, const char *alpha,
                 const atom *A = R->body[best];
                 body_order_out[out_n++] = best;
                 placed[best] = 1;
-                if (!best_nonprop) {
+                if (is_arith_atom(A)) {
+                    /* propagate the arithmetic result var */
+                    if (A->nargs >= 1 && A->args[0]->kind == TOK_VAR)
+                        if (ns_add(&bound, A->args[0]->text) != 0) goto oom;
+                } else if (!best_nonprop) {
                     for (j = 0; j < A->nargs; j++)
                         if (A->args[j]->kind == TOK_VAR)
                             if (ns_add(&bound, A->args[j]->text) != 0) goto oom;
@@ -722,11 +785,12 @@ static void sips_cache_free(sips_cache *sc)
 /* Walk R's body in SIPS order under head adornment `alpha`, maintaining the
  * SIPS bound-variable set, and fill betas[j] (indexed by ORIGINAL body
  * position j) with each positive IDB atom's adornment, "" for every other
- * atom (equality, negated, aggregate, EDB).  The bound-set propagation
- * exactly mirrors sips_body_order (equalities propagate; positive atoms
- * propagate all their var args; negated/aggregate atoms propagate nothing),
- * so betas are the single source of truth for BOTH variant discovery (Phase
- * B) and synthesis renaming (Phase C).  Returns 0 / -1 (OOM, err set). */
+ * atom (equality, comparison, arithmetic, negated, aggregate, EDB).  The
+ * bound-set propagation exactly mirrors sips_body_order (equalities propagate;
+ * positive atoms propagate all their var args; arithmetic propagates its result
+ * var; comparisons/negated/aggregate atoms propagate nothing), so betas are the
+ * single source of truth for BOTH variant discovery (Phase B) and synthesis
+ * renaming (Phase C).  Returns 0 / -1 (OOM, err set). */
 static int compute_betas(const rule *R, const char *alpha,
                          const pred_vec *preds, const int *body_order,
                          char (*betas)[9], char *err, size_t errsz)
@@ -745,7 +809,7 @@ static int compute_betas(const rule *R, const char *alpha,
         int bi = body_order ? body_order[j] : j;
         if (!A) continue;
 
-        if (A->pred && strcmp(A->pred, "=") == 0) {
+        if (is_equality_atom(A)) {
             /* equality X = Y: propagate binding in either direction */
             if (A->nargs == 2 &&
                 A->args[0]->kind == TOK_VAR &&
@@ -757,6 +821,19 @@ static int compute_betas(const rule *R, const char *alpha,
                 if (b0 && !b1) { if (ns_add(&bound, a1) != 0) goto oom; }
                 else if (b1 && !b0) { if (ns_add(&bound, a0) != 0) goto oom; }
             }
+            continue;
+        }
+
+        if (is_arith_atom(A)) {
+            /* arithmetic X = E: propagate the result var (mirror equality
+             * propagation); betas stay "" (arithmetic is never an IDB atom) */
+            if (A->nargs >= 1 && A->args[0]->kind == TOK_VAR)
+                if (ns_add(&bound, A->args[0]->text) != 0) goto oom;
+            continue;
+        }
+
+        if (is_comparison_atom(A)) {
+            /* comparison: zero-propagation */
             continue;
         }
 
