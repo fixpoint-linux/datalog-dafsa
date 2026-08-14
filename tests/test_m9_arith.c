@@ -690,6 +690,51 @@ static void test_t10_property(void)
 
 /* ─── Main ────────────────────────────────────────────────────────────── */
 
+/* ─── T11: reserved temp/const slot names must not alias user variables ──
+ * Regression: compiler-generated constant/temp slots are named __kN / __tN.
+ * A user variable literally named __t0 or __k0 (legal: vars may start with _)
+ * used to alias the generated slot, silently binding the wrong value.  The
+ * name generator now skips past any name already taken by a user variable. */
+static void test_t11_reserved_names(void)
+{
+    dl_db *db;
+
+    TEST("T11: __t0/__k0 user vars do not alias generated temp/const slots");
+
+    setup_db(&db, "t11");
+    {
+        uint32_t v[] = {1, 2};
+        load_rows(db, "p", 1, v, 2, "t11");
+    }
+
+    /* __t0 is a USER variable (bound from p) AND a would-be generated temp
+     * name; __k0 likewise a user var colliding with a would-be generated
+     * constant slot.  Under the old name generation these aliased each other,
+     * clobbering the user variable.  The rules below are equivalent to
+     * r(W,Z):-p(Y),p(Z),W=Y+1. and s(Z):-p(Z),p(Y),Y>1. over p={1,2}. */
+    assert(dl_load_rules(db,
+        "r(W,__t0):-p(Y),p(__t0),W=Y+1.\n"
+        "s(__k0):-p(__k0),p(Y),Y>1.\n") == 0);
+    assert(dl_compile(db) == 0);
+
+    {
+        /* r = { (2,1),(2,2),(3,1),(3,2) } : W=Y+1, __t0 from p (unrelated) */
+        uint32_t e_r[] = {2,1, 2,2, 3,1, 3,2};
+        if (!check_query(db, "r", e_r, 4, 2)) {
+            FAIL("__t0 clobbered by generated temp slot");
+            teardown_db(db, "t11"); return;
+        }
+        /* s = {1,2} : __k0 projected from p (unrelated to the Y>1 constant) */
+        uint32_t e_s[] = {1, 2};
+        if (!check_query(db, "s", e_s, 2, 1)) {
+            FAIL("__k0 clobbered by generated constant slot");
+            teardown_db(db, "t11"); return;
+        }
+    }
+    PASS();
+    teardown_db(db, "t11");
+}
+
 int main(void)
 {
     printf("M9 Arithmetic + Comparison Tests\n");
@@ -705,6 +750,7 @@ int main(void)
     test_t8_edge_cases();
     test_t9_magic_arith();
     test_t10_property();
+    test_t11_reserved_names();
 
     printf("\n%d tests run, %d failed\n", tests_run, tests_failed);
     return tests_failed ? 1 : 0;

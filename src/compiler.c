@@ -115,6 +115,22 @@ static int v_add(v_tab *t, const char *n) {
     return t->n++;
 }
 
+/* Generate a fresh reserved slot name "__X%d" (X = 'k' constant or 't' temp)
+ * that does NOT collide with any existing variable in the table.  User
+ * variables are all added to the table before emission, so any name already
+ * present here is a user variable — skip past it (and any other aliases) so a
+ * user variable named e.g. `__k0` or `__t0` can never be silently overwritten
+ * by a compiler-generated constant/temp slot.  Writes into `buf` (size `cap`)
+ * and returns it; the caller must pass the value of the name to v_add. */
+static const char *v_fresh_name(v_tab *t, char *buf, size_t cap,
+                                int *counter, char kind)
+{
+    for (;;) {
+        snprintf(buf, cap, "__%c%d", kind, (*counter)++);
+        if (v_find(t, buf) < 0) return buf;
+    }
+}
+
 /* ─── Instruction buffer ────────────────────────────────────────────── */
 
 typedef struct {
@@ -142,9 +158,44 @@ static int token_const(dl_db *db, const token *t, uint32_t *out)
     if (t->kind == TOK_INT) { *out = t->ival; return 0; }
     if (t->kind == TOK_IDENT) {
         *out = intern_str(db_get_interner(db), t->text);
-        if (*out == 0) return -1;
+        if (*out == 0) {
+            /* Truncate the echoed constant so a >4096-byte string doesn't
+             * flood stderr with the whole literal.  brief is built with plain
+             * char arithmetic (no %zu) to stay clear of -Wformat-truncation. */
+            char brief[48];
+            size_t tl = strlen(t->text);
+            size_t pos = 0, x, dd, i;
+            char rev[16];
+
+            if (tl >= sizeof(brief)) {
+                size_t keep = sizeof(brief) - 14;   /* room for "... (N bytes)" */
+                memcpy(brief, t->text, keep);
+                pos = keep;
+                memcpy(brief + pos, "... (", 5);
+                pos += 5;
+            } else {
+                memcpy(brief, t->text, tl);
+                pos = tl;
+            }
+            /* decimal byte count into rev */
+            x = tl; dd = 0;
+            if (x == 0) rev[dd++] = '0';
+            while (x) { rev[dd++] = (char)('0' + x % 10); x /= 10; }
+            for (i = 0; i < dd; i++) brief[pos + i] = rev[dd - 1 - i];
+            pos += dd;
+            memcpy(brief + pos, " bytes)", 8);
+            pos += 8;
+            brief[pos] = '\0';
+
+            fprintf(stderr, "compile error: failed to intern string constant "
+                    "'%s' (out of memory, or string exceeds the %d-byte "
+                    "interner key limit)\n", brief, 4096);
+            return -1;
+        }
         return 0;
     }
+    fprintf(stderr, "compile error: internal: unexpected token kind %d in a "
+            "constant position\n", (int)t->kind);
     return -1;
 }
 
@@ -336,7 +387,7 @@ static int lower_expr(dl_db *db, const expr *e, v_tab *vt, i_buf *ib,
     if (!e) return -1;
     switch (e->kind) {
     case EX_INT:
-        snprintf(cname, sizeof(cname), "__k%d", (*cc)++);
+        v_fresh_name(vt, cname, sizeof(cname), cc, 'k');
         vi = v_add(vt, cname);
         if (vi < 0) return -1;
         in = i_emit(ib);
@@ -353,7 +404,7 @@ static int lower_expr(dl_db *db, const expr *e, v_tab *vt, i_buf *ib,
         int ls = lower_expr(db, e->l, vt, ib, cc, tc, body_idx);
         int rs = lower_expr(db, e->r, vt, ib, cc, tc, body_idx);
         if (ls < 0 || rs < 0) return -1;
-        snprintf(cname, sizeof(cname), "__t%d", (*tc)++);
+        v_fresh_name(vt, cname, sizeof(cname), tc, 't');
         vi = v_add(vt, cname);
         if (vi < 0) return -1;
         in = i_emit(ib);
@@ -386,7 +437,7 @@ static int cmp_operand_slot(dl_db *db, const token *t, v_tab *vt, i_buf *ib,
         int vi;
         uint32_t cv;
         vm_instr *eq;
-        snprintf(cname, sizeof(cname), "__k%d", (*cc)++);
+        v_fresh_name(vt, cname, sizeof(cname), cc, 'k');
         vi = v_add(vt, cname);
         if (vi < 0) return -1;
         if (token_const(db, t, &cv)) return -1;
@@ -1204,7 +1255,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
                     neg->slots[j] = vt.e[vi].slot;
                 } else {
                     char cname[16];
-                    snprintf(cname, sizeof(cname), "__k%d", cc++);
+                    v_fresh_name(&vt, cname, sizeof(cname), &cc, 'k');
                     int vi = v_add(&vt, cname);
                     neg->slots[j] = vt.e[vi].slot;
                     uint32_t cv;
@@ -1234,7 +1285,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
                     ts[j] = vt.e[vi].slot;
                 } else {
                     char cname[16];
-                    snprintf(cname, sizeof(cname), "__k%d", cc++);
+                    v_fresh_name(&vt, cname, sizeof(cname), &cc, 'k');
                     int vi = v_add(&vt, cname);
                     ts[j] = vt.e[vi].slot;
                 }
@@ -1270,7 +1321,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
                         neg->slots[j] = vt.e[vi].slot;
                     } else {
                         char cname[16];
-                        snprintf(cname, sizeof(cname), "__k%d", cc++);
+                        v_fresh_name(&vt, cname, sizeof(cname), &cc, 'k');
                         int vi = v_add(&vt, cname);
                         neg->slots[j] = vt.e[vi].slot;
                         uint32_t cv;
@@ -1316,7 +1367,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
                         ts[j] = vt.e[vi].slot;
                     } else {
                         char cname[16];
-                        snprintf(cname, sizeof(cname), "__k%d", cc++);
+                        v_fresh_name(&vt, cname, sizeof(cname), &cc, 'k');
                         int vi = v_add(&vt, cname);
                         ts[j] = vt.e[vi].slot;
                     }
@@ -1347,7 +1398,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
                         slot_map[j] = vt.e[vi].slot;
                     } else {
                         char cname[16];
-                        snprintf(cname, sizeof(cname), "__k%d", cc++);
+                        v_fresh_name(&vt, cname, sizeof(cname), &cc, 'k');
                         int vi = v_add(&vt, cname);
                         ip->slots[si] = vt.e[vi].slot;
                         slot_map[j] = vt.e[vi].slot;
@@ -1406,7 +1457,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
                             ip->slots[j] = vt.e[vi].slot;
                         } else {
                             char cname[16];
-                            snprintf(cname, sizeof(cname), "__k%d", cc++);
+                            v_fresh_name(&vt, cname, sizeof(cname), &cc, 'k');
                             int vi = v_add(&vt, cname);
                             ip->slots[j] = vt.e[vi].slot;
                         }
@@ -1431,7 +1482,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
                             ts[j] = vt.e[vi].slot;
                         } else {
                             char cname[16];
-                            snprintf(cname, sizeof(cname), "__k%d", cc++);
+                            v_fresh_name(&vt, cname, sizeof(cname), &cc, 'k');
                             int vi = v_add(&vt, cname);
                             ts[j] = vt.e[vi].slot;
                         }
@@ -1491,7 +1542,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
             char cname[16];
             int vi, ls, rs;
             vm_instr *op;
-            snprintf(cname, sizeof(cname), "__t%d", tc++);
+            v_fresh_name(&vt, cname, sizeof(cname), &tc, 't');
             vi = v_add(&vt, cname);
             if (vi < 0) goto fail;
             if (!strcmp(ba->pred, "concat")) {
@@ -1607,7 +1658,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
                 uint32_t cv;
                 if (token_const(db, a, &cv)) goto fail;
                 char cname[16];
-                snprintf(cname, sizeof(cname), "__k%d", cc++);
+                v_fresh_name(&vt, cname, sizeof(cname), &cc, 'k');
                 int vi = v_add(&vt, cname);
                 if (vi < 0) goto fail;
                 head_slots[j] = vt.e[vi].slot;
@@ -1668,6 +1719,11 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
     }
 
 fail:
+    if (vt.err) {
+        fprintf(stderr, "compile error: rule '%s' exceeds the maximum of %d "
+                "distinct variables / temps / constants in a single rule\n",
+                r->head->pred, MAX_VARS);
+    }
     v_free(&vt); i_free(&ib); free(bri);
     free(pat_idx);
     if (pat_dfa) {
