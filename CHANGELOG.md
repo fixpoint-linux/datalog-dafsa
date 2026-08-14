@@ -5,17 +5,47 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
-- M8 magic-sets: negation + aggregates in adorned rules.  Negated body atoms
-  and aggregates are now supported under a conservative soundness boundary —
-  a negated atom is allowed only on a predicate OUTSIDE the adorned closure
-  (EDB, or an IDB not reached by positive references), and an aggregate is
-  allowed only in a rule with no adorned-closure body atom.  Negation on an
-  adorned-closure predicate and aggregates over a closure predicate are still
-  rejected with a clear reason (never a silent wrong answer).  `dl_query_magic`
-  now materializes the source fixpoint (internal `dl_compile`) when a rule uses
-  negation/aggregate and the fixpoint is dirty, so a negated non-closure IDB is
-  evaluated against its full materialization — the no-mutation guarantee now
-  holds only for all-positive programs.
+- M8 magic-sets: the full deferred magic-sets plan (slices 1–5), plus a
+  correctness fix, are now implemented.  `dl_query_magic` /
+  `dl_query_magic_adorn` are opt-in per-query paths that re-evaluate a scoped
+  clone of the EDB seeded by the bound query arguments, coexisting with the
+  publish-once model:
+  - **First slice**: single goal predicate, leading-prefix-bound adornment,
+    all-EDB + self-recursive-through-same-adornment bodies.
+  - **Multi-predicate dependency closure**: a goal may depend on other IDB
+    predicates; every predicate in the goal's dependency closure is adorned
+    and magic-synthesized.
+  - **Non-leading-prefix adornments (fb/bfb)**: a goal may be bound on an
+    arbitrary subset of positions, not just a leading k-prefix.
+  - **SIPS body reordering**: always-on deterministic greedy reordering of
+    rule bodies to maximize binding propagation.
+  - **Negation + aggregates**: supported under a conservative soundness
+    boundary — a negated atom is allowed only on a predicate OUTSIDE the
+    adorned closure (EDB, or an IDB not reached by positive references), and
+    an aggregate only in a rule with no adorned-closure body atom.  Negation
+    on an adorned-closure predicate and aggregates over a closure predicate
+    are rejected with a clear reason (never a silent wrong answer).
+    `dl_query_magic` materializes the source fixpoint (internal `dl_compile`)
+    when a rule uses negation/aggregate and the fixpoint is dirty, so a
+    negated non-closure IDB is evaluated against its full materialization —
+    the no-mutation guarantee now holds only for all-positive programs.
+  - **Adornment-closure fixpoint**: a predicate may carry multiple distinct
+    adorned variants (e.g. `tc__bf` and `tc__bb`) discovered by a closure
+    fixpoint, removing the last magic-sets reject.  `dl_query_magic_adorn`
+    gained a `size_t src_nrels` parameter (tightened MAX_RELS budget).
+  - Unsupported cases stay loud REJECTs (never silently mis-evaluated).
+  M8 magic-sets suite now 43 tests; full M0–M8 suite green.
+- Design note `design/datalog-dafsa-topdown-magic.md`: architecture-of-record
+  for a DEFERRED top-down / QSQ evaluation strategy (the one architectural
+  change that would make magic-sets compute O(N) per-source reachability
+  instead of the O(N²) forward-chaining closure, ~600–1000× on reachability
+  queries in the no-publish regime).  Deferred pending a real workload
+  (selective queries on an unpublished db) — it cannot beat `dl_query_bound`
+  on a published db (~100× constant-factor gap remains intrinsic).  §8
+  documents that top-down and the publish-once model coexist orthogonally
+  (top-down is an opt-in 4th query path) and can mutually accelerate
+  (top-down reads a published snapshot for its EDB leaf lookups; top-down
+  memo results can seed a later publish), with a proposed routing rule.
 - Top-level `README.md` (intro, quickstart, how-it-works, API summary,
   milestone table, build/license notes).
 - `CHANGELOG.md` and `LICENSE` (MIT).
@@ -29,6 +59,23 @@ All notable changes to this project are documented in this file.
   `regex_compile` dropping a lexer error on the "success" path, and character-class
   handling of metacharacters and descending ranges.
 - `.gitignore` entries for the new test binaries and the bench binary.
+
+### Fixed
+- **Silent wrong answer in the semi-naive fixpoint for multi-recursive-atom
+  rules** (`dl_query_magic` returned a too-small result, e.g. `tc(1,?)` = 5
+  tuples when it should be 6).  Root cause: a non-delta `OP_LOOKUP` recursive
+  body atom reads the full-idb override via `ts_prefix` (binary search, needs
+  sorted data), but `idb` was only sorted once at stratum start and grown
+  unsorted via `ts_add`; with two `OP_LOOKUP` recursive atoms every delta
+  firing leaves one on unsorted data.  Fixed in `eval_stratum_recursive`: (1)
+  re-sort `idb` at the top of each iteration only when a stratum has a rule
+  with ≥2 plain-`OP_LOOKUP` recursive atoms (`need_idb_sort`), and (2) freeze
+  `idb` during the firing sub-loop (candidates go to `next_delta` only) and
+  merge them into `idb` at rollover so the sort is never stale within an
+  iteration.  Regression test T43.  Full M0–M8 suite green.
+- Materialize goal-first non-recursive rule chains: `eval_nonrecursive` now
+  evaluates to a fixpoint instead of a single emit-order pass, so a
+  non-recursive dependency chain written goal-first is fully materialized.
 
 ## [0.1.0] — 2026-08-12
 
