@@ -82,6 +82,22 @@ static int is_equality_atom(const atom *A)
            A->nargs == 2 && A->arith == NULL;
 }
 
+/* M9-strings: string builtin classification (mirror compiler.c). */
+static int is_str_producing_atom(const atom *A)
+{
+    if (!A || !A->pred) return 0;
+    return strcmp(A->pred, "concat") == 0 ||
+           strcmp(A->pred, "length") == 0;
+}
+
+static int is_str_filter_atom(const atom *A)
+{
+    if (!A || !A->pred) return 0;
+    return strcmp(A->pred, "prefix")   == 0 ||
+           strcmp(A->pred, "suffix")   == 0 ||
+           strcmp(A->pred, "contains") == 0;
+}
+
 /* ─── Growable buffers ────────────────────────────────────────────────── */
 
 typedef struct { rule **v; int n, cap; } rule_vec;
@@ -160,6 +176,22 @@ static void expr_operand_vars(const expr *e, const name_set *bound,
         break;
     default:
         break;
+    }
+}
+
+/* Score the VARIABLE operands of a string builtin.  `start` selects the
+ * operand window: 1 for producing builtins (args[0] is the result var, never
+ * scored), 0 for filters (args[0..1] are both operands).  Mirrors
+ * expr_operand_vars/sips_atom_score semantics. */
+static void str_operand_vars(const atom *A, int start, const name_set *bound,
+                             int *s, int *nn)
+{
+    int j;
+    for (j = start; j < A->nargs; j++) {
+        const token *t = A->args[j];
+        if (t->kind != TOK_VAR) continue;
+        if (ns_contains(bound, t->text)) (*s)++;
+        else (*nn)++;
     }
 }
 
@@ -660,23 +692,38 @@ static int sips_body_order(const rule *R, const char *alpha,
             int best_nonprop = 0;   /* best atom is negated/aggregate/cmp */
             for (i = 0; i < n; i++) {
                 const atom *A = R->body[i];
-                int score, n_new, edb, nonprop, is_ar, is_cp;
+                int score, n_new, edb, nonprop, is_ar, is_cp, is_sp, is_sf;
                 if (placed[i] || !A || !A->pred) continue;
                 if (is_equality_atom(A)) continue;  /* none fireable now */
                 is_ar = is_arith_atom(A);
                 is_cp = is_comparison_atom(A);
+                is_sp = is_str_producing_atom(A);
+                is_sf = is_str_filter_atom(A);
                 if (is_ar) {
                     /* arithmetic: eligible once all operand vars bound;
                      * score over operand vars; propagates its result var */
                     expr_operand_vars(A->arith, &bound, &score, &n_new);
                     nonprop = 0;
                     if (n_new > 0) continue;   /* defer until operands bound */
+                } else if (is_sp) {
+                    /* string-producing: eligible once all operand vars
+                     * (args[1..]) bound; score over operands; propagates its
+                     * result var (args[0]) */
+                    str_operand_vars(A, 1, &bound, &score, &n_new);
+                    nonprop = 0;
+                    if (n_new > 0) continue;
                 } else if (is_cp) {
                     /* comparison: zero-propagation; eligible only when every
                      * variable operand is bound */
                     sips_atom_score(A, &bound, &score, &n_new);
                     nonprop = 1;
                     if (n_new > 0) continue;   /* defer */
+                } else if (is_sf) {
+                    /* string filter: zero-propagation; eligible only when
+                     * every variable operand (args[0..1]) is bound */
+                    str_operand_vars(A, 0, &bound, &score, &n_new);
+                    nonprop = 1;
+                    if (n_new > 0) continue;
                 } else {
                     nonprop = (A->aggregate || A->negated);
                     sips_atom_score(A, &bound, &score, &n_new);
@@ -699,6 +746,10 @@ static int sips_body_order(const rule *R, const char *alpha,
                 placed[best] = 1;
                 if (is_arith_atom(A)) {
                     /* propagate the arithmetic result var */
+                    if (A->nargs >= 1 && A->args[0]->kind == TOK_VAR)
+                        if (ns_add(&bound, A->args[0]->text) != 0) goto oom;
+                } else if (is_str_producing_atom(A)) {
+                    /* propagate the string-producing result var (args[0]) */
                     if (A->nargs >= 1 && A->args[0]->kind == TOK_VAR)
                         if (ns_add(&bound, A->args[0]->text) != 0) goto oom;
                 } else if (!best_nonprop) {
@@ -832,8 +883,21 @@ static int compute_betas(const rule *R, const char *alpha,
             continue;
         }
 
+        if (is_str_producing_atom(A)) {
+            /* string-producing: propagate the result var (args[0]); betas
+             * stay "" (never an IDB atom) */
+            if (A->nargs >= 1 && A->args[0]->kind == TOK_VAR)
+                if (ns_add(&bound, A->args[0]->text) != 0) goto oom;
+            continue;
+        }
+
         if (is_comparison_atom(A)) {
             /* comparison: zero-propagation */
+            continue;
+        }
+
+        if (is_str_filter_atom(A)) {
+            /* string filter: zero-propagation */
             continue;
         }
 
@@ -1058,6 +1122,7 @@ int magic_transform_adorn(const rule *const *ast_rules, int n_ast,
             int bi;
             if (!A || !A->pred) continue;
             if (strcmp(A->pred, "=") == 0) continue;
+            if (is_str_producing_atom(A) || is_str_filter_atom(A)) continue;
             bi = pred_find(&preds, A->pred);
             if (bi >= 0)               /* IDB body atom → edge bi -> hi */
                 if (ev_push(&edges, bi, hi) != 0) REJECT("out of memory");

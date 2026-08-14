@@ -22,6 +22,19 @@
  *     feeds a symbol constant into OP_ARITH.
  *   - `X != ident` is the one builtin form that interns a symbol constant and
  *     compares sym_ids; it is supported and consistent with the above.
+ *
+ * M9-strings (concat/length/prefix/suffix/contains) operates on SYMBOLS.
+ *   - operands are TOK_VAR or TOK_IDENT (a "double-quoted" string constant
+ *     interned at compile time); a TOK_INT operand is REJECTED (a raw int is
+ *     never a string, and a raw int like 1 collides with sym_id 1).
+ *   - a VAR operand that is actually an int-typed column value colliding with
+ *     a valid sym_id is the DOCUMENTED B6 limitation; the runtime backstop is
+ *     intern_str_of -> NULL -> backtrack (never crash, never mis-evaluate).
+ *   - length is the BYTE length (strlen over UTF-8 bytes), not codepoints.
+ *   - concat interns its result at RUNTIME (OP_STR_BIND); a result longer than
+ *     4096 bytes makes intern_str return 0 -> backtrack.  New syms mark the
+ *     interner dirty and persist on dl_close/dl_publish (identical to fact-load
+ *     interning).
  */
 
 #include "compiler.h"
@@ -159,10 +172,84 @@ static int is_equality(const atom *a)
            a->nargs == 2 && a->arith == NULL;
 }
 
-/* any non-relational builtin (equality / comparison / arithmetic) */
+/* M9-strings: string builtin classification.  The lowercase builtin names
+ * are RESERVED — a body atom whose pred matches one is ALWAYS treated as a
+ * builtin, never as a relation reference.  In scope: concat + length
+ * (producers) and prefix/suffix/contains (filters).  lower/upper are
+ * DEFERRED (OP_STR_BIND imm 1/2 reserved; not classified, so a rule using
+ * them fails loudly as an unknown predicate / bad arithmetic factor). */
+
+/* producing string builtin: `VAR = concat(A,B)` / `VAR = length(S)` —
+ * args[0] is the result var, args[1..] are the operand tokens */
+static int is_str_producing(const atom *a)
+{
+    if (!a || !a->pred) return 0;
+    return strcmp(a->pred, "concat") == 0 ||
+           strcmp(a->pred, "length") == 0;
+}
+
+/* string filter builtin: bare function-call atom `prefix(S,P)` etc. —
+ * args[0..1] are the operand tokens */
+static int is_str_filter(const atom *a)
+{
+    if (!a || !a->pred) return 0;
+    return strcmp(a->pred, "prefix")   == 0 ||
+           strcmp(a->pred, "suffix")   == 0 ||
+           strcmp(a->pred, "contains") == 0;
+}
+
+/* any string builtin (producer or filter) */
+static int is_str_builtin(const atom *a)
+{
+    return is_str_producing(a) || is_str_filter(a);
+}
+
+/* any non-relational builtin (equality / comparison / arithmetic / string) */
 static int is_builtin_pred(const atom *a)
 {
-    return is_equality(a) || is_comparison(a) || is_arith(a);
+    return is_equality(a) || is_comparison(a) || is_arith(a) ||
+           is_str_builtin(a);
+}
+
+/* A string-builtin operand token must be TOK_VAR or TOK_IDENT (a string
+ * constant).  TOK_INT is rejected — a raw int is never a string, and a raw
+ * int like 1 collides with sym_id 1 (the documented B6 int/symbol namespace
+ * collision), so feeding it to a string builtin would silently
+ * mis-evaluate. */
+static int str_operand_ok(const token *t)
+{
+    return t && (t->kind == TOK_VAR || t->kind == TOK_IDENT);
+}
+
+/* Validate the arity + operand/result kinds of a string builtin.  Returns
+ * 1 if well-formed, 0 otherwise (caller rejects loudly). */
+static int str_builtin_valid(const atom *a)
+{
+    int i, need;
+    if (!a || !a->pred) return 0;
+    if (is_str_producing(a)) {
+        need = strcmp(a->pred, "concat") == 0 ? 3 : 2;
+        if (a->nargs != need) return 0;
+        if (a->args[0]->kind != TOK_VAR) return 0;
+        for (i = 1; i < need; i++)
+            if (!str_operand_ok(a->args[i])) return 0;
+        return 1;
+    }
+    if (is_str_filter(a)) {
+        if (a->nargs != 2) return 0;
+        for (i = 0; i < 2; i++)
+            if (!str_operand_ok(a->args[i])) return 0;
+        return 1;
+    }
+    return 0;
+}
+
+/* string filter pred -> OP_STR_FILTER imm code */
+static int str_filter_code(const char *pred)
+{
+    if (!strcmp(pred, "prefix")) return 0;
+    if (!strcmp(pred, "suffix")) return 1;
+    return 2;  /* contains */
 }
 
 /* comparison operator string -> OP_CMP imm code */
@@ -310,6 +397,56 @@ static int cmp_operand_slot(dl_db *db, const token *t, v_tab *vt, i_buf *ib,
         eq->imm = cv;
         return (int)vt->e[vi].slot;
     }
+}
+
+/* require every VARIABLE operand of a producing string builtin (args[1..])
+ * to be bound; returns 0 on the first unbound operand (with a diagnostic),
+ * 1 if all bound.  Constants are always "bound". */
+static int str_producing_operands_bound(const atom *a, v_tab *vt,
+                                        const int *bound_vars,
+                                        const char *head_pred)
+{
+    int j;
+    for (j = 1; j < a->nargs; j++) {
+        token *t = a->args[j];
+        if (t->kind != TOK_VAR) continue;
+        {
+            int vi = v_find(vt, t->text);
+            if (vi < 0 || !bound_vars[vi]) {
+                fprintf(stderr,
+                    "compile error: ungrounded string operand — variable "
+                    "'%s' in '%s' is not bound by a positive body atom "
+                    "(rule '%s')\n", t->text, a->pred, head_pred);
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+/* require every VARIABLE operand of a string filter (args[0..1]) to be
+ * bound; returns 0 on the first unbound operand (with a diagnostic),
+ * 1 if all bound. */
+static int str_filter_operands_bound(const atom *a, v_tab *vt,
+                                     const int *bound_vars,
+                                     const char *head_pred)
+{
+    int j;
+    for (j = 0; j < a->nargs; j++) {
+        token *t = a->args[j];
+        if (t->kind != TOK_VAR) continue;
+        {
+            int vi = v_find(vt, t->text);
+            if (vi < 0 || !bound_vars[vi]) {
+                fprintf(stderr,
+                    "compile error: ungrounded string filter — variable "
+                    "'%s' in '%s' is not bound by a positive body atom "
+                    "(rule '%s')\n", t->text, a->pred, head_pred);
+                return 0;
+            }
+        }
+    }
+    return 1;
 }
 
 /* ─── Stratification ────────────────────────────────────────────────── */
@@ -788,13 +925,22 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
     if (!bri) goto fail;
     for (bi = 0; bi < r->nbody; bi++) {
         atom *ba = r->body[bi];
-        /* aggregates and builtins (equality/comparison/arithmetic) are not
-         * relation references */
+        /* aggregates and builtins (equality/comparison/arithmetic/string) are
+         * not relation references */
         if (ba->aggregate) { bri[bi] = -1; continue; }
         if (is_builtin_pred(ba)) {
             if (ba->negated) {
                 fprintf(stderr, "compile error: negated builtin not supported "
                         "(rule '%s')\n", r->head->pred); goto fail;
+            }
+            /* M9-strings: validate arity/operand/result kinds so a malformed
+             * string builtin (bad arity, INT operand) is rejected loudly
+             * rather than silently mis-evaluated. */
+            if (is_str_builtin(ba) && !str_builtin_valid(ba)) {
+                fprintf(stderr, "compile error: malformed string builtin "
+                        "'%s' (bad arity or non-symbol operand) "
+                        "(rule '%s')\n", ba->pred, r->head->pred);
+                goto fail;
             }
             bri[bi] = -1; continue;
         }
@@ -859,11 +1005,12 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
                 }
                 continue;
             }
-            if (is_arith(ba) || is_comparison(ba)) {
+            if (is_arith(ba) || is_comparison(ba) || is_str_builtin(ba)) {
                 /* builtins execute AFTER the relational phase (NEG_CHECK runs
                  * during it), so their vars are NOT bound for negation-safety
-                 * purposes — a negated atom cannot safely read an arithmetic
-                 * result var or a comparison operand. */
+                 * purposes — a negated atom cannot safely read an arithmetic /
+                 * string-builtin result var or a comparison / string-filter
+                 * operand. */
                 continue;
             }
             if (ba->negated) {
@@ -934,35 +1081,51 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
                 if (vi1 >= 0) bound_vars[vi1] = 1;
             }
         }
-        /* (c) arithmetic in body order: require operands bound, then add the
-         *     result var (left-to-right dependency among arithmetic atoms). */
+        /* (c) PRODUCERS in body order: arithmetic + string-producing.  Require
+         *     every operand var bound, then ADD the result var (left-to-right
+         *     dependency among producers). */
         for (bi = 0; bi < r->nbody; bi++) {
             atom *ba = r->body[bi];
-            if (!is_arith(ba)) continue;
-            if (!expr_vars_bound(ba->arith, &vt, bound_vars, r->head->pred))
-                goto fail;
-            if (ba->nargs >= 1 && ba->args[0]->kind == TOK_VAR) {
-                int vi = v_find(&vt, ba->args[0]->text);
-                if (vi >= 0) bound_vars[vi] = 1;
+            if (is_arith(ba)) {
+                if (!expr_vars_bound(ba->arith, &vt, bound_vars, r->head->pred))
+                    goto fail;
+                if (ba->nargs >= 1 && ba->args[0]->kind == TOK_VAR) {
+                    int vi = v_find(&vt, ba->args[0]->text);
+                    if (vi >= 0) bound_vars[vi] = 1;
+                }
+            } else if (is_str_producing(ba)) {
+                if (!str_producing_operands_bound(ba, &vt, bound_vars,
+                                                  r->head->pred))
+                    goto fail;
+                {
+                    int vi = v_find(&vt, ba->args[0]->text);
+                    if (vi >= 0) bound_vars[vi] = 1;
+                }
             }
         }
-        /* (d) comparisons: both operand vars must be bound (by a relational
-         *     atom, equality, or an earlier arithmetic result). */
+        /* (d) FILTERS: comparisons + string filters.  All variable operands
+         *     must be bound (by a relational atom, equality, or an earlier
+         *     producer result). */
         for (bi = 0; bi < r->nbody; bi++) {
             atom *ba = r->body[bi];
-            if (!is_comparison(ba)) continue;
-            for (j = 0; j < ba->nargs; j++) {
-                token *t = ba->args[j];
-                if (t->kind != TOK_VAR) continue;
-                int vi = v_find(&vt, t->text);
-                if (vi < 0 || !bound_vars[vi]) {
-                    fprintf(stderr,
-                        "compile error: ungrounded comparison — variable "
-                        "'%s' in comparison '%s' is not bound by a positive "
-                        "body atom (rule '%s')\n",
-                        t->text, ba->pred, r->head->pred);
-                    goto fail;
+            if (is_comparison(ba)) {
+                for (j = 0; j < ba->nargs; j++) {
+                    token *t = ba->args[j];
+                    if (t->kind != TOK_VAR) continue;
+                    int vi = v_find(&vt, t->text);
+                    if (vi < 0 || !bound_vars[vi]) {
+                        fprintf(stderr,
+                            "compile error: ungrounded comparison — variable "
+                            "'%s' in comparison '%s' is not bound by a positive "
+                            "body atom (rule '%s')\n",
+                            t->text, ba->pred, r->head->pred);
+                        goto fail;
+                    }
                 }
+            } else if (is_str_filter(ba)) {
+                if (!str_filter_operands_bound(ba, &vt, bound_vars,
+                                               r->head->pred))
+                    goto fail;
             }
         }
     }
@@ -984,15 +1147,19 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
         /* aggregate result var is produced by the aggregate, so it is
          * grounded without appearing in a positive body atom */
         if (agg && !strcmp(a->text, agg->pred)) continue;
-        /* M9: an arithmetic result var is produced by OP_ARITH+OP_EQ, so it
-         * is grounded without appearing in a positive body atom (the same
-         * exemption as the aggregate result var). */
+        /* M9: an arithmetic or string-producing result var is produced by
+         * OP_ARITH / OP_STR_* + OP_EQ, so it is grounded without appearing in
+         * a positive body atom (the same exemption as the aggregate result
+         * var). */
         {
             int ares = 0;
-            for (bi = 0; bi < r->nbody; bi++)
-                if (is_arith(r->body[bi]) && r->body[bi]->nargs >= 1 &&
-                    !strcmp(r->body[bi]->args[0]->text, a->text))
+            for (bi = 0; bi < r->nbody; bi++) {
+                atom *ba = r->body[bi];
+                if (ba->nargs >= 1 && ba->args[0]->kind == TOK_VAR &&
+                    !strcmp(ba->args[0]->text, a->text) &&
+                    (is_arith(ba) || is_str_producing(ba)))
                     { ares = 1; break; }
+            }
             if (ares) continue;
         }
         int ok = 0;
@@ -1089,7 +1256,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
             atom *curr = r->body[bi];
 
             if (curr->aggregate) continue;          /* AGG_ACC emitted below */
-            if (is_builtin_pred(curr)) continue; /* equality/arith/comparison via OP_EQ/OP_ARITH/OP_CMP below */
+            if (is_builtin_pred(curr)) continue; /* equality/builtins (arith, comparison, string) emitted below */
 
             if (curr->negated) {
                 vm_instr *neg = i_emit(&ib);
@@ -1299,43 +1466,96 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
         eq->body_idx = (uint8_t)bi;
     }
 
-    /* Arithmetic atoms (`X = E`) → OP_ARITH into a fresh temp, then
-     * OP_EQ(X, tmp).  The final OP_EQ reuses the bind-or-filter semantics, so
-     * a pre-bound X filters (never silently overwrites) and an unbound X is
-     * bound — both paths preserve the b_try never-overwrite invariant.
-     * Emitted in body order after equality (which runs first) and before
-     * comparisons (which may reference arithmetic results). */
+    /* PRODUCERS in body order → arithmetic (OP_ARITH) + string-producing
+     * (OP_STR_BIND / OP_STR_LEN).  Each producer lowers into a fresh temp,
+     * then a final OP_EQ(result_slot, temp_slot) reusing the bind-or-filter
+     * semantics: a pre-bound result var filters (never silently overwrites)
+     * and an unbound one binds — preserving the b_try never-overwrite
+     * invariant.  Emitted in BODY ORDER after equality (which runs first)
+     * and before filters (which may reference producer results). */
     for (bi = 0; bi < r->nbody; bi++) {
         atom *ba = r->body[bi];
-        if (!is_arith(ba)) continue;
-        if (ba->negated) continue;  /* negated builtin already rejected */
-        int rs = lower_expr(db, ba->arith, &vt, &ib, &cc, &tc, bi);
-        if (rs < 0) goto fail;
-        int rvi = v_find(&vt, ba->args[0]->text);
-        if (rvi < 0) goto fail;
-        vm_instr *eq = i_emit(&ib);
-        eq->op = OP_EQ;
-        eq->a = vt.e[rvi].slot;
-        eq->b = (uint8_t)rs;
-        eq->body_idx = (uint8_t)bi;
+        if (is_arith(ba)) {
+            if (ba->negated) continue;  /* negated builtin already rejected */
+            int rs = lower_expr(db, ba->arith, &vt, &ib, &cc, &tc, bi);
+            if (rs < 0) goto fail;
+            int rvi = v_find(&vt, ba->args[0]->text);
+            if (rvi < 0) goto fail;
+            vm_instr *eq = i_emit(&ib);
+            eq->op = OP_EQ;
+            eq->a = vt.e[rvi].slot;
+            eq->b = (uint8_t)rs;
+            eq->body_idx = (uint8_t)bi;
+        } else if (is_str_producing(ba)) {
+            if (ba->negated) continue;  /* negated builtin already rejected */
+            char cname[16];
+            int vi, ls, rs;
+            vm_instr *op;
+            snprintf(cname, sizeof(cname), "__t%d", tc++);
+            vi = v_add(&vt, cname);
+            if (vi < 0) goto fail;
+            if (!strcmp(ba->pred, "concat")) {
+                ls = cmp_operand_slot(db, ba->args[1], &vt, &ib, &cc);
+                rs = cmp_operand_slot(db, ba->args[2], &vt, &ib, &cc);
+                if (ls < 0 || rs < 0) goto fail;
+                op = i_emit(&ib);
+                if (!op) goto fail;
+                op->op = OP_STR_BIND;
+                op->a = (uint8_t)ls;
+                op->b = (uint8_t)rs;
+                op->c = vt.e[vi].slot;
+                op->imm = 0;  /* CONCAT */
+                op->body_idx = (uint8_t)bi;
+            } else {  /* length */
+                ls = cmp_operand_slot(db, ba->args[1], &vt, &ib, &cc);
+                if (ls < 0) goto fail;
+                op = i_emit(&ib);
+                if (!op) goto fail;
+                op->op = OP_STR_LEN;
+                op->a = (uint8_t)ls;
+                op->c = vt.e[vi].slot;
+                op->imm = 0;
+                op->body_idx = (uint8_t)bi;
+            }
+            int rvi = v_find(&vt, ba->args[0]->text);
+            if (rvi < 0) goto fail;
+            vm_instr *eq = i_emit(&ib);
+            eq->op = OP_EQ;
+            eq->a = vt.e[rvi].slot;
+            eq->b = vt.e[vi].slot;
+            eq->body_idx = (uint8_t)bi;
+        }
     }
 
-    /* Comparison atoms (`X <op> Y`) → OP_CMP.  Both operand slots are bound
-     * by now (compiler guarantees; constants were materialized by
-     * cmp_operand_slot's OP_EQ_CONST). */
+    /* FILTERS in body order → comparisons (OP_CMP) + string filters
+     * (OP_STR_FILTER).  All operand slots are bound by now (compiler
+     * guarantees; constants were materialized by cmp_operand_slot's
+     * OP_EQ_CONST). */
     for (bi = 0; bi < r->nbody; bi++) {
         atom *ba = r->body[bi];
-        if (!is_comparison(ba)) continue;
-        if (ba->negated) continue;  /* negated builtin already rejected */
-        int ls = cmp_operand_slot(db, ba->args[0], &vt, &ib, &cc);
-        int rs = cmp_operand_slot(db, ba->args[1], &vt, &ib, &cc);
-        if (ls < 0 || rs < 0) goto fail;
-        vm_instr *c = i_emit(&ib);
-        c->op = OP_CMP;
-        c->a = (uint8_t)ls;
-        c->b = (uint8_t)rs;
-        c->imm = (uint32_t)cmp_op_code(ba->pred);
-        c->body_idx = (uint8_t)bi;
+        if (is_comparison(ba)) {
+            if (ba->negated) continue;  /* negated builtin already rejected */
+            int ls = cmp_operand_slot(db, ba->args[0], &vt, &ib, &cc);
+            int rs = cmp_operand_slot(db, ba->args[1], &vt, &ib, &cc);
+            if (ls < 0 || rs < 0) goto fail;
+            vm_instr *c = i_emit(&ib);
+            c->op = OP_CMP;
+            c->a = (uint8_t)ls;
+            c->b = (uint8_t)rs;
+            c->imm = (uint32_t)cmp_op_code(ba->pred);
+            c->body_idx = (uint8_t)bi;
+        } else if (is_str_filter(ba)) {
+            if (ba->negated) continue;  /* negated builtin already rejected */
+            int ls = cmp_operand_slot(db, ba->args[0], &vt, &ib, &cc);
+            int rs = cmp_operand_slot(db, ba->args[1], &vt, &ib, &cc);
+            if (ls < 0 || rs < 0) goto fail;
+            vm_instr *f = i_emit(&ib);
+            f->op = OP_STR_FILTER;
+            f->a = (uint8_t)ls;
+            f->b = (uint8_t)rs;
+            f->imm = (uint32_t)str_filter_code(ba->pred);
+            f->body_idx = (uint8_t)bi;
+        }
     }
 
     /* Aggregate: emit AGG_ACC to accumulate all body bindings into

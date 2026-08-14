@@ -40,6 +40,21 @@ typedef enum {
                              0=ADD 1=SUB 2=MUL 3=DIV 4=MOD; result written via
                              b_try (never overwrite); DIV/MOD rhs==0 -> backtrack;
                              u32 wrap-around */
+    OP_STR_FILTER  = 15, /* M9-strings: string filter — a=lhs slot, b=rhs slot,
+                             imm=0 PREFIX 1 SUFFIX 2 CONTAINS; both operands are
+                             interned symbols (intern_str_of NULL -> backtrack);
+                             false -> backtrack */
+    OP_STR_LEN     = 16, /* M9-strings: string length bind — a=operand slot,
+                             c=result int temp slot; operand NULL via
+                             intern_str_of -> backtrack; writes BYTE length
+                             (strlen) via b_try */
+    OP_STR_BIND    = 17, /* M9-strings: string-producing bind — a=lhs slot,
+                             b=rhs slot (unused for unary ops), c=result temp
+                             slot, imm=0 CONCAT (1 LOWER / 2 UPPER RESERVED);
+                             builds the result into a heap buffer and calls
+                             intern_str(db->ir, buf); intern==0 (OOM or result
+                             > 4096 bytes) -> backtrack; else b_try(c, sym_id).
+                             This is the ONLY opcode that interns at runtime. */
 } vm_opcode;
 
 typedef struct {

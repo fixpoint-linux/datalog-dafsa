@@ -14,7 +14,7 @@
  *   exec_rule()         — bytecode interpreter (opcodes: SCAN, LOOKUP,
  *                         EQ, EQ_CONST, PROJECT, NEG_CHECK, HALT, AGG_ACC,
  *                         AGG_EMIT, WALK, LOOKUP_PERM, HASH_JOIN,
- *                         CMP, ARITH)
+ *                         CMP, ARITH, STR_FILTER, STR_LEN, STR_BIND)
  *   eval_nonrecursive() — M1 path: one exec_rule per rule, commits to DAFSA
  *   eval_stratum_recursive() — semi-naive fixpoint using tuple_sets
  *   vm_execute()        — stratify + dispatch
@@ -912,6 +912,96 @@ static long exec_rule(dl_db *db, const compiled_rule *cr,
                 break;
             }
             if (!b_try(&b, in->c, r)) {
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                break;
+            }
+            ip++;
+            break;
+        }
+
+        /* ── OP_STR_FILTER: string filter (M9-strings) ────────────────
+         * a=lhs slot, b=rhs slot, imm=0 PREFIX 1 SUFFIX 2 CONTAINS.
+         * Both operands are interned symbols.  intern_str_of returns NULL
+         * for an out-of-range sym_id (the documented B6 int/symbol
+         * collision backstop) -> backtrack (never crash, never
+         * mis-evaluate).  false -> backtrack. */
+        case OP_STR_FILTER: {
+            const char *as = intern_str_of(db->ir, b_get(&b, in->a));
+            const char *bs = intern_str_of(db->ir, b_get(&b, in->b));
+            int pass = 0;
+            if (as && bs) {
+                size_t al = strlen(as), bl = strlen(bs);
+                switch (in->imm) {
+                    case 0: pass = (bl <= al && strncmp(as, bs, bl) == 0);
+                            break;
+                    case 1: pass = (bl <= al &&
+                                    strcmp(as + al - bl, bs) == 0);
+                            break;
+                    case 2: pass = (strstr(as, bs) != NULL);
+                            break;
+                    default: pass = 0; break;
+                }
+            }
+            if (!pass) {
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                break;
+            }
+            ip++;
+            break;
+        }
+
+        /* ── OP_STR_LEN: string length bind (M9-strings) ──────────────
+         * a=operand slot, c=result int temp slot.  operand NULL via
+         * intern_str_of -> backtrack; writes BYTE length (strlen) via
+         * b_try.  No interning. */
+        case OP_STR_LEN: {
+            const char *s = intern_str_of(db->ir, b_get(&b, in->a));
+            if (!s) {
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                break;
+            }
+            {
+                uint32_t len = (uint32_t)strlen(s);
+                if (!b_try(&b, in->c, len)) {
+                    if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                    break;
+                }
+            }
+            ip++;
+            break;
+        }
+
+        /* ── OP_STR_BIND: string-producing bind (M9-strings) ──────────
+         * a=lhs slot, b=rhs slot (unused for unary ops), c=result temp
+         * slot, imm=0 CONCAT (1 LOWER / 2 UPPER reserved).  Builds the
+         * result into a heap buffer and interns it; intern_str returns 0
+         * for OOM or a result longer than 4096 bytes (intern.c key cap)
+         * -> backtrack.  This is the ONLY opcode that interns at runtime
+         * (db->ir reachable via dl_internal.h). */
+        case OP_STR_BIND: {
+            uint32_t sid = 0;
+            if (in->imm == 0) {
+                const char *as = intern_str_of(db->ir, b_get(&b, in->a));
+                const char *bs = intern_str_of(db->ir, b_get(&b, in->b));
+                if (as && bs) {
+                    size_t al = strlen(as), bl = strlen(bs);
+                    if (al + bl <= 4096) {
+                        char *buf = malloc(al + bl + 1);
+                        if (buf) {
+                            memcpy(buf, as, al);
+                            memcpy(buf + al, bs, bl);
+                            buf[al + bl] = '\0';
+                            sid = intern_str(db->ir, buf);
+                            free(buf);
+                        }
+                    }
+                }
+            }
+            if (sid == 0) {
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                break;
+            }
+            if (!b_try(&b, in->c, sid)) {
                 if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
                 break;
             }

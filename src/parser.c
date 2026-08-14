@@ -59,7 +59,7 @@ static token *tok_new(token_kind kind, const char *start, size_t len)
     token *t = calloc(1, sizeof(*t));
     if (!t) return NULL;
     t->kind = kind;
-    if (start && len > 0) {
+    if (start) {
         t->text = malloc(len + 1);
         if (!t->text) { free(t); return NULL; }
         memcpy(t->text, start, len);
@@ -595,6 +595,16 @@ static expr *parse_factor(parser *p)
     return NULL;
 }
 
+/* M9-strings: producing builtin names, recognized only in the `VAR = name(...)`
+ * form.  Filter builtins (prefix/suffix/contains) need NO parser change — they
+ * lex as ordinary lowercase function-call atoms and the compiler classifies
+ * them.  lower/upper are DEFERRED (not recognized here: a rule using them
+ * fails loudly as a bad arithmetic factor / unknown predicate). */
+static int is_str_producing_name(const char *s)
+{
+    return s && (strcmp(s, "concat") == 0 || strcmp(s, "length") == 0);
+}
+
 /* Parse a body atom: [ ! ] atom, where the atom may also be an equality
  * (VAR = VAR), a comparison (VAR <op> VAR/INT), an aggregate
  * (VAR = count()/sum(X)/min(X)/max(X)), or an arithmetic assignment
@@ -691,6 +701,78 @@ static atom *parse_body_atom(parser *p)
                     a->args[0] = tok_dup(src);
                     a->nargs = 1;
                 }
+                return a;
+            } else if (rhs && rhs->kind == TOK_IDENT &&
+                       is_str_producing_name(rhs->text) &&
+                       peek_at(p, 3) && peek_at(p, 3)->kind == TOK_LPAREN) {
+                /* string-producing builtin: VAR = concat(A,B) / VAR = length(S).
+                 * Operands are TOK_VAR or TOK_IDENT (string constant) only —
+                 * a TOK_INT operand is REJECTED here (a raw int is never a
+                 * string, and a raw int like 1 collides with sym_id 1). */
+                token *res = advance(p);   /* result var */
+                advance(p);                /* = */
+                token *nm  = advance(p);   /* builtin name */
+                if (!expect(p, TOK_LPAREN)) return NULL;
+
+                atom *a = atom_new();
+                if (!a) return NULL;
+                a->pred = strdup(nm->text);
+                a->negated = negated;
+                if (!a->pred) { atom_free(a); return NULL; }
+
+                token **args = NULL;
+                int nargs = 0, cap = 4, fail = 0;
+                args = realloc(args, (size_t)cap * sizeof(token *));
+                if (!args) { atom_free(a); return NULL; }
+                args[nargs++] = tok_dup(res);
+                if (!args[0]) { fail = 1; }
+
+                while (!fail) {
+                    token *op = peek(p);
+                    if (!op) { fail = 1; break; }
+                    if (op->kind == TOK_RPAREN) { advance(p); break; }
+                    if (op->kind == TOK_INT) {
+                        fprintf(stderr,
+                            "parser: integer operand not allowed in string "
+                            "builtin '%s' (only variables / string constants)\n",
+                            nm->text);
+                        fail = 1; break;
+                    }
+                    if (op->kind != TOK_VAR && op->kind != TOK_IDENT) {
+                        fprintf(stderr,
+                            "parser: expected variable or string constant in "
+                            "string builtin '%s', got kind %d\n",
+                            nm->text, (int)op->kind);
+                        fail = 1; break;
+                    }
+                    if (nargs >= cap) {
+                        int nc = cap * 2;
+                        token **na = realloc(args, (size_t)nc * sizeof(token *));
+                        if (!na) { fail = 1; break; }
+                        args = na; cap = nc;
+                    }
+                    args[nargs++] = tok_dup(advance(p));
+                    if (!args[nargs - 1]) { fail = 1; break; }
+
+                    token *sep = peek(p);
+                    if (!sep) { fail = 1; break; }
+                    if (sep->kind == TOK_COMMA) { advance(p); continue; }
+                    if (sep->kind == TOK_RPAREN) { advance(p); break; }
+                    fprintf(stderr, "parser: expected ',' or ')' in string "
+                            "builtin '%s', got kind %d\n",
+                            nm->text, (int)sep->kind);
+                    fail = 1; break;
+                }
+
+                if (fail) {
+                    int k;
+                    for (k = 0; k < nargs; k++) tok_free(args[k]);
+                    free(args);
+                    atom_free(a);
+                    return NULL;
+                }
+                a->args = args;
+                a->nargs = nargs;
                 return a;
             } else if (rhs) {
                 /* arithmetic assignment: VAR = E */

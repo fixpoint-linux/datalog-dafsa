@@ -18,6 +18,7 @@ build-tmp/
 /tests/test_m7
 /tests/test_m8_magic
 /tests/test_m9_arith
+/tests/test_m9_str
 /tests/test_bulk
 /tests/test_m4_review
 /tests/test_m5_review
