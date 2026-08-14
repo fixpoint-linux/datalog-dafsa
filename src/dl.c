@@ -35,6 +35,13 @@
 
 /* dl_db layout lives in dl_internal.h (shared with internal consumers) */
 
+/* Magic-sets skip-materialize hook (defined in vm.c): let the scoped fixpoint
+ * skip the post-fixpoint DAFSA bulk-build and export the adorned-goal idb
+ * directly, since the eval clone is torn down right after streaming. */
+extern int vm_nomaterialize;
+extern int vm_export_relid;
+extern tuple_set *vm_export_ts;
+
 /* ─── Internal helpers ────────────────────────────────────────────────── */
 
 /* Find a relation by name, return index or -1 */
@@ -1325,23 +1332,45 @@ long dl_query_magic_adorn(dl_db *db, const char *goal_rel,
         goto out_free_crules;
     }
 
-    /* 8. Scoped fixpoint. */
-    if (vm_execute(&edb, magic_crules, n_magic) != 0) {
-        fprintf(stderr, "dl_query_magic: scoped fixpoint failed\n");
-        magic_program_free(&prog);
-        goto out_free_crules;
-    }
-
-    /* 9. Stream: full-scan + per-position filter on the adorned goal. */
+    /* 8. Scoped fixpoint (skip-materialize: the eval clone is torn down
+     *    immediately after streaming, so skip the DAFSA bulk-build and
+     *    export the adorned-goal idb tuple_set via the vm_* hook). */
     {
         int a_idx = find_rel(&edb, prog.adorned_goal);
-        magic_filter_ctx ctx;
         if (a_idx < 0) {
             fprintf(stderr, "dl_query_magic: internal: adorned goal '%s' "
                     "missing\n", prog.adorned_goal);
             magic_program_free(&prog);
             goto out_free_crules;
         }
+
+        tuple_set goal_ts;
+        memset(&goal_ts, 0, sizeof(goal_ts));
+        vm_nomaterialize = 1;
+        vm_export_relid  = a_idx;
+        vm_export_ts     = &goal_ts;
+
+        int exec_rc = vm_execute(&edb, magic_crules, n_magic);
+
+        /* Reset the hook regardless of the fixpoint result. */
+        vm_nomaterialize = 0;
+        vm_export_relid  = -1;
+        vm_export_ts     = NULL;
+
+        if (exec_rc != 0) {
+            fprintf(stderr, "dl_query_magic: scoped fixpoint failed\n");
+            ts_free(&goal_ts);   /* no-op unless the goal was exported */
+            magic_program_free(&prog);
+            goto out_free_crules;
+        }
+
+        /* 9. Stream the fully-materialized adorned goal through the
+         * per-position filter.  Two cases:
+         *   - The goal is a recursive head → its idb was exported to goal_ts
+         *     (arity set) by the skip-materialize hook in section 6.
+         *   - The goal is non-recursive (aggregate / negation / projection) →
+         *     it was materialized via the M1 path; stream its DAFSA. */
+        magic_filter_ctx ctx;
         memset(&ctx, 0, sizeof(ctx));
         ctx.user_cb = cb;
         ctx.user = user;
@@ -1349,11 +1378,24 @@ long dl_query_magic_adorn(dl_db *db, const char *goal_rel,
         memcpy(ctx.adorn, adorn, alen);
         ctx.adorn[alen] = '\0';
         memcpy(ctx.vals, vals, (size_t)nvals * sizeof(uint32_t));
-        if (rel_prefix(edb.rels[a_idx].rel, NULL, 0,
-                       magic_filter_cb, &ctx) < 0)
-            result = -1;
-        else
+
+        if (goal_ts.arity > 0) {
+            /* Exported recursive-goal idb (already sorted). */
+            long ci;
+            for (ci = 0; ci < goal_ts.count; ci++) {
+                const uint32_t *t = goal_ts.data + (size_t)ci * goal_ts.arity;
+                if (magic_filter_cb(t, goal_ts.arity, &ctx) != 0) break;
+            }
             result = ctx.matched;
+            ts_free(&goal_ts);
+        } else {
+            /* Non-recursive goal: DAFSA materialized via M1. */
+            if (rel_prefix(edb.rels[a_idx].rel, NULL, 0,
+                           magic_filter_cb, &ctx) < 0)
+                result = -1;
+            else
+                result = ctx.matched;
+        }
     }
 
     magic_program_free(&prog);

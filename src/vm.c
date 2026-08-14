@@ -32,6 +32,18 @@
 
 /* ─── dl_db internal access (authoritative layout in dl_internal.h) ──── */
 
+/* Magic-sets skip-materialize hook.  When a caller (dl_query_magic_adorn)
+ * sets vm_nomaterialize=1, the recursive stratum skips the DAFSA bulk-build
+ * of the GOAL relation (section 6) and instead hands its idb tuple_set to the
+ * caller via vm_export_ts, since the eval clone is torn down immediately after
+ * streaming and that DAFSA would never be read again.  ALL OTHER relations are
+ * still materialized so higher strata keep seeing correct data.  The globals
+ * default to 0/-1/NULL so every non-magic path (dl_compile/dl_query/dl_publish)
+ * is byte-identical to before. */
+int vm_nomaterialize = 0;
+int vm_export_relid = -1;
+tuple_set *vm_export_ts = NULL;
+
 static relation *db_rel(dl_db *db, int idx)
 {
     if (idx < 0 || (size_t)idx >= db->nrels) return NULL;
@@ -1074,29 +1086,35 @@ static int eval_stratum_recursive(dl_db *db, compiled_rule **rules, int n)
     /* ── 1b. Decide whether the full-idb override must be kept sorted ──
      * A non-delta OP_LOOKUP recursive body atom is evaluated via ts_prefix
      * (binary search, requires SORTED data) over the full-idb override.  idb
-     * is grown via ts_add during the loop (unsorted tail).  If a rule has
-     * TWO OR MORE plain-OP_LOOKUP recursive atoms (e.g. magic-sets'
-     * tc__bf(X,Y):-magic_tc__bf(X),tc__bf(X,Z),tc__bf(Z,Y) — the magic guard
-     * binds X so BOTH tc atoms are leading-bound OP_LOOKUP), then every delta
-     * firing leaves at least one OP_LOOKUP atom on the unsorted idb, so
-     * ts_prefix silently misses tuples (silent wrong answer).  OP_SCAN is
-     * order-independent and OP_LOOKUP_PERM reads a per-iteration re-sorted
-     * shadow, so they never need this.  We therefore re-sort idb each
-     * iteration ONLY when such a rule exists, preserving the M2 perf win
-     * (idb left unsorted) for the common single-recursive-atom /
-     * OP_SCAN-first shapes. */
+     * is grown via ts_add during the loop (unsorted tail).  Any recursive rule
+     * with TWO OR MORE recursive body atoms leaves at least one non-delta
+     * atom per firing; if any of those is a plain-OP_LOOKUP (leading-bound,
+     * e.g. magic-sets' tc__bf(X,Y):-magic_tc__bf(X),tc__bf(X,Z),tc__bf(Z,Y)),
+     * then that OP_LOOKUP reads the full idb and needs it sorted, or ts_prefix
+     * silently misses tuples (silent wrong answer).  This covers BOTH the
+     * two-OP_LOOKUP shape AND the mixed OP_SCAN/OP_LOOKUP shape (a recursive
+     * atom with all-fresh variables compiles to OP_SCAN; if its sibling is an
+     * OP_LOOKUP, the firing where OP_SCAN is the delta still reads the full
+     * idb through OP_LOOKUP).  OP_LOOKUP_PERM reads a per-iteration re-sorted
+     * shadow and a lone recursive atom is always the delta (reads the sorted
+     * delta, never the unsorted full idb), so neither needs this.
+     * We therefore re-sort idb each iteration ONLY when such a rule exists,
+     * preserving the M2 perf win (idb left unsorted) for the common
+     * single-recursive-atom / all-OP_SCAN shapes. */
     int need_idb_sort = 0;
     for (i = 0; i < n; i++) {
         compiled_rule *cr = rules[i];
-        int n_lookup = 0, ii;
+        int n_rec = 0, n_lookup = 0, ii;
         if (!cr->is_recursive) continue;
         for (ii = 0; ii < cr->n_instrs; ii++) {
             const vm_instr *in = &cr->instrs[ii];
-            if (in->op != OP_LOOKUP) continue;
+            if (in->op != OP_LOOKUP && in->op != OP_SCAN
+                && in->op != OP_LOOKUP_PERM) continue;
             if (rp_idx[in->a] < 0) continue;  /* not a recursive body atom */
-            n_lookup++;
+            n_rec++;
+            if (in->op == OP_LOOKUP) n_lookup++;
         }
-        if (n_lookup >= 2) { need_idb_sort = 1; break; }
+        if (n_rec >= 2 && n_lookup >= 1) { need_idb_sort = 1; break; }
     }
 
     /* ── 2. Allocate IDB and delta tuple_sets ──────────────────────── */
@@ -1361,8 +1379,8 @@ static int eval_stratum_recursive(dl_db *db, compiled_rule **rules, int n)
             REBUILD_PERM_SHADOWS();
 
             /* Keep idb sorted for non-delta OP_LOOKUP ts_prefix lookups when
-             * the stratum has a rule with ≥2 plain-OP_LOOKUP recursive atoms
-             * (see the need_idb_sort decision above). */
+             * the stratum has a recursive rule with ≥2 recursive body atoms
+             * AND ≥1 plain-OP_LOOKUP among them (see need_idb_sort above). */
             if (need_idb_sort) {
                 for (i = 0; i < nr; i++) ts_sort(&rd[i].idb);
             }
@@ -1435,15 +1453,17 @@ static int eval_stratum_recursive(dl_db *db, compiled_rule **rules, int n)
                             overrides[n_ov].perm_id = -1;
                         } else {
                             /* Full IDB.  rd[jbdi].idb is kept sorted when the
-                             * stratum has a rule with ≥2 plain-OP_LOOKUP
-                             * recursive atoms (see need_idb_sort above), so the
-                             * ts_prefix binary search in OP_LOOKUP is correct.
-                             * For the common shapes idb stays unsorted, which is
-                             * safe: OP_SCAN is order-independent, OP_LOOKUP_PERM
-                             * reads a per-iteration re-sorted shadow, and a single
-                             * OP_LOOKUP atom is always the delta (never the
-                             * non-delta override).  Do NOT unconditionally re-sort
-                             * idb here — that was the M2 perf bottleneck. */
+                             * stratum has a recursive rule with ≥2 recursive
+                             * body atoms AND ≥1 plain-OP_LOOKUP among them
+                             * (see need_idb_sort above), so the ts_prefix
+                             * binary search in OP_LOOKUP is correct.  For the
+                             * common shapes idb stays unsorted, which is safe:
+                             * OP_SCAN is order-independent, OP_LOOKUP_PERM
+                             * reads a per-iteration re-sorted shadow, and a
+                             * single OP_LOOKUP atom is always the delta (never
+                             * the non-delta override).  Do NOT unconditionally
+                             * re-sort idb here — that was the M2 perf
+                             * bottleneck. */
                             overrides[n_ov].body_idx = (int)jin->body_idx;
                             overrides[n_ov].ts = &rd[jbdi].idb;
                             overrides[n_ov].perm_id = -1;
@@ -1557,7 +1577,12 @@ static int eval_stratum_recursive(dl_db *db, compiled_rule **rules, int n)
         }
     }
 
-    /* ── 6. Materialize: bulk-write idb to DAFSA ───────────────────── */
+    /* ── 6. Materialize: bulk-write idb to DAFSA ─────────────────────
+     * In the magic path (vm_nomaterialize), the GOAL relation's DAFSA is not
+     * needed (the clone is torn down right after streaming); instead export
+     * its idb to the caller.  ALL OTHER relations are still materialized so
+     * higher strata (which read lower-stratum relations via their DAFSAs)
+     * keep seeing correct data. */
     for (i = 0; i < nr; i++) {
         relation *rel = (relation *)db_rel(db, rd[i].rel_id);
         if (!rel) continue;
@@ -1567,6 +1592,14 @@ static int eval_stratum_recursive(dl_db *db, compiled_rule **rules, int n)
          * no-op for pure-idb relations (start empty). */
         rel_prefix(rel, NULL, 0, ts_sink_cb, &rd[i].idb);
         ts_sort(&rd[i].idb);
+        if (vm_nomaterialize && rd[i].rel_id == vm_export_relid) {
+            /* Goal: hand the idb (base facts unioned, sorted) to the caller
+             * instead of building a DAFSA.  idb is zeroed so section 7's
+             * ts_free is a no-op; delta/next_delta still need freeing. */
+            *vm_export_ts = rd[i].idb;
+            memset(&rd[i].idb, 0, sizeof(rd[i].idb));
+            continue;
+        }
         rel_build_from_tupleset(rel, &rd[i].idb);
     }
 
@@ -1601,7 +1634,9 @@ static int eval_stratum_recursive(dl_db *db, compiled_rule **rules, int n)
         }
     }
 
-    /* ── 7. Clean up ───────────────────────────────────────────────── */
+    /* ── 7. Clean up ─────────────────────────────────────────────────
+     * The goal relation (when exported in section 6) has its idb zeroed, so
+     * ts_free below is a no-op for it; all others are freed normally. */
     for (i = 0; i < nr; i++) {
         ts_free(&rd[i].idb);
         ts_free(&rd[i].delta);

@@ -1549,6 +1549,95 @@ static void test_t43_multirecursive_fixpoint(void)
     PASS();
 }
 
+/* ─── T44: mixed OP_SCAN/OP_LOOKUP recursive-atom fixpoint ──────────────
+ * A recursive rule whose body has TWO recursive atoms, one compiled to
+ * OP_SCAN (all-fresh vars: p(A,B) in the rule below) and one to OP_LOOKUP
+ * (leading-bound var: p(B,C)).  This is the shape the old need_idb_sort
+ * condition (n_lookup >= 2) could MISS: in the firing where the OP_SCAN atom
+ * is the delta, the OP_LOOKUP atom reads the FULL idb via ts_prefix (binary
+ * search) and needs it sorted.  The tightened condition
+ * (n_recursive_atoms >= 2 AND n_lookup >= 1) sorts for this shape too.
+ * NOTE: on the chain inputs below this test passes under BOTH the old and the
+ * tightened condition (the data does not surface the unsorted-idb miss), so it
+ * is a fixpoint-correctness regression test for the mixed SCAN/LOOKUP shape,
+ * NOT a guard that the tightening is doing work.  The tightening itself is
+ * sound as a strict superset (it only ever ADDS sorting for this shape).
+ * Oracle = brute-force least fixpoint of the same rules in C. */
+
+static void test_t44_mixed_scan_lookup(void)
+{
+    dl_db *db;
+    tuple_set got = {0};
+    int i;
+
+    TEST("T44: mixed OP_SCAN/OP_LOOKUP recursive-atom fixpoint");
+
+    /* edges 1->2->...->11 (chain). */
+    setup_db(&db, "t44");
+    {
+        uint32_t e[22];
+        int j;
+        for (j = 0; j < 11; j++) { e[j*2] = (uint32_t)(j+1); e[j*2+1] = (uint32_t)(j+2); }
+        load_rows(db, "edge", 2, e, 11, "t44");
+    }
+    assert(dl_load_rules(db,
+        "p(X,Y):-edge(X,Y).\n"
+        "p(X,Y):-p(A,B),edge(A,X),p(B,C),edge(C,Y).\n") == 0);
+    assert(dl_compile(db) == 0);
+
+    /* Brute-force oracle: p seeded by edge; derive p(X,Y) from
+     * p(A,B),edge(A,X),p(B,C),edge(C,Y). */
+    {
+        int P[300][2], nP = 0, changed = 1;
+        /* edges are chain i->i+1 */
+        for (i = 1; i < 12; i++) { P[nP][0]=i; P[nP][1]=i+1; nP++; }
+        while (changed) {
+            changed = 0;
+            for (i = 0; i < 11; i++) {        /* edge(A,X): A=i+1, X=i+2 */
+                int A = i+1, X = i+2;
+                int pi, cj;
+                for (pi = 0; pi < nP; pi++) {
+                    if (P[pi][0] != A) continue;
+                    int B = P[pi][1];
+                    for (cj = 0; cj < nP; cj++) {
+                        if (P[cj][0] != B) continue;
+                        int C = P[cj][1];
+                        int Y = C+1;          /* edge(C,Y) */
+                        if (Y > 12) continue;
+                        int k, found = 0;
+                        for (k = 0; k < nP; k++)
+                            if (P[k][0]==X && P[k][1]==Y) { found = 1; break; }
+                        if (!found) { P[nP][0]=X; P[nP][1]=Y; nP++; changed=1; }
+                    }
+                }
+            }
+        }
+        /* sort + load into got for comparison */
+        got.count = 0; got.cap = 0; got.data = NULL; got.arity = 2;
+        for (i = 0; i < nP; i++) {
+            if (got.count >= got.cap) {
+                long nc = got.cap ? got.cap*2 : 64;
+                uint32_t *nd = realloc(got.data,(size_t)nc*2*sizeof(uint32_t));
+                if (!nd) { FAIL("t44 oom"); teardown_db(db,"t44"); return; }
+                got.data = nd; got.cap = nc;
+            }
+            got.data[got.count*2]=(uint32_t)P[i][0];
+            got.data[got.count*2+1]=(uint32_t)P[i][1];
+            got.count++;
+        }
+    }
+
+    if (!cmp_full_materialization(db, "p", &got)) {
+        printf("  mixed OP_SCAN/OP_LOOKUP recursive fixpoint mismatch\n");
+        FAIL("T44 mixed scan/lookup fixpoint");
+        teardown_db(db, "t44"); tset_free(&got);
+        return;
+    }
+    teardown_db(db, "t44");
+    tset_free(&got);
+    PASS();
+}
+
 /* ─── T19: extended multi-predicate property test ─────────────────────── */
 
 static void test_t19_multipred_property(void)
@@ -2414,6 +2503,7 @@ int main(void)
     test_t41_adornment_blowup();
     test_t42_two_adorn_property();
     test_t43_multirecursive_fixpoint();
+    test_t44_mixed_scan_lookup();
 
     printf("\n%d tests run, %d failed\n", tests_run, tests_failed);
     return tests_failed ? 1 : 0;
