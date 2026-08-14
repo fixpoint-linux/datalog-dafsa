@@ -2,7 +2,7 @@
 
 A DAFSA-backed Datalog engine in C: load facts into an on-disk minimal-acyclic-DAFSA
 fact store, compile Datalog rules to a small VM, materialize derived relations, and
-serve reads from an mmap'd snapshot. M0–M7 complete (224 test cases green).
+serve reads from an mmap'd snapshot. M0–M9 complete (288 test cases green).
 
 ## Quickstart
 
@@ -95,8 +95,11 @@ Public C API in [`src/dl.h`](src/dl.h). All value arrays are u32 (raw ints or sy
 | M6 | Permutation indices + hash-join | 8 (+5 review +10 deep) |
 | M7 | Durability (lock, WAL, incremental add/delete) | 14 |
 | bulk | Bulk DAFSA construction | 16 |
+| M8 | Magic-sets (`dl_query_magic` / `dl_query_magic_adorn`) | 44 |
+| M9 | Arithmetic + comparison builtins (`< <= > >= !=`, `X = E`) | 11 |
+| M9-s | String builtins (concat, length, lower/upper, prefix/suffix/contains) | 9 |
 
-Total: 224 test cases across 13 test binaries + a CLI smoke test.
+Total: 288 test cases across 16 test binaries + a CLI smoke test.
 
 ## Design Docs
 

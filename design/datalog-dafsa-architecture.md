@@ -116,11 +116,17 @@ Product construction: walk `(dafsa_state, regex_state)` pairs in lockstep, emitt
 - **Stratified negation** (`!atom`): allowed, must be stratifiable (compile-time check rejects un-stratifiable rulesets).
 - **Recursion** via semi-naive fixpoint (delta relations).
 - **Equality** (`X = Y`): unify two variables; `X = c` filter by constant.
+- **Comparison builtins** (M9): `<`, `<=`, `>`, `>=`, `!=` as infix body atoms.
+- **Arithmetic builtins** (M9): `X = E` over `+ - * / %` (precedence-climbing
+  expression parser); division/modulo by zero backtracks; u32 wrap-around.
+- **String builtins** (M9): `concat`, `length`, `lower`, `upper`, `prefix`,
+  `suffix`, `contains`; `concat`/`lower`/`upper` produce a new interned string
+  at runtime.
 - **Aggregates** (v1.0): `count`, `sum`, `min`, `max` -- grouped by zero or more group-by columns. One aggregate per rule head.
 - **Arity limit <= 8** per relation.
 
 ### 3.2 DEFERRED to v2
-- Arithmetic expressions, string builtins, comparison builtins beyond equality (`<`, `>`, ...).
+- Richer string ops (regex-based functions, locale-aware case mapping, ...).
 - Magic-sets / QSQ top-down rewrites (constant propagation only in v1).
 - Negation inside aggregates; aggregates inside negation.
 - Nested subqueries / rule composition beyond standard Datalog.

@@ -973,11 +973,11 @@ static long exec_rule(dl_db *db, const compiled_rule *cr,
 
         /* ── OP_STR_BIND: string-producing bind (M9-strings) ──────────
          * a=lhs slot, b=rhs slot (unused for unary ops), c=result temp
-         * slot, imm=0 CONCAT (1 LOWER / 2 UPPER reserved).  Builds the
-         * result into a heap buffer and interns it; intern_str returns 0
-         * for OOM or a result longer than 4096 bytes (intern.c key cap)
-         * -> backtrack.  This is the ONLY opcode that interns at runtime
-         * (db->ir reachable via dl_internal.h). */
+         * slot, imm=0 CONCAT / 1 LOWER / 2 UPPER.  Builds the result into a
+         * heap buffer and interns it; intern_str returns 0 for OOM or a
+         * result longer than 4096 bytes (intern.c key cap) -> backtrack.
+         * This is the ONLY opcode that interns at runtime (db->ir reachable
+         * via dl_internal.h).  lower/upper are ASCII case folding. */
         case OP_STR_BIND: {
             uint32_t sid = 0;
             if (in->imm == 0) {
@@ -991,6 +991,32 @@ static long exec_rule(dl_db *db, const compiled_rule *cr,
                             memcpy(buf, as, al);
                             memcpy(buf + al, bs, bl);
                             buf[al + bl] = '\0';
+                            sid = intern_str(db->ir, buf);
+                            free(buf);
+                        }
+                    }
+                }
+            } else if (in->imm == 1 || in->imm == 2) {
+                /* LOWER (1) / UPPER (2): ASCII case folding on one operand. */
+                const char *as = intern_str_of(db->ir, b_get(&b, in->a));
+                if (as) {
+                    size_t al = strlen(as);
+                    if (al <= 4096) {
+                        char *buf = malloc(al + 1);
+                        if (buf) {
+                            size_t j;
+                            for (j = 0; j < al; j++) {
+                                char ch = as[j];
+                                if (in->imm == 1) {        /* lower */
+                                    if (ch >= 'A' && ch <= 'Z')
+                                        ch = (char)(ch + ('a' - 'A'));
+                                } else {                  /* upper */
+                                    if (ch >= 'a' && ch <= 'z')
+                                        ch = (char)(ch - ('a' - 'A'));
+                                }
+                                buf[j] = ch;
+                            }
+                            buf[al] = '\0';
                             sid = intern_str(db->ir, buf);
                             free(buf);
                         }

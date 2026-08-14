@@ -1,5 +1,5 @@
 /*
- * test_m9_str.c — M9-strings builtin tests (concat / length /
+ * test_m9_str.c — M9-strings builtin tests (concat / length / lower / upper /
  * prefix / suffix / contains)
  *
  * Coverage matrix (mirrors the M9-strings plan):
@@ -364,7 +364,7 @@ static void test_t4_parser_rejects(void)
 {
     dl_db *db;
 
-    TEST("T4: parser rejects (INT operand, unclosed paren, deferred lower)");
+    TEST("T4: parser rejects (INT operand, unclosed paren)");
 
     setup_db(&db, "t4");
     { const char *s[] = { "hello" }; load_str_rows(db, "str", 1, s, 1, "t4"); }
@@ -377,9 +377,9 @@ static void test_t4_parser_rejects(void)
     if (dl_load_rules(db, "r(C):-str(A),C=concat(A,\"b\".\n") == 0) {
         FAIL("unclosed paren in concat not rejected"); teardown_db(db, "t4"); return;
     }
-    /* deferred lower/upper must fail loudly (not recognized) */
-    if (dl_load_rules(db, "r(C):-str(A),C=lower(A).\n") == 0) {
-        FAIL("deferred lower not rejected"); teardown_db(db, "t4"); return;
+    /* INT operand to lower (a raw int is never a string) */
+    if (dl_load_rules(db, "r(C):-str(A),C=lower(1).\n") == 0) {
+        FAIL("INT operand to lower not rejected"); teardown_db(db, "t4"); return;
     }
     PASS();
     teardown_db(db, "t4");
@@ -758,6 +758,44 @@ static void test_t8_empty_string_literals(void)
     teardown_db(db, "t8");
 }
 
+/* ─── T9: lower/upper (ASCII case folding, OP_STR_BIND imm 1/2) ───────── */
+static void test_t9_lower_upper(void)
+{
+    dl_db *db;
+
+    TEST("T9: lower/upper (ASCII case folding)");
+
+    setup_db(&db, "t9");
+    {
+        const char *cells[] = { "Hello World", "MiXeD", "abc", "ABC123!" };
+        load_str_rows(db, "s", 1, cells, 4, "t9");
+    }
+
+    assert(dl_load_rules(db,
+        "lc(X):-s(Y),X=lower(Y).\n"
+        "uc(X):-s(Y),X=upper(Y).\n") == 0);
+    assert(dl_compile(db) == 0);
+
+    {
+        uint32_t e_lc[] = {
+            sid(db,"hello world"), sid(db,"mixed"),
+            sid(db,"abc"),         sid(db,"abc123!"),
+        };
+        uint32_t e_uc[] = {
+            sid(db,"HELLO WORLD"), sid(db,"MIXED"),
+            sid(db,"ABC"),         sid(db,"ABC123!"),
+        };
+        if (!check_query(db, "lc", e_lc, 4, 1)) {
+            FAIL("lower mismatch"); teardown_db(db, "t9"); return;
+        }
+        if (!check_query(db, "uc", e_uc, 4, 1)) {
+            FAIL("upper mismatch"); teardown_db(db, "t9"); return;
+        }
+    }
+    PASS();
+    teardown_db(db, "t9");
+}
+
 int main(void)
 {
     printf("M9-strings Builtin Tests\n");
@@ -771,6 +809,7 @@ int main(void)
     test_t6_edge_cases();
     test_t7_property();
     test_t8_empty_string_literals();
+    test_t9_lower_upper();
 
     printf("\n%d tests run, %d failed\n", tests_run, tests_failed);
     return tests_failed ? 1 : 0;

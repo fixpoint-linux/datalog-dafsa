@@ -5,6 +5,46 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **M9 arithmetic + comparison builtins**: non-relational builtins extend the
+  existing equality to a full comparison / arithmetic set:
+  - **Comparisons** `<`, `<=`, `>`, `>=`, `!=` as infix body atoms (operands =
+    variable or integer literal; `!=` also accepts a symbol constant).
+  - **Arithmetic** `X = E` over `+ - * / %` via a precedence-climbing
+    expression parser (`* / %` bind tighter, left-associative, parentheses).
+  - Two generic VM opcodes: `OP_CMP` (filter; false → backtrack) and
+    `OP_ARITH` (bind; result written via `b_try`, never overwrites).  An
+    arithmetic result lowers to `OP_ARITH` into a fresh temp then `OP_EQ`
+    reusing the existing bind-or-filter invariant, so both "bind a new var"
+    and "filter a pre-bound var" work.  Division/modulo by zero backtracks
+    (never crashes); integers wrap mod 2³² (matching the sum aggregate).
+  - A builtin-safety pass rejects ungrounded operands, negated builtins, and
+    division/modulo by a literal 0 loudly (never silently mis-evaluates).
+    Arithmetic is allowed in recursive rules; aggregates remain banned there.
+  - magic-sets integration: SIPS/`compute_betas` treat comparison as
+    zero-propagation and arithmetic as result-var propagation, so
+    `dl_query_magic` over an arithmetic rule matches full materialization.
+  - Operands are interpreted as raw u32 (the documented B6 int/symbol
+    limitation); arithmetic on a symbol-constant operand is rejected at parse
+    time.  Suite: `tests/test_m9_arith.c` (11 tests incl. 200 seeded property
+    cases against a C reference).
+- **M9-strings string builtins**: `concat` (produces a new string value via
+  runtime interning), `length` (byte length, UTF-8 counted per byte), `lower` /
+  `upper` (ASCII case folding), and `prefix` / `suffix` / `contains` (pure
+  filters).  Function-call syntax reusing M9's `X = name(args)` for producers
+  and bare atoms for filters.  Three new VM opcodes
+  (`OP_STR_FILTER`/`OP_STR_LEN`/`OP_STR_BIND`); only `OP_STR_BIND` interns
+  (builds a heap buffer, calls `intern_str`, >4096-byte result backtracks).
+  New symbols persist with the interner on `dl_close` / `dl_publish_snapshot`,
+  identical to fact-load interning.  Suite: `tests/test_m9_str.c` (9 tests
+  incl. empty-string-literal regression + 200 seeded property cases).
+- **M9 compiler hardening (nits)**: (1) generated constant/temp slot names
+  (`__kN`/`__tN`) no longer collide with a user variable literally named
+  `__k0`/`__t0` — a new `v_fresh_name()` skips past names already in the var
+  table, fixing a potential silent wrong answer (regression test T11).  (2)
+  rules exceeding the 64-var/temp/constant budget now print a loud
+  diagnostic instead of failing silently.  (3) a failed string-constant
+  intern (OOM or >4096-byte key limit) prints a diagnostic (with the constant
+  truncated) instead of a silent `goto fail`.
 - M8 magic-sets: the full deferred magic-sets plan (slices 1–5), plus a
   correctness fix, are now implemented.  `dl_query_magic` /
   `dl_query_magic_adorn` are opt-in per-query paths that re-evaluate a scoped

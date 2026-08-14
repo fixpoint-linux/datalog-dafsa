@@ -23,7 +23,8 @@
  *   - `X != ident` is the one builtin form that interns a symbol constant and
  *     compares sym_ids; it is supported and consistent with the above.
  *
- * M9-strings (concat/length/prefix/suffix/contains) operates on SYMBOLS.
+ * M9-strings (concat/length/lower/upper/prefix/suffix/contains) operates on
+ * SYMBOLS.
  *   - operands are TOK_VAR or TOK_IDENT (a "double-quoted" string constant
  *     interned at compile time); a TOK_INT operand is REJECTED (a raw int is
  *     never a string, and a raw int like 1 collides with sym_id 1).
@@ -31,10 +32,10 @@
  *     a valid sym_id is the DOCUMENTED B6 limitation; the runtime backstop is
  *     intern_str_of -> NULL -> backtrack (never crash, never mis-evaluate).
  *   - length is the BYTE length (strlen over UTF-8 bytes), not codepoints.
- *   - concat interns its result at RUNTIME (OP_STR_BIND); a result longer than
- *     4096 bytes makes intern_str return 0 -> backtrack.  New syms mark the
- *     interner dirty and persist on dl_close/dl_publish (identical to fact-load
- *     interning).
+ *   - concat/lower/upper intern their result at RUNTIME (OP_STR_BIND); a result
+ *     longer than 4096 bytes makes intern_str return 0 -> backtrack.  New syms
+ *     mark the interner dirty and persist on dl_close/dl_publish (identical to
+ *     fact-load interning).
  */
 
 #include "compiler.h"
@@ -230,13 +231,16 @@ static int is_equality(const atom *a)
  * DEFERRED (OP_STR_BIND imm 1/2 reserved; not classified, so a rule using
  * them fails loudly as an unknown predicate / bad arithmetic factor). */
 
-/* producing string builtin: `VAR = concat(A,B)` / `VAR = length(S)` —
- * args[0] is the result var, args[1..] are the operand tokens */
+/* producing string builtin: `VAR = concat(A,B)` / `VAR = length(S)` /
+ * `VAR = lower(S)` / `VAR = upper(S)` — args[0] is the result var,
+ * args[1..] are the operand tokens */
 static int is_str_producing(const atom *a)
 {
     if (!a || !a->pred) return 0;
     return strcmp(a->pred, "concat") == 0 ||
-           strcmp(a->pred, "length") == 0;
+           strcmp(a->pred, "length") == 0 ||
+           strcmp(a->pred, "lower")  == 0 ||
+           strcmp(a->pred, "upper")  == 0;
 }
 
 /* string filter builtin: bare function-call atom `prefix(S,P)` etc. —
@@ -301,6 +305,16 @@ static int str_filter_code(const char *pred)
     if (!strcmp(pred, "prefix")) return 0;
     if (!strcmp(pred, "suffix")) return 1;
     return 2;  /* contains */
+}
+
+/* string-producing builtin imm/opcode encoding.  Returns OP_STR_BIND imm for
+ * concat/lower/upper (0/1/2), or -1 for length (which is OP_STR_LEN). */
+static int str_bind_imm(const char *pred)
+{
+    if (!strcmp(pred, "concat")) return 0;
+    if (!strcmp(pred, "lower"))  return 1;
+    if (!strcmp(pred, "upper"))  return 2;
+    return -1;  /* length */
 }
 
 /* comparison operator string -> OP_CMP imm code */
@@ -1545,17 +1559,24 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
             v_fresh_name(&vt, cname, sizeof(cname), &tc, 't');
             vi = v_add(&vt, cname);
             if (vi < 0) goto fail;
-            if (!strcmp(ba->pred, "concat")) {
+            if (str_bind_imm(ba->pred) >= 0) {
+                /* OP_STR_BIND: concat (2 operands, imm 0) or lower/upper
+                 * (1 operand, imm 1/2). */
                 ls = cmp_operand_slot(db, ba->args[1], &vt, &ib, &cc);
-                rs = cmp_operand_slot(db, ba->args[2], &vt, &ib, &cc);
-                if (ls < 0 || rs < 0) goto fail;
+                if (ls < 0) goto fail;
+                if (!strcmp(ba->pred, "concat")) {
+                    rs = cmp_operand_slot(db, ba->args[2], &vt, &ib, &cc);
+                    if (rs < 0) goto fail;
+                } else {
+                    rs = ls;  /* b unused for unary lower/upper */
+                }
                 op = i_emit(&ib);
                 if (!op) goto fail;
                 op->op = OP_STR_BIND;
                 op->a = (uint8_t)ls;
                 op->b = (uint8_t)rs;
                 op->c = vt.e[vi].slot;
-                op->imm = 0;  /* CONCAT */
+                op->imm = (uint32_t)str_bind_imm(ba->pred);
                 op->body_idx = (uint8_t)bi;
             } else {  /* length */
                 ls = cmp_operand_slot(db, ba->args[1], &vt, &ib, &cc);

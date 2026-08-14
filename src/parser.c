@@ -598,11 +598,11 @@ static expr *parse_factor(parser *p)
 /* M9-strings: producing builtin names, recognized only in the `VAR = name(...)`
  * form.  Filter builtins (prefix/suffix/contains) need NO parser change — they
  * lex as ordinary lowercase function-call atoms and the compiler classifies
- * them.  lower/upper are DEFERRED (not recognized here: a rule using them
- * fails loudly as a bad arithmetic factor / unknown predicate). */
+ * them. */
 static int is_str_producing_name(const char *s)
 {
-    return s && (strcmp(s, "concat") == 0 || strcmp(s, "length") == 0);
+    return s && (strcmp(s, "concat") == 0 || strcmp(s, "length") == 0 ||
+                 strcmp(s, "lower") == 0 || strcmp(s, "upper") == 0);
 }
 
 /* Parse a body atom: [ ! ] atom, where the atom may also be an equality

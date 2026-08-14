@@ -1,6 +1,6 @@
 # Implementation Plan: DAFSA-Backed Deductive Database (Datalog VM)
 
-**Status:** M0-M7 complete (2026-08-12). 148 tests green (M0=9, M1=18, M2=18, M3=17, M4=8, bulk=16, M5=25, M6=8, M6-review=5, M6-deep=10, M7=14 + smoke). Next: M8+ (v2 deferred).
+**Status:** M0-M9 complete (2026-08-14). 288 tests green (M0=9, M1=18, M2=18, M3=17, M4=8, bulk=16, M5=25, M6=8, M6-review=5, M6-deep=10, M7=14, M8-magic=44, M9-arith=11, M9-str=9 + smoke). M8 added magic-sets (`dl_query_magic`/`dl_query_magic_adorn`); M9 added arithmetic/comparison and string builtins. See CHANGELOG for details. M8+ v2 items (top-down QSQ, IVM, bushy joins, trace compilation) remain deferred.
 **Goal:** Turn the architecture into a concrete, executable build plan with file layout, per-milestone tasks, and verification for each step.
 **Repos involved:** this project (new, e.g. `~/projects/datalog-dafsa/`), consuming the proven jing-meta DAFSA C engine (`indexer/dafsa/dafsa.c` + `dafsa_core.c` + `dafsa_persist.c` + `dafsa_view.c` + `dafsa_wal.c` + `dafsa.h`).
 

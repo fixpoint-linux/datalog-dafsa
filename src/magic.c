@@ -87,7 +87,9 @@ static int is_str_producing_atom(const atom *A)
 {
     if (!A || !A->pred) return 0;
     return strcmp(A->pred, "concat") == 0 ||
-           strcmp(A->pred, "length") == 0;
+           strcmp(A->pred, "length") == 0 ||
+           strcmp(A->pred, "lower")  == 0 ||
+           strcmp(A->pred, "upper")  == 0;
 }
 
 static int is_str_filter_atom(const atom *A)
