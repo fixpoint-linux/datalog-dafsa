@@ -139,9 +139,13 @@ All notable changes to this project are documented in this file.
   the cost is dominated by C tuple/DAFSA operations that a native-compiled rule
   body would still call into. QBE (the candidate backend) was evaluated and
   found to emit assembly text rather than executable memory, so it does not
-  solve the asm→executable half of a runtime JIT. See design §10.8. If a
-  dispatch-bound workload ever emerges, interpreter-level optimization comes
-  first, not a JIT.
+  solve the asm→executable half of a runtime JIT. Reconsidered with DynASM
+  (LuaJIT's runtime assembler, which does emit executable memory): the verdict
+  stands — the bottleneck is intrinsic memory-bound DAFSA data access, not
+  dispatch; full trace specialization would reimplement vendored private structs
+  in dual-arch asm for a ~3–15% win that interpreter-level optimization
+  recovers at zero dependency cost. See design §10.8. If a dispatch-bound
+  workload ever emerges, interpreter-level optimization comes first, not a JIT.
 
 ### Fixed
 - **Silent wrong answer in the semi-naive fixpoint for multi-recursive-atom
