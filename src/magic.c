@@ -199,6 +199,8 @@ static void str_operand_vars(const atom *A, int start, const name_set *bound,
 
 /* ─── AST allocation helpers (mirror parser.c discipline) ─────────────── */
 
+static void tok_free_local(token *t);
+
 static token *tok_dup(const token *t)
 {
     token *n = calloc(1, sizeof(*n));
@@ -209,7 +211,31 @@ static token *tok_dup(const token *t)
         n->text = strdup(t->text);
         if (!n->text) { free(n); return NULL; }
     }
+    if (t->nchildren > 0) {
+        int i;
+        n->children = calloc((size_t)t->nchildren, sizeof(token *));
+        if (!n->children) { free(n->text); free(n); return NULL; }
+        n->nchildren = t->nchildren;
+        for (i = 0; i < t->nchildren; i++) {
+            n->children[i] = tok_dup(t->children[i]);
+            if (!n->children[i]) { tok_free_local(n); return NULL; }
+        }
+    }
     return n;
+}
+
+/* Recursively free a token (text + list children). */
+static void tok_free_local(token *t)
+{
+    int i;
+    if (!t) return;
+    if (t->children) {
+        for (i = 0; i < t->nchildren; i++)
+            tok_free_local(t->children[i]);
+        free(t->children);
+    }
+    free(t->text);
+    free(t);
 }
 
 /* Reclaim an atom exactly like parser.c's static atom_free. */
@@ -220,14 +246,12 @@ static void atom_free_local(atom *a)
     free(a->pred);
     free(a->pattern);
     if (a->args) {
-        for (i = 0; i < a->nargs; i++) {
-            if (a->args[i]) { free(a->args[i]->text); free(a->args[i]); }
-        }
+        for (i = 0; i < a->nargs; i++)
+            tok_free_local(a->args[i]);
         free(a->args);
     }
-    if (a->aggregate) {
-        if (a->agg_op) { free(a->agg_op->text); free(a->agg_op); }
-    }
+    if (a->aggregate)
+        tok_free_local(a->agg_op);
     expr_free(a->arith);
     free(a);
 }
@@ -246,9 +270,8 @@ static void tokens_free(token **arr, int n)
 {
     int i;
     if (!arr) return;
-    for (i = 0; i < n; i++) {
-        if (arr[i]) { free(arr[i]->text); free(arr[i]); }
-    }
+    for (i = 0; i < n; i++)
+        tok_free_local(arr[i]);
     free(arr);
 }
 

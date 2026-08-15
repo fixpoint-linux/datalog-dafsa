@@ -24,6 +24,7 @@ VENDOR_OBJS = vendor/dafsa.o \
 # ─── Our library objects ─────────────────────────────────────────────────
 
 LIB_OBJS = src/intern.o \
+           src/termstore.o \
            src/relation.o \
            src/vrelation.o \
            src/tupleset.o \
@@ -129,6 +130,9 @@ tests/test_bushy: tests/test_bushy.c $(ALL_OBJS)
 tests/test_vararity: tests/test_vararity.c $(ALL_OBJS)
 	$(CC) $(CFLAGS) $(INC) -static -o $@ tests/test_vararity.c $(ALL_OBJS)
 
+tests/test_lists: tests/test_lists.c $(ALL_OBJS)
+	$(CC) $(CFLAGS) $(INC) -static -o $@ tests/test_lists.c $(ALL_OBJS)
+
 tests/bench: tests/bench.c $(ALL_OBJS)
 	$(CC) $(CFLAGS) $(INC) -static -o $@ tests/bench.c $(ALL_OBJS)
 
@@ -136,7 +140,7 @@ bench: tests/bench
 	@echo "=== Running demonstration benchmark ==="
 	LD_LIBRARY_PATH=. ./tests/bench
 
-test: tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4 tests/test_m4_review tests/test_bulk tests/test_m5 tests/test_m5_review tests/test_m6 tests/test_m6_review tests/test_m6_deep_review tests/test_m7 tests/test_m8_magic tests/test_m9_arith tests/test_m9_str tests/test_ivm tests/test_bushy tests/test_vararity dl build-tmp
+test: tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4 tests/test_m4_review tests/test_bulk tests/test_m5 tests/test_m5_review tests/test_m6 tests/test_m6_review tests/test_m6_deep_review tests/test_m7 tests/test_m8_magic tests/test_m9_arith tests/test_m9_str tests/test_ivm tests/test_bushy tests/test_vararity tests/test_lists dl build-tmp
 	@echo "=== Running M0 unit tests ==="
 	LD_LIBRARY_PATH=. ./tests/test_m0
 	@echo ""
@@ -194,6 +198,9 @@ test: tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4 test
 	@echo "=== Running v2 variable-arity tests ==="
 	LD_LIBRARY_PATH=. ./tests/test_vararity
 	@echo ""
+	@echo "=== Running v2 lists tests ==="
+	LD_LIBRARY_PATH=. ./tests/test_lists
+	@echo ""
 	@echo "=== Running CLI smoke test ==="
 	@sh tests/smoke.sh
 
@@ -214,5 +221,6 @@ clean:
 	      tests/test_m4_review tests/test_m5 tests/test_m5_review tests/test_m6 \
 	      tests/test_m6_review tests/test_bulk \
 	      tests/test_m6_deep_review tests/test_m7 tests/test_m8_magic tests/test_m9_arith \
-	      tests/test_m9_str tests/test_ivm tests/test_bushy tests/test_vararity tests/bench
-	rm -rf /tmp/dl-test-db build-tmp/smoke build-tmp/m1 build-tmp/vararity
+	      tests/test_m9_str tests/test_ivm tests/test_bushy tests/test_vararity \
+	      tests/test_lists tests/bench
+	rm -rf /tmp/dl-test-db build-tmp/smoke build-tmp/m1 build-tmp/vararity build-tmp/lists

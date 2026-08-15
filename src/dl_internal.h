@@ -26,6 +26,7 @@
 #include "vrelation.h"
 #include "snapshot.h"
 #include "permindex.h"
+#include "termstore.h"
 #include "compiler.h"   /* compiled_rule (anonymous-struct typedef — cannot
                            be forward-declared; compiler.h includes dl.h but
                            NOT dl_internal.h, so no cycle) */
@@ -59,6 +60,7 @@ typedef struct {
 struct dl_db {
     char      *dir;
     interner  *ir;
+    termstore *terms;      /* v2-lists: hash-consed list term store (terms.bin) */
     rel_entry  rels[MAX_RELS];
     size_t     nrels;
     int        lock_fd;    /* M7: fcntl lock file descriptor, or -1 */
@@ -114,6 +116,14 @@ int db_entry_is_variadic(const rel_entry *e);
 /* 1 if ANY relation in the db is variadic (the incremental-maintenance and
  * magic-sets exclusion test: such programs route to the full fixpoint). */
 int db_has_variadic(const dl_db *db);
+
+/* 1 if ANY compiled rule uses a list-CONSTRUCTION/DECOMPOSITION builtin
+ * (OP_LIST_CONS/CAR/CDR/APPEND).  Such programs are excluded from the
+ * incremental-maintenance classes (IVM/DRed/aggregates) and magic-sets
+ * queries and always route to the full fixpoint — never silently
+ * mis-evaluated.  List VALUES as pure data (a fact column holding a list
+ * handle, with no list builtin) do NOT set this flag. */
+int db_has_list_builtin(const dl_db *db);
 
 /* READ resolution: for a fixed entry, the relation iff arity matches (else
  * NULL); for a variadic entry, variant[arity] WITHOUT materializing it

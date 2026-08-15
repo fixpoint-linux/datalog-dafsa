@@ -9,6 +9,7 @@
  */
 
 #include "parser.h"
+#include "termstore.h"   /* TERM_BASE: reject int literals >= TERM_BASE */
 
 #include <ctype.h>
 #include <stdlib.h>
@@ -68,6 +69,8 @@ static token *tok_new(token_kind kind, const char *start, size_t len)
     return t;
 }
 
+static void tok_free(token *t);
+
 static token *tok_dup(const token *t)
 {
     token *n = calloc(1, sizeof(*n));
@@ -78,12 +81,28 @@ static token *tok_dup(const token *t)
         n->text = strdup(t->text);
         if (!n->text) { free(n); return NULL; }
     }
+    if (t->nchildren > 0) {
+        int i;
+        n->children = calloc((size_t)t->nchildren, sizeof(token *));
+        if (!n->children) { free(n->text); free(n); return NULL; }
+        n->nchildren = t->nchildren;
+        for (i = 0; i < t->nchildren; i++) {
+            n->children[i] = tok_dup(t->children[i]);
+            if (!n->children[i]) { tok_free(n); return NULL; }
+        }
+    }
     return n;
 }
 
 static void tok_free(token *t)
 {
+    int i;
     if (!t) return;
+    if (t->children) {
+        for (i = 0; i < t->nchildren; i++)
+            tok_free(t->children[i]);
+        free(t->children);
+    }
     free(t->text);
     free(t);
 }
@@ -187,6 +206,15 @@ static int lex(parser *p)
     } else if (*s == '~') {
         t = tok_new(TOK_TILDE, NULL, 0);
         s++;
+    } else if (*s == '[') {
+        t = tok_new(TOK_LBRACKET, NULL, 0);
+        s++;
+    } else if (*s == ']') {
+        t = tok_new(TOK_RBRACKET, NULL, 0);
+        s++;
+    } else if (*s == '|') {
+        t = tok_new(TOK_PIPE, NULL, 0);
+        s++;
     } else if (*s == ':' && *(s + 1) == '-') {
         t = tok_new(TOK_COLONMINUS, NULL, 0);
         s += 2;
@@ -229,6 +257,16 @@ static int lex(parser *p)
         }
         t = tok_new(TOK_INT, start, (size_t)(s - start));
         if (t) t->ival = (uint32_t)val;
+        /* v2-lists boundary: raw int literals are limited to 31 bits so they
+         * cannot alias a list handle in [TERM_BASE, ...). */
+        if (val >= TERM_BASE) {
+            fprintf(stderr,
+                    "parser: integer literal %lu is out of range (raw ints "
+                    "are limited to 31 bits, < %u, to keep list handles "
+                    "distinct)\n",
+                    val, (unsigned)TERM_BASE);
+            return -1;
+        }
     } else if (is_var_start(*s)) {
         /* Variable (uppercase or _) */
         const char *start = s;
@@ -399,19 +437,114 @@ expr *expr_clone(const expr *e)
 
 /* Forward declaration */
 static atom *parse_atom(parser *p);
+static token *parse_list(parser *p);
 
 /* Parse an argument */
 static token *parse_arg(parser *p)
 {
     token *t = peek(p);
     if (!t) return NULL;
+    if (t->kind == TOK_LBRACKET)
+        return parse_list(p);   /* a list literal is ONE argument */
     if (t->kind == TOK_IDENT || t->kind == TOK_VAR ||
         t->kind == TOK_INT || t->kind == TOK_AGGREGATE) {
         return tok_dup(advance(p));
     }
-    fprintf(stderr, "parser: expected argument (ident/var/int), got kind %d\n",
+    fprintf(stderr, "parser: expected argument (ident/var/int/list), got kind %d\n",
             t->kind);
     return NULL;
+}
+
+/* Parse one list element (constants only in Phase 1).  Nested lists are
+ * recursed; a TOK_VAR inside a list is the Phase-2 [X|Xs] pattern, REJECTED
+ * here with a loud diagnostic. */
+static token *parse_list_element(parser *p)
+{
+    token *t = peek(p);
+    if (!t) return NULL;
+    if (t->kind == TOK_INT || t->kind == TOK_IDENT || t->kind == TOK_STRING)
+        return tok_dup(advance(p));
+    if (t->kind == TOK_LBRACKET)
+        return parse_list(p);
+    if (t->kind == TOK_VAR) {
+        fprintf(stderr,
+                "parser: variable '%s' inside a list literal is a Phase-2 "
+                "[X|Xs] pattern and is not supported yet\n",
+                t->text ? t->text : "?");
+        return NULL;
+    }
+    if (t->kind == TOK_PIPE) {
+        fprintf(stderr,
+                "parser: '[X|Xs]' head/tail pattern syntax is deferred to "
+                "Phase 2 (constants only in list literals)\n");
+        return NULL;
+    }
+    fprintf(stderr, "parser: unexpected token kind %d in list literal\n",
+            (int)t->kind);
+    return NULL;
+}
+
+/* Parse a list literal [e1, e2, ...] into a single TOK_LIST token.  The
+ * current token is '['.  '[]' = empty list (nchildren == 0 = NIL). */
+static token *parse_list(parser *p)
+{
+    token *lst = NULL;
+    token **elems = NULL;
+    int n = 0, cap = 0;
+
+    if (!expect(p, TOK_LBRACKET)) return NULL;
+
+    lst = calloc(1, sizeof(*lst));
+    if (!lst) return NULL;
+    lst->kind = TOK_LIST;
+
+    if (peek(p) && peek(p)->kind == TOK_RBRACKET) {
+        advance(p);              /* consume ']' */
+        return lst;              /* empty list */
+    }
+
+    while (1) {
+        token *e = parse_list_element(p);
+        if (!e) goto fail;
+        if (n >= cap) {
+            int nc = cap ? cap * 2 : 4;
+            token **ne = realloc(elems, (size_t)nc * sizeof(token *));
+            if (!ne) { tok_free(e); goto fail; }
+            elems = ne;
+            cap = nc;
+        }
+        elems[n++] = e;
+
+        {
+            token *sep = peek(p);
+            if (!sep) goto fail;
+            if (sep->kind == TOK_COMMA) { advance(p); continue; }
+            if (sep->kind == TOK_RBRACKET) { advance(p); break; }
+            if (sep->kind == TOK_PIPE) {
+                fprintf(stderr,
+                        "parser: '[X|Xs]' head/tail pattern syntax is "
+                        "deferred to Phase 2\n");
+                goto fail;
+            }
+            fprintf(stderr, "parser: expected ',' or ']' in list literal, "
+                    "got kind %d\n", (int)sep->kind);
+            goto fail;
+        }
+    }
+
+    lst->children = elems;
+    lst->nchildren = n;
+    return lst;
+
+fail:
+    {
+        int k;
+        for (k = 0; k < n; k++)
+            tok_free(elems[k]);
+        free(elems);
+        tok_free(lst);
+        return NULL;
+    }
 }
 
 /* Parse atom: pred ( args ) */
@@ -605,6 +738,15 @@ static int is_str_producing_name(const char *s)
                  strcmp(s, "lower") == 0 || strcmp(s, "upper") == 0);
 }
 
+/* M9/v2-lists: LIST-producing builtin names, recognized only in the
+ * `VAR = name(...)` form.  cons(H,T)/car(L)/cdr(L)/append(A,B).  (length(L)
+ * is deferred to Phase 2 — the name collides with the string `length`.) */
+static int is_list_producing_name(const char *s)
+{
+    return s && (strcmp(s, "cons") == 0 || strcmp(s, "car") == 0 ||
+                 strcmp(s, "cdr") == 0 || strcmp(s, "append") == 0);
+}
+
 /* Parse a body atom: [ ! ] atom, where the atom may also be an equality
  * (VAR = VAR), a comparison (VAR <op> VAR/INT), an aggregate
  * (VAR = count()/sum(X)/min(X)/max(X)), or an arithmetic assignment
@@ -703,15 +845,15 @@ static atom *parse_body_atom(parser *p)
                 }
                 return a;
             } else if (rhs && rhs->kind == TOK_IDENT &&
-                       is_str_producing_name(rhs->text) &&
+                       (is_str_producing_name(rhs->text) ||
+                        is_list_producing_name(rhs->text)) &&
                        peek_at(p, 3) && peek_at(p, 3)->kind == TOK_LPAREN) {
-                /* string-producing builtin: VAR = concat(A,B) / VAR = length(S).
-                 * Operands are TOK_VAR or TOK_IDENT (string constant) only —
-                 * a TOK_INT operand is REJECTED here (a raw int is never a
-                 * string, and a raw int like 1 collides with sym_id 1). */
+                /* Producing builtin: string (concat/length/lower/upper) or
+                 * list (cons/car/cdr/append).  See the operand checks below. */
                 token *res = advance(p);   /* result var */
                 advance(p);                /* = */
                 token *nm  = advance(p);   /* builtin name */
+                int   is_list = is_list_producing_name(nm->text);
                 if (!expect(p, TOK_LPAREN)) return NULL;
 
                 atom *a = atom_new();
@@ -731,28 +873,47 @@ static atom *parse_body_atom(parser *p)
                     token *op = peek(p);
                     if (!op) { fail = 1; break; }
                     if (op->kind == TOK_RPAREN) { advance(p); break; }
-                    if (op->kind == TOK_INT) {
-                        fprintf(stderr,
-                            "parser: integer operand not allowed in string "
-                            "builtin '%s' (only variables / string constants)\n",
-                            nm->text);
-                        fail = 1; break;
+                    if (is_list && op->kind == TOK_LBRACKET) {
+                        /* nested list-literal operand */
+                        if (nargs >= cap) {
+                            int nc = cap * 2;
+                            token **na = realloc(args, (size_t)nc * sizeof(token *));
+                            if (!na) { fail = 1; break; }
+                            args = na; cap = nc;
+                        }
+                        args[nargs++] = parse_list(p);
+                        if (!args[nargs - 1]) { fail = 1; break; }
+                    } else {
+                        int ok;
+                        if (is_list)
+                            ok = (op->kind == TOK_VAR || op->kind == TOK_INT ||
+                                  op->kind == TOK_IDENT || op->kind == TOK_STRING);
+                        else
+                            ok = (op->kind == TOK_VAR || op->kind == TOK_IDENT);
+                        if (!ok) {
+                            if (is_list)
+                                fprintf(stderr,
+                                    "parser: expected variable or constant "
+                                    "(int/string/list) operand in list builtin "
+                                    "'%s', got kind %d\n",
+                                    nm->text, (int)op->kind);
+                            else
+                                fprintf(stderr,
+                                    "parser: expected variable or string "
+                                    "constant operand in string builtin '%s', "
+                                    "got kind %d\n",
+                                    nm->text, (int)op->kind);
+                            fail = 1; break;
+                        }
+                        if (nargs >= cap) {
+                            int nc = cap * 2;
+                            token **na = realloc(args, (size_t)nc * sizeof(token *));
+                            if (!na) { fail = 1; break; }
+                            args = na; cap = nc;
+                        }
+                        args[nargs++] = tok_dup(advance(p));
+                        if (!args[nargs - 1]) { fail = 1; break; }
                     }
-                    if (op->kind != TOK_VAR && op->kind != TOK_IDENT) {
-                        fprintf(stderr,
-                            "parser: expected variable or string constant in "
-                            "string builtin '%s', got kind %d\n",
-                            nm->text, (int)op->kind);
-                        fail = 1; break;
-                    }
-                    if (nargs >= cap) {
-                        int nc = cap * 2;
-                        token **na = realloc(args, (size_t)nc * sizeof(token *));
-                        if (!na) { fail = 1; break; }
-                        args = na; cap = nc;
-                    }
-                    args[nargs++] = tok_dup(advance(p));
-                    if (!args[nargs - 1]) { fail = 1; break; }
 
                     token *sep = peek(p);
                     if (!sep) { fail = 1; break; }

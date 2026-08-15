@@ -120,6 +120,25 @@ int db_has_variadic(const dl_db *db)
     return 0;
 }
 
+/* v2-lists: 1 if ANY compiled rule emits a list builtin opcode.  List
+ * VALUES as pure data (a list-literal constant -> OP_EQ_CONST) do NOT count
+ * — only the construction/decomposition builtins do. */
+int db_has_list_builtin(const dl_db *db)
+{
+    int i, k;
+    if (!db) return 0;
+    for (i = 0; i < db->n_crules; i++) {
+        const compiled_rule *cr = db->crules[i];
+        for (k = 0; k < cr->n_instrs; k++) {
+            uint8_t op = cr->instrs[k].op;
+            if (op == OP_LIST_CONS || op == OP_LIST_CAR ||
+                op == OP_LIST_CDR || op == OP_LIST_APPEND)
+                return 1;
+        }
+    }
+    return 0;
+}
+
 relation *db_entry_variant_ro(const rel_entry *e, uint8_t arity)
 {
     if (!e) return NULL;
@@ -315,6 +334,26 @@ dl_db *dl_open2(const char *dir, int *err_out)
         }
     }
 
+    /* v2-lists: load the list term store.  A pre-lists DB has no terms.bin
+     * and opens with an EMPTY store (NIL only). */
+    {
+        char *tpath = make_path(db, "terms", ".bin");
+        if (!tpath) {
+            intern_free(db->ir);
+            close(lfd); free(db->dir); free(db);
+            if (err_out) *err_out = -1;
+            return NULL;
+        }
+        db->terms = term_load(tpath);
+        free(tpath);
+        if (!db->terms) {
+            intern_free(db->ir);
+            close(lfd); free(db->dir); free(db);
+            if (err_out) *err_out = -1;
+            return NULL;
+        }
+    }
+
     /* Load existing relations from metadata file.  Read the WHOLE file into
      * a temporary array BEFORE declaring any relation: declaring rewrites
      * rels.txt, so declaring inside the read loop would truncate the file
@@ -405,6 +444,17 @@ void dl_close(dl_db *db)
         free(rev_path);
     }
 
+    /* v2-lists: save the term store AFTER the interner and BEFORE any
+     * relation DAFSA that references list handles (the same ordering
+     * invariant as the interner-before-relation rule). */
+    {
+        char *tpath = make_path(db, "terms", ".bin");
+        if (tpath) {
+            term_save(db->terms, tpath);
+            free(tpath);
+        }
+    }
+
     /* M7/IVM: compact each relation's BASE (save + truncate WAL).  Rule-head
      * (IDB) relations additionally persist their VIEW to <name>.dafsa>.
      * v2: a VARIADIC relation does the same PER VARIANT under
@@ -483,6 +533,7 @@ void dl_close(dl_db *db)
     }
 
     intern_free(db->ir);
+    term_free(db->terms);
     free(db->dir);
 
     /* M7: release fcntl lock LAST (lock released when fd closes) */
@@ -895,6 +946,19 @@ static int dl_load_facts_variadic(dl_db *db, int idx,
         free(rev_path);
     }
 
+    /* v2-lists: term store durable before any relation DAFSA referencing
+     * list handles. */
+    {
+        char *tpath = make_path(db, "terms", ".bin");
+        if (tpath) {
+            if (term_save(db->terms, tpath) != 0) {
+                free(tpath);
+                goto out;
+            }
+            free(tpath);
+        }
+    }
+
     for (a = 1; a <= MAX_VAR_ARITY; a++) {
         relation *vr;
         char *path;
@@ -1089,6 +1153,19 @@ int dl_load_facts(dl_db *db, const char *rel_name, const char *csv_path)
         free(rev_path);
     }
 
+    /* v2-lists: term store durable before the relation base DAFSA. */
+    {
+        char *tpath = make_path(db, "terms", ".bin");
+        if (tpath) {
+            if (term_save(db->terms, tpath) != 0) {
+                free(tpath);
+                ts_free(&delta);
+                return -1;
+            }
+            free(tpath);
+        }
+    }
+
     /* Auto-save the relation's BASE DAFSA after load (atomic via dafsa_save).
      * Bulk load bypasses the WAL — the base DAFSA is the durable home for the
      * loaded facts (a documented durability difference vs dl_add_fact). */
@@ -1260,6 +1337,15 @@ static int dl_add_fact_variadic(dl_db *db, int idx, const char *rel_name,
         free(rev_path);
     }
 
+    /* v2-lists: the term store must be durable before a WAL that references
+     * a list handle (same invariant as the interner). */
+    if (term_is_dirty(db->terms)) {
+        char *tpath = make_path(db, "terms", ".bin");
+        if (!tpath) return -1;
+        if (term_save(db->terms, tpath) != 0) { free(tpath); return -1; }
+        free(tpath);
+    }
+
     /* 2. Duplicate check against the variant BASE. */
     if (rel_exact_base(vr, cols))
         return 0;
@@ -1338,6 +1424,15 @@ int dl_add_fact(dl_db *db, const char *rel_name,
         }
         free(fwd_path);
         free(rev_path);
+    }
+
+    /* v2-lists: the term store must be durable before a WAL that references
+     * a list handle (same invariant as the interner). */
+    if (term_is_dirty(db->terms)) {
+        char *tpath = make_path(db, "terms", ".bin");
+        if (!tpath) return -1;
+        if (term_save(db->terms, tpath) != 0) { free(tpath); return -1; }
+        free(tpath);
     }
 
     /* 2. Duplicate check against BASE: if already present, skip WAL
@@ -1561,6 +1656,8 @@ long dl_prefix(dl_db *db, const char *rel_name,
  * allocation discipline exactly (strdup for text, calloc'd atom/rule).
  */
 
+static void ast_tok_free(token *t);
+
 static token *ast_tok_clone(const token *t)
 {
     token *n = calloc(1, sizeof(*n));
@@ -1571,7 +1668,30 @@ static token *ast_tok_clone(const token *t)
         n->text = strdup(t->text);
         if (!n->text) { free(n); return NULL; }
     }
+    if (t->nchildren > 0) {
+        int i;
+        n->children = calloc((size_t)t->nchildren, sizeof(token *));
+        if (!n->children) { free(n->text); free(n); return NULL; }
+        n->nchildren = t->nchildren;
+        for (i = 0; i < t->nchildren; i++) {
+            n->children[i] = ast_tok_clone(t->children[i]);
+            if (!n->children[i]) { ast_tok_free(n); return NULL; }
+        }
+    }
     return n;
+}
+
+static void ast_tok_free(token *t)
+{
+    int i;
+    if (!t) return;
+    if (t->children) {
+        for (i = 0; i < t->nchildren; i++)
+            ast_tok_free(t->children[i]);
+        free(t->children);
+    }
+    free(t->text);
+    free(t);
 }
 
 static atom *ast_atom_clone(const atom *a)
@@ -1611,12 +1731,11 @@ fail:
         free(n->pred);
         free(n->pattern);
         if (n->args) {
-            for (j = 0; j < n->nargs; j++) {
-                if (n->args[j]) { free(n->args[j]->text); free(n->args[j]); }
-            }
+            for (j = 0; j < n->nargs; j++)
+                ast_tok_free(n->args[j]);
             free(n->args);
         }
-        if (n->agg_op) { free(n->agg_op->text); free(n->agg_op); }
+        ast_tok_free(n->agg_op);
         expr_free(n->arith);
         free(n);
     }
@@ -1856,6 +1975,7 @@ static int eval_db_clone(dl_db *src, dl_db *out)
     memset(out, 0, sizeof(*out));
     out->dir = NULL;
     out->ir = src->ir;
+    out->terms = src->terms;   /* v2-lists: borrowed — list handles shared */
     out->lock_fd = -1;
     for (i = 0; i < src->nrels; i++) {
         out->rels[i].name  = src->rels[i].name;   /* borrowed — not owned */
@@ -1982,6 +2102,13 @@ long dl_query_magic(dl_db *db, const char *goal_rel,
                 "variadic relation (outside the magic-sets class)\n");
         return -1;
     }
+    /* v2-lists: list-builtin programs are outside the magic-sets class
+     * (never silently mis-evaluated) — route to the full fixpoint. */
+    if (db_has_list_builtin(db)) {
+        fprintf(stderr, "dl_query_magic: rejected: program uses a list "
+                "builtin (outside the magic-sets class)\n");
+        return -1;
+    }
 
     /* Resolve goal + validate k (mirrors the old leading/k entry checks). */
     goal_idx = find_rel(db, goal_rel);
@@ -2032,6 +2159,13 @@ long dl_query_magic_adorn(dl_db *db, const char *goal_rel,
     if (db_has_variadic(db)) {
         fprintf(stderr, "dl_query_magic: rejected: program contains a "
                 "variadic relation (outside the magic-sets class)\n");
+        return -1;
+    }
+    /* v2-lists: list-builtin programs are outside the magic-sets class
+     * (never silently mis-evaluated) — route to the full fixpoint. */
+    if (db_has_list_builtin(db)) {
+        fprintf(stderr, "dl_query_magic: rejected: program uses a list "
+                "builtin (outside the magic-sets class)\n");
         return -1;
     }
 
@@ -2409,6 +2543,15 @@ int dl_publish_snapshot(dl_db *db)
         snprintf(fwd, sizeof(fwd), "%s/symbols.dafsa", tmp_dir);
         snprintf(rev, sizeof(rev), "%s/symbols.array", tmp_dir);
         if (intern_save(db->ir, fwd, rev) != 0)
+            goto fail;
+    }
+
+    /* 4a'. Save the list term store (list handles) BEFORE the relations that
+     * reference them (same ordering invariant as the interner). */
+    {
+        char tpath[4096];
+        snprintf(tpath, sizeof(tpath), "%s/terms.bin", tmp_dir);
+        if (term_save(db->terms, tpath) != 0)
             goto fail;
     }
 

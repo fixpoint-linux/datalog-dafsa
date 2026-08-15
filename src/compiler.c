@@ -179,7 +179,7 @@ static vm_instr *i_emit(i_buf *b) {
 static int token_const(dl_db *db, const token *t, uint32_t *out)
 {
     if (t->kind == TOK_INT) { *out = t->ival; return 0; }
-    if (t->kind == TOK_IDENT) {
+    if (t->kind == TOK_IDENT || t->kind == TOK_STRING) {
         *out = intern_str(db_get_interner(db), t->text);
         if (*out == 0) {
             /* Truncate the echoed constant so a >4096-byte string doesn't
@@ -215,6 +215,24 @@ static int token_const(dl_db *db, const token *t, uint32_t *out)
                     "interner key limit)\n", brief, 4096);
             return -1;
         }
+        return 0;
+    }
+    if (t->kind == TOK_LIST) {
+        /* [e1, e2, ..., en] = cons(e1, cons(e2, ... cons(en, NIL) ...)).
+         * Right-fold to NIL so element order is preserved (head = e1). */
+        uint32_t acc = TERM_NIL;
+        int i;
+        for (i = t->nchildren - 1; i >= 0; i--) {
+            uint32_t eh;
+            if (token_const(db, t->children[i], &eh)) return -1;
+            acc = term_cons(db->terms, eh, acc);
+            if (acc == 0) {
+                fprintf(stderr, "compile error: out of memory interning a "
+                        "list literal (term store)\n");
+                return -1;
+            }
+        }
+        *out = acc;
         return 0;
     }
     fprintf(stderr, "compile error: internal: unexpected token kind %d in a "
@@ -281,11 +299,29 @@ static int is_str_builtin(const atom *a)
     return is_str_producing(a) || is_str_filter(a);
 }
 
-/* any non-relational builtin (equality / comparison / arithmetic / string) */
+/* v2-lists: LIST-producing builtin (`VAR = cons(H,T)` / `VAR = car(L)` /
+ * `VAR = cdr(L)` / `VAR = append(A,B)`).  args[0] is the result var,
+ * args[1..] are the operand tokens.  These lowercase names are RESERVED. */
+static int is_list_producing(const atom *a)
+{
+    if (!a || !a->pred) return 0;
+    return strcmp(a->pred, "cons")   == 0 ||
+           strcmp(a->pred, "car")    == 0 ||
+           strcmp(a->pred, "cdr")    == 0 ||
+           strcmp(a->pred, "append") == 0;
+}
+
+static int is_list_builtin(const atom *a)
+{
+    return is_list_producing(a);
+}
+
+/* any non-relational builtin (equality / comparison / arithmetic / string /
+ * list) */
 static int is_builtin_pred(const atom *a)
 {
     return is_equality(a) || is_comparison(a) || is_arith(a) ||
-           is_str_builtin(a);
+           is_str_builtin(a) || is_list_builtin(a);
 }
 
 /* A string-builtin operand token must be TOK_VAR or TOK_IDENT (a string
@@ -319,6 +355,32 @@ static int str_builtin_valid(const atom *a)
         return 1;
     }
     return 0;
+}
+
+/* A list-builtin operand token must be a variable or a constant of any kind
+ * (int / symbol / string / list literal).  The runtime is_list check is the
+ * definitive list-ness test (term_cons / term_append / car / cdr backtrack on
+ * a non-list) — a constant is never "wrong", just possibly non-list. */
+static int list_operand_ok(const token *t)
+{
+    return t && (t->kind == TOK_VAR || t->kind == TOK_INT ||
+                 t->kind == TOK_IDENT || t->kind == TOK_STRING ||
+                 t->kind == TOK_LIST);
+}
+
+/* Validate the arity + operand/result kinds of a list builtin.  Returns 1 if
+ * well-formed, 0 otherwise (caller rejects loudly). */
+static int list_builtin_valid(const atom *a)
+{
+    int i, need;
+    if (!a || !a->pred) return 0;
+    need = (strcmp(a->pred, "cons") == 0 ||
+            strcmp(a->pred, "append") == 0) ? 3 : 2;
+    if (a->nargs != need) return 0;
+    if (a->args[0]->kind != TOK_VAR) return 0;
+    for (i = 1; i < need; i++)
+        if (!list_operand_ok(a->args[i])) return 0;
+    return 1;
 }
 
 /* string filter pred -> OP_STR_FILTER imm code */
@@ -460,10 +522,21 @@ static int lower_expr(dl_db *db, const expr *e, v_tab *vt, i_buf *ib,
 
 /* Resolve a comparison operand to a slot: variables use their var slot,
  * constants (TOK_INT, or TOK_IDENT for `!=`) are materialized into a fresh
- * __kN slot via OP_EQ_CONST.  Returns the slot, or -1 on error. */
+ * __kN slot via OP_EQ_CONST.  Returns the slot, or -1 on error.
+ *
+ * `allow_list` (v2-lists): 1 permits a TOK_LIST literal operand (interned via
+ * token_const — used by the LIST builtins, whose operands may be constants);
+ * 0 REJECTS a list literal — used by comparisons and string builtins, where a
+ * list operand is meaningless (lists have no order) or never produced. */
 static int cmp_operand_slot(dl_db *db, const token *t, v_tab *vt, i_buf *ib,
-                            int *cc)
+                            int *cc, int allow_list)
 {
+    if (t->kind == TOK_LIST && !allow_list) {
+        fprintf(stderr,
+                "compile error: list literal not allowed in this position "
+                "(lists have no meaningful order; use = / != via variables)\n");
+        return -1;
+    }
     if (t->kind == TOK_VAR) {
         int vi = v_find(vt, t->text);
         return (vi >= 0) ? (int)vt->e[vi].slot : -1;
@@ -502,6 +575,30 @@ static int str_producing_operands_bound(const atom *a, v_tab *vt,
             if (vi < 0 || !bound_vars[vi]) {
                 fprintf(stderr,
                     "compile error: ungrounded string operand — variable "
+                    "'%s' in '%s' is not bound by a positive body atom "
+                    "(rule '%s')\n", t->text, a->pred, head_pred);
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+/* require every VARIABLE operand of a producing LIST builtin (args[1..]) to
+ * be bound — same shape as str_producing_operands_bound, distinct diagnostic. */
+static int list_producing_operands_bound(const atom *a, v_tab *vt,
+                                         const int *bound_vars,
+                                         const char *head_pred)
+{
+    int j;
+    for (j = 1; j < a->nargs; j++) {
+        token *t = a->args[j];
+        if (t->kind != TOK_VAR) continue;
+        {
+            int vi = v_find(vt, t->text);
+            if (vi < 0 || !bound_vars[vi]) {
+                fprintf(stderr,
+                    "compile error: ungrounded list operand — variable "
                     "'%s' in '%s' is not bound by a positive body atom "
                     "(rule '%s')\n", t->text, a->pred, head_pred);
                 return 0;
@@ -1511,6 +1608,14 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
                         "(rule '%s')\n", ba->pred, r->head->pred);
                 goto fail;
             }
+            /* v2-lists: same validation for list builtins (bad arity / result
+             * not a variable / operand not a variable-or-constant). */
+            if (is_list_builtin(ba) && !list_builtin_valid(ba)) {
+                fprintf(stderr, "compile error: malformed list builtin "
+                        "'%s' (bad arity or non-variable result / non-constant "
+                        "operand) (rule '%s')\n", ba->pred, r->head->pred);
+                goto fail;
+            }
             bri[bi] = -1; continue;
         }
         int ri = db_find_rel(db, ba->pred);
@@ -1605,7 +1710,8 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
                 }
                 continue;
             }
-            if (is_arith(ba) || is_comparison(ba) || is_str_builtin(ba)) {
+            if (is_arith(ba) || is_comparison(ba) || is_str_builtin(ba) ||
+                is_list_builtin(ba)) {
                 /* builtins execute AFTER the relational phase (NEG_CHECK runs
                  * during it), so their vars are NOT bound for negation-safety
                  * purposes — a negated atom cannot safely read an arithmetic /
@@ -1701,6 +1807,14 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
                     int vi = v_find(&vt, ba->args[0]->text);
                     if (vi >= 0) bound_vars[vi] = 1;
                 }
+            } else if (is_list_producing(ba)) {
+                if (!list_producing_operands_bound(ba, &vt, bound_vars,
+                                                   r->head->pred))
+                    goto fail;
+                {
+                    int vi = v_find(&vt, ba->args[0]->text);
+                    if (vi >= 0) bound_vars[vi] = 1;
+                }
             }
         }
         /* (d) FILTERS: comparisons + string filters.  All variable operands
@@ -1757,7 +1871,8 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
                 atom *ba = r->body[bi];
                 if (ba->nargs >= 1 && ba->args[0]->kind == TOK_VAR &&
                     !strcmp(ba->args[0]->text, a->text) &&
-                    (is_arith(ba) || is_str_producing(ba)))
+                    (is_arith(ba) || is_str_producing(ba) ||
+                     is_list_producing(ba)))
                     { ares = 1; break; }
             }
             if (ares) continue;
@@ -2136,10 +2251,10 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
             if (str_bind_imm(ba->pred) >= 0) {
                 /* OP_STR_BIND: concat (2 operands, imm 0) or lower/upper
                  * (1 operand, imm 1/2). */
-                ls = cmp_operand_slot(db, ba->args[1], &vt, &ib, &cc);
+                ls = cmp_operand_slot(db, ba->args[1], &vt, &ib, &cc, 0);
                 if (ls < 0) goto fail;
                 if (!strcmp(ba->pred, "concat")) {
-                    rs = cmp_operand_slot(db, ba->args[2], &vt, &ib, &cc);
+                    rs = cmp_operand_slot(db, ba->args[2], &vt, &ib, &cc, 0);
                     if (rs < 0) goto fail;
                 } else {
                     rs = ls;  /* b unused for unary lower/upper */
@@ -2153,7 +2268,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
                 op->imm = (uint32_t)str_bind_imm(ba->pred);
                 op->body_idx = (uint8_t)bi;
             } else {  /* length */
-                ls = cmp_operand_slot(db, ba->args[1], &vt, &ib, &cc);
+                ls = cmp_operand_slot(db, ba->args[1], &vt, &ib, &cc, 0);
                 if (ls < 0) goto fail;
                 op = i_emit(&ib);
                 if (!op) goto fail;
@@ -2163,6 +2278,67 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
                 op->imm = 0;
                 op->body_idx = (uint8_t)bi;
             }
+            int rvi = v_find(&vt, ba->args[0]->text);
+            if (rvi < 0) goto fail;
+            vm_instr *eq = i_emit(&ib);
+            eq->op = OP_EQ;
+            eq->a = vt.e[rvi].slot;
+            eq->b = vt.e[vi].slot;
+            eq->body_idx = (uint8_t)bi;
+        } else if (is_list_producing(ba)) {
+            /* OP_LIST_CONS / CAR / CDR / APPEND: resolve operands FIRST
+             * (a TOK_LIST / int / symbol constant materializes via an
+             * OP_EQ_CONST that must precede the list opcode), then emit the
+             * opcode into a fresh temp, then a final OP_EQ(result, temp)
+             * reusing bind-or-filter semantics (never silently overwrites a
+             * bound result var).  Encodings: CONS a=result b=head c=tail;
+             * CAR/CDR a=operand c=result; APPEND a,b=operands c=result. */
+            if (ba->negated) continue;  /* negated builtin already rejected */
+            char cname[16];
+            int vi, ls, rs, opcode;
+            vm_instr *op;
+            v_fresh_name(&vt, cname, sizeof(cname), &tc, 't');
+            vi = v_add(&vt, cname);
+            if (vi < 0) goto fail;
+
+            ls = rs = -1;
+            if (!strcmp(ba->pred, "cons")) {
+                ls = cmp_operand_slot(db, ba->args[1], &vt, &ib, &cc, 1);
+                rs = cmp_operand_slot(db, ba->args[2], &vt, &ib, &cc, 1);
+                if (ls < 0 || rs < 0) goto fail;
+                opcode = OP_LIST_CONS;
+            } else if (!strcmp(ba->pred, "car")) {
+                ls = cmp_operand_slot(db, ba->args[1], &vt, &ib, &cc, 1);
+                if (ls < 0) goto fail;
+                opcode = OP_LIST_CAR;
+            } else if (!strcmp(ba->pred, "cdr")) {
+                ls = cmp_operand_slot(db, ba->args[1], &vt, &ib, &cc, 1);
+                if (ls < 0) goto fail;
+                opcode = OP_LIST_CDR;
+            } else {  /* append */
+                ls = cmp_operand_slot(db, ba->args[1], &vt, &ib, &cc, 1);
+                rs = cmp_operand_slot(db, ba->args[2], &vt, &ib, &cc, 1);
+                if (ls < 0 || rs < 0) goto fail;
+                opcode = OP_LIST_APPEND;
+            }
+
+            op = i_emit(&ib);
+            if (!op) goto fail;
+            op->op = (uint8_t)opcode;
+            op->body_idx = (uint8_t)bi;
+            if (opcode == OP_LIST_CONS) {
+                op->a = vt.e[vi].slot;  /* result */
+                op->b = (uint8_t)ls;    /* head */
+                op->c = (uint8_t)rs;    /* tail */
+            } else if (opcode == OP_LIST_CAR || opcode == OP_LIST_CDR) {
+                op->a = (uint8_t)ls;    /* operand */
+                op->c = vt.e[vi].slot;  /* result */
+            } else {                    /* append */
+                op->a = (uint8_t)ls;    /* first operand */
+                op->b = (uint8_t)rs;    /* second operand */
+                op->c = vt.e[vi].slot;  /* result */
+            }
+
             int rvi = v_find(&vt, ba->args[0]->text);
             if (rvi < 0) goto fail;
             vm_instr *eq = i_emit(&ib);
@@ -2181,8 +2357,8 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
         atom *ba = r->body[bi];
         if (is_comparison(ba)) {
             if (ba->negated) continue;  /* negated builtin already rejected */
-            int ls = cmp_operand_slot(db, ba->args[0], &vt, &ib, &cc);
-            int rs = cmp_operand_slot(db, ba->args[1], &vt, &ib, &cc);
+            int ls = cmp_operand_slot(db, ba->args[0], &vt, &ib, &cc, 0);
+            int rs = cmp_operand_slot(db, ba->args[1], &vt, &ib, &cc, 0);
             if (ls < 0 || rs < 0) goto fail;
             vm_instr *c = i_emit(&ib);
             c->op = OP_CMP;
@@ -2192,8 +2368,8 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
             c->body_idx = (uint8_t)bi;
         } else if (is_str_filter(ba)) {
             if (ba->negated) continue;  /* negated builtin already rejected */
-            int ls = cmp_operand_slot(db, ba->args[0], &vt, &ib, &cc);
-            int rs = cmp_operand_slot(db, ba->args[1], &vt, &ib, &cc);
+            int ls = cmp_operand_slot(db, ba->args[0], &vt, &ib, &cc, 0);
+            int rs = cmp_operand_slot(db, ba->args[1], &vt, &ib, &cc, 0);
             if (ls < 0 || rs < 0) goto fail;
             vm_instr *f = i_emit(&ib);
             f->op = OP_STR_FILTER;

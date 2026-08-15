@@ -40,12 +40,19 @@ typedef enum {
     TOK_PERCENT,     /* %  */
     TOK_TILDE,       /* ~ */
     TOK_STRING,      /* 'quoted string' — for regex patterns */
+    TOK_LBRACKET,    /* [  (v2 lists) */
+    TOK_RBRACKET,    /* ]  (v2 lists) */
+    TOK_PIPE,        /* |  (v2 lists — [X|Xs] deferred to Phase 2) */
+    TOK_LIST,        /* [e1,e2,...] literal — a single argument token whose
+                        children are the element tokens */
 } token_kind;
 
-typedef struct {
-    token_kind kind;
-    char      *text;       /* owned; NULL for punctuation tokens */
-    uint32_t   ival;       /* integer value (TOK_INT only) */
+typedef struct token {
+    token_kind  kind;
+    char       *text;       /* owned; NULL for punctuation tokens */
+    uint32_t    ival;       /* integer value (TOK_INT only) */
+    struct token **children;/* TOK_LIST: owned element tokens (NULL otherwise) */
+    int          nchildren; /* TOK_LIST: element count (0 = NIL) */
 } token;
 
 /* ─── Arithmetic expression tree (M9) ─────────────────────────────────── */

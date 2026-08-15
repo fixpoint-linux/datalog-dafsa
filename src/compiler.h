@@ -70,6 +70,18 @@ typedef enum {
                              [shared(0..c-1) ++ L.private ++ R.private].  Pushes
                              a frame iterating the result (like OP_HASH_JOIN)
                              binding output cols into the current bindings. */
+    OP_LIST_CONS   = 20, /* LISTS (v2): intern cons(b, c) into the term store
+                             and bind result a.  a=result slot, b=head slot,
+                             c=tail slot.  term_cons==0 (OOM or non-list tail)
+                             -> backtrack. */
+    OP_LIST_CAR    = 21, /* LISTS (v2): a=operand slot, c=result slot.  If
+                             !is_list(a) or a==NIL -> backtrack; else bind
+                             c = car(a) via b_try. */
+    OP_LIST_CDR    = 22, /* LISTS (v2): a=operand slot, c=result slot
+                             (symmetric to OP_LIST_CAR). */
+    OP_LIST_APPEND = 23, /* LISTS (v2): a,b=operand slots, c=result slot.
+                             !is_list(a) or !is_list(b) -> backtrack; else
+                             bind c = append(a,b) via b_try. */
 } vm_opcode;
 
 typedef struct {

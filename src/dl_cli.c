@@ -57,17 +57,41 @@ static uint32_t cli_parse_value(dl_db *db, const char *s)
     return intern_str(ir, s);
 }
 
-/* Print a column value: resolve string symbols, print ints as-is.
- * Heuristic: look up in reverse map; if found, print string; else int. */
-static void print_value(dl_db *db, uint32_t v)
+/* Print a column value: resolve list handles (EXACT, first), then string
+ * symbols (reverse-map heuristic), then raw ints.  Lists are first so list
+ * printing is exact even though int-vs-symbol stays heuristic (B6). */
+static void print_list(dl_db *db, uint32_t h, int depth);
+
+static void print_value(dl_db *db, uint32_t v, int depth)
 {
     interner *ir = cli_get_interner(db);
-    const char *s = intern_str_of(ir, v);
-    if (s && *s) {
-        printf("%s", s);
-    } else {
-        printf("%u", v);
+    if (term_is_list(db->terms, v)) {
+        print_list(db, v, depth);
+        return;
     }
+    {
+        const char *s = intern_str_of(ir, v);
+        if (s && *s) {
+            printf("%s", s);
+        } else {
+            printf("%u", v);
+        }
+    }
+}
+
+/* Render a list handle recursively.  The DAG is well-founded (acyclic), so
+ * this terminates; the depth cap is a defensive bound against a pathological
+ * long list overflowing the CLI stack. */
+static void print_list(dl_db *db, uint32_t h, int depth)
+{
+    if (depth > 4096) { printf("[...]"); return; }
+    printf("[");
+    while (h != TERM_NIL) {
+        print_value(db, term_car(db->terms, h), depth + 1);
+        h = term_cdr(db->terms, h);
+        if (h != TERM_NIL) printf(", ");
+    }
+    printf("]");
 }
 
 /* Callback for dl_prefix: print one tuple */
@@ -77,7 +101,7 @@ static int print_tuple(const uint32_t *cols, uint8_t arity, void *user)
     uint8_t i;
     for (i = 0; i < arity; i++) {
         if (i > 0) printf(" ");
-        print_value(db, cols[i]);
+        print_value(db, cols[i], 0);
     }
     printf("\n");
     return 0;

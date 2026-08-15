@@ -1209,6 +1209,73 @@ static long exec_range(dl_db *db, const compiled_rule *cr,
             break;
         }
 
+        /* ── OP_LIST_CONS: intern cons(b, c) into the term store ──────
+         * a=result slot, b=head slot, c=tail slot.  term_cons returns 0 on
+         * OOM or a non-list tail -> backtrack (never crash, never an
+         * improper list). */
+        case OP_LIST_CONS: {
+            uint32_t h = term_cons(db->terms, b_get(&b, in->b),
+                                   b_get(&b, in->c));
+            if (h == 0) {
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
+                break;
+            }
+            if (!b_try(&b, in->a, h)) {
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
+                break;
+            }
+            ip++;
+            break;
+        }
+
+        /* ── OP_LIST_CAR: a=operand slot, c=result slot ──────────────
+         * !is_list(a) or a==NIL -> backtrack; else bind c = car(a). */
+        case OP_LIST_CAR: {
+            uint32_t opv = b_get(&b, in->a);
+            if (!term_is_list(db->terms, opv) || opv == TERM_NIL) {
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
+                break;
+            }
+            if (!b_try(&b, in->c, term_car(db->terms, opv))) {
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
+                break;
+            }
+            ip++;
+            break;
+        }
+
+        /* ── OP_LIST_CDR: a=operand slot, c=result slot (symmetric) ── */
+        case OP_LIST_CDR: {
+            uint32_t opv = b_get(&b, in->a);
+            if (!term_is_list(db->terms, opv) || opv == TERM_NIL) {
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
+                break;
+            }
+            if (!b_try(&b, in->c, term_cdr(db->terms, opv))) {
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
+                break;
+            }
+            ip++;
+            break;
+        }
+
+        /* ── OP_LIST_APPEND: a,b=operand slots, c=result slot ────────
+         * term_append returns 0 on OOM or a non-list operand -> backtrack. */
+        case OP_LIST_APPEND: {
+            uint32_t r = term_append(db->terms, b_get(&b, in->a),
+                                     b_get(&b, in->b));
+            if (r == 0) {
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
+                break;
+            }
+            if (!b_try(&b, in->c, r)) {
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
+                break;
+            }
+            ip++;
+            break;
+        }
+
         /* ── OP_PROJECT: emit / commit tuple ──────────────────────── */
         case OP_PROJECT: {
             if (capture) {
@@ -2331,7 +2398,7 @@ int vm_ivm_eligible(dl_db *db)
     /* v2: any program containing a variadic relation is OUTSIDE the
      * incremental classes (mixed-arity facts defeat the single-arity
      * delta_pending model) — always route to the full fixpoint. */
-    if (!db || db_has_variadic(db)) return 0;
+    if (!db || db_has_variadic(db) || db_has_list_builtin(db)) return 0;
 
     memset(is_rule_head, 0, sizeof(is_rule_head));
     memset(is_rec_head, 0, sizeof(is_rec_head));
@@ -2601,7 +2668,7 @@ int vm_dred_eligible(dl_db *db)
 {
     int i, k;
     /* v2: variadic programs are outside DRed (see vm_ivm_eligible). */
-    if (!db || db_has_variadic(db)) return 0;
+    if (!db || db_has_variadic(db) || db_has_list_builtin(db)) return 0;
     for (i = 0; i < db->n_crules; i++) {
         const compiled_rule *cr = db->crules[i];
         /* Recursion: retracting a recursive SCC's mutually-dependent tuples
@@ -3099,7 +3166,7 @@ int vm_agg_eligible(dl_db *db)
 
     /* v2: variadic programs are outside aggregate IVM (aggregates over a
      * variadic relation are additionally a COMPILE error). */
-    if (!db || db_has_variadic(db)) return 0;
+    if (!db || db_has_variadic(db) || db_has_list_builtin(db)) return 0;
 
     memset(is_head, 0, sizeof(is_head));
     memset(agg_head, 0, sizeof(agg_head));
