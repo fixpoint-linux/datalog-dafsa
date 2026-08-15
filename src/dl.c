@@ -47,6 +47,12 @@ static int  dl_declare_relation_kind(dl_db *db, const char *name,
                                      uint8_t arity, int is_idb);
 static void write_rels_txt(dl_db *db);
 
+/* IVM Slice 5: forward decls for the batched-delta capture in dl_load_facts
+ * (defined below, in the Incremental fact API section). */
+static int  ivm_rel_is_head(dl_db *db, int rel_id);
+static int  ivm_capture_delta(dl_db *db, int rel_id,
+                              const uint32_t *cols, uint8_t arity);
+
 /* ─── Internal helpers ────────────────────────────────────────────────── */
 
 /* Find a relation by name, return index or -1 */
@@ -328,19 +334,40 @@ static int is_reserved_pi_name(const char *name)
 static void write_rels_txt(dl_db *db)
 {
     char *rels_path = make_path(db, "rels", ".txt");
-    FILE *rf;
+    char *buf;
+    char *p;
+    size_t total = 1;  /* trailing NUL */
     size_t i;
 
     if (!rels_path) return;
-    rf = fopen(rels_path, "w");
-    if (rf) {
-        for (i = 0; i < db->nrels; i++) {
-            fprintf(rf, "%s:%d:%s\n", db->rels[i].name,
-                    (int)rel_arity(db->rels[i].rel),
-                    rel_is_idb(db->rels[i].rel) ? "idb" : "edb");
-        }
-        fclose(rf);
+
+    /* Size the buffer: each line is "name:arity:edb|idb\n" — arity is one
+     * digit (1-8), the flag is 3 chars, so strlen(name) + 16 is ample. */
+    for (i = 0; i < db->nrels; i++)
+        total += strlen(db->rels[i].name) + 16;
+
+    buf = malloc(total);
+    if (!buf) { free(rels_path); return; }
+
+    p = buf;
+    for (i = 0; i < db->nrels; i++) {
+        int n = snprintf(p, total - (size_t)(p - buf), "%s:%d:%s\n",
+                         db->rels[i].name,
+                         (int)rel_arity(db->rels[i].rel),
+                         rel_is_idb(db->rels[i].rel) ? "idb" : "edb");
+        if (n < 0) { free(buf); free(rels_path); return; }
+        p += n;
     }
+
+    /* IVM Slice 5 (persistence polish): atomic write — tmp + fsync + rename +
+     * dir-fsync (the same pattern dafsa_save uses).  A crash mid-write under
+     * the old fopen("w") truncate-then-write could leave a corrupt rels.txt,
+     * and with the edb|idb flag a relation could be reopened with the WRONG
+     * kind (edb as idb or vice versa).  atomic_write_str never exposes a
+     * partial file: readers see either the old or the new rels.txt, never a
+     * truncated one. */
+    atomic_write_str(rels_path, buf);
+    free(buf);
     free(rels_path);
 }
 
@@ -499,8 +526,11 @@ int dl_load_facts(dl_db *db, const char *rel_name, const char *csv_path)
     size_t linecap = 0;
     ssize_t linelen;
     int idx, loaded = 0;
+    int delta_failed = 0;
+    int n_new = 0;
     uint8_t arity;
     tuple_set ts;
+    tuple_set delta;
 
     if (!db || !rel_name || !csv_path) return -1;
 
@@ -512,8 +542,14 @@ int dl_load_facts(dl_db *db, const char *rel_name, const char *csv_path)
     f = fopen(csv_path, "r");
     if (!f) return -1;
 
-    /* Collect new facts in a tuple_set */
+    /* Collect new facts in a tuple_set (ts = base ∪ new for the bulk rebuild);
+     * delta = the newly-added facts (the +delta batch for IVM). */
     if (ts_init(&ts, arity) != 0) {
+        fclose(f);
+        return -1;
+    }
+    if (ts_init(&delta, arity) != 0) {
+        ts_free(&ts);
         fclose(f);
         return -1;
     }
@@ -523,6 +559,7 @@ int dl_load_facts(dl_db *db, const char *rel_name, const char *csv_path)
     if (rel_prefix_base(db->rels[idx].rel, NULL, 0,
                         ts_sink_cb, &ts) < 0) {
         ts_free(&ts);
+        ts_free(&delta);
         fclose(f);
         return -1;
     }
@@ -565,6 +602,7 @@ int dl_load_facts(dl_db *db, const char *rel_name, const char *csv_path)
                 if (sym == 0) {
                     /* Intern failed (OOM) — abort */
                     ts_free(&ts);
+                    ts_free(&delta);
                     fclose(f);
                     free(line);
                     return -1;
@@ -573,14 +611,22 @@ int dl_load_facts(dl_db *db, const char *rel_name, const char *csv_path)
             }
         }
 
-        /* Add to tuple_set (hash dedup) */
+        /* Add to tuple_set (hash dedup).  ts already holds the pre-existing
+         * BASE facts, so ts_add returns 1 only for a genuinely NEW fact (not in
+         * base, not already added by this CSV) — capture it as a +delta. */
         {
             int rc = ts_add(&ts, cols);
             if (rc < 0) {
                 ts_free(&ts);
+                ts_free(&delta);
                 fclose(f);
                 free(line);
                 return -1;
+            }
+            if (rc == 1) {
+                n_new++;
+                if (!delta_failed && ts_add(&delta, cols) < 0)
+                    delta_failed = 1;   /* OOM: fall back to full re-eval */
             }
         }
     }
@@ -588,11 +634,12 @@ int dl_load_facts(dl_db *db, const char *rel_name, const char *csv_path)
     free(line);
     fclose(f);
 
-    /* Sort and bulk-build the DAFSA */
+    /* Sort and bulk-build the DAFSA. */
     ts_sort(&ts);
 
     if (rel_build_base_from_tupleset(db->rels[idx].rel, &ts) != 0) {
         ts_free(&ts);
+        ts_free(&delta);
         return -1;
     }
 
@@ -600,13 +647,16 @@ int dl_load_facts(dl_db *db, const char *rel_name, const char *csv_path)
     ts_free(&ts);
 
     /* M7: save interner BEFORE relation save (invariant: interner durable
-     * before relation, so relation DAFSA never references a sym_id not on disk) */
+     * before relation, so relation DAFSA never references a sym_id not on
+     * disk).  Bulk load interns string columns inline, so any new syms must be
+     * durable before the base DAFSA that references them. */
     {
         char *fwd_path = make_path(db, "symbols", ".dafsa");
         char *rev_path = make_path(db, "symbols", ".array");
         if (fwd_path && rev_path) {
             if (intern_save(db->ir, fwd_path, rev_path) != 0) {
                 free(fwd_path); free(rev_path);
+                ts_free(&delta);
                 return -1;
             }
         }
@@ -614,7 +664,9 @@ int dl_load_facts(dl_db *db, const char *rel_name, const char *csv_path)
         free(rev_path);
     }
 
-    /* Auto-save the relation's BASE DAFSA after load */
+    /* Auto-save the relation's BASE DAFSA after load (atomic via dafsa_save).
+     * Bulk load bypasses the WAL — the base DAFSA is the durable home for the
+     * loaded facts (a documented durability difference vs dl_add_fact). */
     {
         char *path = rel_is_idb(db->rels[idx].rel)
                    ? make_path(db, rel_name, ".base.dafsa")
@@ -625,20 +677,46 @@ int dl_load_facts(dl_db *db, const char *rel_name, const char *csv_path)
         }
     }
 
-    /* IVM Slice 1: bulk load bypasses dl_add_fact (no per-tuple delta), so a
-     * full re-eval is required at the next publish. */
-    db->full_reeval_pending = 1;
-
-    /* M4: facts changed, mark fixpoint dirty */
-    db->fixpoint_dirty = 1;
-
-    /* M6: mark permutation indices of this relation dirty */
-    {
-        int pi;
-        for (pi = 0; pi < db->n_perms; pi++) {
-            if (db->perms[pi].rel_id == idx)
-                db->perms[pi].dirty = 1;
+    /* IVM Slice 5: bulk load is a BATCHED DELTA.  The newly-loaded facts are
+     * captured as a single +delta batch and propagated by the existing IVM
+     * machinery at the next publish (vm_propagate_deltas / the recursive seed
+     * / aggregate maintenance / DRed) instead of unconditionally forcing a
+     * full re-eval.  Only the cases outside the incremental classes fall back:
+     *   - loading into a RULE-HEAD relation (mixed EDB+IDB: the fact must
+     *     appear in the view AND propagate) → full re-eval;
+     *   - OOM while capturing the delta → full re-eval (never leave derived
+     *     views stale). */
+    if (n_new > 0) {
+        if (delta_failed || ivm_rel_is_head(db, idx)) {
+            db->full_reeval_pending = 1;
+        } else {
+            long di;
+            for (di = 0; di < delta.count; di++) {
+                if (ivm_capture_delta(db, idx,
+                        delta.data + (size_t)di * arity, arity) != 0) {
+                    /* OOM: the base is already committed (rebuilt + saved).
+                     * Fall back to a full re-eval at publish rather than a
+                     * partial propagate (never silently mis-evaluate). */
+                    db->full_reeval_pending = 1;
+                    break;
+                }
+            }
         }
+        ts_free(&delta);
+
+        /* M4: facts changed, mark fixpoint dirty */
+        db->fixpoint_dirty = 1;
+
+        /* M6: mark permutation indices of this relation dirty */
+        {
+            int pi;
+            for (pi = 0; pi < db->n_perms; pi++) {
+                if (db->perms[pi].rel_id == idx)
+                    db->perms[pi].dirty = 1;
+            }
+        }
+    } else {
+        ts_free(&delta);
     }
 
     return loaded;

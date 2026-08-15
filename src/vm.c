@@ -52,6 +52,11 @@ int vm_dred_runs = 0;
 /* IVM Slice 4: test observable — counts vm_agg_maintain runs (see vm.h). */
 int vm_agg_runs = 0;
 
+/* IVM Slice 5: test observable — counts vm_propagate_deltas runs (see vm.h).
+ * Lets the bulk-load tests prove the batched-delta path was taken (a silently
+ * fell-back full re-eval would also produce correct views). */
+int vm_propagate_runs = 0;
+
 static relation *db_rel(dl_db *db, int idx)
 {
     if (idx < 0 || (size_t)idx >= db->nrels) return NULL;
@@ -2198,6 +2203,8 @@ int vm_propagate_deltas(dl_db *db)
     int        i, rc = -1;
 
     if (!db) return -1;
+
+    vm_propagate_runs++;   /* test observable: prove the insert path was taken */
 
     /* Seed the queue from pending base deltas, transferring ownership (the
      * tuple_set structs are heap-allocated by the capture path in dl.c). */

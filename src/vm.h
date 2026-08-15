@@ -151,4 +151,10 @@ int vm_agg_maintain(dl_db *db);
  * Proves the aggregate-IVM path was taken (not the full re-eval fallback). */
 extern int vm_agg_runs;
 
+/* IVM Slice 5: test observable — number of times vm_propagate_deltas has run
+ * in this process.  Proves a BULK-LOAD publish routed through the insert
+ * propagator (the batched-delta path) rather than a full re-eval fallback
+ * (which would also produce correct views — the counter distinguishes them). */
+extern int vm_propagate_runs;
+
 #endif

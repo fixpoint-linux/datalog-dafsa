@@ -2088,11 +2088,339 @@ static void test_aggregate_ivm_fallback_eligibility(void)
     PASS();
 }
 
+/* ─── IVM Slice 5: bulk-load IVM + persistence polish ───────────────────── */
+
+/* Bulk-load a batch of rows into an already-declared relation via CSV (no
+ * declare, no strict-count assert — batches may carry duplicates across
+ * iterations, which must be deduped against the existing base). */
+static void bulk_load_rows(dl_db *db, const char *name, const char *rel,
+                           uint8_t arity, const uint32_t *cols, int nrows)
+{
+    char path[512];
+    FILE *f;
+    int i, c;
+    snprintf(path, sizeof(path), "build-tmp/ivm-%s/%s.csv", name, rel);
+    f = fopen(path, "w");
+    assert(f);
+    for (i = 0; i < nrows; i++) {
+        for (c = 0; c < arity; c++) {
+            if (c > 0) fputc(',', f);
+            fprintf(f, "%u", cols[(size_t)i * (size_t)arity + (size_t)c]);
+        }
+        fputc('\n', f);
+    }
+    fclose(f);
+    assert(dl_load_facts(db, rel, path) >= 0);
+}
+
+/* T22: deterministic bulk-load IVM.  Bulk loading a batch of base facts is a
+ * BATCHED DELTA: the whole loaded set propagates through the DAG via the
+ * insert propagator (vm_propagate_deltas), NOT a full re-eval.  The
+ * vm_propagate_runs counter proves the incremental path ran (a silently
+ * fell-back full re-eval would also produce correct views). */
+static void test_bulk_load_ivm_deterministic(void)
+{
+    dl_db *db;
+
+    TEST("T22: bulk-load IVM — batched delta propagates through the DAG");
+
+    setup_db(&db, "t22");
+
+    {
+        int i;
+        for (i = 0; i < 5; i++)
+            assert(dl_declare_relation(db, IVM_EDB[i], 2) == 0);
+    }
+    assert(dl_load_rules(db, IVM_RULES) == 0);
+    assert(vm_ivm_eligible(db) == 1);
+    assert(dl_compile(db) == 0);
+
+    /* Bulk-load the whole seed in one batch per relation (no dl_add_fact). */
+    {
+        uint32_t edge[] = {1,2, 8,9};
+        uint32_t mid[]  = {2,3, 9,3};
+        uint32_t tail[] = {3,4};
+        uint32_t fin[]  = {4,5};
+        uint32_t end[]  = {2,7};
+
+        int runs0 = vm_propagate_runs;
+        bulk_load_rows(db, "t22", "edge", 2, edge, 2);
+        bulk_load_rows(db, "t22", "mid",  2, mid,  2);
+        bulk_load_rows(db, "t22", "tail", 2, tail, 1);
+        bulk_load_rows(db, "t22", "fin",  2, fin,  1);
+        bulk_load_rows(db, "t22", "end",  2, end,  1);
+        assert(dl_publish_snapshot(db) == 0);
+
+        /* PROVE the batched-delta path ran (not a silent full re-eval). */
+        if (vm_propagate_runs != runs0 + 1) {
+            teardown_db(db, "t22");
+            FAIL("T22: bulk-load publish did not route through the insert propagator");
+            return;
+        }
+    }
+
+    {
+        uint32_t p[] = {1,2, 1,3, 8,9, 8,3};
+        uint32_t q[] = {1,4, 1,7, 8,4};
+        uint32_t r[] = {1,5, 8,5};
+        if (!check_rel2(db, "p", p, 4) ||
+            !check_rel2(db, "q", q, 3) ||
+            !check_rel2(db, "r", r, 2)) {
+            teardown_db(db, "t22");
+            FAIL("T22: bulk-load cascade wrong");
+            return;
+        }
+    }
+
+    /* Second bulk batch: two facts in one publish must extend the cascade and
+     * leave the earlier tuples undisturbed. */
+    {
+        uint32_t edge[] = {10,11};
+        uint32_t end[]  = {11,12};
+        int runs0 = vm_propagate_runs;
+        bulk_load_rows(db, "t22", "edge", 2, edge, 1);
+        bulk_load_rows(db, "t22", "end",  2, end,  1);
+        assert(dl_publish_snapshot(db) == 0);
+        if (vm_propagate_runs != runs0 + 1) {
+            teardown_db(db, "t22");
+            FAIL("T22: second bulk batch did not route through the insert propagator");
+            return;
+        }
+    }
+
+    {
+        uint32_t p[] = {1,2, 1,3, 8,9, 8,3, 10,11};
+        uint32_t q[] = {1,4, 1,7, 8,4, 10,12};
+        uint32_t r[] = {1,5, 8,5};
+        if (!check_rel2(db, "p", p, 5) ||
+            !check_rel2(db, "q", q, 4) ||
+            !check_rel2(db, "r", r, 2)) {
+            teardown_db(db, "t22");
+            FAIL("T22: incremental bulk cascade wrong");
+            return;
+        }
+    }
+
+    teardown_db(db, "t22");
+    PASS();
+}
+
+/* T23: bulk-load equivalence-oracle property — random bulk-add sequences.
+ * After each bulk load + publish, the IVM-maintained views must equal a full
+ * re-eval over the current EDB, byte-for-byte. */
+static void test_bulk_load_ivm_property(void)
+{
+    dl_db *ivm_db, *oracle_db;
+    int iter, i;
+
+    TEST("T23: bulk-load IVM — seeded random bulk-add property vs full re-eval");
+
+    setup_db(&ivm_db, "t23ivm");
+    setup_db(&oracle_db, "t23ora");
+
+    for (i = 0; i < 5; i++) {
+        assert(dl_declare_relation(ivm_db, IVM_EDB[i], 2) == 0);
+        assert(dl_declare_relation(oracle_db, IVM_EDB[i], 2) == 0);
+    }
+    assert(dl_load_rules(ivm_db, IVM_RULES) == 0);
+    assert(dl_load_rules(oracle_db, IVM_RULES) == 0);
+    assert(vm_ivm_eligible(ivm_db) == 1);
+    assert(dl_compile(ivm_db) == 0);
+    assert(dl_compile(oracle_db) == 0);
+
+    prng_state = 0xB10C4DEu;
+
+    for (iter = 0; iter < 60; iter++) {
+        int rel = (int)(prng_next() % 5);
+        int batch = 1 + (int)(prng_next() % 4);   /* 1..4 rows per batch */
+        uint32_t rows[4 * 2];
+        int b;
+
+        for (b = 0; b < batch; b++) {
+            rows[b * 2]     = prng_next() % 8;
+            rows[b * 2 + 1] = prng_next() % 8;
+        }
+
+        /* Identical bulk load into both databases. */
+        bulk_load_rows(ivm_db, "t23ivm", IVM_EDB[rel], 2, rows, batch);
+        bulk_load_rows(oracle_db, "t23ora", IVM_EDB[rel], 2, rows, batch);
+
+        /* IVM: batched-delta propagation on publish.  Oracle: full re-eval. */
+        if (dl_publish_snapshot(ivm_db) != 0) {
+            printf("  publish failed at iter %d\n", iter);
+            goto fail_prop;
+        }
+        if (dl_compile(oracle_db) != 0) {
+            printf("  oracle compile failed at iter %d\n", iter);
+            goto fail_prop;
+        }
+
+        if (!compare_all_views(ivm_db, oracle_db)) {
+            printf("  divergence at iter %d (rel %s)\n", iter, IVM_EDB[rel]);
+            goto fail_prop;
+        }
+    }
+
+    teardown_db(ivm_db, "t23ivm");
+    teardown_db(oracle_db, "t23ora");
+    PASS();
+    return;
+
+fail_prop:
+    teardown_db(ivm_db, "t23ivm");
+    teardown_db(oracle_db, "t23ora");
+    FAIL("T23: bulk-load IVM views diverged from full re-eval oracle");
+}
+
+/* T24: bulk loading into a RULE-HEAD relation (mixed EDB+IDB) must fall back
+ * to the full re-eval — the loaded base fact appears in the view AND the
+ * derived tuples are re-derived (not {1,2} from a delta-only view, not {3}
+ * from dropping derived tuples). */
+static void test_bulk_load_mixed_head_fallback(void)
+{
+    dl_db *db;
+    tuple_set ts;
+
+    TEST("T24: bulk load into a rule-head relation -> full re-eval (mixed)");
+
+    setup_db(&db, "t24");
+
+    assert(dl_declare_relation(db, "a", 1) == 0);
+    {
+        uint32_t one = 1, two = 2;
+        assert(dl_add_fact(db, "a", &one, 1) == 1);
+        assert(dl_add_fact(db, "a", &two, 1) == 1);
+    }
+    assert(dl_load_rules(db, "r(X):-a(X).\n") == 0);
+    assert(dl_compile(db) == 0);
+
+    /* Bulk-load r(3) into the rule-head relation r. */
+    {
+        uint32_t three = 3;
+        int runs0 = vm_propagate_runs;
+        bulk_load_rows(db, "t24", "r", 1, &three, 1);
+        assert(dl_publish_snapshot(db) == 0);
+        /* The mixed-head load must NOT route through the insert propagator. */
+        if (vm_propagate_runs != runs0) {
+            teardown_db(db, "t24");
+            FAIL("T24: mixed-head bulk load wrongly routed through the propagator");
+            return;
+        }
+    }
+
+    query_set_prefix(db, "r", &ts);
+    if (ts.count != 3 || ts.arity != 1) {
+        printf("  r got %ld rows, expected 3\n", ts.count);
+        long j;
+        for (j = 0; j < ts.count; j++) printf("    r(%u)\n", ts.data[j]);
+        tset_free(&ts); teardown_db(db, "t24");
+        FAIL("T24: mixed-head bulk load did not full re-eval");
+        return;
+    }
+    {
+        uint32_t v;
+        for (v = 1; v <= 3; v++) {
+            uint32_t row[1] = {v};
+            if (!tset_has(&ts, row)) {
+                printf("  r missing %u\n", v);
+                tset_free(&ts); teardown_db(db, "t24");
+                FAIL("T24: r missing value after mixed bulk load");
+                return;
+            }
+        }
+    }
+    tset_free(&ts);
+
+    teardown_db(db, "t24");
+    PASS();
+}
+
+/* T25: reopen re-derives an IDB relation's view from its persisted BASE even
+ * when the view (.dafsa) file is MISSING — the crash-consistency gap where
+ * dl_close wrote base.dafsa but not the view (or the view was lost).  The VM
+ * resets view = copy(base) on the next eval, so the view is rebuilt from
+ * base + rules, never from a stale/missing view file. */
+static void test_reopen_missing_view_rederive(void)
+{
+    dl_db *db;
+    tuple_set ts;
+    int i;
+
+    TEST("T25: reopen with a missing view file re-derives from base");
+
+    setup_db(&db, "t25");
+
+    {
+        uint32_t succ[20];
+        for (i = 0; i < 10; i++) { succ[i*2] = (uint32_t)i; succ[i*2+1] = (uint32_t)(i+1); }
+        load_rows(db, "t25", "succ", 2, succ, 10);
+    }
+    {
+        uint32_t ev = 0;
+        load_rows(db, "t25", "even", 1, &ev, 1);
+    }
+
+    assert(dl_load_rules(db,
+        "even(X):-succ(Y,X),odd(Y).\n"
+        "odd(X):-succ(Y,X),even(Y).\n") == 0);
+    assert(dl_compile(db) == 0);
+
+    /* Persist: writes even.base.dafsa + even.dafsa(view), odd.base.dafsa +
+     * odd.dafsa(view). */
+    dl_close(db);
+
+    /* Simulate a crash between the base write and the view write: drop the
+     * view files for BOTH IDB relations. */
+    assert(remove("build-tmp/ivm-t25/even.dafsa") == 0);
+    assert(remove("build-tmp/ivm-t25/odd.dafsa") == 0);
+
+    db = dl_open("build-tmp/ivm-t25");
+    assert(db != NULL);
+
+    assert(dl_load_rules(db,
+        "even(X):-succ(Y,X),odd(Y).\n"
+        "odd(X):-succ(Y,X),even(Y).\n") == 0);
+    assert(dl_compile(db) == 0);
+
+    query_set(db, "even", &ts);
+    if (ts.count != 6 || ts.arity != 1) {
+        printf("  even got %ld rows, expected 6\n", ts.count);
+        tset_free(&ts); teardown_db(db, "t25");
+        FAIL("T25: even not re-derived after missing-view reopen");
+        return;
+    }
+    {
+        uint32_t expected[6] = {0,2,4,6,8,10};
+        for (i = 0; i < 6; i++) {
+            uint32_t row[1] = {expected[i]};
+            if (!tset_has(&ts, row)) {
+                printf("  missing even(%u)\n", expected[i]);
+                tset_free(&ts); teardown_db(db, "t25");
+                FAIL("T25: missing even value after reopen");
+                return;
+            }
+        }
+    }
+    tset_free(&ts);
+
+    query_set(db, "odd", &ts);
+    if (ts.count != 5 || ts.arity != 1) {
+        printf("  odd got %ld rows, expected 5\n", ts.count);
+        tset_free(&ts); teardown_db(db, "t25");
+        FAIL("T25: odd not re-derived after missing-view reopen");
+        return;
+    }
+    tset_free(&ts);
+
+    teardown_db(db, "t25");
+    PASS();
+}
+
 /* ─── Main ────────────────────────────────────────────────────────────── */
 
 int main(void)
 {
-    printf("IVM Slice 0/1/2/3/4 correctness + IVM equivalence-oracle tests\n");
+    printf("IVM Slice 0/1/2/3/4/5 correctness + IVM equivalence-oracle tests\n");
     printf("==========================================================\n\n");
 
     test_tc_delete();
@@ -2116,6 +2444,10 @@ int main(void)
     test_aggregate_ivm_deterministic();
     test_aggregate_ivm_property();
     test_aggregate_ivm_fallback_eligibility();
+    test_bulk_load_ivm_deterministic();
+    test_bulk_load_ivm_property();
+    test_bulk_load_mixed_head_fallback();
+    test_reopen_missing_view_rederive();
 
     printf("\n%d tests run, %d failed\n", tests_run, tests_failed);
     return tests_failed ? 1 : 0;
