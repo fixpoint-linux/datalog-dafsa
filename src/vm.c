@@ -46,6 +46,9 @@ int vm_nomaterialize = 0;
 int vm_export_relid = -1;
 tuple_set *vm_export_ts = NULL;
 
+/* IVM Slice 3: test observable — counts vm_dred_delete runs (see vm.h). */
+int vm_dred_runs = 0;
+
 static relation *db_rel(dl_db *db, int idx)
 {
     if (idx < 0 || (size_t)idx >= db->nrels) return NULL;
@@ -2298,5 +2301,366 @@ fail:
     free(queue);
     /* Free any delta_pending not yet seeded into the queue (OOM mid-seed). */
     vm_clear_deltas(db);
+    return rc;
+}
+
+/* ─── IVM Slice 3: DRed deletion (over-delete + re-derive) ─────────────── */
+/*
+ * Deletion maintenance for NON-RECURSIVE programs (monotone or stratified
+ * negation).  Anything else — recursion, aggregates, OP_WALK /
+ * OP_LOOKUP_PERM / OP_HASH_JOIN — is rejected by vm_dred_eligible and the
+ * publish path runs the FULL fixpoint (the correctness floor; DRed is an
+ * optimization, never a silent mis-evaluation).
+ *
+ * Algorithm (per publish that has pending changes):
+ *
+ *   OVER-DELETE (bounded cascade, stratum-ordered):
+ *     over[R] starts as the pending -delta of R (the deleted base tuples).
+ *     For each rule whose body reads some S with over[S] != NULL via a
+ *     POSITIVE OP_SCAN/OP_LOOKUP atom, a dry-run with over[S] substituted
+ *     for that atom (the existing exec_rule override) enumerates every head
+ *     tuple derivable using an over-deleted tuple — a SUPERSET of the tuples
+ *     that actually lose support.  The cascade iterates to a fixpoint within
+ *     each stratum (same-stratum rules form a DAG) and moves up the strata
+ *     (a rule's body relations are always in stratum <= its head, so lower
+ *     strata are final before higher ones cascade).
+ *
+ *   NEGATION-RESET (conservative, sound):
+ *     Retraction through NEGATED body atoms cannot be enumerated by the
+ *     positive cascade: a negatively-read relation GROWING (an insert, or a
+ *     delete that unblocks a lower-stratum negation) makes !G(args) fail and
+ *     silently retracts dependents.  When any change is pending and the
+ *     program contains OP_NEG_CHECK, every head of a negation-containing
+ *     rule is fully RESET (view = base, all derived dropped) and the reset
+ *     propagates to every dependent — their inputs change wholesale.  The
+ *     re-derive phase then rebuilds them exactly.  (Monotone programs skip
+ *     this entirely and keep the bounded cascade.)
+ *
+ *   RE-DERIVE (ADD-only fixpoint over the affected cone):
+ *     Relations in the transitive dependent cone of any changed relation are
+ *     re-derived stratum-by-stratum with eval_nonrecursive: survivors of the
+ *     over-delete are re-added, tuples newly derivable — including tuples
+ *     unlocked by a negated body atom becoming TRUE after a delete — are
+ *     added, and stale tuples stay deleted.  Base facts are never
+ *     over-deleted (mixed EDB+IDB: delete from base; if still derivable the
+ *     tuple survives in the view, else it vanishes).
+ *
+ * rel_delete on the view DAFSA is safe for absent keys (dafsa_delete_n
+ * returns 0), so over-deleting a tuple that is not present is a no-op.
+ */
+
+int vm_dred_eligible(dl_db *db)
+{
+    int i, k;
+    if (!db) return 0;
+    for (i = 0; i < db->n_crules; i++) {
+        const compiled_rule *cr = db->crules[i];
+        /* Recursion: retracting a recursive SCC's mutually-dependent tuples
+         * soundly is out of the DRed class here — fall back (advisor-approved
+         * scope: recursive deletion uses the full re-eval). */
+        if (cr->is_recursive)   return 0;
+        /* Aggregates: group state (esp. min/max of a deleted extremum) cannot
+         * be maintained by over-delete + re-add — fall back (Slice 4). */
+        if (cr->has_aggregate) return 0;
+        for (k = 0; k < cr->n_instrs; k++) {
+            uint8_t op = cr->instrs[k].op;
+            /* OP_NEG_CHECK is ALLOWED — see the negation-reset phase above. */
+            if (op == OP_WALK)        return 0;  /* rel_pattern: no override */
+            if (op == OP_LOOKUP_PERM) return 0;  /* permuted shadow: no override */
+            if (op == OP_HASH_JOIN)   return 0;  /* reads DAFSA directly */
+        }
+    }
+    return 1;
+}
+
+void vm_clear_deletes(dl_db *db)
+{
+    int i;
+    if (!db) return;
+    for (i = 0; i < MAX_RELS; i++) {
+        if (db->del_pending[i]) {
+            ts_free(db->del_pending[i]);
+            free(db->del_pending[i]);
+            db->del_pending[i] = NULL;
+        }
+    }
+}
+
+/* Does this rule read relation `rel_id` in a body atom (any opcode whose
+ * in->a names a body relation)?  Used for the affected-cone BFS. */
+static int dred_rule_reads(const compiled_rule *cr, int rel_id)
+{
+    int k;
+    for (k = 0; k < cr->n_instrs; k++) {
+        const vm_instr *in = &cr->instrs[k];
+        switch (in->op) {
+        case OP_SCAN: case OP_LOOKUP: case OP_NEG_CHECK:
+        case OP_WALK: case OP_LOOKUP_PERM: case OP_HASH_JOIN:
+            if ((int)in->a == rel_id) return 1;
+            break;
+        default:
+            break;
+        }
+    }
+    return 0;
+}
+
+int vm_dred_delete(dl_db *db)
+{
+    tuple_set *over[MAX_RELS];       /* over-delete set per relation (owned) */
+    uint8_t    full_reset[MAX_RELS]; /* 1 = drop ALL derived, re-derive */
+    uint8_t    changed[MAX_RELS];    /* 1 = has pending +/- delta */
+    uint8_t    affected[MAX_RELS];   /* 1 = in the affected dependent cone */
+    uint8_t    is_head[MAX_RELS];
+    uint8_t    has_negation = 0;
+    int        max_stratum = 0;
+    int        any_change = 0;
+    int        i, k, s, rc = -1;
+
+    if (!db) return -1;
+    vm_dred_runs++;   /* test observable: prove the DRed path was taken */
+
+    memset(over, 0, sizeof(over));
+    memset(full_reset, 0, sizeof(full_reset));
+    memset(changed, 0, sizeof(changed));
+    memset(affected, 0, sizeof(affected));
+    memset(is_head, 0, sizeof(is_head));
+
+    /* 0. Sort pending insert deltas (the OP_LOOKUP override binary-searches
+     * sorted data; deletes get sorted below when seeded into over[]). */
+    for (i = 0; i < MAX_RELS; i++) {
+        if (db->delta_pending[i] && db->delta_pending[i]->count > 0) {
+            ts_sort(db->delta_pending[i]);
+            if (i < (int)db->nrels) changed[i] = 1;
+            any_change = 1;
+        }
+        if (db->del_pending[i] && db->del_pending[i]->count > 0) {
+            if (i < (int)db->nrels) changed[i] = 1;
+            any_change = 1;
+        }
+    }
+
+    /* Head bookkeeping + does the program contain negation anywhere? */
+    for (i = 0; i < db->n_crules; i++) {
+        const compiled_rule *cr = db->crules[i];
+        int hid = cr->head_rel_id;
+        if (hid < MAX_RELS) is_head[hid] = 1;
+        if (cr->stratum > max_stratum) max_stratum = cr->stratum;
+        for (k = 0; k < cr->n_instrs; k++)
+            if (cr->instrs[k].op == OP_NEG_CHECK) { has_negation = 1; break; }
+    }
+
+    /* 1. Seed over[R] = del_pending[R] (positive-cascade seed: the directly
+     *    deleted base tuples). */
+    for (i = 0; i < (int)db->nrels; i++) {
+        long ci;
+        if (!db->del_pending[i] || db->del_pending[i]->count == 0) continue;
+        over[i] = malloc(sizeof(tuple_set));
+        if (!over[i]) goto out;
+        if (ts_init(over[i], rel_arity(db->rels[i].rel)) != 0) {
+            free(over[i]); over[i] = NULL; goto out;
+        }
+        for (ci = 0; ci < db->del_pending[i]->count; ci++)
+            ts_add(over[i], db->del_pending[i]->data +
+                   ci * db->del_pending[i]->arity);
+        ts_sort(over[i]);   /* OP_LOOKUP override needs sorted data */
+    }
+
+    /* 2. Negation-reset seed + propagation.  Any pending change can grow a
+     *    negatively-read relation (an insert directly, or a delete that
+     *    unblocks a lower-stratum negation and adds derived tuples), so when
+     *    negation is present EVERY head of a negation-containing rule takes
+     *    the conservative full reset.  Propagate to dependents: a rule
+     *    reading a reset relation sees its inputs change wholesale. */
+    if (has_negation && any_change) {
+        for (i = 0; i < db->n_crules; i++) {
+            const compiled_rule *cr = db->crules[i];
+            int hid = cr->head_rel_id;
+            if (hid >= MAX_RELS) continue;
+            for (k = 0; k < cr->n_instrs; k++)
+                if (cr->instrs[k].op == OP_NEG_CHECK) { full_reset[hid] = 1; break; }
+        }
+        {
+            int again = 1;
+            while (again) {
+                again = 0;
+                for (i = 0; i < db->n_crules; i++) {
+                    const compiled_rule *cr = db->crules[i];
+                    int hid = cr->head_rel_id;
+                    if (hid >= MAX_RELS || full_reset[hid]) continue;
+                    for (k = 0; k < cr->n_instrs; k++) {
+                        const vm_instr *in = &cr->instrs[k];
+                        switch (in->op) {
+                        case OP_SCAN: case OP_LOOKUP: case OP_NEG_CHECK:
+                        case OP_WALK: case OP_LOOKUP_PERM: case OP_HASH_JOIN:
+                            if (in->a < MAX_RELS && full_reset[in->a]) {
+                                full_reset[hid] = 1;
+                                again = 1;
+                            }
+                            break;
+                        default:
+                            break;
+                        }
+                        if (full_reset[hid]) break;
+                    }
+                }
+            }
+        }
+    }
+
+    /* 3. Bounded over-delete cascade: stratum by stratum, to a fixpoint
+     *    within each stratum.  Heads marked full_reset are skipped (their
+     *    whole derived view is dropped anyway); cascading THROUGH a
+     *    full_reset body relation is skipped too (its dependents are reset
+     *    by propagation). */
+    for (s = 0; s <= max_stratum; s++) {
+        int again = 1;
+        while (again) {
+            again = 0;
+            for (i = 0; i < db->n_crules; i++) {
+                const compiled_rule *cr = db->crules[i];
+                int hid = cr->head_rel_id;
+                if (cr->stratum != s) continue;
+                if (hid >= MAX_RELS || full_reset[hid]) continue;
+                for (k = 0; k < cr->n_instrs; k++) {
+                    const vm_instr *in = &cr->instrs[k];
+                    int br;
+                    long m;
+                    tuple_set cand;
+                    cand_ctx ctx;
+                    long ci;
+                    if (in->op != OP_SCAN && in->op != OP_LOOKUP) continue;
+                    br = (int)in->a;
+                    if (br < 0 || br >= MAX_RELS) continue;
+                    if (!over[br] || over[br]->count == 0) continue;
+                    if (full_reset[br]) continue;
+
+                    {
+                        vm_override ov[1];
+                        ov[0].body_idx = (int)in->body_idx;
+                        ov[0].ts       = over[br];
+                        ov[0].perm_id  = -1;
+                        if (ts_init(&cand, rel_arity(db->rels[hid].rel)) != 0)
+                            goto out;
+                        ctx.ts = &cand;
+                        m = exec_rule(db, cr, ov, 1,
+                                      1 /* dry */, cand_cb, &ctx);
+                    }
+                    if (m < 0) { ts_free(&cand); goto out; }
+                    for (ci = 0; ci < cand.count; ci++) {
+                        const uint32_t *t = cand.data + ci * cand.arity;
+                        if (!over[hid]) {
+                            over[hid] = malloc(sizeof(tuple_set));
+                            if (!over[hid]) { ts_free(&cand); goto out; }
+                            if (ts_init(over[hid], cand.arity) != 0) {
+                                free(over[hid]); over[hid] = NULL;
+                                ts_free(&cand); goto out;
+                            }
+                        }
+                        {
+                            int ar = ts_add(over[hid], t);
+                            if (ar < 0) { ts_free(&cand); goto out; }
+                            if (ar == 1) again = 1;
+                        }
+                    }
+                    ts_free(&cand);
+                    /* Keep over[hid] sorted so a LATER rule in the same
+                     * stratum iteration can read it as an OP_LOOKUP override
+                     * via ts_prefix (binary search).  The in-stratum fixpoint
+                     * grows over[] unsorted; without this, ts_prefix silently
+                     * misses tuples and the over-delete cascade is incomplete
+                     * -> stale survivors (silent wrong answer).  ts_sort is a
+                     * no-op for count<=1 and idempotent (ts_add dedups). */
+                    if (over[hid] && over[hid]->count > 1)
+                        ts_sort(over[hid]);
+                }
+            }
+        }
+        /* Keep every grown over[] sorted for the next stratum's overrides. */
+        for (i = 0; i < MAX_RELS; i++)
+            if (over[i] && over[i]->count > 0) ts_sort(over[i]);
+    }
+
+    /* 4. Apply over-delete to views.  BASE tuples are never over-deleted
+     *    (they are durable); rel_delete of an absent key is a safe no-op. */
+    for (i = 0; i < (int)db->nrels; i++) {
+        long ci;
+        int dirtied = 0;
+        relation *rel;
+        if (!over[i] || over[i]->count == 0) continue;
+        if (full_reset[i]) continue;         /* reset drops everything below */
+        rel = db->rels[i].rel;
+        for (ci = 0; ci < over[i]->count; ci++) {
+            const uint32_t *t = over[i]->data + ci * over[i]->arity;
+            if (rel_exact_base(rel, t)) continue;   /* durable base fact */
+            if (rel_delete(rel, t) == 1) dirtied = 1;
+        }
+        if (dirtied) permindex_mark_dirty(db, i);
+    }
+
+    /* 5. Apply full-reset: drop ALL derived tuples (view = copy of base). */
+    for (i = 0; i < (int)db->nrels; i++) {
+        if (!full_reset[i] || !is_head[i]) continue;
+        if (rel_reset_view(db->rels[i].rel) != 0) goto out;
+        permindex_mark_dirty(db, i);
+    }
+    if (permindex_build_dirty(db) != 0) goto out;
+
+    /* 6. Affected cone: BFS from every changed / over-deleted / reset
+     *    relation through the rule dependency graph. */
+    {
+        int queue[MAX_RELS], qh = 0, qt = 0;
+        for (i = 0; i < MAX_RELS; i++) {
+            if (changed[i] || full_reset[i]
+                || (over[i] && over[i]->count > 0)) {
+                affected[i] = 1;
+                if (qt < MAX_RELS) queue[qt++] = i;
+            }
+        }
+        while (qh < qt) {
+            int r = queue[qh++];
+            for (i = 0; i < db->n_crules; i++) {
+                const compiled_rule *cr = db->crules[i];
+                int hid = cr->head_rel_id;
+                if (hid >= MAX_RELS || affected[hid]) continue;
+                if (dred_rule_reads(cr, r)) {
+                    affected[hid] = 1;
+                    if (qt < MAX_RELS) queue[qt++] = hid;
+                }
+            }
+        }
+    }
+
+    /* 7. Re-derive: run the affected rules of each stratum to a fixpoint.
+     *    ADD-only: over-deleted survivors come back, newly-derivable tuples
+     *    (incl. negation-unlocked ones) are added, stale tuples stay gone.
+     *    Stratum order guarantees lower strata are final before higher ones
+     *    read them.  Rules whose head is outside the affected cone are
+     *    skipped — none of their body inputs changed (by the BFS closure). */
+    for (s = 0; s <= max_stratum; s++) {
+        compiled_rule *srules[256];
+        int sc = 0;
+        for (i = 0; i < db->n_crules; i++) {
+            const compiled_rule *cr = db->crules[i];
+            if (cr->stratum != s) continue;
+            if (cr->head_rel_id < MAX_RELS && !affected[cr->head_rel_id])
+                continue;
+            if (sc < 256) srules[sc++] = db->crules[i];
+        }
+        if (sc == 0) continue;
+        if (eval_nonrecursive(db, srules, sc) != 0) goto out;
+    }
+
+    rc = 0;
+
+out:
+    for (i = 0; i < MAX_RELS; i++) {
+        if (over[i]) { ts_free(over[i]); free(over[i]); }
+    }
+    /* Consume the pending changes even on failure: the caller forces a full
+     * re-eval on the next publish, which resets every head view to base and
+     * recomputes from scratch — the partially-updated views are irrelevant. */
+    vm_clear_deltas(db);
+    vm_clear_deletes(db);
     return rc;
 }

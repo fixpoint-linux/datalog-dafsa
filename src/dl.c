@@ -227,8 +227,9 @@ void dl_close(dl_db *db)
     /* M6: free permutation indices */
     permindex_free_all(db);
 
-    /* IVM Slice 1: free any pending delta tuple_sets */
+    /* IVM Slice 1/3: free any pending delta/delete tuple_sets */
     vm_clear_deltas(db);
+    vm_clear_deletes(db);
 
     /* Save interner */
     {
@@ -705,6 +706,23 @@ static int ivm_capture_delta(dl_db *db, int rel_id,
     return (rc < 0) ? -1 : 0;
 }
 
+/* IVM Slice 3: append a -delta for rel_id to db->del_pending (lazy-init).
+ * Returns 0 on success (added or duplicate), -1 on error. */
+static int ivm_capture_delete(dl_db *db, int rel_id,
+                              const uint32_t *cols, uint8_t arity)
+{
+    tuple_set *ts = db->del_pending[rel_id];
+    int rc;
+    if (!ts) {
+        ts = malloc(sizeof(*ts));
+        if (!ts) return -1;
+        if (ts_init(ts, arity) != 0) { free(ts); return -1; }
+        db->del_pending[rel_id] = ts;
+    }
+    rc = ts_add(ts, cols);
+    return (rc < 0) ? -1 : 0;
+}
+
 int dl_add_fact(dl_db *db, const char *rel_name,
                 const uint32_t *cols, uint8_t arity)
 {
@@ -822,9 +840,14 @@ int dl_delete_fact(dl_db *db, const char *rel_name,
     rc = rel_delete_base(db->rels[idx].rel, cols);
     if (rc < 0) return -1;
 
-    /* IVM Slice 1: deletion is out of the insert-only class — force a full
-     * re-eval (the correctness floor; never wrongly propagate a delete). */
-    db->full_reeval_pending = 1;
+    /* IVM Slice 3: record the -delta.  If the program is DRed-eligible
+     * (non-recursive, no aggregates, no WALK/LOOKUP_PERM/HASH_JOIN), the
+     * publish path maintains the derived views incrementally via DRed
+     * (over-delete + re-derive); otherwise the dispatch falls back to the
+     * full fixpoint (the correctness floor).  An OOM capturing the delta
+     * forces the fallback — never silently leave derived views stale. */
+    if (ivm_capture_delete(db, idx, cols, arity) != 0)
+        db->full_reeval_pending = 1;
 
     /* M4: facts changed, mark fixpoint dirty */
     db->fixpoint_dirty = 1;
@@ -1096,12 +1119,13 @@ int dl_compile(dl_db *db)
     if (vm_execute(db, db->crules, db->n_crules) != 0)
         return -1;
 
-    /* M4: compilation successful, fixpoint is now clean.  IVM Slice 1: the
-     * full re-eval consumed every pending change — drop deltas + the
-     * full-reeval flag so subsequent inserts can propagate incrementally. */
+    /* M4: compilation successful, fixpoint is now clean.  IVM Slice 1/3: the
+     * full re-eval consumed every pending change — drop deltas + deletes +
+     * the full-reeval flag so subsequent changes can propagate incrementally. */
     db->fixpoint_dirty = 0;
     db->full_reeval_pending = 0;
     vm_clear_deltas(db);
+    vm_clear_deletes(db);
     return 0;
 }
 
@@ -1584,18 +1608,49 @@ int dl_publish_snapshot(dl_db *db)
     if (!db) return -1;
 
     /* 1. Materialize derived views if rules exist and the fixpoint is dirty.
-     * IVM Slice 1: three-way dispatch —
-     *   full_reeval_pending OR an ineligible program  → FULL fixpoint (oracle)
-     *   else pending insert deltas + eligible program → delta propagation
-     *   else                                            → pure save
-     * Any change outside the IVM-insert class MUST have set
-     * full_reeval_pending (delete/bulk/rule-load/mixed-head), so we never
+     * IVM Slice 1/3 dispatch —
+     *   full_reeval_pending, or a change outside every incremental class
+     *                                       → FULL fixpoint (oracle)
+     *   pending DELETE deltas on a DRed-eligible program (or inserts on a
+     *   program that is only DRed-eligible, e.g. stratified negation)
+     *                                       → DRed over-delete + re-derive
+     *   pending insert deltas + eligible    → delta propagation (Slice 1/2)
+     *   else                                → pure save
+     * Any change outside the incremental classes MUST end in the first
+     * branch (full_reeval_pending is set at the change site), so we never
      * wrongly propagate. */
     if (db->n_crules > 0 && db->fixpoint_dirty) {
-        if (db->full_reeval_pending || !vm_ivm_eligible(db)) {
+        int has_del = 0, has_ins = 0, dri;
+        for (dri = 0; dri < MAX_RELS; dri++) {
+            if (db->del_pending[dri] && db->del_pending[dri]->count > 0)
+                has_del = 1;
+            if (db->delta_pending[dri] && db->delta_pending[dri]->count > 0)
+                has_ins = 1;
+        }
+        if (db->full_reeval_pending
+            || (has_del && !vm_dred_eligible(db))
+            || (has_ins && !vm_ivm_eligible(db) && !vm_dred_eligible(db))) {
             if (vm_execute(db, db->crules, db->n_crules) != 0)
                 return -1;
             vm_clear_deltas(db);   /* full re-eval consumed pending changes */
+            vm_clear_deletes(db);
+        } else if (has_del || (has_ins && !vm_ivm_eligible(db))) {
+            /* IVM Slice 3: DRed over-delete + re-derive.  Consumes both the
+             * pending deletes and any co-pending inserts. */
+            if (vm_dred_delete(db) != 0) {
+                /* The view may be partially updated and the pending changes
+                 * were consumed.  Force a full re-eval on the next publish
+                 * (never leave a silently-incomplete view). */
+                db->full_reeval_pending = 1;
+                return -1;
+            }
+        } else if (!vm_ivm_eligible(db)) {
+            /* Defensive: dirty with no tracked deltas on an ineligible
+             * program — run the full fixpoint (the correctness floor). */
+            if (vm_execute(db, db->crules, db->n_crules) != 0)
+                return -1;
+            vm_clear_deltas(db);
+            vm_clear_deletes(db);
         } else if (vm_has_recursive(db)) {
             /* IVM Slice 2: recursive insert IVM — seed the semi-naive fixpoint
              * with the current view + the pending insert deltas (never reset

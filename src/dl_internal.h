@@ -74,16 +74,23 @@ struct dl_db {
     /* IVM Slice 1: insert-only incremental maintenance state.
      *   full_reeval_pending — 1 forces the next publish/compile to run the
      *     FULL fixpoint (the correct oracle) instead of delta propagation.
-     *     Set on ANY change outside the IVM-insert class: deletion, bulk
-     *     load, rule load, a base fact into a rule-head relation, or a rule
-     *     that is recursive / negated / aggregate / pattern-walk / perm-join.
+     *     Set on ANY change outside the IVM-insert class: bulk load, rule
+     *     load, a base fact into a rule-head relation, or a rule that is
+     *     recursive / negated / aggregate / pattern-walk / perm-join.
      *   delta_pending[i] — pending +delta tuple_set for relation i, captured
      *     at dl_add_fact after the in-memory base commit.  NULL when empty.
-     *     Insert-only: only +tuples; deletes never land here. */
+     *     Insert-only: only +tuples.
+     * IVM Slice 3: deletion state.
+     *   del_pending[i] — pending -delta tuple_set for relation i, captured at
+     *     dl_delete_fact after the in-memory base commit.  NULL when empty.
+     *     Consumed by vm_dred_delete (DRed over-delete + re-derive) at the
+     *     next publish; a program outside the DRed class routes to the full
+     *     re-eval fallback via the publish dispatch (never mis-evaluate). */
     int                full_reeval_pending;
     struct tuple_set  *delta_pending[MAX_RELS];  /* struct tuple_set forward-
                                                     declared in relation.h;
                                                     full def in tupleset.h */
+    struct tuple_set  *del_pending[MAX_RELS];    /* pending -deltas (Slice 3) */
 };
 
 #endif /* DL_INTERNAL_H */

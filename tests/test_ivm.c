@@ -1116,12 +1116,612 @@ static void test_nonrecursive_head_feeds_recursion_fallback(void)
     PASS();
 }
 
+/* ─── IVM Slice 3: DRed deletion (over-delete + re-derive) ──────────────── */
+
+/* T13: deterministic DRed delete over the monotone DAG (IVM_RULES).
+ * Deleting mid(2,3) must retract the multi-level cascade p(1,3) -> q(1,4)
+ * -> r(1,5) while keeping every tuple with alternative support, and a
+ * re-insert must restore the full cascade through the Slice-1 insert path
+ * (DRed-maintained state feeds the insert propagator). */
+static void test_dred_delete_deterministic(void)
+{
+    dl_db *db;
+
+    TEST("T13: DRed delete — deterministic cascade retraction over the DAG");
+
+    setup_db(&db, "t13");
+
+    {
+        int i;
+        for (i = 0; i < 5; i++)
+            assert(dl_declare_relation(db, IVM_EDB[i], 2) == 0);
+    }
+    assert(dl_load_rules(db, IVM_RULES) == 0);
+    assert(vm_dred_eligible(db) == 1);   /* monotone non-recursive: DRed */
+    assert(dl_compile(db) == 0);
+
+    /* Same seed as T5 milestone 1. */
+    {
+        uint32_t edge12[]  = {1,2};
+        uint32_t edge89[]  = {8,9};
+        uint32_t mid23[]   = {2,3};
+        uint32_t mid93[]   = {9,3};
+        uint32_t tail34[]  = {3,4};
+        uint32_t fin45[]   = {4,5};
+        uint32_t end27[]   = {2,7};
+
+        assert(dl_add_fact(db, "edge", edge12, 2) == 1);
+        assert(dl_add_fact(db, "mid",  mid23, 2) == 1);
+        assert(dl_add_fact(db, "tail", tail34, 2) == 1);
+        assert(dl_add_fact(db, "fin",  fin45, 2) == 1);
+        assert(dl_add_fact(db, "end",  end27, 2) == 1);
+        assert(dl_add_fact(db, "edge", edge89, 2) == 1);
+        assert(dl_add_fact(db, "mid",  mid93, 2) == 1);
+    }
+    assert(dl_publish_snapshot(db) == 0);
+
+    /* Delete mid(2,3):
+     *   p loses (1,3)  [p(1,3):-edge(1,2),mid(2,3)]  but keeps (1,2) [edge
+     *     alone], (8,9) [edge alone], (8,3) [mid(9,3) survives].
+     *   q loses (1,4)  [q(1,4):-p(1,3),tail(3,4)]    but keeps (1,7),(8,4).
+     *   r loses (1,5)  [r(1,5):-q(1,4),fin(4,5)]     but keeps (8,5).
+     * A single-level retraction (only p) or a one-shot re-derive that fails
+     * to cascade would leave (1,4)/(1,5) stale. */
+    {
+        int runs0 = vm_dred_runs;
+        uint32_t m23[2] = {2,3};
+        assert(dl_delete_fact(db, "mid", m23, 2) == 1);
+        assert(dl_publish_snapshot(db) == 0);
+        /* PROVE the DRed path ran (a silent full-re-eval fallback would also
+         * produce correct views — the counter distinguishes them). */
+        if (vm_dred_runs != runs0 + 1) {
+            teardown_db(db, "t13");
+            FAIL("T13: delete did not route through DRed");
+            return;
+        }
+    }
+
+    {
+        uint32_t p[] = {1,2, 8,9, 8,3};
+        uint32_t q[] = {1,7, 8,4};
+        uint32_t r[] = {8,5};
+        if (!check_rel2(db, "p", p, 3) ||
+            !check_rel2(db, "q", q, 2) ||
+            !check_rel2(db, "r", r, 1)) {
+            teardown_db(db, "t13");
+            FAIL("T13: cascade retraction wrong after delete");
+            return;
+        }
+    }
+
+    /* Re-insert mid(2,3): the insert-only path (Slice 1) must restore the
+     * whole cascade on top of the DRed-maintained views. */
+    {
+        int runs0 = vm_dred_runs;
+        uint32_t m23[2] = {2,3};
+        assert(dl_add_fact(db, "mid", m23, 2) == 1);
+        assert(dl_publish_snapshot(db) == 0);
+        /* Insert-only on an insert-IVM-eligible program routes to the
+         * Slice-1 propagator, NOT DRed. */
+        if (vm_dred_runs != runs0) {
+            teardown_db(db, "t13");
+            FAIL("T13: insert wrongly routed through DRed");
+            return;
+        }
+    }
+
+    {
+        uint32_t p[] = {1,2, 1,3, 8,9, 8,3};
+        uint32_t q[] = {1,4, 1,7, 8,4};
+        uint32_t r[] = {1,5, 8,5};
+        if (!check_rel2(db, "p", p, 4) ||
+            !check_rel2(db, "q", q, 3) ||
+            !check_rel2(db, "r", r, 2)) {
+            teardown_db(db, "t13");
+            FAIL("T13: cascade not restored after re-insert");
+            return;
+        }
+    }
+
+    /* Delete edge(1,2) too: now (1,2) AND (1,3) leave p, (1,4),(1,7) leave
+     * q, (1,5) leaves r — everything from the 1-branch. */
+    {
+        uint32_t e12[2] = {1,2};
+        assert(dl_delete_fact(db, "edge", e12, 2) == 1);
+    }
+    assert(dl_publish_snapshot(db) == 0);
+
+    {
+        uint32_t p[] = {8,9, 8,3};
+        uint32_t q[] = {8,4};
+        uint32_t r[] = {8,5};
+        if (!check_rel2(db, "p", p, 2) ||
+            !check_rel2(db, "q", q, 1) ||
+            !check_rel2(db, "r", r, 1)) {
+            teardown_db(db, "t13");
+            FAIL("T13: 1-branch retraction wrong");
+            return;
+        }
+    }
+
+    teardown_db(db, "t13");
+    PASS();
+}
+
+/* ─── T14: DRed with stratified negation (deterministic) ───────────────── */
+
+#define NEG_RULES \
+    "mid(X,Y):-edge(X,Y).\n" \
+    "ok(X,Y):-mid(X,Y),!blocked(X,Y).\n" \
+    "top(X,Y):-ok(X,Y),!cut(X,Y).\n"
+
+static const char *NEG_EDB[3] = {"edge", "blocked", "cut"};
+
+static void test_dred_negation_deterministic(void)
+{
+    dl_db *db;
+
+    TEST("T14: DRed + stratified negation — unblock/retract/cascade");
+
+    setup_db(&db, "t14");
+
+    {
+        int i;
+        for (i = 0; i < 3; i++)
+            assert(dl_declare_relation(db, NEG_EDB[i], 2) == 0);
+    }
+    assert(dl_load_rules(db, NEG_RULES) == 0);
+    /* Negation: NOT insert-IVM-eligible, but DRed-eligible (non-recursive). */
+    assert(vm_ivm_eligible(db) == 0);
+    assert(vm_dred_eligible(db) == 1);
+    assert(dl_compile(db) == 0);
+
+    /* Seed: edge={(1,2),(2,3),(3,4)}, blocked={(2,3)}, cut={(1,2)}.
+     * mid=edge (3 rows); ok=mid\blocked={(1,2),(3,4)}; top=ok\cut={(3,4)}. */
+    {
+        uint32_t e12[2] = {1,2}, e23[2] = {2,3}, e34[2] = {3,4};
+        uint32_t b23[2] = {2,3}, c12[2] = {1,2};
+        assert(dl_add_fact(db, "edge",    e12, 2) == 1);
+        assert(dl_add_fact(db, "edge",    e23, 2) == 1);
+        assert(dl_add_fact(db, "edge",    e34, 2) == 1);
+        assert(dl_add_fact(db, "blocked", b23, 2) == 1);
+        assert(dl_add_fact(db, "cut",     c12, 2) == 1);
+    }
+    assert(dl_publish_snapshot(db) == 0);
+
+    {
+        uint32_t mid[] = {1,2, 2,3, 3,4};
+        uint32_t ok[]  = {1,2, 3,4};
+        uint32_t top[] = {3,4};
+        if (!check_rel2(db, "mid", mid, 3) ||
+            !check_rel2(db, "ok",  ok,  2) ||
+            !check_rel2(db, "top", top, 1)) {
+            teardown_db(db, "t14");
+            FAIL("T14: seed derivation wrong");
+            return;
+        }
+    }
+
+    /* Step 1: DELETE blocked(2,3) — the negated body atom becomes TRUE, so
+     * ok(2,3) becomes newly derivable (an ADD caused by a delete) and
+     * top(2,3) follows in the higher stratum. */
+    {
+        int runs0 = vm_dred_runs;
+        uint32_t b23[2] = {2,3};
+        assert(dl_delete_fact(db, "blocked", b23, 2) == 1);
+        assert(dl_publish_snapshot(db) == 0);
+        if (vm_dred_runs != runs0 + 1) {
+            teardown_db(db, "t14");
+            FAIL("T14: delete did not route through DRed");
+            return;
+        }
+    }
+
+    {
+        uint32_t mid[] = {1,2, 2,3, 3,4};
+        uint32_t ok[]  = {1,2, 2,3, 3,4};
+        uint32_t top[] = {2,3, 3,4};
+        if (!check_rel2(db, "mid", mid, 3) ||
+            !check_rel2(db, "ok",  ok,  3) ||
+            !check_rel2(db, "top", top, 2)) {
+            teardown_db(db, "t14");
+            FAIL("T14: negation-unblock ADD missing after delete");
+            return;
+        }
+    }
+
+    /* Step 2: INSERT blocked(1,2) — a negated body atom becomes FALSE, so
+     * ok(1,2) must be RETRACTED (and top stays without (1,2), which cut
+     * already blocked).  This is the insert-retraction direction DRed
+     * handles via the conservative full view reset of negation heads.
+     * The program is NOT insert-IVM-eligible (negation), so the insert
+     * itself routes through DRed here. */
+    {
+        int runs0 = vm_dred_runs;
+        uint32_t b12[2] = {1,2};
+        assert(dl_add_fact(db, "blocked", b12, 2) == 1);
+        assert(dl_publish_snapshot(db) == 0);
+        if (vm_dred_runs != runs0 + 1) {
+            teardown_db(db, "t14");
+            FAIL("T14: negation insert did not route through DRed");
+            return;
+        }
+    }
+
+    {
+        uint32_t mid[] = {1,2, 2,3, 3,4};
+        uint32_t ok[]  = {2,3, 3,4};
+        uint32_t top[] = {2,3, 3,4};
+        if (!check_rel2(db, "mid", mid, 3) ||
+            !check_rel2(db, "ok",  ok,  2) ||
+            !check_rel2(db, "top", top, 2)) {
+            teardown_db(db, "t14");
+            FAIL("T14: stale ok(1,2) after insert into negated relation");
+            return;
+        }
+    }
+
+    /* Step 3: DELETE edge(2,3) — a positive-cascade delete WITH negation
+     * present: mid(2,3) and ok(2,3) must vanish. */
+    {
+        uint32_t e23[2] = {2,3};
+        assert(dl_delete_fact(db, "edge", e23, 2) == 1);
+    }
+    assert(dl_publish_snapshot(db) == 0);
+
+    {
+        uint32_t mid[] = {1,2, 3,4};
+        uint32_t ok[]  = {3,4};
+        uint32_t top[] = {3,4};
+        if (!check_rel2(db, "mid", mid, 2) ||
+            !check_rel2(db, "ok",  ok,  1) ||
+            !check_rel2(db, "top", top, 1)) {
+            teardown_db(db, "t14");
+            FAIL("T14: positive cascade wrong with negation present");
+            return;
+        }
+    }
+
+    teardown_db(db, "t14");
+    PASS();
+}
+
+/* ─── T15: DRed equivalence-oracle property (monotone DAG, add+delete) ──── */
+
+static void test_dred_property_monotone(void)
+{
+    dl_db *ivm_db, *oracle_db;
+    int iter, i;
+
+    TEST("T15: DRed — seeded random add/delete property vs full re-eval");
+
+    setup_db(&ivm_db, "t15ivm");
+    setup_db(&oracle_db, "t15ora");
+
+    for (i = 0; i < 5; i++) {
+        assert(dl_declare_relation(ivm_db, IVM_EDB[i], 2) == 0);
+        assert(dl_declare_relation(oracle_db, IVM_EDB[i], 2) == 0);
+    }
+    assert(dl_load_rules(ivm_db, IVM_RULES) == 0);
+    assert(dl_load_rules(oracle_db, IVM_RULES) == 0);
+    assert(vm_dred_eligible(ivm_db) == 1);
+    assert(dl_compile(ivm_db) == 0);
+    assert(dl_compile(oracle_db) == 0);
+
+    prng_state = 0xD00DFEEDu;
+
+    {
+        int runs0 = vm_dred_runs;
+        int expect_dred = 0;   /* exactly the successful-delete iterations */
+
+        for (iter = 0; iter < 150; iter++) {
+            int rel = (int)(prng_next() % 5);
+            int is_del = (int)(prng_next() & 1u);
+            uint32_t cols[2] = { prng_next() % 8, prng_next() % 8 };
+            int rc;
+
+            /* Identical random add-or-delete into both databases. */
+            if (is_del) {
+                rc = dl_delete_fact(ivm_db, IVM_EDB[rel], cols, 2);
+                if (rc < 0) { printf("  IVM dl_delete_fact error\n"); goto fail_prop; }
+                if (rc == 1) expect_dred++;
+                rc = dl_delete_fact(oracle_db, IVM_EDB[rel], cols, 2);
+                if (rc < 0) { printf("  oracle dl_delete_fact error\n"); goto fail_prop; }
+            } else {
+                rc = dl_add_fact(ivm_db, IVM_EDB[rel], cols, 2);
+                if (rc < 0) { printf("  IVM dl_add_fact error\n"); goto fail_prop; }
+                rc = dl_add_fact(oracle_db, IVM_EDB[rel], cols, 2);
+                if (rc < 0) { printf("  oracle dl_add_fact error\n"); goto fail_prop; }
+            }
+
+            /* IVM: DRed/propagation on publish.  Oracle: full re-eval. */
+            if (dl_publish_snapshot(ivm_db) != 0) {
+                printf("  publish failed at iter %d\n", iter);
+                goto fail_prop;
+            }
+            if (dl_compile(oracle_db) != 0) {
+                printf("  oracle compile failed at iter %d\n", iter);
+                goto fail_prop;
+            }
+
+            if (!compare_all_views(ivm_db, oracle_db)) {
+                printf("  divergence at iter %d (rel %s, %s (%u,%u))\n",
+                       iter, IVM_EDB[rel], is_del ? "DEL" : "ADD",
+                       cols[0], cols[1]);
+                goto fail_prop;
+            }
+        }
+
+        /* Every successful delete ran DRed (deletes never fall back on this
+         * monotone non-recursive program); every add used the Slice-1
+         * propagator instead.  Exact count proves the routing. */
+        if (vm_dred_runs != runs0 + expect_dred) {
+            printf("  DRed ran %d times, expected %d\n",
+                   vm_dred_runs - runs0, expect_dred);
+            goto fail_prop;
+        }
+    }
+
+    teardown_db(ivm_db, "t15ivm");
+    teardown_db(oracle_db, "t15ora");
+    PASS();
+    return;
+
+fail_prop:
+    teardown_db(ivm_db, "t15ivm");
+    teardown_db(oracle_db, "t15ora");
+    FAIL("T15: DRed views diverged from full re-eval oracle");
+}
+
+/* ─── T16: DRed equivalence-oracle property (stratified negation) ───────── */
+
+static int compare_neg_views(dl_db *ivm, dl_db *oracle)
+{
+    const char *rels[] = {"edge", "blocked", "cut", "mid", "ok", "top"};
+    int i;
+    for (i = 0; i < 6; i++) {
+        tuple_set ta, tb;
+        query_set_prefix(ivm, rels[i], &ta);
+        query_set_prefix(oracle, rels[i], &tb);
+        if (!sets_equal(&ta, &tb)) {
+            printf("  %s: IVM %ld rows vs oracle %ld rows\n",
+                   rels[i], ta.count, tb.count);
+            long j;
+            for (j = 0; j < ta.count; j++)
+                printf("    ivm (%u,%u)\n", ta.data[j*2], ta.data[j*2+1]);
+            for (j = 0; j < tb.count; j++)
+                printf("    ora (%u,%u)\n", tb.data[j*2], tb.data[j*2+1]);
+            tset_free(&ta); tset_free(&tb);
+            return 0;
+        }
+        tset_free(&ta); tset_free(&tb);
+    }
+    return 1;
+}
+
+static void test_dred_property_negation(void)
+{
+    dl_db *ivm_db, *oracle_db;
+    int iter, i;
+
+    TEST("T16: DRed + negation — seeded random add/delete property vs oracle");
+
+    setup_db(&ivm_db, "t16ivm");
+    setup_db(&oracle_db, "t16ora");
+
+    for (i = 0; i < 3; i++) {
+        assert(dl_declare_relation(ivm_db, NEG_EDB[i], 2) == 0);
+        assert(dl_declare_relation(oracle_db, NEG_EDB[i], 2) == 0);
+    }
+    assert(dl_load_rules(ivm_db, NEG_RULES) == 0);
+    assert(dl_load_rules(oracle_db, NEG_RULES) == 0);
+    assert(vm_ivm_eligible(ivm_db) == 0);    /* negation: insert path out */
+    assert(vm_dred_eligible(ivm_db) == 1);   /* DRed handles it           */
+    assert(dl_compile(ivm_db) == 0);
+    assert(dl_compile(oracle_db) == 0);
+
+    prng_state = 0xFACEB00Cu;
+
+    {
+        int runs0 = vm_dred_runs;
+        int expect_dred = 0;   /* every effective change (add OR delete):
+                                * inserts also route to DRed here because the
+                                * negation program is not insert-IVM-eligible */
+
+        for (iter = 0; iter < 150; iter++) {
+            int rel = (int)(prng_next() % 3);
+            int is_del = (int)(prng_next() & 1u);
+            uint32_t cols[2] = { prng_next() % 6, prng_next() % 6 };
+            int rc;
+
+            if (is_del) {
+                rc = dl_delete_fact(ivm_db, NEG_EDB[rel], cols, 2);
+                if (rc < 0) { printf("  IVM dl_delete_fact error\n"); goto fail_prop; }
+                if (rc == 1) expect_dred++;
+                rc = dl_delete_fact(oracle_db, NEG_EDB[rel], cols, 2);
+                if (rc < 0) { printf("  oracle dl_delete_fact error\n"); goto fail_prop; }
+            } else {
+                rc = dl_add_fact(ivm_db, NEG_EDB[rel], cols, 2);
+                if (rc < 0) { printf("  IVM dl_add_fact error\n"); goto fail_prop; }
+                if (rc == 1) expect_dred++;
+                rc = dl_add_fact(oracle_db, NEG_EDB[rel], cols, 2);
+                if (rc < 0) { printf("  oracle dl_add_fact error\n"); goto fail_prop; }
+            }
+
+            if (dl_publish_snapshot(ivm_db) != 0) {
+                printf("  publish failed at iter %d\n", iter);
+                goto fail_prop;
+            }
+            if (dl_compile(oracle_db) != 0) {
+                printf("  oracle compile failed at iter %d\n", iter);
+                goto fail_prop;
+            }
+
+            if (!compare_neg_views(ivm_db, oracle_db)) {
+                printf("  divergence at iter %d (rel %s, %s (%u,%u))\n",
+                       iter, NEG_EDB[rel], is_del ? "DEL" : "ADD",
+                       cols[0], cols[1]);
+                goto fail_prop;
+            }
+        }
+
+        if (vm_dred_runs != runs0 + expect_dred) {
+            printf("  DRed ran %d times, expected %d\n",
+                   vm_dred_runs - runs0, expect_dred);
+            goto fail_prop;
+        }
+    }
+
+    teardown_db(ivm_db, "t16ivm");
+    teardown_db(oracle_db, "t16ora");
+    PASS();
+    return;
+
+fail_prop:
+    teardown_db(ivm_db, "t16ivm");
+    teardown_db(oracle_db, "t16ora");
+    FAIL("T16: DRed+negation views diverged from full re-eval oracle");
+}
+
+/* ─── T17: DRed eligibility boundary — recursion/aggregates fall back ───── */
+
+static void test_dred_fallback_eligibility(void)
+{
+    dl_db *db;
+
+    TEST("T17: recursive / aggregate programs are DRed-ineligible -> fallback");
+
+    setup_db(&db, "t17");
+
+    /* Recursive: the over-delete cascade cannot retract a recursive SCC's
+     * mutually-dependent tuples — must fall back to the full fixpoint. */
+    assert(dl_declare_relation(db, "edge", 2) == 0);
+    assert(dl_load_rules(db,
+        "tc(X,Y):-edge(X,Y).\n"
+        "tc(X,Z):-edge(X,Y),tc(Y,Z).\n") == 0);
+    assert(vm_dred_eligible(db) == 0);
+
+    /* Aggregate: group state (min/max of a deleted extremum) cannot be
+     * maintained by over-delete + re-add — must fall back. */
+    {
+        dl_db *adb;
+        setup_db(&adb, "t17a");
+        assert(dl_declare_relation(adb, "sale", 2) == 0);
+        assert(dl_load_rules(adb, "total(X,S):-sale(X,Y),S=sum(Y).\n") == 0);
+        if (vm_dred_eligible(adb) != 0) {
+            teardown_db(adb, "t17a");
+            teardown_db(db, "t17");
+            FAIL("T17: aggregate program wrongly DRed-eligible");
+            return;
+        }
+        teardown_db(adb, "t17a");
+    }
+
+    /* The fallback itself stays correct (pinned end-to-end by T1/T2; here a
+     * small recursive delete through the full re-eval path). */
+    {
+        uint32_t e12[2] = {1,2}, e23[2] = {2,3};
+        assert(dl_add_fact(db, "edge", e12, 2) == 1);
+        assert(dl_add_fact(db, "edge", e23, 2) == 1);
+    }
+    assert(dl_publish_snapshot(db) == 0);
+    {
+        uint32_t tc[] = {1,2, 2,3, 1,3};
+        if (!check_rel2(db, "tc", tc, 3)) {
+            teardown_db(db, "t17");
+            FAIL("T17: wrong tc before delete");
+            return;
+        }
+    }
+    {
+        uint32_t e23[2] = {2,3};
+        assert(dl_delete_fact(db, "edge", e23, 2) == 1);
+    }
+    assert(dl_publish_snapshot(db) == 0);
+    {
+        uint32_t tc[] = {1,2};
+        if (!check_rel2(db, "tc", tc, 1)) {
+            teardown_db(db, "t17");
+            FAIL("T17: recursive delete did not fall back correctly");
+            return;
+        }
+    }
+
+    teardown_db(db, "t17");
+    PASS();
+}
+
+/* ─── T18: DRed over-delete with a same-stratum OP_LOOKUP consumer ───────
+ * Regression for a confirmed blocker: the over-delete cascade grew over[hid]
+ * via ts_add (unsorted) and only sorted it AFTER the in-stratum fixpoint
+ * converged.  A same-stratum consumer reading over[hid] as an OP_LOOKUP
+ * override (ts_prefix binary search) silently missed tuples -> incomplete
+ * over-delete -> stale survivors.  Here q(X):-b(X),p(X) reads p (over-delete
+ * set) via OP_LOOKUP while p(X):-a(X). p(X):-c(X). both feed it in the same
+ * stratum. */
+static void test_dred_overdelete_lookup_same_stratum(void)
+{
+    dl_db *db;
+
+    TEST("T18: DRed over-delete stays correct when a consumer reads via OP_LOOKUP");
+
+    setup_db(&db, "t18");
+    assert(dl_declare_relation(db, "a", 1) == 0);
+    assert(dl_declare_relation(db, "b", 1) == 0);
+    assert(dl_declare_relation(db, "c", 1) == 0);
+    {
+        uint32_t v;
+        v = 5; assert(dl_add_fact(db, "a", &v, 1) == 1);
+        uint32_t bv[3] = {1, 3, 5};
+        for (int i = 0; i < 3; i++) { v = bv[i]; assert(dl_add_fact(db, "b", &v, 1) == 1); }
+        v = 1; assert(dl_add_fact(db, "c", &v, 1) == 1);
+    }
+    assert(dl_load_rules(db,
+        "p(X):-a(X).\n"
+        "p(X):-c(X).\n"
+        "q(X):-b(X),p(X).\n") == 0);
+    assert(dl_compile(db) == 0);
+    assert(dl_publish_snapshot(db) == 0);
+
+    /* q = b ∩ p = {1,3,5} ∩ {1,5} = {1,5} (2 rows). */
+    {
+        tuple_set ts = {0};
+        long n = dl_query(db, "q", tset_cb, &ts);
+        if (n < 0 || ts.count != 2) {
+            FAIL("T18: wrong q before delete"); tset_free(&ts); teardown_db(db, "t18"); return;
+        }
+        tset_free(&ts);
+    }
+
+    /* Delete a(5) and c(1): p becomes empty, so q must become empty.  A stale
+     * over-delete would leave q={1,5} (silent wrong answer). */
+    {
+        uint32_t v = 5;
+        assert(dl_delete_fact(db, "a", &v, 1) == 1);
+        v = 1;
+        assert(dl_delete_fact(db, "c", &v, 1) == 1);
+    }
+    assert(dl_publish_snapshot(db) == 0);
+    {
+        tuple_set ts = {0};
+        long n = dl_query(db, "q", tset_cb, &ts);
+        if (n < 0 || ts.count != 0) {
+            FAIL("T18: stale over-delete survivors (OP_LOOKUP consumer)");
+            tset_free(&ts); teardown_db(db, "t18"); return;
+        }
+        tset_free(&ts);
+    }
+
+    teardown_db(db, "t18");
+    PASS();
+}
+
 /* ─── Main ────────────────────────────────────────────────────────────── */
 
 int main(void)
 {
-    printf("IVM Slice 0/1/2 correctness + IVM equivalence-oracle tests\n");
-    printf("=======================================================\n\n");
+    printf("IVM Slice 0/1/2/3 correctness + IVM equivalence-oracle tests\n");
+    printf("==========================================================\n\n");
 
     test_tc_delete();
     test_aggregate_delete();
@@ -1135,6 +1735,12 @@ int main(void)
     test_recursive_negation_fallback();
     test_mutual_recursion_insert_ivm();
     test_nonrecursive_head_feeds_recursion_fallback();
+    test_dred_delete_deterministic();
+    test_dred_negation_deterministic();
+    test_dred_property_monotone();
+    test_dred_property_negation();
+    test_dred_fallback_eligibility();
+    test_dred_overdelete_lookup_same_stratum();
 
     printf("\n%d tests run, %d failed\n", tests_run, tests_failed);
     return tests_failed ? 1 : 0;

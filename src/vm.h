@@ -71,4 +71,47 @@ void vm_clear_deltas(dl_db *db);
  * PRECONDITION: vm_ivm_eligible(db) == 1 and vm_has_recursive(db) == 1. */
 int vm_execute_ivm(dl_db *db);
 
+/* ─── IVM Slice 3: DRed deletion (over-delete + re-derive) ─────────────── */
+
+/* 1 if EVERY compiled rule is DRed-deletion-eligible: non-recursive,
+ * aggregate-free, and free of the override-incompatible opcodes
+ * (OP_WALK / OP_LOOKUP_PERM / OP_HASH_JOIN).  Stratified NEGATION IS allowed:
+ * the bounded over-delete cascade handles retraction through positive body
+ * atoms, and the heads of negation-containing rules take a conservative
+ * full view reset (drop derived + re-derive) because negation-driven
+ * retractions cannot be enumerated by the positive cascade.  Returns 0 if
+ * any deletion must fall back to the full fixpoint (the correctness floor):
+ * recursion, aggregates, or an opcode whose body atom cannot be overridden
+ * by the over-delete cascade. */
+int vm_dred_eligible(dl_db *db);
+
+/* DRed deletion maintenance: consume db->del_pending (and any co-pending
+ * db->delta_pending inserts) by
+ *   (1) over-deleting every tuple transitively derived from a deleted base
+ *       fact through POSITIVE body atoms (bounded cascade, stratum-ordered),
+ *   (2) resetting (view = base) every head of a rule containing negation
+ *       when any change is pending (negation retractions are not enumerable
+ *       by the positive cascade — conservative full reset, propagated to
+ *       dependents),
+ *   (3) re-deriving the affected cone stratum-by-stratum (ADD-only fixpoint,
+ *       so survivors and newly-derivable tuples — including tuples unlocked
+ *       by a negated body atom becoming true — are re-added).
+ * Base facts are never over-deleted (mixed EDB+IDB semantics: delete from
+ * base; if the tuple is still derivable it survives in the view, else it
+ * vanishes).  Frees both pending sets.  Returns 0 on success, -1 on error
+ * (the publish path then forces a full re-eval — never mis-evaluate).
+ *
+ * PRECONDITION: vm_dred_eligible(db) == 1 (the publish dispatch enforces). */
+int vm_dred_delete(dl_db *db);
+
+/* Free all pending delete tuple_sets (after a full re-eval consumes the
+ * pending changes, and on dl_close). */
+void vm_clear_deletes(dl_db *db);
+
+/* Test observable: number of times vm_dred_delete has run in this process.
+ * Lets the equivalence-oracle tests PROVE the DRed path was taken (a test
+ * that silently fell back to the full re-eval would also produce correct
+ * views — this counter distinguishes them). */
+extern int vm_dred_runs;
+
 #endif
