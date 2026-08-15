@@ -133,8 +133,8 @@ Product construction: walk `(dafsa_state, regex_state)` pairs in lockstep, emitt
 - Time-travel (CozoDB-style valid-time) -- would need a time-axis in the key encoding.
 - Variable-arity relations.
 - Bushy join plans (v1 = left-deep only).
-- Incremental view maintenance across snapshot changes (v1 = full re-eval at snapshot time; see section 7).
-- Trace/JIT compilation of hot rules (v1 = pure bytecode interpreter).
+- ~~Incremental view maintenance~~ (SHIPPED: v2 IVM, Slices 0-5).
+- ~~Trace/JIT compilation of hot rules~~ (REJECTED — see §10.8).
 
 ---
 
@@ -351,7 +351,8 @@ Each milestone is independently testable. The first vertical slice (M0+M1) is on
 
 7. **Concurrency (no file locking anywhere in jing-meta -- verified 2026-08-10)** -- Single-writer/multi-reader in v1. **Mitigation:** document; v1 = single writer process; multi-writer requires a server process (v2). The mmap read path is multi-reader safe by construction (read-only mmap). **Watch:** two processes calling `publish_snapshot` concurrently will corrupt each other's WAL -- enforce single-writer at the API or filesystem level (flock on a lockfile in the DB dir).
 
-8. **Perf vs Souffle on raw rule eval** -- Souffle synthesizes native code per rule; we interpret bytecode. We'll be slower on the fixpoint itself. **Mitigation:** lean on the DAFSA density advantage for storage and the mmap zero-copy read path; if VM is the bottleneck, add hot-rule trace compilation in v2. **Watch:** if a workload is dominated by complex rules over small data, Souffle wins outright; the user's value prop is embedding + storage density, not raw rule throughput.
+8. **Perf vs Souffle on raw rule eval** -- Souffle synthesizes native code per rule; we interpret bytecode. We'll be slower on the fixpoint itself. **Mitigation:** lean on the DAFSA density advantage for storage and the mmap zero-copy read path. **Watch:** if a workload is dominated by complex rules over small data, Souffle wins outright; the user's value prop is embedding + storage density, not raw rule throughput.
+   **RESOLVED (2026-08-15): trace/JIT compilation is REJECTED.** Measurement + code inspection show the interpreter is NOT the bottleneck: the fixpoint cost is dominated by C tuple/DAFSA operations (`rel_prefix`/`rel_add`/`rel_exact`/`ts_*` and the post-fixpoint DAFSA bulk-build) that a native-compiled rule body would still call into. A microbenchmark found bytecode dispatch is ~60% of a *pure-compute* body (the best case) and vanishes into noise on join-anchored rules; a single C-op call costs ~3.7× the entire compiled compute loop. Native codegen could only help compute-heavy bodies, and QBE (the candidate backend) emits assembly text rather than executable memory, so it does not even solve the asm→executable half of a runtime JIT. IVM (shipped) has additionally removed most full-fixpoint re-runs. If a dispatch-bound workload ever emerges, the first step is interpreter-level optimization (inline `b_get`/`b_try`, superinstruction fusion, streaming prefix enumeration), not a JIT backend.
 
 9. **WAL/compaction races inherited from dafsa.c** -- The known jing-meta "no file locking" caveat carries over. **Mitigation:** v1 single-writer model; explicit lifecycle (one process publishes). **Watch:** an embedded use case where the host app and a maintenance process both publish will race -- refuse at the API level (flock on a lockfile in the DB dir).
 
@@ -371,4 +372,4 @@ Each milestone is independently testable. The first vertical slice (M0+M1) is on
 8. **Joins:** index-nested-loop via prefix-binding (primary), hash-join (fallback), **sort-merge rejected**.
 9. **Evaluation:** bottom-up semi-naive to fixpoint once per snapshot; point-lookup queries against materialized goal relations.
 10. **Lifecycle:** load -> declare -> compile -> publish-snapshot -> serve-reads; single writer, multi reader.
-11. **Deferred (v2):** magic-sets, bushy plans, IVM, time-travel, variable arity, trace compilation, negation/aggregates interaction.
+11. **Deferred (v2):** magic-sets/QSQ top-down, bushy plans, time-travel, variable arity, negation/aggregates interaction. (IVM SHIPPED v2 Slices 0-5; trace/JIT REJECTED — see §10.8.)

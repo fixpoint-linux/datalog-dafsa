@@ -5,6 +5,39 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **v2 IVM (incremental view maintenance)**, Slices 0-5: the fixpoint is now
+  incrementally maintained instead of fully re-evaluated on every change.
+  - **Slice 0 — deletion-correctness**: a base/view partition inside each
+    relation (`base` = durable EDB facts, `view` = base ∪ derived) fixes a
+    pre-existing silent wrong answer where `dl_delete_fact` + re-publish left
+    stale derived tuples (recursive `tc` returned 6 rows after deleting
+    `edge(2,3)`; an aggregate kept a stale `(1,15)`). `vm_execute` now resets
+    every rule-head view to a copy of base before re-evaluating. IDB base
+    persists to `<name>.base.dafsa`; rels.txt + snapshot manifest gain a
+    backward-compatible `edb|idb` flag.
+  - **Slice 1 — insert-only IVM**: `dl_add_fact` captures a +delta; the publish
+    dispatch propagates eligible deltas through dependent rules (semi-naive
+    single-step via the existing `exec_rule` override) instead of a full
+    fixpoint. Anything outside the eligible class (recursion, negation,
+    aggregates, OP_WALK/OP_LOOKUP_PERM) falls back to a full re-eval.
+  - **Slice 2 — recursive insert IVM**: the semi-naive recursive fixpoint is
+    seeded from the current view + the new base delta (never reset on the IVM
+    path). `vm_ivm_eligible` accepts recursive rules under a correctness
+    restriction.
+  - **Slice 3 — DRed deletion**: on delete, over-delete + re-derive for the
+    monotone + stratified-negation cases, with a mandatory full-re-eval
+    fallback for recursion/aggregates/anything unproven. Recursion+deletion
+    falls back to full re-eval.
+  - **Slice 4 — aggregates under change**: count/sum/min/max via affected-group
+    re-scan (uniformly correct incl. delete-an-extremum); non-tractable shapes
+    (shared head, repeated-variable anchor, derived anchor, etc.) fall back.
+  - **Slice 5 — bulk-load IVM + persistence**: `dl_load_facts` is a batched
+    delta through the existing dispatch; `write_rels_txt` hardened to atomic
+    (tmp+fsync+rename).
+  - Correctness is guaranteed throughout by a full-re-eval fallback (never
+    silently mis-evaluate) and by equivalence-oracle property tests comparing
+    IVM-maintained views to full re-eval byte-for-byte over random
+    add/delete/bulk sequences. 25 IVM tests; full suite 306 tests green.
 - **M9 arithmetic + comparison builtins**: non-relational builtins extend the
   existing equality to a full comparison / arithmetic set:
   - **Comparisons** `<`, `<=`, `>`, `>=`, `!=` as infix body atoms (operands =
@@ -99,6 +132,16 @@ All notable changes to this project are documented in this file.
   `regex_compile` dropping a lexer error on the "success" path, and character-class
   handling of metacharacters and descending ranges.
 - `.gitignore` entries for the new test binaries and the bench binary.
+
+### Rejected
+- **Trace/JIT compilation of hot rules** (2026-08-15): rejected. Measurement and
+  code inspection show the bytecode interpreter is not the fixpoint bottleneck —
+  the cost is dominated by C tuple/DAFSA operations that a native-compiled rule
+  body would still call into. QBE (the candidate backend) was evaluated and
+  found to emit assembly text rather than executable memory, so it does not
+  solve the asm→executable half of a runtime JIT. See design §10.8. If a
+  dispatch-bound workload ever emerges, interpreter-level optimization comes
+  first, not a JIT.
 
 ### Fixed
 - **Silent wrong answer in the semi-naive fixpoint for multi-recursive-atom
