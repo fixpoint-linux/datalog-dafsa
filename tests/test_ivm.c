@@ -1716,11 +1716,383 @@ static void test_dred_overdelete_lookup_same_stratum(void)
     PASS();
 }
 
+/* ─── IVM Slice 4: aggregates under change ──────────────────────────────── */
+
+/* Four grouped aggregates over a single anchor `sale/2`, grouped by the
+ * leading column X.  Each head is TERMINAL and pure-derived, so the whole
+ * program is aggregate-IVM-eligible (vm_agg_eligible == 1). */
+#define AGG_RULES \
+    "cnt(X,N):-sale(X,Y),N=count().\n" \
+    "tot(X,S):-sale(X,Y),S=sum(Y).\n" \
+    "minv(X,M):-sale(X,Y),M=min(Y).\n" \
+    "maxv(X,M):-sale(X,Y),M=max(Y).\n"
+
+/* Compare the in-memory views of the aggregate ruleset's relations. */
+static int compare_agg_views(dl_db *ivm, dl_db *oracle)
+{
+    const char *rels[] = {"sale", "cnt", "tot", "minv", "maxv"};
+    int i;
+    for (i = 0; i < 5; i++) {
+        tuple_set ta, tb;
+        query_set_prefix(ivm, rels[i], &ta);
+        query_set_prefix(oracle, rels[i], &tb);
+        if (!sets_equal(&ta, &tb)) {
+            printf("  %s: IVM %ld rows vs oracle %ld rows\n",
+                   rels[i], ta.count, tb.count);
+            tset_free(&ta); tset_free(&tb);
+            return 0;
+        }
+        tset_free(&ta); tset_free(&tb);
+    }
+    return 1;
+}
+
+/* T19: deterministic aggregate IVM — count/sum/min/max under add/delete,
+ * including delete-an-extremum (min/max) and the empty-group edge, with a
+ * routing-proof assertion that the aggregate path (not full re-eval) ran. */
+static void test_aggregate_ivm_deterministic(void)
+{
+    dl_db *db;
+    int runs0;
+
+    TEST("T19: aggregate IVM — count/sum/min/max under add/delete");
+
+    setup_db(&db, "t19");
+    assert(dl_declare_relation(db, "sale", 2) == 0);
+    assert(dl_load_rules(db, AGG_RULES) == 0);
+    if (vm_agg_eligible(db) != 1) {
+        teardown_db(db, "t19");
+        FAIL("T19: aggregate ruleset should be agg-IVM-eligible");
+        return;
+    }
+    assert(dl_compile(db) == 0);
+
+    /* Seed: sale = {(1,10),(1,5),(2,3),(3,7)}.  Populated via the INCREMENTAL
+     * path (dl_add_fact + publish after an empty compile). */
+    runs0 = vm_agg_runs;
+    {
+        uint32_t s[][2] = {{1,10},{1,5},{2,3},{3,7}};
+        int i;
+        for (i = 0; i < 4; i++)
+            assert(dl_add_fact(db, "sale", s[i], 2) == 1);
+    }
+    assert(dl_publish_snapshot(db) == 0);
+    if (vm_agg_runs != runs0 + 1) {
+        teardown_db(db, "t19");
+        FAIL("T19: seed publish did not route through aggregate IVM");
+        return;
+    }
+
+    {
+        uint32_t cnt[] = {1,2, 2,1, 3,1};
+        uint32_t tot[] = {1,15, 2,3, 3,7};
+        uint32_t minv[] = {1,5, 2,3, 3,7};
+        uint32_t maxv[] = {1,10, 2,3, 3,7};
+        if (!check_rel2(db, "cnt", cnt, 3) || !check_rel2(db, "tot", tot, 3) ||
+            !check_rel2(db, "minv", minv, 3) || !check_rel2(db, "maxv", maxv, 3)) {
+            teardown_db(db, "t19");
+            FAIL("T19: seed aggregate derivation wrong");
+            return;
+        }
+    }
+
+    /* add sale(2,9): count/sum/max of group 2 update; min unchanged. */
+    runs0 = vm_agg_runs;
+    { uint32_t s[2] = {2,9}; assert(dl_add_fact(db, "sale", s, 2) == 1); }
+    assert(dl_publish_snapshot(db) == 0);
+    if (vm_agg_runs != runs0 + 1) {
+        teardown_db(db, "t19");
+        FAIL("T19: add did not route through aggregate IVM");
+        return;
+    }
+    {
+        uint32_t cnt[] = {1,2, 2,2, 3,1};
+        uint32_t tot[] = {1,15, 2,12, 3,7};
+        uint32_t minv[] = {1,5, 2,3, 3,7};
+        uint32_t maxv[] = {1,10, 2,9, 3,7};
+        if (!check_rel2(db, "cnt", cnt, 3) || !check_rel2(db, "tot", tot, 3) ||
+            !check_rel2(db, "minv", minv, 3) || !check_rel2(db, "maxv", maxv, 3)) {
+            teardown_db(db, "t19");
+            FAIL("T19: add(2,9) aggregate update wrong");
+            return;
+        }
+    }
+
+    /* delete sale(1,10): the MAX extremum of group 1 — group re-scan must
+     * re-find maxv(1)=5. */
+    runs0 = vm_agg_runs;
+    { uint32_t s[2] = {1,10}; assert(dl_delete_fact(db, "sale", s, 2) == 1); }
+    assert(dl_publish_snapshot(db) == 0);
+    if (vm_agg_runs != runs0 + 1) {
+        teardown_db(db, "t19");
+        FAIL("T19: delete-extremum did not route through aggregate IVM");
+        return;
+    }
+    {
+        uint32_t cnt[] = {1,1, 2,2, 3,1};
+        uint32_t tot[] = {1,5, 2,12, 3,7};
+        uint32_t minv[] = {1,5, 2,3, 3,7};
+        uint32_t maxv[] = {1,5, 2,9, 3,7};
+        if (!check_rel2(db, "cnt", cnt, 3) || !check_rel2(db, "tot", tot, 3) ||
+            !check_rel2(db, "minv", minv, 3) || !check_rel2(db, "maxv", maxv, 3)) {
+            teardown_db(db, "t19");
+            FAIL("T19: delete-extremum max update wrong");
+            return;
+        }
+    }
+
+    /* delete sale(1,5): group 1 becomes empty — all four heads drop (1,*). */
+    runs0 = vm_agg_runs;
+    { uint32_t s[2] = {1,5}; assert(dl_delete_fact(db, "sale", s, 2) == 1); }
+    assert(dl_publish_snapshot(db) == 0);
+    {
+        uint32_t cnt[] = {2,2, 3,1};
+        uint32_t tot[] = {2,12, 3,7};
+        uint32_t minv[] = {2,3, 3,7};
+        uint32_t maxv[] = {2,9, 3,7};
+        if (!check_rel2(db, "cnt", cnt, 2) || !check_rel2(db, "tot", tot, 2) ||
+            !check_rel2(db, "minv", minv, 2) || !check_rel2(db, "maxv", maxv, 2)) {
+            teardown_db(db, "t19");
+            FAIL("T19: empty-group drop wrong");
+            return;
+        }
+    }
+
+    /* add sale(1,4): group 1 reappears (count/sum/min/max all = 4). */
+    { uint32_t s[2] = {1,4}; assert(dl_add_fact(db, "sale", s, 2) == 1); }
+    assert(dl_publish_snapshot(db) == 0);
+    {
+        uint32_t cnt[] = {1,1, 2,2, 3,1};
+        uint32_t tot[] = {1,4, 2,12, 3,7};
+        uint32_t minv[] = {1,4, 2,3, 3,7};
+        uint32_t maxv[] = {1,4, 2,9, 3,7};
+        if (!check_rel2(db, "cnt", cnt, 3) || !check_rel2(db, "tot", tot, 3) ||
+            !check_rel2(db, "minv", minv, 3) || !check_rel2(db, "maxv", maxv, 3)) {
+            teardown_db(db, "t19");
+            FAIL("T19: group reappear wrong");
+            return;
+        }
+    }
+
+    teardown_db(db, "t19");
+    PASS();
+}
+
+/* T20: aggregate equivalence-oracle property test — count/sum/min/max views
+ * must equal a full re-eval over random add/delete sequences (multiple
+ * groups, empty-group edges, delete-an-extremum), with a routing-proof
+ * assertion that the incremental aggregate path ran for every effective
+ * change. */
+static void test_aggregate_ivm_property(void)
+{
+    dl_db *ivm_db, *oracle_db;
+    int iter;
+    int runs0, effective = 0;
+
+    TEST("T20: aggregate IVM — seeded random add/delete property vs oracle");
+
+    setup_db(&ivm_db, "t20ivm");
+    setup_db(&oracle_db, "t20ora");
+
+    assert(dl_declare_relation(ivm_db, "sale", 2) == 0);
+    assert(dl_declare_relation(oracle_db, "sale", 2) == 0);
+    assert(dl_load_rules(ivm_db, AGG_RULES) == 0);
+    assert(dl_load_rules(oracle_db, AGG_RULES) == 0);
+    assert(vm_agg_eligible(ivm_db) == 1);
+    assert(dl_compile(ivm_db) == 0);
+    assert(dl_compile(oracle_db) == 0);
+
+    prng_state = 0x5EEDC0DEu;
+    runs0 = vm_agg_runs;
+
+    for (iter = 0; iter < 150; iter++) {
+        int is_del = (int)(prng_next() & 1u);
+        uint32_t cols[2] = { prng_next() % 6, prng_next() % 8 };
+        int rc;
+
+        if (is_del) {
+            rc = dl_delete_fact(ivm_db, "sale", cols, 2);
+            if (rc < 0) { printf("  IVM dl_delete_fact error\n"); goto fail_prop; }
+            if (rc == 1) effective++;
+            rc = dl_delete_fact(oracle_db, "sale", cols, 2);
+            if (rc < 0) { printf("  oracle dl_delete_fact error\n"); goto fail_prop; }
+        } else {
+            rc = dl_add_fact(ivm_db, "sale", cols, 2);
+            if (rc < 0) { printf("  IVM dl_add_fact error\n"); goto fail_prop; }
+            if (rc == 1) effective++;
+            rc = dl_add_fact(oracle_db, "sale", cols, 2);
+            if (rc < 0) { printf("  oracle dl_add_fact error\n"); goto fail_prop; }
+        }
+
+        if (dl_publish_snapshot(ivm_db) != 0) {
+            printf("  publish failed at iter %d\n", iter);
+            goto fail_prop;
+        }
+        if (dl_compile(oracle_db) != 0) {
+            printf("  oracle compile failed at iter %d\n", iter);
+            goto fail_prop;
+        }
+
+        if (!compare_agg_views(ivm_db, oracle_db)) {
+            printf("  divergence at iter %d (%s (%u,%u))\n",
+                   iter, is_del ? "DEL" : "ADD", cols[0], cols[1]);
+            goto fail_prop;
+        }
+    }
+
+    if (vm_agg_runs != runs0 + effective) {
+        printf("  aggregate IVM ran %d times, expected %d\n",
+               vm_agg_runs - runs0, effective);
+        goto fail_prop;
+    }
+
+    teardown_db(ivm_db, "t20ivm");
+    teardown_db(oracle_db, "t20ora");
+    PASS();
+    return;
+
+fail_prop:
+    teardown_db(ivm_db, "t20ivm");
+    teardown_db(oracle_db, "t20ora");
+    FAIL("T20: aggregate IVM views diverged from full re-eval oracle");
+}
+
+/* T21: aggregate-IVM eligibility boundary — tricky aggregate shapes fall
+ * back to the full fixpoint (still correct) rather than the incremental
+ * path. */
+static void test_aggregate_ivm_fallback_eligibility(void)
+{
+    TEST("T21: non-tractable aggregate shapes fall back (and stay correct)");
+
+    /* result-var-first head: group is not a leading head prefix. */
+    {
+        dl_db *db;
+        setup_db(&db, "t21a");
+        assert(dl_declare_relation(db, "sale", 2) == 0);
+        assert(dl_load_rules(db, "cnt2(N,X):-sale(X,Y),N=count().\n") == 0);
+        if (vm_agg_eligible(db) != 0) {
+            teardown_db(db, "t21a");
+            FAIL("T21: result-first head wrongly agg-IVM-eligible");
+            return;
+        }
+        /* End-to-end: the fallback (full re-eval) stays correct on delete. */
+        {
+            uint32_t s[][2] = {{1,10},{1,5},{2,3}};
+            int i;
+            for (i = 0; i < 3; i++) assert(dl_add_fact(db, "sale", s[i], 2) == 1);
+        }
+        assert(dl_publish_snapshot(db) == 0);
+        { uint32_t s[2] = {1,10}; assert(dl_delete_fact(db, "sale", s, 2) == 1); }
+        assert(dl_publish_snapshot(db) == 0);
+        {
+            tuple_set ts = {0};
+            long n = dl_query(db, "cnt2", tset_cb, &ts);
+            /* cnt2(N,X): after deleting sale(1,10) from {(1,10),(1,5),(2,3)},
+             * group X=1 has 1 row -> (N=1,X=1); group X=2 has 1 row -> (1,2).
+             * Head order is (N,X). */
+            uint32_t e1[2] = {1,1}, e2[2] = {1,2};
+            if (n < 0 || ts.count != 2 || !tset_has(&ts, e1) || !tset_has(&ts, e2)) {
+                printf("  cnt2 got %ld rows\n", ts.count);
+                long j;
+                for (j = 0; j < ts.count; j++)
+                    printf("    (%u,%u)\n", ts.data[j*2], ts.data[j*2+1]);
+                tset_free(&ts); teardown_db(db, "t21a");
+                FAIL("T21: result-first fallback delete wrong");
+                return;
+            }
+            tset_free(&ts);
+        }
+        teardown_db(db, "t21a");
+    }
+
+    /* join body (multi-atom): not the minimal scan-anchor shape. */
+    {
+        dl_db *db;
+        setup_db(&db, "t21b");
+        assert(dl_declare_relation(db, "sale", 2) == 0);
+        assert(dl_declare_relation(db, "q", 1) == 0);
+        assert(dl_load_rules(db, "big(X,N):-sale(X,Y),q(Y),N=count().\n") == 0);
+        if (vm_agg_eligible(db) != 0) {
+            teardown_db(db, "t21b");
+            FAIL("T21: join-body aggregate wrongly agg-IVM-eligible");
+            return;
+        }
+        teardown_db(db, "t21b");
+    }
+
+    /* derived anchor (aggregate reads a rule head): no base delta to track. */
+    {
+        dl_db *db;
+        setup_db(&db, "t21c");
+        assert(dl_declare_relation(db, "sale", 2) == 0);
+        assert(dl_load_rules(db,
+            "p(X):-sale(X,Y).\n"
+            "cnt3(X,N):-p(X),N=count().\n") == 0);
+        if (vm_agg_eligible(db) != 0) {
+            teardown_db(db, "t21c");
+            FAIL("T21: derived-anchor aggregate wrongly agg-IVM-eligible");
+            return;
+        }
+        teardown_db(db, "t21c");
+    }
+
+    /* non-terminal aggregate head (a downstream rule reads it). */
+    {
+        dl_db *db;
+        setup_db(&db, "t21d");
+        assert(dl_declare_relation(db, "sale", 2) == 0);
+        assert(dl_load_rules(db,
+            "cnt4(X,N):-sale(X,Y),N=count().\n"
+            "big(X):-cnt4(X,N).\n") == 0);
+        if (vm_agg_eligible(db) != 0) {
+            teardown_db(db, "t21d");
+            FAIL("T21: non-terminal aggregate head wrongly agg-IVM-eligible");
+            return;
+        }
+        teardown_db(db, "t21d");
+    }
+
+    /* shared aggregate head: two rules producing the same head would corrupt
+     * the in-place re-scan (union semantics).  Must fall back. */
+    {
+        dl_db *db;
+        setup_db(&db, "t21e");
+        assert(dl_declare_relation(db, "a", 2) == 0);
+        assert(dl_declare_relation(db, "b", 2) == 0);
+        assert(dl_load_rules(db,
+            "cnt(X,N):-a(X,Y),N=count().\n"
+            "cnt(X,N):-b(X,Y),N=count().\n") == 0);
+        if (vm_agg_eligible(db) != 0) {
+            teardown_db(db, "t21e");
+            FAIL("T21: shared aggregate head wrongly agg-IVM-eligible");
+            return;
+        }
+        teardown_db(db, "t21e");
+    }
+
+    /* repeated variable in the anchor (intra-anchor equality, e.g. pair(X,X)):
+     * rel_prefix re-scan cannot enforce col0==col1.  Must fall back. */
+    {
+        dl_db *db;
+        setup_db(&db, "t21f");
+        assert(dl_declare_relation(db, "pair", 2) == 0);
+        assert(dl_load_rules(db, "cnt(X,N):-pair(X,X),N=count().\n") == 0);
+        if (vm_agg_eligible(db) != 0) {
+            teardown_db(db, "t21f");
+            FAIL("T21: repeated-variable anchor wrongly agg-IVM-eligible");
+            return;
+        }
+        teardown_db(db, "t21f");
+    }
+
+    PASS();
+}
+
 /* ─── Main ────────────────────────────────────────────────────────────── */
 
 int main(void)
 {
-    printf("IVM Slice 0/1/2/3 correctness + IVM equivalence-oracle tests\n");
+    printf("IVM Slice 0/1/2/3/4 correctness + IVM equivalence-oracle tests\n");
     printf("==========================================================\n\n");
 
     test_tc_delete();
@@ -1741,6 +2113,9 @@ int main(void)
     test_dred_property_negation();
     test_dred_fallback_eligibility();
     test_dred_overdelete_lookup_same_stratum();
+    test_aggregate_ivm_deterministic();
+    test_aggregate_ivm_property();
+    test_aggregate_ivm_fallback_eligibility();
 
     printf("\n%d tests run, %d failed\n", tests_run, tests_failed);
     return tests_failed ? 1 : 0;

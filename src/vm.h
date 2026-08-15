@@ -114,4 +114,41 @@ void vm_clear_deletes(dl_db *db);
  * views — this counter distinguishes them). */
 extern int vm_dred_runs;
 
+/* ─── IVM Slice 4: aggregates under change ──────────────────────────────── */
+
+/* 1 if the program's AGGREGATE rules are all incrementally maintainable and
+ * the surrounding program permits it:
+ *   - non-recursive (aggregate rules are never recursive by construction);
+ *   - every aggregate rule is TRACTABLE: its body is exactly ONE positive
+ *     OP_SCAN anchor atom (pure-EDB — not a rule head), the group-by columns
+ *     are a leading prefix of that atom IN GROUP-KEY ORDER, the result var is
+ *     the LAST head column (group = leading prefix of the head tuple), and the
+ *     source var (sum/min/max) is a column of the anchor.  count/sum/min/max
+ *     are all handled by the SAME affected-group re-scan (uniform, so min/max
+ *     delete-extremum and empty-group edges fall out for free);
+ *   - every aggregate HEAD is TERMINAL (no rule body reads it) and has NO
+ *     base facts (mixed EDB+IDB aggregate heads are out of scope);
+ *   - non-aggregate rules are free of OP_WALK / OP_LOOKUP_PERM / OP_HASH_JOIN
+ *     (they are maintained by the existing DRed / insert-propagator, which
+ *     skip aggregate rules).  Stratified negation in non-aggregate rules is
+ *     allowed (DRed handles it).
+ * Returns 0 for anything that must fall back to the full fixpoint. */
+int vm_agg_eligible(dl_db *db);
+
+/* Incremental aggregate maintenance: for every affected aggregate rule,
+ * re-scan ONLY the groups touched by the pending +/- deltas (O(group) per
+ * affected group) and update the aggregate head view in place (delete the
+ * stale head tuple, add the recomputed one; an emptied group drops its head
+ * tuple).  Then delegates the NON-aggregate part of the program to the
+ * existing DRed / insert-propagator (which skip aggregate rules).  Consumes
+ * (frees) the pending +/- delta sets.  Returns 0 on success, -1 on error
+ * (the publish path then forces a full re-eval — never mis-evaluate).
+ *
+ * PRECONDITION: vm_agg_eligible(db) == 1 (the publish dispatch enforces). */
+int vm_agg_maintain(dl_db *db);
+
+/* Test observable: number of times vm_agg_maintain has run in this process.
+ * Proves the aggregate-IVM path was taken (not the full re-eval fallback). */
+extern int vm_agg_runs;
+
 #endif

@@ -49,6 +49,9 @@ tuple_set *vm_export_ts = NULL;
 /* IVM Slice 3: test observable — counts vm_dred_delete runs (see vm.h). */
 int vm_dred_runs = 0;
 
+/* IVM Slice 4: test observable — counts vm_agg_maintain runs (see vm.h). */
+int vm_agg_runs = 0;
+
 static relation *db_rel(dl_db *db, int idx)
 {
     if (idx < 0 || (size_t)idx >= db->nrels) return NULL;
@@ -2226,6 +2229,11 @@ int vm_propagate_deltas(dl_db *db)
             compiled_rule *cr = db->crules[ri];
             int k;
 
+            /* IVM Slice 4: aggregate rules are maintained by vm_agg_maintain
+             * (affected-group re-scan), never by the insert worklist — a delta
+             * override on their anchor would produce a WRONG partial aggregate. */
+            if (cr->has_aggregate) continue;
+
             for (k = 0; k < cr->n_instrs; k++) {
                 const vm_instr *in = &cr->instrs[k];
                 uint8_t op = in->op;
@@ -2444,6 +2452,7 @@ int vm_dred_delete(dl_db *db)
     for (i = 0; i < db->n_crules; i++) {
         const compiled_rule *cr = db->crules[i];
         int hid = cr->head_rel_id;
+        if (cr->has_aggregate) continue;   /* Slice 4: maintained separately */
         if (hid < MAX_RELS) is_head[hid] = 1;
         if (cr->stratum > max_stratum) max_stratum = cr->stratum;
         for (k = 0; k < cr->n_instrs; k++)
@@ -2476,6 +2485,7 @@ int vm_dred_delete(dl_db *db)
         for (i = 0; i < db->n_crules; i++) {
             const compiled_rule *cr = db->crules[i];
             int hid = cr->head_rel_id;
+            if (cr->has_aggregate) continue;   /* Slice 4: maintained separately */
             if (hid >= MAX_RELS) continue;
             for (k = 0; k < cr->n_instrs; k++)
                 if (cr->instrs[k].op == OP_NEG_CHECK) { full_reset[hid] = 1; break; }
@@ -2487,6 +2497,7 @@ int vm_dred_delete(dl_db *db)
                 for (i = 0; i < db->n_crules; i++) {
                     const compiled_rule *cr = db->crules[i];
                     int hid = cr->head_rel_id;
+                    if (cr->has_aggregate) continue;  /* Slice 4 */
                     if (hid >= MAX_RELS || full_reset[hid]) continue;
                     for (k = 0; k < cr->n_instrs; k++) {
                         const vm_instr *in = &cr->instrs[k];
@@ -2520,6 +2531,7 @@ int vm_dred_delete(dl_db *db)
             for (i = 0; i < db->n_crules; i++) {
                 const compiled_rule *cr = db->crules[i];
                 int hid = cr->head_rel_id;
+                if (cr->has_aggregate) continue;  /* Slice 4: no override */
                 if (cr->stratum != s) continue;
                 if (hid >= MAX_RELS || full_reset[hid]) continue;
                 for (k = 0; k < cr->n_instrs; k++) {
@@ -2622,6 +2634,7 @@ int vm_dred_delete(dl_db *db)
             for (i = 0; i < db->n_crules; i++) {
                 const compiled_rule *cr = db->crules[i];
                 int hid = cr->head_rel_id;
+                if (cr->has_aggregate) continue;  /* Slice 4: not in cone */
                 if (hid >= MAX_RELS || affected[hid]) continue;
                 if (dred_rule_reads(cr, r)) {
                     affected[hid] = 1;
@@ -2642,6 +2655,7 @@ int vm_dred_delete(dl_db *db)
         int sc = 0;
         for (i = 0; i < db->n_crules; i++) {
             const compiled_rule *cr = db->crules[i];
+            if (cr->has_aggregate) continue;  /* Slice 4: re-scanned separately */
             if (cr->stratum != s) continue;
             if (cr->head_rel_id < MAX_RELS && !affected[cr->head_rel_id])
                 continue;
@@ -2663,4 +2677,418 @@ out:
     vm_clear_deltas(db);
     vm_clear_deletes(db);
     return rc;
+}
+
+/* ─── IVM Slice 4: aggregates under change ─────────────────────────────── */
+/*
+ * Aggregates (count/sum/min/max) are non-recursive by construction (the
+ * compiler rejects aggregates in recursive rules) and are maintained here
+ * by AFFECTED-GROUP RE-SCAN — a single uniform mechanism for all four ops:
+ *
+ *   On a +delta/-delta of a base relation R that an aggregate rule's anchor
+ *   reads, project the delta onto the leading group columns (the group key is
+ *   a prefix of the anchor, guaranteed by vm_agg_eligible), collect the
+ *   distinct affected group keys, and for EACH re-scan that group over the
+ *   CURRENT base (rel_prefix on the leading group columns — O(group), not
+ *   O(relation)) recomputing count/sum/min/max.  The head view is then
+ *   updated in place: delete the stale head tuple, add the recomputed one, or
+ *   drop the head tuple entirely when the group became empty.
+ *
+ * This uniform re-scan handles the hard cases for free: a deleted extremum is
+ * re-found by the re-scan (min/max); an emptied group drops its tuple; a
+ * newly-created group materializes; sum wraps exactly like the full eval.
+ *
+ * Why re-scan instead of a persisted per-group accumulator?  It is uniformly
+ * correct for all four ops (no count/sum-vs-min/max special casing), avoids a
+ * new persisted per-group data structure (its own hashing, lifecycle, and
+ * serialization), and O(group) is the natural cost for the common small-group
+ * aggregate workload.  Anything a tractable re-scan cannot cover (joins,
+ * filters, negation, non-prefix groups, result-var-not-last heads, derived
+ * anchors, non-terminal heads, mixed EDB+IDB heads) is rejected by
+ * vm_agg_eligible and falls back to the full fixpoint — NEVER a silent
+ * mis-evaluation.
+ */
+
+typedef struct {
+    uint8_t  op;        /* 0 count, 1 sum, 2 min, 3 max */
+    uint8_t  src_col;   /* anchor column of the source var (unused for count) */
+    uint32_t count;
+    uint32_t sum;
+    uint32_t min;
+    uint32_t max;
+} agg_scan;
+
+static int agg_scan_cb(const uint32_t *cols, uint8_t arity, void *user)
+{
+    agg_scan *st = (agg_scan *)user;
+    (void)arity;
+    st->count++;
+    if (st->op == 1) {
+        st->sum += cols[st->src_col];          /* u32 wrap, like OP_AGG_ACC */
+    } else if (st->op == 2) {
+        uint32_t v = cols[st->src_col];
+        if (st->count == 1) st->min = v;
+        else if (v < st->min) st->min = v;
+    } else if (st->op == 3) {
+        uint32_t v = cols[st->src_col];
+        if (st->count == 1) st->max = v;
+        else if (v > st->max) st->max = v;
+    }
+    return 0;
+}
+
+typedef struct {
+    uint32_t cols[8];
+    int      found;
+} agg_old;
+
+static int agg_old_cb(const uint32_t *cols, uint8_t arity, void *user)
+{
+    agg_old *oh = (agg_old *)user;
+    if (!oh->found && arity >= 1 && arity <= 8) {
+        memcpy(oh->cols, cols, (size_t)arity * sizeof(uint32_t));
+        oh->found = 1;
+    }
+    return 0;
+}
+
+static int agg_count_cb(const uint32_t *cols, uint8_t arity, void *user)
+{
+    long *n = (long *)user;
+    (void)cols; (void)arity;
+    (*n)++;
+    return 0;
+}
+
+/* 1 if the relation has NO base facts (pure derived view), 0 if it has base
+ * facts, -1 on error.  Used to reject mixed EDB+IDB aggregate heads. */
+static int rel_base_empty(dl_db *db, int rel_id)
+{
+    relation *r = db_rel(db, rel_id);
+    long n = 0;
+    if (!r) return -1;
+    if (rel_prefix_base(r, NULL, 0, agg_count_cb, &n) < 0) return -1;
+    return (n == 0) ? 1 : 0;
+}
+
+/* 1 if this aggregate rule is incrementally maintainable (see vm_agg_eligible
+ * in vm.h for the full contract).  is_head[rel_id] marks every rule head. */
+static int agg_rule_tractable(dl_db *db, const compiled_rule *cr,
+                              const uint8_t *is_head)
+{
+    const vm_instr *scan, *acc, *emit;
+    int anchor, anchor_arity, n_key, op, res_slot, head_arity;
+    int g, c;
+
+    /* Exact minimal bytecode shape [SCAN, AGG_ACC, AGG_EMIT, HALT]: a single
+     * positive scan anchor, no joins/filters/negation/patterns. */
+    if (cr->n_instrs != 4) return 0;
+    if (cr->instrs[0].op != OP_SCAN     ||
+        cr->instrs[1].op != OP_AGG_ACC  ||
+        cr->instrs[2].op != OP_AGG_EMIT ||
+        cr->instrs[3].op != OP_HALT) return 0;
+
+    scan = &cr->instrs[0];
+    acc  = &cr->instrs[1];
+    emit = &cr->instrs[2];
+
+    anchor       = (int)scan->a;
+    anchor_arity = (int)scan->b;
+    n_key        = (int)acc->a;
+    op           = (int)acc->b;
+    res_slot     = (int)acc->c;
+    head_arity   = (int)emit->b;
+
+    /* Anchor must be a pure EDB relation (not a rule head): a derived anchor
+     * produces no base delta, so group re-scan cannot track it. */
+    if (anchor < 0 || anchor >= MAX_RELS) return 0;
+    if (anchor >= (int)db->nrels) return 0;
+    if (is_head[anchor]) return 0;
+
+    /* The anchor must bind each column to a DISTINCT variable.  A repeated
+     * variable (e.g. pair(X,X)) is an intra-anchor equality constraint that
+     * rel_prefix(anchor, key, n_key) cannot enforce: the group re-scan would
+     * enumerate tuples the full scan rejects (col0==col1), silently
+     * over-counting the group.  Reject any shape with a shared slot. */
+    for (c = 0; c < anchor_arity; c++) {
+        uint8_t sc = scan->slots[c];
+        if (sc == 0xFF) continue;   /* unbound column - no constraint */
+        for (g = c + 1; g < anchor_arity; g++)
+            if (scan->slots[g] == sc) return 0;
+    }
+
+    /* Group columns must be a leading prefix of the anchor IN GROUP-KEY
+     * ORDER (column g binds group slot g), so rel_prefix(anchor, key, n_key)
+     * enumerates exactly the group. */
+    if (n_key > anchor_arity) return 0;
+    for (g = 0; g < n_key; g++)
+        if (scan->slots[g] != acc->slots[g]) return 0;
+
+    /* sum/min/max: the source var must be bound by a column of the anchor. */
+    if (op != 0) {
+        int src_slot = (int)acc->slots[n_key];
+        for (c = 0; c < anchor_arity; c++)
+            if ((int)scan->slots[c] == src_slot) break;
+        if (c == anchor_arity) return 0;
+    }
+
+    /* Head mapping: group columns are the leading head columns (group-key
+     * order), result var LAST — so the head tuple is (g0..g_{k-1}, val) and
+     * rel_prefix(head, key, n_key) finds the old tuple directly. */
+    if (head_arity != n_key + 1) return 0;
+    for (g = 0; g < n_key; g++)
+        if (emit->slots[g] != acc->slots[g]) return 0;
+    if (emit->slots[n_key] != (uint8_t)res_slot) return 0;
+
+    /* Head must be a pure derived view (no base facts). */
+    if (rel_base_empty(db, (int)emit->a) != 1) return 0;
+
+    return 1;
+}
+
+int vm_agg_eligible(dl_db *db)
+{
+    uint8_t is_head[MAX_RELS];
+    uint8_t agg_head[MAX_RELS];
+    int i, k, has_agg = 0;
+
+    if (!db) return 0;
+
+    memset(is_head, 0, sizeof(is_head));
+    memset(agg_head, 0, sizeof(agg_head));
+
+    for (i = 0; i < db->n_crules; i++) {
+        const compiled_rule *cr = db->crules[i];
+        if (cr->is_recursive) return 0;
+        if (cr->has_aggregate) has_agg = 1;
+        if (cr->head_rel_id < MAX_RELS) is_head[cr->head_rel_id] = 1;
+    }
+    if (!has_agg) return 0;   /* not an aggregate program */
+
+    for (i = 0; i < db->n_crules; i++)
+        if (db->crules[i]->has_aggregate &&
+            db->crules[i]->head_rel_id < MAX_RELS)
+            agg_head[db->crules[i]->head_rel_id] = 1;
+
+    /* An aggregate head must be produced by EXACTLY ONE rule.  The affected-
+     * group re-scan updates the head in place assuming one head tuple per
+     * group key (rel_prefix finds "the" old tuple); two rules sharing a head
+     * (two aggregates, or an aggregate + a non-aggregate) each re-scan and
+     * clobber the other's tuple under union semantics.  Reject. */
+    {
+        int head_count[MAX_RELS];
+        memset(head_count, 0, sizeof(head_count));
+        for (i = 0; i < db->n_crules; i++) {
+            const compiled_rule *cr = db->crules[i];
+            if (cr->head_rel_id < MAX_RELS) head_count[cr->head_rel_id]++;
+        }
+        for (i = 0; i < MAX_RELS; i++)
+            if (agg_head[i] && head_count[i] > 1) return 0;
+    }
+
+    /* Aggregate heads must be TERMINAL: no rule body reads one. */
+    for (i = 0; i < db->n_crules; i++) {
+        const compiled_rule *cr = db->crules[i];
+        for (k = 0; k < cr->n_instrs; k++) {
+            uint8_t op = cr->instrs[k].op;
+            switch (op) {
+            case OP_SCAN: case OP_LOOKUP: case OP_NEG_CHECK:
+            case OP_WALK: case OP_LOOKUP_PERM: case OP_HASH_JOIN:
+                if (cr->instrs[k].a < MAX_RELS &&
+                    agg_head[cr->instrs[k].a]) return 0;
+                break;
+            default:
+                break;
+            }
+        }
+    }
+
+    /* Non-aggregate rules must be free of override-incompatible opcodes
+     * (they are maintained by DRed / the insert propagator). */
+    for (i = 0; i < db->n_crules; i++) {
+        const compiled_rule *cr = db->crules[i];
+        if (cr->has_aggregate) continue;
+        for (k = 0; k < cr->n_instrs; k++) {
+            uint8_t op = cr->instrs[k].op;
+            if (op == OP_WALK || op == OP_LOOKUP_PERM || op == OP_HASH_JOIN)
+                return 0;
+        }
+    }
+
+    /* Every aggregate rule must be tractable. */
+    for (i = 0; i < db->n_crules; i++) {
+        const compiled_rule *cr = db->crules[i];
+        if (!cr->has_aggregate) continue;
+        if (!agg_rule_tractable(db, cr, is_head)) return 0;
+    }
+
+    return 1;
+}
+
+/* Recompute one aggregate group (or the whole relation for a global
+ * aggregate) over the CURRENT base and update the head view in place. */
+static int agg_update_group(dl_db *db, const compiled_rule *cr,
+                            const uint32_t *group_key)
+{
+    const vm_instr *scan = &cr->instrs[0];
+    const vm_instr *acc  = &cr->instrs[1];
+    const vm_instr *emit = &cr->instrs[2];
+    int anchor = (int)scan->a;
+    int anchor_arity = (int)scan->b;
+    int n_key = (int)acc->a;
+    int op = (int)acc->b;
+    int head = (int)emit->a;
+    relation *arel = db_rel(db, anchor);
+    relation *hrel = db_rel(db, head);
+    agg_scan st;
+    agg_old  oh;
+    int c, src_col = 0;
+
+    if (!arel || !hrel) return -1;
+
+    if (op != 0) {
+        int src_slot = (int)acc->slots[n_key];
+        src_col = -1;
+        for (c = 0; c < anchor_arity; c++)
+            if ((int)scan->slots[c] == src_slot) { src_col = c; break; }
+        if (src_col < 0) return -1;   /* eligibility should have caught this */
+    }
+
+    memset(&st, 0, sizeof(st));
+    st.op = (uint8_t)op;
+    st.src_col = (uint8_t)src_col;
+
+    if (rel_prefix(arel, group_key, (uint8_t)n_key, agg_scan_cb, &st) < 0)
+        return -1;
+
+    memset(&oh, 0, sizeof(oh));
+    if (rel_prefix(hrel, group_key, (uint8_t)n_key, agg_old_cb, &oh) < 0)
+        return -1;
+
+    if (st.count == 0) {
+        /* Group vanished: drop the old head tuple (if present). */
+        if (oh.found && rel_delete(hrel, oh.cols) < 0) return -1;
+        return 0;
+    }
+
+    {
+        uint32_t agg_val, new_tuple[8];
+        int gi;
+        switch (op) {
+        case 1: agg_val = st.sum;  break;
+        case 2: agg_val = st.min;  break;
+        case 3: agg_val = st.max;  break;
+        default: agg_val = st.count; break;
+        }
+        for (gi = 0; gi < n_key; gi++) new_tuple[gi] = group_key[gi];
+        new_tuple[n_key] = agg_val;
+
+        if (rel_exact(hrel, new_tuple)) return 0;   /* unchanged */
+        if (oh.found && rel_delete(hrel, oh.cols) < 0) return -1;
+        if (rel_add(hrel, new_tuple) < 0) return -1;
+    }
+    return 0;
+}
+
+/* Collect the affected group keys (project the pending +/- deltas onto the
+ * leading group columns) and re-scan each.  A global aggregate (n_key==0) is
+ * a single group re-scanned whenever the anchor changed at all. */
+static int agg_maintain_rule(dl_db *db, const compiled_rule *cr)
+{
+    const vm_instr *scan = &cr->instrs[0];
+    const vm_instr *acc  = &cr->instrs[1];
+    int anchor = (int)scan->a;
+    int n_key  = (int)acc->a;
+    tuple_set groups;
+    long gi;
+    int which;
+
+    if (n_key == 0) {
+        int changed = (db->delta_pending[anchor] &&
+                       db->delta_pending[anchor]->count > 0)
+                   || (db->del_pending[anchor] &&
+                       db->del_pending[anchor]->count > 0);
+        if (!changed) return 0;
+        return agg_update_group(db, cr, NULL);
+    }
+
+    if (ts_init(&groups, (uint8_t)n_key) != 0) return -1;
+
+    for (which = 0; which < 2; which++) {
+        tuple_set *ts = (which == 0) ? db->delta_pending[anchor]
+                                     : db->del_pending[anchor];
+        if (!ts || ts->count == 0) continue;
+        for (gi = 0; gi < ts->count; gi++) {
+            const uint32_t *t = ts->data + gi * ts->arity;
+            if (ts_add(&groups, t) < 0) { ts_free(&groups); return -1; }
+        }
+    }
+
+    if (groups.count == 0) { ts_free(&groups); return 0; }
+    ts_sort(&groups);
+
+    for (gi = 0; gi < groups.count; gi++) {
+        const uint32_t *g = groups.data + gi * groups.arity;
+        if (agg_update_group(db, cr, g) != 0) { ts_free(&groups); return -1; }
+    }
+    ts_free(&groups);
+    return 0;
+}
+
+int vm_agg_maintain(dl_db *db)
+{
+    int ri, i;
+    int has_ins = 0, has_del = 0, has_nonagg = 0, has_neg = 0;
+
+    if (!db) return -1;
+    vm_agg_runs++;
+
+    /* 1. Aggregate rules: affected-group re-scan + head update (READS, does
+     *    not consume, the pending deltas). */
+    for (ri = 0; ri < db->n_crules; ri++) {
+        const compiled_rule *cr = db->crules[ri];
+        if (!cr->has_aggregate) continue;
+        if (agg_maintain_rule(db, cr) != 0) goto fail;
+    }
+
+    /* 2. Perm-index consistency: updated aggregate heads mark perms dirty
+     *    (defensive — aggregate heads are terminal, but stay consistent with
+     *    the M6 silent-wrong-answer guard). */
+    for (ri = 0; ri < db->n_crules; ri++) {
+        if (!db->crules[ri]->has_aggregate) continue;
+        permindex_mark_dirty(db, db->crules[ri]->head_rel_id);
+    }
+    if (permindex_build_dirty(db) != 0) goto fail;
+
+    /* 3. Non-aggregate part: delegate to DRed (deletes / negation) or the
+     *    insert propagator — both skip aggregate rules. */
+    for (i = 0; i < MAX_RELS; i++) {
+        if (db->delta_pending[i] && db->delta_pending[i]->count > 0) has_ins = 1;
+        if (db->del_pending[i] && db->del_pending[i]->count > 0) has_del = 1;
+    }
+    for (ri = 0; ri < db->n_crules; ri++) {
+        const compiled_rule *cr = db->crules[ri];
+        int k;
+        if (cr->has_aggregate) continue;
+        has_nonagg = 1;
+        for (k = 0; k < cr->n_instrs; k++)
+            if (cr->instrs[k].op == OP_NEG_CHECK) { has_neg = 1; break; }
+    }
+
+    if (!has_nonagg || (!has_ins && !has_del)) {
+        vm_clear_deltas(db);
+        vm_clear_deletes(db);
+        return 0;
+    }
+    if (has_del || (has_ins && has_neg)) {
+        if (vm_dred_delete(db) != 0) goto fail;
+    } else if (has_ins) {
+        if (vm_propagate_deltas(db) != 0) goto fail;
+    }
+    return 0;
+
+fail:
+    vm_clear_deltas(db);
+    vm_clear_deletes(db);
+    return -1;
 }

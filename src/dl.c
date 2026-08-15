@@ -1620,16 +1620,42 @@ int dl_publish_snapshot(dl_db *db)
      * branch (full_reeval_pending is set at the change site), so we never
      * wrongly propagate. */
     if (db->n_crules > 0 && db->fixpoint_dirty) {
-        int has_del = 0, has_ins = 0, dri;
+        int has_del = 0, has_ins = 0, has_agg = 0, dri;
         for (dri = 0; dri < MAX_RELS; dri++) {
             if (db->del_pending[dri] && db->del_pending[dri]->count > 0)
                 has_del = 1;
             if (db->delta_pending[dri] && db->delta_pending[dri]->count > 0)
                 has_ins = 1;
         }
-        if (db->full_reeval_pending
-            || (has_del && !vm_dred_eligible(db))
-            || (has_ins && !vm_ivm_eligible(db) && !vm_dred_eligible(db))) {
+        for (dri = 0; dri < db->n_crules; dri++)
+            if (db->crules[dri]->has_aggregate) has_agg = 1;
+        if (db->full_reeval_pending) {
+            if (vm_execute(db, db->crules, db->n_crules) != 0)
+                return -1;
+            vm_clear_deltas(db);   /* full re-eval consumed pending changes */
+            vm_clear_deletes(db);
+        } else if (has_agg) {
+            /* IVM Slice 4: aggregates under change.  Incremental affected-
+             * group re-scan for count/sum/min/max; anything the maintenance
+             * cannot handle soundly falls back to the full fixpoint (the
+             * correctness floor — never silently mis-evaluate). */
+            if (vm_agg_eligible(db)) {
+                if (vm_agg_maintain(db) != 0) {
+                    db->full_reeval_pending = 1;
+                    return -1;
+                }
+            } else {
+                if (vm_execute(db, db->crules, db->n_crules) != 0)
+                    return -1;
+                vm_clear_deltas(db);
+                vm_clear_deletes(db);
+            }
+        } else if (has_del && !vm_dred_eligible(db)) {
+            if (vm_execute(db, db->crules, db->n_crules) != 0)
+                return -1;
+            vm_clear_deltas(db);   /* full re-eval consumed pending changes */
+            vm_clear_deletes(db);
+        } else if (has_ins && !vm_ivm_eligible(db) && !vm_dred_eligible(db)) {
             if (vm_execute(db, db->crules, db->n_crules) != 0)
                 return -1;
             vm_clear_deltas(db);   /* full re-eval consumed pending changes */
