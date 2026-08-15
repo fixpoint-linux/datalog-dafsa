@@ -849,6 +849,11 @@ int dl_add_fact(dl_db *db, const char *rel_name,
     /* 4. In-memory add to BASE */
     rc = rel_add_base(db->rels[idx].rel, cols);
     if (rc < 0) return -1;
+    if (rc == 1) {
+        /* M6: the base grew — any perm index on this relation is stale until
+         * the next permindex_build_dirty (perm DAFSAs are not delta-aware). */
+        permindex_mark_dirty(db, idx);
+    }
 
     /* 4a. IVM Slice 1: capture the insert delta (AFTER the in-memory commit,
      * per the interner-before-WAL ordering note — no interner interaction
@@ -917,6 +922,13 @@ int dl_delete_fact(dl_db *db, const char *rel_name,
     /* 3. In-memory delete from BASE */
     rc = rel_delete_base(db->rels[idx].rel, cols);
     if (rc < 0) return -1;
+    if (rc == 1) {
+        /* M6: the base shrank — any perm index on this relation is stale
+         * until the next permindex_build_dirty (perm DAFSAs are not
+         * delta-aware).  Without this, a delete could leave stale tuples
+         * visible through a non-leading (OP_LOOKUP_PERM) join. */
+        permindex_mark_dirty(db, idx);
+    }
 
     /* IVM Slice 3: record the -delta.  If the program is DRed-eligible
      * (non-recursive, no aggregates, no WALK/LOOKUP_PERM/HASH_JOIN), the

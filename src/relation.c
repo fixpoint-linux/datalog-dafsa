@@ -145,6 +145,14 @@ uint8_t rel_arity(const relation *rel)
     return rel ? rel->arity : 0;
 }
 
+uint64_t rel_count(const relation *rel)
+{
+    dafsa_stats_out st;
+    if (!rel || !rel->d) return 0;
+    dafsa_stats(rel->d, &st);
+    return (uint64_t)st.n_final;
+}
+
 /* ─── Fact operations ─────────────────────────────────────────────────── */
 
 static int rel_add_d(relation *rel, dafsa *d, const uint32_t *cols)

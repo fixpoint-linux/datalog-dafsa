@@ -21,6 +21,7 @@ build-tmp/
 /tests/test_m9_str
 /tests/test_ivm
 /tests/test_bulk
+/tests/test_bushy
 /tests/test_m4_review
 /tests/test_m5_review
 

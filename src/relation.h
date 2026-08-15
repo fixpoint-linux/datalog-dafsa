@@ -56,6 +56,11 @@ void rel_free(relation *rel);
 
 uint8_t rel_arity(const relation *rel);
 
+/* Number of tuples in the VIEW (base ∪ derived) — dafsa_stats(rel->d).n_final.
+ * Used by the compiler's join-order heuristics (a perf hint only: any value
+ * is semantically safe, since it only permutes join emission order). */
+uint64_t rel_count(const relation *rel);
+
 /* ─── Fact operations ─────────────────────────────────────────────────── */
 /* A relation holds TWO DAFSAs after it becomes a rule head (see rel_is_idb):
  *   base — durable EDB facts (written by dl_add_fact/dl_delete_fact/

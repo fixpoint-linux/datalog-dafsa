@@ -79,6 +79,17 @@ static size_t db_rel_count(dl_db *db)
 static interner *db_get_interner(dl_db *db)
 { return db->ir; }
 
+/* ─── BUSHY (v2) compile-time toggles ──────────────────────────────────── */
+/* See compiler.h.  Default: bushy + reorder both ON. */
+int g_bushy   = 1;
+int g_reorder = 1;
+
+static uint64_t db_rel_card(dl_db *db, int idx)
+{
+    if (idx < 0 || (size_t)idx >= db->nrels) return 0;
+    return rel_count(db->rels[idx].rel);
+}
+
 /* ─── Variable slot tracking ────────────────────────────────────────── */
 
 typedef struct {
@@ -874,6 +885,457 @@ static int compute_strata(dl_db *db, rule **rules, int n_rules,
 #undef ADD_EDGE
 }
 
+/* ─── BUSHY (v2): natural-partition join planning ─────────────────────── */
+
+#define BUSHY_MAX_CUT   2   /* min cut width that still justifies bushy      */
+#define BUSHY_MAX_ATOMS 16  /* cap on the 2^n partition enumeration (safety) */
+
+/* Emission context threaded through the recursive bushy/left-deep emitters. */
+typedef struct {
+    dl_db         *db;
+    const rule    *r;
+    const int     *bri;       /* body atom -> rel id (-1 for non-relational) */
+    const uint8_t *pat_idx;   /* body atom -> pattern index, 0xFF if none     */
+    v_tab         *vt;
+    i_buf         *ib;
+    int           *cc;        /* constant-slot counter                        */
+    const uint64_t *mask;     /* var mask per positive atom (by body idx)     */
+    int            do_bushy;  /* 1 = may emit binary-tree plans               */
+    int            next_buf;  /* next free intermediate buffer index          */
+} emit_ctx;
+
+static int popcount64(uint64_t x)
+{
+    int c = 0;
+    while (x) { x &= x - 1; c++; }
+    return c;
+}
+
+/* Bitmask of the var slots referenced by body atom `bi` (constants
+ * contribute nothing).  Bits 0..MAX_VARS-1 map to var slots. */
+static uint64_t atom_var_mask(const rule *r, int bi, v_tab *vt)
+{
+    const atom *a = r->body[bi];
+    uint64_t m = 0;
+    int j;
+    for (j = 0; j < a->nargs; j++) {
+        if (a->args[j]->kind != TOK_VAR) continue;
+        int vi = v_find(vt, a->args[j]->text);
+        if (vi >= 0 && vi < 64) m |= (1ULL << vi);
+    }
+    return m;
+}
+
+/* Are atoms[0..n-1] connected via shared variables?  Edge between two atoms
+ * iff their var masks intersect. */
+static int atoms_connected(const int *atoms, int n, const uint64_t *mask)
+{
+    uint8_t visited[64] = {0};
+    int stack[64], sp = 0;
+    int i;
+    if (n <= 1) return 1;
+    visited[0] = 1;
+    stack[sp++] = 0;
+    while (sp > 0) {
+        int u = stack[--sp];
+        int v;
+        for (v = 0; v < n; v++) {
+            if (visited[v]) continue;
+            if (mask[atoms[u]] & mask[atoms[v]]) { visited[v] = 1; stack[sp++] = v; }
+        }
+    }
+    for (i = 0; i < n; i++) if (!visited[i]) return 0;
+    return 1;
+}
+
+/* Enumerate 2-partitions of atoms[0..n-1] into L/R with |L|>=2, |R|>=2 and
+ * BOTH induced subgraphs connected; return the partition with minimal cut
+ * width w = popcount(vars(L) & vars(R)).  On success sets best_l and best_r to
+ * bitmasks over positions [0,n) and *best_w=w, returning 1; else 0. */
+static int min_cut_split(const int *atoms, int n, const uint64_t *mask,
+                         uint32_t *best_l, uint32_t *best_r, int *best_w)
+{
+    uint32_t total = (n >= 32) ? 0xFFFFFFFFu : ((1u << n) - 1);
+    uint32_t sub;
+    int found = 0;
+    int best = 1 << 20;
+    uint32_t bL = 0, bR = 0;
+    for (sub = 1; sub < total; sub++) {
+        uint32_t comp = total & ~sub;
+        int nl = popcount64((uint64_t)sub);
+        int nr = n - nl;
+        int L[64], R[64];
+        int il = 0, ir = 0, i;
+        uint64_t mL = 0, mR = 0;
+        if (nl < 2 || nr < 2) continue;
+        for (i = 0; i < n; i++) {
+            if (sub & (1u << i)) { L[il++] = atoms[i]; mL |= mask[atoms[i]]; }
+            else                 { R[ir++] = atoms[i]; mR |= mask[atoms[i]]; }
+        }
+        if (!atoms_connected(L, il, mask)) continue;
+        if (!atoms_connected(R, ir, mask)) continue;
+        {
+            int w = popcount64(mL & mR);
+            if (w < best) { best = w; bL = sub; bR = comp; found = 1; }
+        }
+    }
+    if (!found) return 0;
+    *best_l = bL; *best_r = bR; *best_w = best;
+    return 1;
+}
+
+/* Ascending-slot-order list of the vars in mask m.  Returns count (<=64). */
+static int mask_to_slots(uint64_t m, uint8_t *out)
+{
+    int n = 0, s;
+    for (s = 0; s < 64; s++)
+        if (m & (1ULL << s)) out[n++] = (uint8_t)s;
+    return n;
+}
+
+/* Greedy left-deep reorder: ascending rel_count, tie-broken by most vars
+ * shared with the already-placed prefix.  `order` holds body indices of the
+ * positive atoms (body order in), rewritten in place.  OOM leaves it
+ * unchanged (still a correct body-order sequence). */
+static void reorder_pos_atoms(dl_db *db, const int *bri, const uint64_t *mask,
+                              int *order, int n)
+{
+    int *used = calloc((size_t)(n > 0 ? n : 1), sizeof(int));
+    int *res  = malloc((size_t)(n > 0 ? n : 1) * sizeof(int));
+    uint64_t placed_mask = 0;
+    int out;
+    if (!used || !res) { free(used); free(res); return; }
+    for (out = 0; out < n; out++) {
+        int best = -1, k;
+        uint64_t bc = 0;
+        int bsh = -1;
+        for (k = 0; k < n; k++) {
+            uint64_t cnt;
+            int s;
+            if (used[k]) continue;
+            cnt = db_rel_card(db, bri[order[k]]);
+            s = popcount64(mask[order[k]] & placed_mask);
+            if (best < 0 || cnt < bc || (cnt == bc && s > bsh)) {
+                best = k; bc = cnt; bsh = s;
+            }
+        }
+        used[best] = 1;
+        res[out] = order[best];
+        placed_mask |= mask[order[best]];
+    }
+    memcpy(order, res, (size_t)n * sizeof(int));
+    free(used); free(res);
+}
+
+/* Emit the join instruction for positive body atom `bi`.  `bound` is the
+ * bitmask of var slots already bound in the CURRENT scope (subtree): an atom
+ * whose only join column is sibling-bound compiles to SCAN not LOOKUP — the
+ * parent hash join enforces the equality (the cross-subtree-probe
+ * correctness rule).  `is_first` forces a full scan (first atom of a scope). */
+static int emit_pos_atom(dl_db *db, const rule *r, int bi, const int *bri,
+                         const uint8_t *pat_idx, uint64_t bound, int is_first,
+                         v_tab *vt, i_buf *ib, int *cc)
+{
+    const atom *curr = r->body[bi];
+    int j;
+    int sc[8] = {0};
+    int k = 0;
+    vm_instr *ip;
+
+    if (!is_first) {
+        for (j = 0; j < curr->nargs; j++) {
+            if (curr->args[j]->kind != TOK_VAR) continue;
+            int vi = v_find(vt, curr->args[j]->text);
+            if (vi >= 0 && vi < 64 && (bound & (1ULL << vi))) sc[j] = 1;
+        }
+        while (k < curr->nargs && sc[k]) k++;
+    }
+
+    ip = i_emit(ib);
+    if (!ip) return -1;
+
+    if (pat_idx[bi] != 0xFF) {
+        /* Pattern atom: always full scan with regex filter. */
+        uint8_t ts[8];
+        ip->op = OP_WALK;
+        ip->imm = pat_idx[bi];
+        ip->a = (uint8_t)bri[bi];
+        ip->b = (uint8_t)curr->nargs;
+        ip->body_idx = (uint8_t)bi;
+        for (j = 0; j < curr->nargs; j++) {
+            if (curr->args[j]->kind == TOK_VAR) {
+                int vi = v_find(vt, curr->args[j]->text);
+                ts[j] = vt->e[vi].slot;
+            } else {
+                char cname[16];
+                v_fresh_name(vt, cname, sizeof(cname), cc, 'k');
+                int vi = v_add(vt, cname);
+                ts[j] = vt->e[vi].slot;
+            }
+        }
+        for (j = 0; j < curr->nargs; j++) ip->slots[j] = ts[j];
+        for (j = 0; j < curr->nargs; j++) {
+            if (curr->args[j]->kind == TOK_VAR) continue;
+            uint32_t cv;
+            if (token_const(db, curr->args[j], &cv)) return -1;
+            vm_instr *eq = i_emit(ib);
+            if (!eq) return -1;
+            eq->op = OP_EQ_CONST; eq->a = ts[j]; eq->imm = cv;
+        }
+        return 0;
+    }
+
+    if (is_first || k == 0) {
+        int any_shared = 0;
+        if (!is_first) {
+            for (j = 0; j < curr->nargs; j++) if (sc[j]) { any_shared = 1; break; }
+        }
+        if (!is_first && any_shared) {
+            /* M6: non-leading-column join → OP_LOOKUP_PERM */
+            uint8_t perm_arr[8], n_join = 0, n_other = 0;
+            uint8_t join_cols[8], other_cols[8];
+            int pj;
+            int perm_id;
+            for (j = 0; j < curr->nargs; j++) {
+                if (sc[j]) join_cols[n_join++] = (uint8_t)j;
+                else       other_cols[n_other++] = (uint8_t)j;
+            }
+            for (pj = 0; pj < n_join; pj++) perm_arr[pj] = join_cols[pj];
+            for (pj = 0; pj < n_other; pj++)
+                perm_arr[(int)n_join + pj] = other_cols[pj];
+            perm_id = dl_db_declare_perm(db, bri[bi],
+                (uint8_t)curr->nargs, perm_arr);
+            if (perm_id < 0) {
+                fprintf(stderr, "compile error: too many permutation "
+                        "indices (rule '%s')\n", r->head->pred);
+                return -1;
+            }
+            ip->op = OP_LOOKUP_PERM;
+            ip->a   = (uint8_t)bri[bi];
+            ip->b   = n_join;
+            ip->c   = (uint8_t)curr->nargs;
+            ip->imm = (uint32_t)perm_id;
+            ip->body_idx = (uint8_t)bi;
+            for (j = 0; j < curr->nargs; j++) {
+                if (curr->args[j]->kind == TOK_VAR) {
+                    int vi = v_find(vt, curr->args[j]->text);
+                    ip->slots[j] = vt->e[vi].slot;
+                } else {
+                    char cname[16];
+                    v_fresh_name(vt, cname, sizeof(cname), cc, 'k');
+                    int vi = v_add(vt, cname);
+                    ip->slots[j] = vt->e[vi].slot;
+                }
+            }
+            for (j = 0; j < curr->nargs; j++) {
+                if (curr->args[j]->kind == TOK_VAR) continue;
+                uint32_t cv;
+                if (token_const(db, curr->args[j], &cv)) return -1;
+                vm_instr *eq = i_emit(ib);
+                if (!eq) return -1;
+                eq->op = OP_EQ_CONST; eq->a = ip->slots[j]; eq->imm = cv;
+            }
+        } else {
+            /* OP_SCAN (first atom, or no shared columns at all) */
+            uint8_t ts[8];
+            ip->op = OP_SCAN;
+            ip->a = (uint8_t)bri[bi];
+            ip->b = (uint8_t)curr->nargs;
+            ip->body_idx = (uint8_t)bi;
+            for (j = 0; j < curr->nargs; j++) {
+                if (curr->args[j]->kind == TOK_VAR) {
+                    int vi = v_find(vt, curr->args[j]->text);
+                    ts[j] = vt->e[vi].slot;
+                } else {
+                    char cname[16];
+                    v_fresh_name(vt, cname, sizeof(cname), cc, 'k');
+                    int vi = v_add(vt, cname);
+                    ts[j] = vt->e[vi].slot;
+                }
+            }
+            for (j = 0; j < curr->nargs; j++) ip->slots[j] = ts[j];
+            for (j = 0; j < curr->nargs; j++) {
+                if (curr->args[j]->kind == TOK_VAR) continue;
+                uint32_t cv;
+                if (token_const(db, curr->args[j], &cv)) return -1;
+                vm_instr *eq = i_emit(ib);
+                if (!eq) return -1;
+                eq->op = OP_EQ_CONST; eq->a = ts[j]; eq->imm = cv;
+            }
+        }
+    } else {
+        /* Leading shared columns: OP_LOOKUP */
+        uint8_t slot_map[8];
+        int si;
+        ip->op = OP_LOOKUP;
+        ip->a = (uint8_t)bri[bi];
+        ip->b = (uint8_t)k;
+        ip->c = (uint8_t)curr->nargs;
+        ip->body_idx = (uint8_t)bi;
+        for (j = 0; j < k; j++) {
+            int vi = v_find(vt, curr->args[j]->text);
+            ip->slots[j] = vt->e[vi].slot;
+            slot_map[j] = vt->e[vi].slot;
+        }
+        si = k;
+        for (j = k; j < curr->nargs; j++) {
+            if (curr->args[j]->kind == TOK_VAR) {
+                int vi = v_find(vt, curr->args[j]->text);
+                ip->slots[si] = vt->e[vi].slot;
+                slot_map[j] = vt->e[vi].slot;
+            } else {
+                char cname[16];
+                v_fresh_name(vt, cname, sizeof(cname), cc, 'k');
+                int vi = v_add(vt, cname);
+                ip->slots[si] = vt->e[vi].slot;
+                slot_map[j] = vt->e[vi].slot;
+            }
+            si++;
+        }
+        for (j = 0; j < curr->nargs; j++) {
+            if (curr->args[j]->kind == TOK_VAR) continue;
+            uint32_t cv;
+            if (token_const(db, curr->args[j], &cv)) return -1;
+            vm_instr *eq = i_emit(ib);
+            if (!eq) return -1;
+            eq->op = OP_EQ_CONST; eq->a = slot_map[j]; eq->imm = cv;
+        }
+    }
+    return 0;
+}
+
+/* Emit the interface-capture OP_PROJECT terminating a subtree range.
+ * a=0xFF marks capture mode (never a real head rel id). */
+static int emit_iface_project(emit_ctx *ec, const uint8_t *slots, int ar)
+{
+    vm_instr *pr = i_emit(ec->ib);
+    int j;
+    if (!pr) return -1;
+    pr->op = OP_PROJECT;
+    pr->a = 0xFF;
+    pr->b = (uint8_t)ar;
+    for (j = 0; j < ar; j++) pr->slots[j] = slots[j];
+    return 0;
+}
+
+static int emit_join(emit_ctx *ec, const int *atoms, int n,
+                     const uint8_t *iface_slots, int iface_ar);
+
+/* Left-deep join of atoms[0..n-1] (a leaf subtree or the fallback).  Binding
+ * scope is LOCAL to this sequence (bound starts empty). */
+static int emit_leftdeep_seq(emit_ctx *ec, const int *atoms, int n,
+                             const uint8_t *iface_slots, int iface_ar)
+{
+    uint64_t bound = 0;
+    int i;
+    for (i = 0; i < n; i++) {
+        if (emit_pos_atom(ec->db, ec->r, atoms[i], ec->bri, ec->pat_idx,
+                          bound, i == 0, ec->vt, ec->ib, ec->cc) != 0)
+            return -1;
+        bound |= ec->mask[atoms[i]];
+    }
+    if (iface_slots)
+        return emit_iface_project(ec, iface_slots, iface_ar);
+    return 0;
+}
+
+/* Binary-tree (bushy) emission for atoms[0..n-1]: post-order
+ * [eval left][eval right][OP_MAT_JOIN], each child materialized via
+ * OP_MAT_BEGIN into a per-rule intermediate buffer. */
+static int emit_bushy_tree(emit_ctx *ec, const int *atoms, int n,
+                           const uint8_t *iface_slots, int iface_ar)
+{
+    uint32_t bl, br;
+    int w, i, j;
+    int L[64], R[64];
+    int nl = 0, nr = 0;
+    uint64_t mL = 0, mR = 0;
+    uint8_t sh_slots[8], lp_slots[8], rp_slots[8];
+    int nsh, nlp, nrp;
+    uint8_t liface[8], riface[8], out_slots[8];
+    int la = 0, ra = 0, oa = 0;
+    int bL, bR, left_begin, right_begin;
+    vm_instr *mb, *mj;
+
+    if (!min_cut_split(atoms, n, ec->mask, &bl, &br, &w))
+        return -1;   /* caller guarantees a split exists */
+
+    for (i = 0; i < n; i++) {
+        if (bl & (1u << i)) { L[nl++] = atoms[i]; mL |= ec->mask[atoms[i]]; }
+        else                { R[nr++] = atoms[i]; mR |= ec->mask[atoms[i]]; }
+    }
+    nsh = mask_to_slots(mL & mR, sh_slots);
+    nlp = mask_to_slots(mL & ~mR, lp_slots);
+    nrp = mask_to_slots(mR & ~mL, rp_slots);
+
+    for (j = 0; j < nsh; j++) liface[la++] = sh_slots[j];
+    for (j = 0; j < nlp; j++) liface[la++] = lp_slots[j];
+    for (j = 0; j < nsh; j++) riface[ra++] = sh_slots[j];
+    for (j = 0; j < nrp; j++) riface[ra++] = rp_slots[j];
+    for (j = 0; j < nsh; j++) out_slots[oa++] = sh_slots[j];
+    for (j = 0; j < nlp; j++) out_slots[oa++] = lp_slots[j];
+    for (j = 0; j < nrp; j++) out_slots[oa++] = rp_slots[j];
+
+    bL = ec->next_buf++;
+    bR = ec->next_buf++;
+
+    mb = i_emit(ec->ib);
+    if (!mb) return -1;
+    mb->op = OP_MAT_BEGIN;
+    mb->a = (uint8_t)bL;
+    mb->b = (uint8_t)la;
+    mb->imm = 0;   /* patched below */
+    for (j = 0; j < la; j++) mb->slots[j] = liface[j];
+    left_begin = ec->ib->n - 1;
+    if (emit_join(ec, L, nl, liface, la) != 0) return -1;
+    ec->ib->b[left_begin].imm = (uint32_t)ec->ib->n;
+
+    mb = i_emit(ec->ib);
+    if (!mb) return -1;
+    mb->op = OP_MAT_BEGIN;
+    mb->a = (uint8_t)bR;
+    mb->b = (uint8_t)ra;
+    mb->imm = 0;
+    for (j = 0; j < ra; j++) mb->slots[j] = riface[j];
+    right_begin = ec->ib->n - 1;
+    if (emit_join(ec, R, nr, riface, ra) != 0) return -1;
+    ec->ib->b[right_begin].imm = (uint32_t)ec->ib->n;
+
+    mj = i_emit(ec->ib);
+    if (!mj) return -1;
+    mj->op = OP_MAT_JOIN;
+    mj->a = (uint8_t)bL;
+    mj->b = (uint8_t)bR;
+    mj->c = (uint8_t)nsh;
+    for (j = 0; j < oa; j++) mj->slots[j] = out_slots[j];
+
+    if (iface_slots)
+        return emit_iface_project(ec, iface_slots, iface_ar);
+    return 0;
+}
+
+/* Emit a join for atoms[0..n-1]: bushy iff (n>=4, a split with cut width
+ * <= BUSHY_MAX_CUT exists, and the subtree has <= MAX_ARITY distinct vars —
+ * which bounds every descendant buffer arity by subset).  Otherwise
+ * left-deep.  iface_slots (NULL for the root) is the interface projection
+ * emitted at the end of a child subtree range. */
+static int emit_join(emit_ctx *ec, const int *atoms, int n,
+                     const uint8_t *iface_slots, int iface_ar)
+{
+    uint64_t all = 0;
+    int i;
+    for (i = 0; i < n; i++) all |= ec->mask[atoms[i]];
+    if (ec->do_bushy && n >= 4 && n <= BUSHY_MAX_ATOMS &&
+        popcount64(all) <= MAX_ARITY) {
+        uint32_t bl, br;
+        int w;
+        if (min_cut_split(atoms, n, ec->mask, &bl, &br, &w) &&
+            w <= BUSHY_MAX_CUT)
+            return emit_bushy_tree(ec, atoms, n, iface_slots, iface_ar);
+    }
+    return emit_leftdeep_seq(ec, atoms, n, iface_slots, iface_ar);
+}
+
 /* ─── Compile one rule ──────────────────────────────────────────────── */
 
 static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
@@ -1255,7 +1717,46 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
 
     /* ── 8. emit bytecode ────────────────────────────────────────── */
 
-    {
+    if (!r->has_negation) {
+        /* BUSHY (v2): negation-free rules take the always-on left-deep
+         * reorder, and optionally a binary-tree (bushy) join plan when a
+         * natural 2-partition exists. */
+        int *pos = malloc((size_t)(r->nbody > 0 ? r->nbody : 1) * sizeof(int));
+        uint64_t *mask = calloc((size_t)(r->nbody > 0 ? r->nbody : 1),
+                                sizeof(uint64_t));
+        int n_pos = 0;
+        int any_pattern = 0;
+        emit_ctx ec;
+
+        if (!pos || !mask) { free(pos); free(mask); goto fail; }
+        for (bi = 0; bi < r->nbody; bi++) {
+            atom *ba = r->body[bi];
+            if (ba->negated || ba->aggregate) continue;
+            if (is_builtin_pred(ba)) continue;
+            pos[n_pos++] = bi;
+            mask[bi] = atom_var_mask(r, bi, &vt);
+            if (pat_idx[bi] != 0xFF) any_pattern = 1;
+        }
+        if (n_pos == 0) {
+            free(pos); free(mask);
+            fprintf(stderr, "compile error: rule '%s' has no positive body atom\n",
+                    r->head->pred);
+            goto fail;
+        }
+        if (g_reorder)
+            reorder_pos_atoms(db, bri, mask, pos, n_pos);
+
+        memset(&ec, 0, sizeof(ec));
+        ec.db = db; ec.r = r; ec.bri = bri; ec.pat_idx = pat_idx;
+        ec.vt = &vt; ec.ib = &ib; ec.cc = &cc; ec.mask = mask;
+        ec.do_bushy = g_bushy && (agg == NULL) && !any_pattern;
+        ec.next_buf = 0;
+        if (emit_join(&ec, pos, n_pos, NULL, 0) != 0) {
+            free(pos); free(mask);
+            goto fail;
+        }
+        free(pos); free(mask);
+    } else {
         int first_pos = -1;
 
         for (bi = 0; bi < r->nbody; bi++) {

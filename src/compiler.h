@@ -55,6 +55,21 @@ typedef enum {
                              intern_str(db->ir, buf); intern==0 (OOM or result
                              > 4096 bytes) -> backtrack; else b_try(c, sym_id).
                              This is the ONLY opcode that interns at runtime. */
+    OP_MAT_BEGIN   = 18, /* BUSHY (v2): materialize a subtree into a per-rule
+                             intermediate buffer.  a=buf_idx, imm=end_ip (index
+                             of the instruction AFTER the subtree), b=interface
+                             arity, slots[0..b-1]=interface var slots in
+                             [shared ++ private] canonical ascending-slot order.
+                             Recursively exec_range(ip+1..imm) with FRESH
+                             bindings, capturing the interface projection into
+                             the pool tuple_set via ts_add, then ip=imm. */
+    OP_MAT_JOIN    = 19, /* BUSHY (v2): hash-join two materialized buffers on
+                             their leading shared columns.  a=L buf_idx,
+                             b=R buf_idx, c=n_shared; slots[0..out_ar-1]=outer
+                             var slot per output column, output layout
+                             [shared(0..c-1) ++ L.private ++ R.private].  Pushes
+                             a frame iterating the result (like OP_HASH_JOIN)
+                             binding output cols into the current bindings. */
 } vm_opcode;
 
 typedef struct {
@@ -93,5 +108,21 @@ typedef struct {
 int  compile_rules(dl_db *db, rule **rules, int n_rules,
                    compiled_rule ***out_rules, int *out_n);
 void compiled_rule_free(compiled_rule *cr);
+
+/* ─── BUSHY (v2) compile-time toggles ────────────────────────────────────
+ *
+ * g_bushy (default 1): emit binary-tree (bushy) join plans for eligible
+ * high-arity rules.  Set to 0 to FORCE LEFT-DEEP (the always-on reorder
+ * still applies) — the correctness backstop used by the equivalence test.
+ *
+ * g_reorder (default 1): always-on greedy left-deep reorder of positive
+ * atoms by ascending rel_count().  Set to 0 to restore the v1 body-order
+ * left-deep emission.
+ *
+ * Both are plain globals so tests can flip them directly.  They must be set
+ * BEFORE dl_compile; they are read at compile time and are NOT thread-safe
+ * (single-threaded library).  No env-var initialization is provided. */
+extern int g_bushy;
+extern int g_reorder;
 
 #endif

@@ -14,7 +14,8 @@
  *   exec_rule()         — bytecode interpreter (opcodes: SCAN, LOOKUP,
  *                         EQ, EQ_CONST, PROJECT, NEG_CHECK, HALT, AGG_ACC,
  *                         AGG_EMIT, WALK, LOOKUP_PERM, HASH_JOIN,
- *                         CMP, ARITH, STR_FILTER, STR_LEN, STR_BIND)
+ *                         CMP, ARITH, STR_FILTER, STR_LEN, STR_BIND,
+ *                         MAT_BEGIN, MAT_JOIN)
  *   eval_nonrecursive() — M1 path: one exec_rule per rule, commits to DAFSA
  *   eval_stratum_recursive() — semi-naive fixpoint using tuple_sets
  *   vm_execute()        — stratify + dispatch
@@ -370,31 +371,122 @@ static int backtrack(vm_frame *frames, int *sp, bindings *b,
     return 0;
 }
 
+/* ─── BUSHY (v2): buffer hash join helpers ─────────────────────────────── */
+
+/* Interface-capture sink for OP_MAT_BEGIN: ts_add the projected columns.
+ * Returns 1 (stop) on error, 0 on success. */
+static int mat_capture_cb(const uint32_t *cols, uint8_t arity, void *user)
+{
+    tuple_set *ts = (tuple_set *)user;
+    (void)arity;
+    return ts_add(ts, cols) < 0;
+}
+
+/* FNV-1a over c leading u32 columns (the shared join key). */
+static uint64_t mat_hash(const uint32_t *k, int c)
+{
+    uint64_t h = 14695981039346656037ULL;
+    int i;
+    for (i = 0; i < c; i++) {
+        uint32_t v = k[i];
+        h ^= (v & 0xFF);         h *= 1099511628211ULL;
+        h ^= ((v >> 8) & 0xFF);  h *= 1099511628211ULL;
+        h ^= ((v >> 16) & 0xFF); h *= 1099511628211ULL;
+        h ^= ((v >> 24) & 0xFF); h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+/* Hash-join L and R on their leading c columns.  Output rows have arity
+ * c + (L->arity - c) + (R->arity - c), layout [shared(c) ++ L.private ++
+ * R.private].  Fills tb (caller-initialized empty tuple_buf).  Returns 0 on
+ * success, -1 on OOM. */
+static int mat_join_build(const tuple_set *L, const tuple_set *R, int c,
+                          tuple_buf *tb)
+{
+    int nL = L->arity, nR = R->arity;
+    int nLp = nL - c, nRp = nR - c;
+    int out_ar = c + nLp + nRp;
+    long i, ri;
+    size_t hcap = 1;
+    long *bucket, *nxt;
+
+    while (hcap < (size_t)R->count * 2 + 1) hcap <<= 1;
+    bucket = calloc(hcap, sizeof(long));           /* 0 = empty, else idx+1 */
+    nxt = malloc((size_t)(R->count > 0 ? R->count : 1) * sizeof(long));
+    if (!bucket || !nxt) { free(bucket); free(nxt); return -1; }
+    for (i = 0; i < R->count; i++) {
+        const uint32_t *row = R->data + i * nR;
+        size_t slot = (size_t)(mat_hash(row, c) & (uint64_t)(hcap - 1));
+        nxt[i] = bucket[slot] - 1;
+        bucket[slot] = i + 1;
+    }
+
+    tb->arity = (uint8_t)out_ar;
+    for (i = 0; i < L->count; i++) {
+        const uint32_t *lrow = L->data + i * nL;
+        size_t slot = (size_t)(mat_hash(lrow, c) & (uint64_t)(hcap - 1));
+        ri = bucket[slot] - 1;
+        while (ri >= 0) {
+            const uint32_t *rrow = R->data + ri * nR;
+            int k, match = 1;
+            for (k = 0; k < c; k++)
+                if (lrow[k] != rrow[k]) { match = 0; break; }
+            if (match) {
+                uint32_t *o;
+                if (tb->count >= tb->cap) {
+                    long nc = tb->cap ? tb->cap * 2 : 1024;
+                    uint32_t *nd = realloc(tb->data,
+                        (size_t)nc * (size_t)out_ar * sizeof(uint32_t));
+                    if (!nd) { free(bucket); free(nxt); return -1; }
+                    tb->data = nd; tb->cap = nc;
+                }
+                o = tb->data + tb->count * out_ar;
+                for (k = 0; k < c; k++) o[k] = lrow[k];
+                for (k = 0; k < nLp; k++) o[c + k] = lrow[c + k];
+                for (k = 0; k < nRp; k++) o[c + nLp + k] = rrow[c + k];
+                tb->count++;
+            }
+            ri = nxt[ri];
+        }
+    }
+    free(bucket); free(nxt);
+    return 0;
+}
+
 /* ─── Bytecode interpreter ────────────────────────────────────────────── */
 
 /*
- * Execute one compiled rule against the database.
+ * Execute a bytecode RANGE [start, end) of one compiled rule.
  *
  * Parameters:
  *   db        — database handle
  *   cr        — compiled rule (bytecode)
+ *   start,end — instruction range to execute (fresh bindings + frames)
  *   ov        — overrides: for body_idx -> tuple_set (NULL = use DAFSA)
  *   n_ov      — number of overrides
  *   dry       — 1: collect via cb, do not commit to DAFSA
  *               0: commit to DAFSA via rel_add (non-recursive strata)
  *   cb, user  — tuple callback (for dry mode, or for new-tuple notification)
+ *   capture   — non-NULL => SUBTREE mode: OP_PROJECT projects the interface
+ *               columns into capture (ts_add) instead of committing to a head.
+ *   pool,n_pool — BUSHY intermediate tuple_set pool (shared across nested
+ *                 exec_range recursions), NULL/0 when no bushy nodes.
  *
  * Returns number of tuples produced, or -1 on error.
  */
-static long exec_rule(dl_db *db, const compiled_rule *cr,
-                      const vm_override *ov, int n_ov,
-                      int dry, dl_tuple_cb cb, void *user)
+static long exec_range(dl_db *db, const compiled_rule *cr,
+                       int start, int end,
+                       const vm_override *ov, int n_ov,
+                       int dry, dl_tuple_cb cb, void *user,
+                       int (*capture)(const uint32_t *, uint8_t, void *),
+                       void *capture_user,
+                       tuple_set *pool, int n_pool)
 {
     const vm_instr *p = cr->instrs;
-    int ni = cr->n_instrs;
     bindings b;
     vm_frame frames[MAX_FRAMES];
-    int sp = 0, ip = 0;
+    int sp = 0, ip = start;
     long rc = 0;
 
     /* M3: locate aggregate instructions (if any) and prepare the accumulator */
@@ -403,7 +495,7 @@ static long exec_rule(dl_db *db, const compiled_rule *cr,
     int agg_acc_ip = -1, agg_emit_ip = -1, acc_init = 0;
     {
         int k;
-        for (k = 0; k < ni; k++) {
+        for (k = start; k < end; k++) {
             if (p[k].op == OP_AGG_ACC)      agg_acc_ip = k;
             else if (p[k].op == OP_AGG_EMIT) agg_emit_ip = k;
         }
@@ -429,7 +521,7 @@ static long exec_rule(dl_db *db, const compiled_rule *cr,
     b_init(&b);
     memset(frames, 0, sizeof(frames));
 
-    while (ip < ni) {
+    while (ip < end) {
         const vm_instr *in = &p[ip];
 
         switch (in->op) {
@@ -457,21 +549,21 @@ static long exec_rule(dl_db *db, const compiled_rule *cr,
                        (size_t)ov_ts->count * ov_ts->arity * sizeof(uint32_t));
             } else {
                 void *r = db_rel(db, in->a);
-                if (!r) { ip = ni; break; }
+                if (!r) { ip = end; break; }
                 f->tuples.arity = in->b;
                 rel_prefix((const void *)r, NULL, 0, tbuf_cb, &f->tuples);
             }
 
             if (f->tuples.count == 0) {
                 tbuf_free(&f->tuples);
-                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
                 break;
             }
 
             b_save(&f->saved, &b);
             if (!seek_valid(f, in, 0, (int)f->tuples.arity, &b)) {
                 tbuf_free(&f->tuples);
-                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
                 break;
             }
             sp++;
@@ -491,12 +583,12 @@ static long exec_rule(dl_db *db, const compiled_rule *cr,
             /* Get the compiled regex DFA from the rule */
             int pat_idx = (int)in->imm;
             if (pat_idx < 0 || pat_idx >= cr->n_patterns) {
-                ip = ni; break;
+                ip = end; break;
             }
             regex_dfa *dfa = cr->patterns[pat_idx];
 
             void *r = db_rel(db, in->a);
-            if (!r) { ip = ni; break; }
+            if (!r) { ip = end; break; }
             f->tuples.arity = in->b;
 
             /* Use rel_pattern to enumerate matching tuples */
@@ -504,14 +596,14 @@ static long exec_rule(dl_db *db, const compiled_rule *cr,
 
             if (f->tuples.count == 0) {
                 tbuf_free(&f->tuples);
-                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
                 break;
             }
 
             b_save(&f->saved, &b);
             if (!seek_valid(f, in, 0, (int)f->tuples.arity, &b)) {
                 tbuf_free(&f->tuples);
-                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
                 break;
             }
             sp++;
@@ -542,7 +634,7 @@ static long exec_rule(dl_db *db, const compiled_rule *cr,
                 long first;
                 long cnt = ts_prefix(ov_ts, pref, (uint8_t)k, &first);
                 if (cnt == 0) {
-                    if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                    if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
                     break;
                 }
                 f->tuples.arity = ov_ts->arity;
@@ -557,7 +649,7 @@ static long exec_rule(dl_db *db, const compiled_rule *cr,
             } else {
                 void *r = db_rel(db, in->a);
                 if (!r) {
-                    if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                    if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
                     break;
                 }
                 f->tuples.arity = in->c;
@@ -565,7 +657,7 @@ static long exec_rule(dl_db *db, const compiled_rule *cr,
                            tbuf_cb, &f->tuples);
                 if (f->tuples.count == 0) {
                     tbuf_free(&f->tuples);
-                    if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                    if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
                     break;
                 }
             }
@@ -573,7 +665,7 @@ static long exec_rule(dl_db *db, const compiled_rule *cr,
             b_save(&f->saved, &b);
             if (!seek_valid(f, in, k, (int)f->tuples.arity, &b)) {
                 tbuf_free(&f->tuples);
-                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
                 break;
             }
             sp++;
@@ -592,7 +684,7 @@ static long exec_rule(dl_db *db, const compiled_rule *cr,
             int ar = (int)in->c;
             const uint8_t *perm_arr = dl_db_get_perm(db, rel_id, perm_id);
             if (!perm_arr) {
-                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
                 break;
             }
 
@@ -621,7 +713,7 @@ static long exec_rule(dl_db *db, const compiled_rule *cr,
                 long cnt = ts_prefix(ov_ts, pref, (uint8_t)k, &first);
                 if (cnt == 0) {
                     f->perm = NULL;
-                    if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                    if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
                     break;
                 }
                 f->tuples.arity = ov_ts->arity;
@@ -638,7 +730,7 @@ static long exec_rule(dl_db *db, const compiled_rule *cr,
                 void *pr = (void *)dl_db_get_perm_rel(db, rel_id, perm_id);
                 if (!pr) {
                     f->perm = NULL;
-                    if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                    if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
                     break;
                 }
                 f->tuples.arity = (uint8_t)ar;
@@ -647,7 +739,7 @@ static long exec_rule(dl_db *db, const compiled_rule *cr,
                 if (f->tuples.count == 0) {
                     tbuf_free(&f->tuples);
                     f->perm = NULL;
-                    if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                    if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
                     break;
                 }
             }
@@ -656,7 +748,7 @@ static long exec_rule(dl_db *db, const compiled_rule *cr,
             if (!seek_valid_perm(f, in, k, ar, perm_arr, &b)) {
                 tbuf_free(&f->tuples);
                 f->perm = NULL;
-                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
                 break;
             }
             sp++;
@@ -708,7 +800,7 @@ static long exec_rule(dl_db *db, const compiled_rule *cr,
                 void *r = db_rel(db, rel_id);
                 if (!r) {
                     ts_free(&all_ts);
-                    if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                    if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
                     break;
                 }
                 rel_prefix((const void *)r, NULL, 0, ts_sink_cb, &all_ts);
@@ -717,7 +809,7 @@ static long exec_rule(dl_db *db, const compiled_rule *cr,
 
             if (all_ts.count == 0) {
                 ts_free(&all_ts);
-                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
                 break;
             }
 
@@ -769,7 +861,7 @@ static long exec_rule(dl_db *db, const compiled_rule *cr,
                 if (match_ts.count == 0) {
                     ts_free(&match_ts);
                     ts_free(&all_ts);
-                    if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                    if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
                     break;
                 }
 
@@ -800,15 +892,77 @@ static long exec_rule(dl_db *db, const compiled_rule *cr,
                 if (!seek_valid_perm(f, in, k, ar, perm_arr, &b)) {
                     tbuf_free(&f->tuples);
                     f->perm = NULL;
-                    if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                    if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
                     break;
                 }
             } else {
                 if (!seek_valid(f, in, k, ar, &b)) {
                     tbuf_free(&f->tuples);
-                    if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                    if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
                     break;
                 }
+            }
+            sp++;
+            ip++;
+            break;
+        }
+
+        /* ── OP_MAT_BEGIN: materialize a subtree into a buffer (BUSHY) ── */
+        case OP_MAT_BEGIN: {
+            int buf = (int)in->a;
+            int end_ip = (int)in->imm;
+            int ar = (int)in->b;
+            tuple_set *ts;
+            long sub;
+            if (!pool || buf < 0 || buf >= n_pool) { ip = end; break; }
+            if (end_ip <= ip + 1 || end_ip > end) { ip = end; break; }
+            ts = &pool[buf];
+            if (ts->arity == 0) {
+                if (ts_init(ts, (uint8_t)ar) != 0) return -1;
+            }
+            /* Recursively evaluate the subtree range with FRESH bindings,
+             * capturing the interface projection into the buffer. */
+            sub = exec_range(db, cr, ip + 1, end_ip, ov, n_ov,
+                             dry, cb, user, mat_capture_cb, ts, pool, n_pool);
+            if (sub < 0) return -1;
+            ip = end_ip;
+            break;
+        }
+
+        /* ── OP_MAT_JOIN: hash-join two materialized buffers (BUSHY) ── */
+        case OP_MAT_JOIN: {
+            int Lb = (int)in->a, Rb = (int)in->b, c = (int)in->c;
+            tuple_set *L, *R;
+            int nLp, nRp, out_ar;
+            vm_frame *f;
+            if (!pool || Lb >= n_pool || Rb >= n_pool) { ip = end; break; }
+            L = &pool[Lb]; R = &pool[Rb];
+            if (L->arity == 0 || R->arity == 0) { ip = end; break; }
+            nLp = (int)L->arity - c;
+            nRp = (int)R->arity - c;
+            out_ar = c + nLp + nRp;
+            if (nLp < 0 || nRp < 0 || out_ar > MAX_ARITY) { ip = end; break; }
+
+            if (sp >= MAX_FRAMES) return -1;
+            f = &frames[sp];
+            f->ip = ip;
+            f->op = OP_MAT_JOIN;
+            f->idx = 0;
+            f->perm = NULL;
+            memset(&f->tuples, 0, sizeof(f->tuples));
+
+            if (mat_join_build(L, R, c, &f->tuples) != 0) return -1;
+
+            if (f->tuples.count == 0) {
+                tbuf_free(&f->tuples);
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
+                break;
+            }
+            b_save(&f->saved, &b);
+            if (!seek_valid(f, in, 0, out_ar, &b)) {
+                tbuf_free(&f->tuples);
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
+                break;
             }
             sp++;
             ip++;
@@ -819,7 +973,7 @@ static long exec_rule(dl_db *db, const compiled_rule *cr,
         case OP_NEG_CHECK: {
             void *r = db_rel(db, in->a);
             if (!r) {
-                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
                 break;
             }
             uint32_t cols[8];
@@ -830,12 +984,12 @@ static long exec_rule(dl_db *db, const compiled_rule *cr,
                 cols[j] = b_get(&b, s);
             }
             if (!all) {
-                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
                 break;
             }
             if (rel_exact((const void *)r, cols)) {
                 /* Found in negated relation — backtrack */
-                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
                 break;
             }
             ip++;
@@ -850,7 +1004,7 @@ static long exec_rule(dl_db *db, const compiled_rule *cr,
 
             if (ab && bb) {
                 if (av != bv) {
-                    if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                    if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
                     break;
                 }
             } else if (ab && !bb) {
@@ -868,7 +1022,7 @@ static long exec_rule(dl_db *db, const compiled_rule *cr,
             uint32_t cv = in->imm;
             if (b_ok(&b, s)) {
                 if (b_get(&b, s) != cv) {
-                    if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                    if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
                     break;
                 }
             } else {
@@ -894,7 +1048,7 @@ static long exec_rule(dl_db *db, const compiled_rule *cr,
                 default: pass = 0; break;
             }
             if (!pass) {
-                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
                 break;
             }
             ip++;
@@ -919,11 +1073,11 @@ static long exec_rule(dl_db *db, const compiled_rule *cr,
                 default: ok = 0; break;
             }
             if (!ok) {
-                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
                 break;
             }
             if (!b_try(&b, in->c, r)) {
-                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
                 break;
             }
             ip++;
@@ -954,7 +1108,7 @@ static long exec_rule(dl_db *db, const compiled_rule *cr,
                 }
             }
             if (!pass) {
-                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
                 break;
             }
             ip++;
@@ -968,13 +1122,13 @@ static long exec_rule(dl_db *db, const compiled_rule *cr,
         case OP_STR_LEN: {
             const char *s = intern_str_of(db->ir, b_get(&b, in->a));
             if (!s) {
-                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
                 break;
             }
             {
                 uint32_t len = (uint32_t)strlen(s);
                 if (!b_try(&b, in->c, len)) {
-                    if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                    if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
                     break;
                 }
             }
@@ -1035,11 +1189,11 @@ static long exec_rule(dl_db *db, const compiled_rule *cr,
                 }
             }
             if (sid == 0) {
-                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
                 break;
             }
             if (!b_try(&b, in->c, sid)) {
-                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
                 break;
             }
             ip++;
@@ -1048,30 +1202,41 @@ static long exec_rule(dl_db *db, const compiled_rule *cr,
 
         /* ── OP_PROJECT: emit / commit tuple ──────────────────────── */
         case OP_PROJECT: {
+            if (capture) {
+                /* Subtree range-end: project the interface columns into the
+                 * materialize buffer (a=0xFF marks this capture project). */
+                uint32_t cols[8];
+                int j;
+                for (j = 0; j < in->b; j++) cols[j] = b_get(&b, in->slots[j]);
+                if (capture(cols, (uint8_t)in->b, capture_user)) { ip = end; break; }
+                rc++;
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
+                break;
+            }
             void *r = db_rel(db, in->a);
-            if (!r) { ip = ni; break; }
+            if (!r) { ip = end; break; }
             uint32_t cols[8];
             int j;
             for (j = 0; j < in->b; j++) {
                 uint8_t s = in->slots[j];
-                if (s == 0xFF) { ip = ni; break; }
+                if (s == 0xFF) { ip = end; break; }
                 cols[j] = b_get(&b, s);
             }
-            if (ip >= ni) break;
+            if (ip >= end) break;
 
             if (dry) {
                 rc++;
-                if (cb && cb(cols, (uint8_t)in->b, user)) { ip = ni; break; }
+                if (cb && cb(cols, (uint8_t)in->b, user)) { ip = end; break; }
             } else {
                 int rr = rel_add((void *)r, cols);
-                if (rr < 0) { ip = ni; break; }
+                if (rr < 0) { ip = end; break; }
                 if (rr == 1) {
                     rc++;
-                    if (cb && cb(cols, (uint8_t)in->b, user)) { ip = ni; break; }
+                    if (cb && cb(cols, (uint8_t)in->b, user)) { ip = end; break; }
                 }
             }
             /* Project always backtracks (each binding produces one tuple) */
-            if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+            if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
             break;
         }
 
@@ -1084,11 +1249,11 @@ static long exec_rule(dl_db *db, const compiled_rule *cr,
                 key[g] = b_get(&b, acc.group_slots[g]);
             }
             if (!all_bound) {
-                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
                 break;
             }
             agg_bucket *bk = agg_find_or_create(&acc, key);
-            if (!bk) { ip = ni; break; }
+            if (!bk) { ip = end; break; }
             bk->valid = 1;
             bk->count++;
             if (acc.op == 1) {
@@ -1103,7 +1268,7 @@ static long exec_rule(dl_db *db, const compiled_rule *cr,
                 else if (v > bk->max) bk->max = v;
             }
             /* Aggregate consumes all matching tuples: backtrack to continue */
-            if (!backtrack(frames, &sp, &b, p, &ip)) { ip = ni; }
+            if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
             break;
         }
 
@@ -1115,12 +1280,12 @@ static long exec_rule(dl_db *db, const compiled_rule *cr,
 
         /* ── OP_HALT ──────────────────────────────────────────────── */
         case OP_HALT:
-            ip = ni;
+            ip = end;
             break;
 
         default:
             fprintf(stderr, "vm: bad op %d\n", in->op);
-            ip = ni;
+            ip = end;
             break;
         }
     }
@@ -1181,6 +1346,37 @@ static long exec_rule(dl_db *db, const compiled_rule *cr,
         sp--;
     }
 
+    return rc;
+}
+
+/* ─── Top-level rule entry: exec_rule = exec_range over the whole program,
+ * with a per-rule intermediate tuple_set pool for bushy plans. ─────────── */
+static long exec_rule(dl_db *db, const compiled_rule *cr,
+                      const vm_override *ov, int n_ov,
+                      int dry, dl_tuple_cb cb, void *user)
+{
+    const vm_instr *p = cr->instrs;
+    int n_instrs = cr->n_instrs;
+    int n_mat = 0, k;
+    tuple_set *pool = NULL;
+    long rc;
+
+    for (k = 0; k < n_instrs; k++)
+        if (p[k].op == OP_MAT_BEGIN) n_mat++;
+
+    if (n_mat > 0) {
+        pool = calloc((size_t)n_mat, sizeof(tuple_set));
+        if (!pool) return -1;
+    }
+
+    rc = exec_range(db, cr, 0, n_instrs, ov, n_ov, dry, cb, user,
+                    NULL, NULL, pool, n_mat);
+
+    if (pool) {
+        for (k = 0; k < n_mat; k++)
+            if (pool[k].arity != 0) ts_free(&pool[k]);
+        free(pool);
+    }
     return rc;
 }
 
@@ -2129,6 +2325,11 @@ int vm_ivm_eligible(dl_db *db)
             if (op == OP_WALK)        return 0;
             if (op == OP_LOOKUP_PERM) return 0;
             if (op == OP_HASH_JOIN)   return 0;
+            /* BUSHY: materialize/join opcodes are override-incompatible (the
+             * subtree buffers are built fresh each exec; a delta override on
+             * one body atom cannot be threaded through them) — full re-eval. */
+            if (op == OP_MAT_BEGIN)   return 0;
+            if (op == OP_MAT_JOIN)    return 0;
 
             /* Slice 2 recursive-delta restriction: a RECURSIVE rule's base
              * body atom that reads a RULE-HEAD relation (rather than pure EDB
@@ -2383,6 +2584,10 @@ int vm_dred_eligible(dl_db *db)
             if (op == OP_WALK)        return 0;  /* rel_pattern: no override */
             if (op == OP_LOOKUP_PERM) return 0;  /* permuted shadow: no override */
             if (op == OP_HASH_JOIN)   return 0;  /* reads DAFSA directly */
+            /* BUSHY: materialize/join opcodes are override-incompatible —
+             * full re-eval (correct oracle). */
+            if (op == OP_MAT_BEGIN)   return 0;
+            if (op == OP_MAT_JOIN)    return 0;
         }
     }
     return 1;
@@ -2918,6 +3123,10 @@ int vm_agg_eligible(dl_db *db)
         for (k = 0; k < cr->n_instrs; k++) {
             uint8_t op = cr->instrs[k].op;
             if (op == OP_WALK || op == OP_LOOKUP_PERM || op == OP_HASH_JOIN)
+                return 0;
+            /* BUSHY: materialize/join opcodes are override-incompatible —
+             * full re-eval (correct oracle). */
+            if (op == OP_MAT_BEGIN || op == OP_MAT_JOIN)
                 return 0;
         }
     }
