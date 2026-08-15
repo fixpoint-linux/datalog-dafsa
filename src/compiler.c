@@ -87,7 +87,18 @@ int g_reorder = 1;
 static uint64_t db_rel_card(dl_db *db, int idx)
 {
     if (idx < 0 || (size_t)idx >= db->nrels) return 0;
+    /* v2: a variadic relation's join-order hint is the total across
+     * variants (any value is semantically safe — perf hint only). */
+    if (db->rels[idx].kind == RELK_VARIADIC)
+        return vrel_count(db->rels[idx].vrel);
     return rel_count(db->rels[idx].rel);
+}
+
+/* v2: 1 if the relation is variadic. */
+static int db_rel_is_variadic(dl_db *db, int idx)
+{
+    if (idx < 0 || (size_t)idx >= db->nrels) return 0;
+    return db->rels[idx].kind == RELK_VARIADIC;
 }
 
 /* ─── Variable slot tracking ────────────────────────────────────────── */
@@ -1440,6 +1451,22 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
                    r->head->pred, r->head->nargs); goto fail; }
         head_ri = db_find_rel(db, r->head->pred);
         if (head_ri < 0) goto fail;
+    } else if (db_rel_is_variadic(db, head_ri)) {
+        /* v2: a variadic head accepts any static nargs in 1..8 — the rule
+         * PROJECTS into variant[nargs].  Materialize the variant up front
+         * (durable, WAL-backed) so the fixpoint's view-reset and the
+         * OP_PROJECT write both see it.  To make a head variadic at all,
+         * the user must dl_declare_relation_variadic BEFORE dl_load_rules
+         * (an undeclared head is declared fixed, as in v1). */
+        if (r->head->nargs < 1 || r->head->nargs > MAX_ARITY) {
+            fprintf(stderr, "compile error: head arity %d for variadic '%s'\n",
+                    r->head->nargs, r->head->pred); goto fail;
+        }
+        if (!dl_ensure_variant(db, head_ri, (uint8_t)r->head->nargs)) {
+            fprintf(stderr, "compile error: cannot materialize variant %d "
+                    "of variadic '%s'\n",
+                    r->head->nargs, r->head->pred); goto fail;
+        }
     } else {
         if (db_rel_arity(db, head_ri) != (uint8_t)r->head->nargs) {
             fprintf(stderr, "compile error: arity mismatch for '%s': %d vs %d\n",
@@ -1491,11 +1518,42 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
             fprintf(stderr, "compile error: unknown predicate '%s'\n",
                     ba->pred); goto fail;
         }
-        if (db_rel_arity(db, ri) != (uint8_t)ba->nargs) {
+        if (db_rel_is_variadic(db, ri)) {
+            /* v2: a variadic body atom accepts any static nargs in 1..8;
+             * the VM reads variant[nargs] (an absent variant reads as an
+             * EMPTY relation — no materialization needed for reads). */
+            if (ba->nargs < 1 || ba->nargs > MAX_ARITY) {
+                fprintf(stderr, "compile error: body arity %d for variadic "
+                        "'%s'\n", ba->nargs, ba->pred);
+                goto fail;
+            }
+        } else if (db_rel_arity(db, ri) != (uint8_t)ba->nargs) {
             fprintf(stderr, "compile error: arity mismatch for '%s'\n",
                     ba->pred); goto fail;
         }
         bri[bi] = ri;
+    }
+
+    /* ── 3b. v2: reject aggregate rules that touch a variadic relation ──.
+     * The group-by/leading-prefix structure of the aggregate machinery is
+     * undefined across arities — reject at COMPILE time, never silently
+     * mis-evaluate. */
+    if (agg) {
+        if (db_rel_is_variadic(db, head_ri)) {
+            fprintf(stderr, "compile error: aggregate over a variadic "
+                    "relation is not supported (head '%s', rule '%s')\n",
+                    r->head->pred, r->head->pred);
+            goto fail;
+        }
+        for (bi = 0; bi < r->nbody; bi++) {
+            if (bri[bi] < 0) continue;   /* builtin / aggregate atom */
+            if (db_rel_is_variadic(db, bri[bi])) {
+                fprintf(stderr, "compile error: aggregate over a variadic "
+                        "relation is not supported (body '%s', rule '%s')\n",
+                        r->body[bi]->pred, r->head->pred);
+                goto fail;
+            }
+        }
     }
 
     /* ── 4. collect vars ─────────────────────────────────────────── */
@@ -2329,6 +2387,21 @@ int compile_rules(dl_db *db, rule **rules, int n_rules,
             c[i]->is_recursive =
                 (c[i]->head_rel_id < (uint8_t)nrels
                  && recursive[c[i]->head_rel_id]) ? 1 : 0;
+
+            /* v2: a RECURSIVE variadic head is out of scope — the
+             * semi-naive fixpoint tracks one single-arity idb/delta
+             * tuple_set pair per recursive head, which cannot represent a
+             * mixed-arity family.  Reject at compile time (never silently
+             * mis-evaluate).  Recursive rules whose BODY merely READS
+             * variadic EDB variants remain fine. */
+            if (c[i]->is_recursive &&
+                db_rel_is_variadic(db, c[i]->head_rel_id)) {
+                fprintf(stderr, "compile error: recursive rule over a "
+                        "variadic head is not supported (rule '%s')\n",
+                        c[i]->head_pred);
+                int j; for (j = 0; j <= i; j++) compiled_rule_free(c[j]);
+                free(c); free(recursive); free(rel_strata); return -1;
+            }
 
             /* M3: aggregates only allowed in non-recursive rules */
             if (c[i]->has_aggregate && c[i]->is_recursive) {

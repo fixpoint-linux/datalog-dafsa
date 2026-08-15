@@ -5,6 +5,34 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **v2 variable-arity relations**: a relation declared variadic
+  (`dl_declare_relation_variadic`, or `dl_declare_relation` with arity 0)
+  holds facts of ANY arity 1..8. Storage is PER-ARITY-VARIANT DAFSAs: each
+  arity a is an ordinary fixed-width relation keyed 4·a+1 bytes under
+  `<name>.<a>.dafsa` (+ `.wal`, `.base.dafsa`), so the fixed-width key
+  encoding — the byte-prefix-lookup linchpin — is UNCHANGED.
+  - `dl_add_fact`/`dl_delete_fact` route to the fact's own arity variant
+    (WAL-durable); `dl_load_facts` takes variable-width CSV rows (row field
+    count = arity); `dl_prefix`/`dl_query`/`dl_query_bound`/`dl_pattern` fan
+    out over variants a ≥ k (the callback's arity parameter disambiguates
+    tuples); snapshot publish writes a `name:*:edb|idb` manifest marker plus
+    ordinary per-variant lines, and the mmap query path fans out over them.
+  - Compiler: a variadic atom accepts any syntactic arity 1..8 (each atom's
+    nargs is static); rule heads materialize their variant at compile time;
+    permutation indices are per-variant. AGGREGATES over a variadic relation
+    and RECURSIVE variadic heads are compile errors (never mis-evaluated).
+  - Gating: a program containing a variadic relation is excluded from IVM /
+    DRed / aggregate maintenance and magic-sets queries — every publish runs
+    the full fixpoint (the correctness floor).
+  - Backward-compatible strict superset: fixed relations keep their exact
+    v1 files and `name:arity:edb|idb` lines; older binaries skip the new
+    `name:*:...` marker (arity parse rejects it). No migration.
+  - 10-test suite `tests/test_vararity` (single-variant≡fixed equivalence,
+    variable-tail prefixes, fixed-arity-equivalent oracle incl. cross-arity
+    joins, randomized property tests vs a brute-force model, gating via the
+    `vm_*_runs` counters, compile-error, persistence, snapshot, magic
+    rejection, fixed coexistence).
+
 - **v2 IVM (incremental view maintenance)**, Slices 0-5: the fixpoint is now
   incrementally maintained instead of fully re-evaluated on every change.
   - **Slice 0 — deletion-correctness**: a base/view partition inside each

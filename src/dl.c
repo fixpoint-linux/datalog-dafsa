@@ -13,6 +13,7 @@
 #include "dl_internal.h"
 #include "intern.h"
 #include "relation.h"
+#include "vrelation.h"
 #include "parser.h"
 #include "compiler.h"
 #include "vm.h"
@@ -79,6 +80,154 @@ static char *make_path(dl_db *db, const char *name, const char *suffix)
     memcpy(path + dlen + 1, name, nlen);
     memcpy(path + dlen + 1 + nlen, suffix, slen + 1);
     return path;
+}
+
+/* Build a VARIADIC VARIANT file path: db->dir/name.<a><suffix>.
+ * Predicate names cannot contain '.' (parser.c is_pred_char), so these
+ * paths never collide with a user relation's own files (dl_declare also
+ * guards the pathological C-API case of a fixed name "x.<d>"). */
+static char *make_vpath(dl_db *db, const char *name, uint8_t a,
+                        const char *suffix)
+{
+    size_t dlen = strlen(db->dir);
+    size_t nlen = strlen(name);
+    size_t slen = strlen(suffix);
+    char *path = malloc(dlen + 1 + nlen + 2 + slen + 1);
+    if (!path) return NULL;
+    memcpy(path, db->dir, dlen);
+    path[dlen] = '/';
+    memcpy(path + dlen + 1, name, nlen);
+    path[dlen + 1 + nlen] = '.';
+    path[dlen + 2 + nlen] = (char)('0' + (a % 10));
+    memcpy(path + dlen + 3 + nlen, suffix, slen + 1);
+    return path;
+}
+
+/* ─── v2 variable arity: rel_entry dispatch helpers ────────────────────── */
+
+int db_entry_is_variadic(const rel_entry *e)
+{
+    return (e && e->kind == RELK_VARIADIC) ? 1 : 0;
+}
+
+int db_has_variadic(const dl_db *db)
+{
+    size_t i;
+    if (!db) return 0;
+    for (i = 0; i < db->nrels; i++)
+        if (db->rels[i].kind == RELK_VARIADIC)
+            return 1;
+    return 0;
+}
+
+relation *db_entry_variant_ro(const rel_entry *e, uint8_t arity)
+{
+    if (!e) return NULL;
+    if (e->kind == RELK_VARIADIC)
+        return vrel_variant_or_null(e->vrel, arity);   /* absent = empty */
+    return (e->arity == arity) ? e->rel : NULL;
+}
+
+relation *db_entry_variant_rw(rel_entry *e, uint8_t arity)
+{
+    if (!e) return NULL;
+    if (e->kind == RELK_VARIADIC)
+        return vrel_variant(e->vrel, arity);           /* get-or-create */
+    return (e->arity == arity) ? e->rel : NULL;
+}
+
+relation *db_rel_at_arity_ro(const dl_db *db, int rel_id, uint8_t arity)
+{
+    if (!db || rel_id < 0 || (size_t)rel_id >= db->nrels) return NULL;
+    return db_entry_variant_ro(&db->rels[rel_id], arity);
+}
+
+relation *db_rel_at_arity_rw(dl_db *db, int rel_id, uint8_t arity)
+{
+    if (!db || rel_id < 0 || (size_t)rel_id >= db->nrels) return NULL;
+    return db_entry_variant_rw(&db->rels[rel_id], arity);
+}
+
+/* Does any on-disk file exist for variant a of `name`?  (declare-time scan) */
+static int variant_files_exist(dl_db *db, const char *name, uint8_t a)
+{
+    static const char *suffixes[3] = {".dafsa", ".wal", ".base.dafsa"};
+    struct stat st;
+    int i;
+    for (i = 0; i < 3; i++) {
+        char *p = make_vpath(db, name, a, suffixes[i]);
+        int exists = (p && stat(p, &st) == 0);
+        free(p);
+        if (exists) return 1;
+    }
+    return 0;
+}
+
+/* A variadic variant's rule-head-ness is derived from FILE EXISTENCE:
+ * <name>.<a>.base.dafsa present => open as an idb (split base/view)
+ * variant, else as an EDB variant (base aliases view).  rels.txt carries a
+ * single edb|idb flag for the WHOLE variadic relation, which cannot
+ * express per-variant state — so the base file is the durable per-variant
+ * marker (dl_close writes it for every idb variant, exactly like fixed
+ * rule-head relations). */
+static int variant_is_idb_on_disk(dl_db *db, const char *name, uint8_t a)
+{
+    struct stat st;
+    char *p = make_vpath(db, name, a, ".base.dafsa");
+    int exists = (p && stat(p, &st) == 0);
+    free(p);
+    return exists;
+}
+
+/* Get-or-open (durable, WAL-backed) variant a of a variadic entry.  The
+ * open replays + compacts any existing WAL, mirroring the fixed declare
+ * path.  On a filesystem-less eval clone (dir==NULL) the variant is created
+ * in memory instead. */
+static relation *variadic_open_variant(dl_db *db, rel_entry *e, uint8_t a)
+{
+    relation *r;
+    char *dafsa, *wal, *base = NULL;
+    int is_idb;
+
+    if (!db || !e || e->kind != RELK_VARIADIC) return NULL;
+    if (a == 0 || a > MAX_VAR_ARITY) return NULL;
+    if (!db->dir) return vrel_variant(e->vrel, a);   /* eval clone */
+
+    r = vrel_variant_or_null(e->vrel, a);
+    if (r) return r;
+
+    dafsa = make_vpath(db, e->name, a, ".dafsa");
+    wal   = make_vpath(db, e->name, a, ".wal");
+    is_idb = variant_is_idb_on_disk(db, e->name, a);
+    if (is_idb)
+        base = make_vpath(db, e->name, a, ".base.dafsa");
+
+    if (!dafsa || !wal || (is_idb && !base)) {
+        free(dafsa); free(wal); free(base);
+        return NULL;
+    }
+
+    r = is_idb ? rel_open_writable_idb(base, dafsa, wal, a)
+               : rel_open_writable(dafsa, wal, a);
+
+    free(dafsa);
+    free(wal);
+    free(base);
+
+    if (!r) return NULL;
+    if (vrel_attach(e->vrel, a, r) != 0) {
+        rel_free(r);
+        return NULL;
+    }
+    return r;
+}
+
+relation *dl_ensure_variant(dl_db *db, int rel_id, uint8_t arity)
+{
+    if (!db || rel_id < 0 || (size_t)rel_id >= db->nrels) return NULL;
+    if (db->rels[rel_id].kind != RELK_VARIADIC)
+        return db_entry_variant_ro(&db->rels[rel_id], arity);
+    return variadic_open_variant(db, &db->rels[rel_id], arity);
 }
 
 /* ─── Lifecycle ───────────────────────────────────────────────────────── */
@@ -191,13 +340,22 @@ dl_db *dl_open2(const char *dir, int *err_out)
                     *colon = '\0';
                     char *rest = colon + 1;
                     int arity = atoi(rest);
+                    int is_variadic = (rest[0] == '*');
                     int is_idb = 0;
                     char *colon2 = strchr(rest, ':');
                     if (colon2 && strcmp(colon2 + 1, "idb") == 0) is_idb = 1;
-                    if (arity >= 1 && arity <= 8 && line[0] != '\0') {
+                    /* v2 backward-compat: a 'name:*:edb|idb' variadic marker
+                     * is accepted here; arity 1..8 lines parse identically to
+                     * v1 (old binaries simply skip the '*' line — atoi("*")
+                     * is 0, outside 1..8).  The flag is advisory for
+                     * variadic lines: per-variant edb|idb state is derived
+                     * from <name>.<a>.base.dafsa file existence. */
+                    if (line[0] != '\0' &&
+                        (is_variadic || (arity >= 1 && arity <= 8))) {
                         snprintf(rel_names[n_meta], sizeof(rel_names[n_meta]),
                                  "%s", line);
-                        rel_arities[n_meta] = (uint8_t)arity;
+                        /* arity 0 carries the VARIADIC kind downstream */
+                        rel_arities[n_meta] = (uint8_t)(is_variadic ? 0 : arity);
                         rel_idb[n_meta] = (uint8_t)is_idb;
                         n_meta++;
                     }
@@ -248,10 +406,37 @@ void dl_close(dl_db *db)
     }
 
     /* M7/IVM: compact each relation's BASE (save + truncate WAL).  Rule-head
-     * (IDB) relations additionally persist their VIEW to <name>.dafsa>. */
+     * (IDB) relations additionally persist their VIEW to <name>.dafsa>.
+     * v2: a VARIADIC relation does the same PER VARIANT under
+     * <name>.<a>.dafsa — an idb variant's base file doubles as the durable
+     * per-variant edb|idb marker consulted at reopen. */
     for (i = 0; i < db->nrels; i++) {
         char *path;
-        if (rel_is_idb(db->rels[i].rel)) {
+        if (db->rels[i].kind == RELK_VARIADIC) {
+            uint8_t a;
+            for (a = 1; a <= MAX_VAR_ARITY; a++) {
+                relation *vr = vrel_variant_or_null(db->rels[i].vrel, a);
+                if (!vr) continue;
+                if (rel_is_idb(vr)) {
+                    path = make_vpath(db, db->rels[i].name, a, ".base.dafsa");
+                    if (path) {
+                        rel_compact(vr, path);
+                        free(path);
+                    }
+                    path = make_vpath(db, db->rels[i].name, a, ".dafsa");
+                    if (path) {
+                        rel_save(vr, path);
+                        free(path);
+                    }
+                } else {
+                    path = make_vpath(db, db->rels[i].name, a, ".dafsa");
+                    if (path) {
+                        rel_compact(vr, path);
+                        free(path);
+                    }
+                }
+            }
+        } else if (rel_is_idb(db->rels[i].rel)) {
             path = make_path(db, db->rels[i].name, ".base.dafsa");
             if (path) {
                 rel_compact(db->rels[i].rel, path);
@@ -276,7 +461,10 @@ void dl_close(dl_db *db)
 
     /* Now free relations and their names */
     for (i = 0; i < db->nrels; i++) {
-        rel_free(db->rels[i].rel);
+        if (db->rels[i].kind == RELK_VARIADIC)
+            vrel_free(db->rels[i].vrel);   /* frees every present variant */
+        else
+            rel_free(db->rels[i].rel);
         free(db->rels[i].name);
     }
 
@@ -351,10 +539,21 @@ static void write_rels_txt(dl_db *db)
 
     p = buf;
     for (i = 0; i < db->nrels; i++) {
-        int n = snprintf(p, total - (size_t)(p - buf), "%s:%d:%s\n",
+        int n;
+        if (db->rels[i].kind == RELK_VARIADIC) {
+            /* v2 variadic marker: 'name:*:edb|idb'.  Older binaries skip
+             * this line (their arity 1..8 check rejects it); the flag is
+             * advisory — per-variant edb|idb state is derived at reopen
+             * from <name>.<a>.base.dafsa file existence. */
+            n = snprintf(p, total - (size_t)(p - buf), "%s:*:%s\n",
+                         db->rels[i].name,
+                         vrel_any_idb(db->rels[i].vrel) ? "idb" : "edb");
+        } else {
+            n = snprintf(p, total - (size_t)(p - buf), "%s:%d:%s\n",
                          db->rels[i].name,
                          (int)rel_arity(db->rels[i].rel),
                          rel_is_idb(db->rels[i].rel) ? "idb" : "edb");
+        }
         if (n < 0) { free(buf); free(rels_path); return; }
         p += n;
     }
@@ -371,17 +570,33 @@ static void write_rels_txt(dl_db *db)
     free(rels_path);
 }
 
-/* Declare a relation, optionally as a rule head (is_idb). */
+/* Does `name` look like a variadic-variant file stem "<x>.<d>" with d a
+ * single digit 1..8?  (Parser identifiers cannot contain '.', so only C-API
+ * callers can produce such names — the guard below keeps their files from
+ * aliasing a variadic relation's variant files.) */
+static int is_variant_stem(const char *name, char stem[256])
+{
+    size_t len = strlen(name);
+    if (len < 3 || len > 254) return 0;
+    if (name[len - 2] != '.') return 0;
+    if (name[len - 1] < '1' || name[len - 1] > '8') return 0;
+    memcpy(stem, name, len - 2);
+    stem[len - 2] = '\0';
+    return 1;
+}
+
+/* Declare a relation, optionally as a rule head (is_idb).  arity == 0
+ * declares a VARIADIC relation (dl_declare_relation_variadic). */
 static int dl_declare_relation_kind(dl_db *db, const char *name,
                                     uint8_t arity, int is_idb)
 {
     int idx;
     char *path;
     relation *rel;
+    vrelation *vrel = NULL;
 
     if (!db || !name) return -1;
-    if (arity == 0 || arity > 8) return -1;
-    if (db->nrels >= MAX_RELS) return -1;
+    if (arity > 8) return -1;   /* 0 = variadic (v2) */
 
     /* M8: scoped-eval clones have dir==NULL.  A declaration on such a db
      * means a missed head relation slipped through the transform — fail
@@ -400,17 +615,76 @@ static int dl_declare_relation_kind(dl_db *db, const char *name,
         return -1;
     }
 
+    /* v2: keep variadic variant files (<x>.<a>.dafsa) from aliasing the
+     * files of another declared relation (only reachable via the C API,
+     * since parser identifiers cannot contain '.'). */
+    if (arity == 0) {
+        /* declaring variadic `name`: no fixed "<name>.<d>" may exist */
+        size_t i;
+        for (i = 0; i < db->nrels; i++) {
+            if (db->rels[i].kind != RELK_VARIADIC && db->rels[i].name[0]) {
+                char stem[256];
+                if (is_variant_stem(db->rels[i].name, stem) &&
+                    strcmp(stem, name) == 0) {
+                    fprintf(stderr, "error: variadic relation '%s' collides "
+                            "with variant files of '%s'\n",
+                            name, db->rels[i].name);
+                    return -1;
+                }
+            }
+        }
+    } else {
+        /* declaring fixed `name` shaped "<x>.<d>": `x` may not be variadic */
+        char stem[256];
+        if (is_variant_stem(name, stem)) {
+            int sidx = find_rel(db, stem);
+            if (sidx >= 0 && db->rels[sidx].kind == RELK_VARIADIC) {
+                fprintf(stderr, "error: relation name '%s' collides with "
+                        "variant files of variadic '%s'\n", name, stem);
+                return -1;
+            }
+        }
+    }
+
     /* Check if already declared */
     idx = find_rel(db, name);
     if (idx >= 0) {
+        if (arity == 0) {
+            /* Idempotent variadic redeclare */
+            if (db->rels[idx].kind == RELK_VARIADIC) return 0;
+            return -1;  /* exists as fixed: kind mismatch */
+        }
+        if (db->rels[idx].kind == RELK_VARIADIC) return -1;  /* kind mismatch */
         /* Idempotent: same arity is fine */
         if (rel_arity(db->rels[idx].rel) == arity)
             return 0;
         return -1;  /* arity mismatch */
     }
 
-    /* Try to load existing DAFSA with WAL, or create new */
-    {
+    if (db->nrels >= MAX_RELS) return -1;
+
+    if (arity == 0) {
+        /* ── VARIADIC: create the family and open every variant that has
+         * files on disk (lazy from here on — new arities materialize on
+         * first add/load/compile via variadic_open_variant). */
+        uint8_t a;
+        rel_entry tmp;
+        vrel = vrel_create();
+        if (!vrel) return -1;
+        memset(&tmp, 0, sizeof(tmp));
+        tmp.name = (char *)name;   /* borrowed: variadic_open_variant only
+                                      reads it to build file paths */
+        tmp.kind = RELK_VARIADIC;
+        tmp.vrel = vrel;
+        for (a = 1; a <= MAX_VAR_ARITY; a++) {
+            if (!variant_files_exist(db, name, a)) continue;
+            if (!variadic_open_variant(db, &tmp, a)) {
+                vrel_free(vrel);
+                return -1;
+            }
+        }
+    } else {
+        /* Try to load existing DAFSA with WAL, or create new */
         char *wal_path;
         char *base_path;
         path = make_path(db, name, ".dafsa");
@@ -434,9 +708,15 @@ static int dl_declare_relation_kind(dl_db *db, const char *name,
     /* Register */
     idx = (int)db->nrels++;
     db->rels[idx].name = strdup(name);
-    db->rels[idx].rel  = rel;
-    if (!db->rels[idx].name) {
-        rel_free(rel);
+    db->rels[idx].kind = (arity == 0) ? RELK_VARIADIC : RELK_FIXED;
+    db->rels[idx].arity = arity;
+    db->rels[idx].rel  = (arity == 0) ? NULL : rel;
+    db->rels[idx].vrel = (arity == 0) ? vrel : NULL;
+    if (!db->rels[idx].name ||
+        (arity == 0 ? !db->rels[idx].vrel : !db->rels[idx].rel)) {
+        if (arity == 0) vrel_free(db->rels[idx].vrel);
+        else rel_free(db->rels[idx].rel);
+        free(db->rels[idx].name);
         db->nrels--;
         return -1;
     }
@@ -452,6 +732,11 @@ static int dl_declare_relation_kind(dl_db *db, const char *name,
 int dl_declare_relation(dl_db *db, const char *name, uint8_t arity)
 {
     return dl_declare_relation_kind(db, name, arity, 0);
+}
+
+int dl_declare_relation_variadic(dl_db *db, const char *name)
+{
+    return dl_declare_relation_kind(db, name, 0, 0);
 }
 
 /* ─── CSV parser ──────────────────────────────────────────────────────── */
@@ -519,6 +804,142 @@ static int is_integer(const char *s)
 
 /* ─── Fact loading ────────────────────────────────────────────────────── */
 
+/* v2: variadic bulk load.  The CSV has VARIABLE-WIDTH rows — each row's
+ * field count (1..8) IS that fact's arity, routed to the matching variant
+ * (rows with 0 or >8 fields are skipped, mirroring the fixed loader's
+ * skip-on-mismatch policy).  Per-arity tuple_sets union the pre-existing
+ * variant BASE with the new rows; each touched variant is bulk-rebuilt and
+ * base-saved exactly like the fixed loader.  Returns the total facts loaded
+ * across all arities, or -1 on error. */
+static int dl_load_facts_variadic(dl_db *db, int idx,
+                                  const char *rel_name, const char *csv_path)
+{
+    FILE *f;
+    char *line = NULL;
+    size_t linecap = 0;
+    ssize_t linelen;
+    rel_entry *e = &db->rels[idx];
+    tuple_set ts[MAX_VAR_ARITY + 1];
+    int have[MAX_VAR_ARITY + 1];
+    long loaded = 0;
+    long n_new = 0;
+    int a;
+    int rc = -1;
+
+    memset(ts, 0, sizeof(ts));
+    for (a = 0; a <= MAX_VAR_ARITY; a++) have[a] = 0;
+
+    f = fopen(csv_path, "r");
+    if (!f) return -1;
+
+    while ((linelen = getline(&line, &linecap, f)) > 0) {
+        char *fields[9];   /* one extra: csv_split TRUNCATES at max_fields,
+                              so a >8-field row would otherwise be silently
+                              misread as arity 8 with its tail dropped —
+                              scan with cap 9 and reject nf==9 instead. */
+        int nf;
+        uint32_t cols[8];
+        int i;
+
+        if (linelen > 0 && line[linelen - 1] == '\n')
+            line[--linelen] = '\0';
+        if (linelen > 0 && line[linelen - 1] == '\r')
+            line[--linelen] = '\0';
+        if (linelen == 0) continue;
+
+        /* Variable-width row: field count = arity. */
+        nf = csv_split(line, fields, 9);
+        if (nf < 1 || nf > 8) continue;   /* empty or >8 fields: skip */
+
+        for (i = 0; i < nf; i++) {
+            if (is_integer(fields[i])) {
+                unsigned long val = strtoul(fields[i], NULL, 10);
+                if (val > 0xFFFFFFFFUL) break;   /* overflow: skip row */
+                cols[i] = (uint32_t)val;
+            } else {
+                uint32_t sym = intern_str(db->ir, fields[i]);
+                if (sym == 0) goto out;          /* OOM: abort */
+                cols[i] = sym;
+            }
+        }
+        if (i < nf) continue;                    /* row marked for skip */
+
+        if (!have[nf]) {
+            relation *vr = vrel_variant_or_null(e->vrel, (uint8_t)nf);
+            if (ts_init(&ts[nf], (uint8_t)nf) != 0) goto out;
+            have[nf] = 1;
+            /* Union the variant's pre-existing BASE (e.g. loaded from disk
+             * on open) so the rebuild produces the combined set. */
+            if (vr && rel_prefix_base(vr, NULL, 0, ts_sink_cb, &ts[nf]) < 0)
+                goto out;
+        }
+        {
+            int trc = ts_add(&ts[nf], cols);
+            if (trc < 0) goto out;
+            if (trc == 1) n_new++;
+        }
+    }
+
+    /* M7 invariant: interner durable BEFORE any relation DAFSA that
+     * references the (possibly new) sym_ids. */
+    {
+        char *fwd_path = make_path(db, "symbols", ".dafsa");
+        char *rev_path = make_path(db, "symbols", ".array");
+        if (fwd_path && rev_path) {
+            if (intern_save(db->ir, fwd_path, rev_path) != 0) {
+                free(fwd_path); free(rev_path);
+                goto out;
+            }
+        }
+        free(fwd_path);
+        free(rev_path);
+    }
+
+    for (a = 1; a <= MAX_VAR_ARITY; a++) {
+        relation *vr;
+        char *path;
+
+        if (!have[a]) continue;
+
+        vr = variadic_open_variant(db, e, (uint8_t)a);   /* may materialize */
+        if (!vr) goto out;
+
+        ts_sort(&ts[a]);
+        if (rel_build_base_from_tupleset(vr, &ts[a]) != 0)
+            goto out;
+        loaded += ts[a].count;
+
+        /* Auto-save the variant's BASE (atomic via dafsa_save) — bulk load
+         * bypasses the WAL; the base DAFSA is the durable home. */
+        path = rel_is_idb(vr)
+             ? make_vpath(db, rel_name, (uint8_t)a, ".base.dafsa")
+             : make_vpath(db, rel_name, (uint8_t)a, ".dafsa");
+        if (path) {
+            rel_save_base(vr, path);
+            free(path);
+        }
+    }
+
+    rc = (int)loaded;
+
+    if (n_new > 0) {
+        /* v2 gating: a variadic relation is outside every incremental class
+         * (a single-arity delta_pending cannot represent mixed arities) —
+         * force the FULL fixpoint at the next publish.  Never silently
+         * mis-evaluate. */
+        db->full_reeval_pending = 1;
+        db->fixpoint_dirty = 1;
+        permindex_mark_dirty(db, idx);
+    }
+
+out:
+    free(line);
+    fclose(f);
+    for (a = 1; a <= MAX_VAR_ARITY; a++)
+        if (have[a]) ts_free(&ts[a]);
+    return rc;
+}
+
 int dl_load_facts(dl_db *db, const char *rel_name, const char *csv_path)
 {
     FILE *f;
@@ -536,6 +957,10 @@ int dl_load_facts(dl_db *db, const char *rel_name, const char *csv_path)
 
     idx = find_rel(db, rel_name);
     if (idx < 0) return -1;  /* relation not declared */
+
+    /* v2: variable-width rows routed per-arity. */
+    if (db->rels[idx].kind == RELK_VARIADIC)
+        return dl_load_facts_variadic(db, idx, rel_name, csv_path);
 
     arity = rel_arity(db->rels[idx].rel);
 
@@ -801,6 +1226,80 @@ static int ivm_capture_delete(dl_db *db, int rel_id,
     return (rc < 0) ? -1 : 0;
 }
 
+/* v2: variadic add — routes to (get-or-opens) the WAL-backed variant for
+ * `arity`, mirroring the fixed path's interner-before-WAL / dup-skip /
+ * WAL-append / in-memory-commit / compaction-threshold ordering exactly. */
+static int dl_add_fact_variadic(dl_db *db, int idx, const char *rel_name,
+                                const uint32_t *cols, uint8_t arity)
+{
+    relation *vr;
+    unsigned char key[33];  /* 4*8+1 */
+    size_t key_len;
+    int rc;
+
+    if (arity == 0 || arity > 8) return -1;
+
+    vr = variadic_open_variant(db, &db->rels[idx], arity);
+    if (!vr) return -1;
+
+    if (encode_fact_key(key, &key_len, cols, arity) != 0) return -1;
+
+    /* 1. Interner-before-WAL invariant (see the fixed path). */
+    if (intern_is_dirty(db->ir)) {
+        char *fwd_path = make_path(db, "symbols", ".dafsa");
+        char *rev_path = make_path(db, "symbols", ".array");
+        if (!fwd_path || !rev_path) {
+            free(fwd_path); free(rev_path);
+            return -1;
+        }
+        if (intern_save(db->ir, fwd_path, rev_path) != 0) {
+            free(fwd_path); free(rev_path);
+            return -1;
+        }
+        free(fwd_path);
+        free(rev_path);
+    }
+
+    /* 2. Duplicate check against the variant BASE. */
+    if (rel_exact_base(vr, cols))
+        return 0;
+
+    /* 3. WAL-append ADD + sync (durable before in-memory commit). */
+    if (rel_wal_append_add(vr, key, (uint32_t)key_len) != 0)
+        return -1;
+
+    /* 4. In-memory add to the variant BASE. */
+    rc = rel_add_base(vr, cols);
+    if (rc < 0) return -1;
+    if (rc == 1) {
+        permindex_mark_dirty(db, idx);
+        /* v2 gating: variadic is outside every incremental class (a
+         * single-arity delta_pending cannot represent a variadic relation)
+         * — force the full fixpoint at the next publish.  Never silently
+         * mis-evaluate. */
+        db->full_reeval_pending = 1;
+    }
+
+    /* 5. Compaction threshold (per variant). */
+    {
+        uint64_t wal_sz = rel_wal_size(vr);
+        uint64_t dafsa_sz = rel_dafsa_size(vr);
+        if (dafsa_sz > 0 && wal_sz > dafsa_sz / 4) {
+            char *path = rel_is_idb(vr)
+                       ? make_vpath(db, rel_name, arity, ".base.dafsa")
+                       : make_vpath(db, rel_name, arity, ".dafsa");
+            if (path) {
+                rel_compact(vr, path);
+                free(path);
+            }
+        }
+    }
+
+    db->fixpoint_dirty = 1;
+
+    return 1;  /* added */
+}
+
 int dl_add_fact(dl_db *db, const char *rel_name,
                 const uint32_t *cols, uint8_t arity)
 {
@@ -813,6 +1312,10 @@ int dl_add_fact(dl_db *db, const char *rel_name,
 
     idx = find_rel(db, rel_name);
     if (idx < 0) return -1;
+
+    /* v2: route to the arity's variant. */
+    if (db->rels[idx].kind == RELK_VARIADIC)
+        return dl_add_fact_variadic(db, idx, rel_name, cols, arity);
 
     if (arity != rel_arity(db->rels[idx].rel)) return -1;
 
@@ -893,6 +1396,46 @@ int dl_add_fact(dl_db *db, const char *rel_name,
     return 1;  /* added */
 }
 
+/* v2: variadic delete — routes to the variant for `arity`; a successful
+ * delete forces the full fixpoint (variadic is outside the DRed class). */
+static int dl_delete_fact_variadic(dl_db *db, int idx,
+                                   const uint32_t *cols, uint8_t arity)
+{
+    relation *vr;
+    unsigned char key[33];  /* 4*8+1 */
+    size_t key_len;
+    int rc;
+
+    if (arity == 0 || arity > 8) return -1;
+
+    vr = variadic_open_variant(db, &db->rels[idx], arity);
+    if (!vr) return -1;
+
+    if (encode_fact_key(key, &key_len, cols, arity) != 0) return -1;
+
+    /* 1. Absent check against the variant BASE: if not present, skip WAL. */
+    if (!rel_exact_base(vr, cols))
+        return 0;
+
+    /* 2. WAL-append DEL + sync (durable before in-memory commit). */
+    if (rel_wal_append_del(vr, key, (uint32_t)key_len) != 0)
+        return -1;
+
+    /* 3. In-memory delete from the variant BASE. */
+    rc = rel_delete_base(vr, cols);
+    if (rc < 0) return -1;
+    if (rc == 1) {
+        permindex_mark_dirty(db, idx);
+        /* v2 gating: variadic deletions are outside DRed (no single-arity
+         * del_pending) — force the full fixpoint (correctness floor). */
+        db->full_reeval_pending = 1;
+    }
+
+    db->fixpoint_dirty = 1;
+
+    return 1;  /* deleted */
+}
+
 int dl_delete_fact(dl_db *db, const char *rel_name,
                    const uint32_t *cols, uint8_t arity)
 {
@@ -905,6 +1448,10 @@ int dl_delete_fact(dl_db *db, const char *rel_name,
 
     idx = find_rel(db, rel_name);
     if (idx < 0) return -1;
+
+    /* v2: route to the arity's variant. */
+    if (db->rels[idx].kind == RELK_VARIADIC)
+        return dl_delete_fact_variadic(db, idx, cols, arity);
 
     if (arity != rel_arity(db->rels[idx].rel)) return -1;
 
@@ -971,6 +1518,12 @@ int dl_lookup(dl_db *db, const char *rel_name,
     idx = find_rel(db, rel_name);
     if (idx < 0) return 0;
 
+    /* v2: exact membership against the arity's variant. */
+    if (db->rels[idx].kind == RELK_VARIADIC) {
+        if (arity == 0 || arity > 8) return 0;
+        return vrel_exact(db->rels[idx].vrel, cols, arity);
+    }
+
     if (arity != rel_arity(db->rels[idx].rel)) return 0;
 
     return rel_exact(db->rels[idx].rel, cols);
@@ -986,6 +1539,12 @@ long dl_prefix(dl_db *db, const char *rel_name,
 
     idx = find_rel(db, rel_name);
     if (idx < 0) return -1;
+
+    /* v2: prefix enumeration fanned out over variants a >= k (each is the
+     * existing fixed-width byte-prefix walk; the cb's arity parameter
+     * disambiguates tuples across arities). */
+    if (db->rels[idx].kind == RELK_VARIADIC)
+        return vrel_prefix(db->rels[idx].vrel, leading, k, cb, user);
 
     return rel_prefix(db->rels[idx].rel, leading, k, cb, user);
 }
@@ -1239,6 +1798,9 @@ long dl_query(dl_db *db, const char *goal_rel, dl_tuple_cb cb, void *user)
     if (goal_rel && cb) {
         int idx = find_rel(db, goal_rel);
         if (idx < 0) return -1;
+        /* v2: stream every variant (cb carries each tuple's arity). */
+        if (db->rels[idx].kind == RELK_VARIADIC)
+            return vrel_prefix(db->rels[idx].vrel, NULL, 0, cb, user);
         return rel_prefix(db->rels[idx].rel, NULL, 0, cb, user);
     }
 
@@ -1264,6 +1826,9 @@ long dl_query_bound(dl_db *db, const char *goal_rel,
     {
         int idx = find_rel(db, goal_rel);
         if (idx < 0) return -1;
+        /* v2: prefix fan-out over variants a >= k. */
+        if (db->rels[idx].kind == RELK_VARIADIC)
+            return vrel_prefix(db->rels[idx].vrel, leading, k, cb, user);
         return rel_prefix(db->rels[idx].rel, leading, k, cb, user);
     }
 }
@@ -1293,8 +1858,11 @@ static int eval_db_clone(dl_db *src, dl_db *out)
     out->ir = src->ir;
     out->lock_fd = -1;
     for (i = 0; i < src->nrels; i++) {
-        out->rels[i].name = src->rels[i].name;  /* borrowed — not owned */
-        out->rels[i].rel  = src->rels[i].rel;   /* borrowed — not owned */
+        out->rels[i].name  = src->rels[i].name;   /* borrowed — not owned */
+        out->rels[i].kind  = src->rels[i].kind;   /* v2: keep the kind tag */
+        out->rels[i].arity = src->rels[i].arity;
+        out->rels[i].rel   = src->rels[i].rel;    /* borrowed — not owned */
+        out->rels[i].vrel  = src->rels[i].vrel;   /* borrowed — not owned */
     }
     out->nrels = src->nrels;
     out->n_perms = 0;
@@ -1319,7 +1887,10 @@ static void eval_db_free(dl_db *edb, size_t n_aliased)
     /* Free only the fresh relations + their names (indices >= n_aliased).
      * The first n_aliased rels/names are borrowed from src — do NOT free. */
     for (i = n_aliased; i < edb->nrels; i++) {
-        rel_free(edb->rels[i].rel);
+        if (edb->rels[i].kind == RELK_VARIADIC)
+            vrel_free(edb->rels[i].vrel);
+        else
+            rel_free(edb->rels[i].rel);
         free(edb->rels[i].name);
     }
 
@@ -1338,7 +1909,10 @@ static int eval_db_declare_inmem(dl_db *edb, const char *name, uint8_t arity)
     if (!rel) return -1;
     edb->rels[edb->nrels].name = strdup(name);
     if (!edb->rels[edb->nrels].name) { rel_free(rel); return -1; }
-    edb->rels[edb->nrels].rel = rel;
+    edb->rels[edb->nrels].kind  = RELK_FIXED;
+    edb->rels[edb->nrels].arity = arity;
+    edb->rels[edb->nrels].rel   = rel;
+    edb->rels[edb->nrels].vrel  = NULL;
     edb->nrels++;
     return 0;
 }
@@ -1399,6 +1973,16 @@ long dl_query_magic(dl_db *db, const char *goal_rel,
 
     if (!db || !goal_rel || !cb) return -1;
 
+    /* v2: a variadic goal has no single arity to adorn — and any program
+     * containing a variadic relation is outside the magic-sets class.
+     * REJECT loudly (consistent with the existing rejection list: never
+     * silently mis-evaluate). */
+    if (db_has_variadic(db)) {
+        fprintf(stderr, "dl_query_magic: rejected: program contains a "
+                "variadic relation (outside the magic-sets class)\n");
+        return -1;
+    }
+
     /* Resolve goal + validate k (mirrors the old leading/k entry checks). */
     goal_idx = find_rel(db, goal_rel);
     if (goal_idx < 0) return -1;
@@ -1441,6 +2025,15 @@ long dl_query_magic_adorn(dl_db *db, const char *goal_rel,
     goal_idx = find_rel(db, goal_rel);
     if (goal_idx < 0) return -1;
     goal_arity = rel_arity(db->rels[goal_idx].rel);
+
+    /* v2: variadic relations are outside the magic-sets class (a variadic
+     * goal has no single arity to adorn; the transform's arity-keyed
+     * adorned variants assume fixed-width predicates).  REJECT loudly. */
+    if (db_has_variadic(db)) {
+        fprintf(stderr, "dl_query_magic: rejected: program contains a "
+                "variadic relation (outside the magic-sets class)\n");
+        return -1;
+    }
 
     /* 2. Validate the adornment: length == arity, chars in {b,f},
      *    nvals == count_b(adorn). */
@@ -1833,6 +2426,42 @@ int dl_publish_snapshot(dl_db *db)
 
         for (i = 0; i < db->nrels; i++) {
             char rel_path[4096];
+
+            if (db->rels[i].kind == RELK_VARIADIC) {
+                /* v2: one marker line 'name:*:edb|idb' (old readers skip it)
+                 * plus, per PRESENT variant, an ordinary fixed-arity line
+                 * 'name.<a>:<a>:edb|idb' + 'name.<a>.dafsa' — the per-variant
+                 * lines are exactly what the snapshot query path fans out
+                 * over (and harmless phantoms for old readers). */
+                uint8_t a;
+                fprintf(mf, "%s:*:%s\n", db->rels[i].name,
+                        vrel_any_idb(db->rels[i].vrel) ? "idb" : "edb");
+                for (a = 1; a <= MAX_VAR_ARITY; a++) {
+                    relation *vr = vrel_variant_or_null(db->rels[i].vrel, a);
+                    char vname[384];
+                    if (!vr) continue;
+                    if (snprintf(vname, sizeof(vname), "%s.%d",
+                                 db->rels[i].name, (int)a) >=
+                        (int)sizeof(vname))
+                        { fclose(mf); goto fail; }
+                    fprintf(mf, "%s:%d:%s\n", vname, (int)a,
+                            rel_is_idb(vr) ? "idb" : "edb");
+                    snprintf(rel_path, sizeof(rel_path), "%s/%s.dafsa",
+                             tmp_dir, vname);
+                    if (rel_save(vr, rel_path) != 0) {
+                        fclose(mf);
+                        goto fail;
+                    }
+                    if (db->fault_hook &&
+                        db->fault_hook(DL_FPOINT_AFTER_REL_SAVE,
+                                       db->fault_user) != 0) {
+                        fclose(mf);
+                        goto fail;
+                    }
+                }
+                continue;
+            }
+
             uint8_t arity = rel_arity(db->rels[i].rel);
 
             fprintf(mf, "%s:%d:%s\n", db->rels[i].name, (int)arity,
@@ -1997,13 +2626,36 @@ long dl_pattern(dl_db *db, const char *rel_name, const struct regex_dfa *dfa,
     if (db->snap_version > 0) {
         char sdir[8192];
         uint8_t arity = 0;
+        int variadic = 0;
         dafsa_view *v;
 
         snprintf(sdir, sizeof(sdir), "%s/snapshots/%u",
                  db->dir, db->snap_version);
 
-        if (!manifest_find_rel(sdir, rel_name, &arity))
+        if (!manifest_find_rel_ex(sdir, rel_name, &arity, &variadic))
             return -1;
+
+        if (variadic) {
+            /* v2: pattern walk fanned out over the per-variant views. */
+            uint8_t present[MAX_VAR_ARITY + 1];
+            long total = 0;
+            uint8_t a;
+            manifest_find_variants(sdir, rel_name, present);
+            for (a = 1; a <= MAX_VAR_ARITY; a++) {
+                char vname[384];
+                long n;
+                if (!present[a]) continue;
+                if (snprintf(vname, sizeof(vname), "%s.%d",
+                             rel_name, (int)a) >= (int)sizeof(vname))
+                    return -1;
+                v = view_open_cached(db->vcache, vname, sdir);
+                if (!v) return -1;
+                n = view_pattern(v, a, dfa, cb, user);
+                if (n < 0) return -1;
+                total += n;
+            }
+            return total;
+        }
 
         v = view_open_cached(db->vcache, rel_name, sdir);
         if (!v) return -1;
@@ -2014,6 +2666,10 @@ long dl_pattern(dl_db *db, const char *rel_name, const struct regex_dfa *dfa,
     /* In-memory path */
     idx = find_rel(db, rel_name);
     if (idx < 0) return -1;
+
+    /* v2: pattern walk fanned out over present variants. */
+    if (db->rels[idx].kind == RELK_VARIADIC)
+        return vrel_pattern(db->rels[idx].vrel, dfa, (rel_enum_cb)cb, user);
 
     return rel_pattern(db->rels[idx].rel, dfa,
                        (rel_enum_cb)cb, user);

@@ -19,12 +19,6 @@
 
 /* ─── Internal dl_db access (authoritative layout in dl_internal.h) ──── */
 
-static relation *db_rel_raw(dl_db *db, int idx)
-{
-    if (idx < 0 || (size_t)idx >= db->nrels) return NULL;
-    return db->rels[idx].rel;
-}
-
 /* ─── Build a single permutation index ────────────────────────────────── */
 
 int permindex_build(dl_db *db, int rel_id, int perm_id)
@@ -38,8 +32,19 @@ int permindex_build(dl_db *db, int rel_id, int perm_id)
     pe = &db->perms[perm_id];
     if (pe->rel_id != rel_id) return -1;
 
-    base_rel = db_rel_raw(db, rel_id);
-    if (!base_rel) return -1;
+    /* v2: a perm index is per-arity-variant by construction (dl_db_declare_
+     * perm keys on rel_id + arity + perm, and every atom's nargs is its
+     * static arity) — resolve the VARIANT the perm belongs to. */
+    base_rel = db_rel_at_arity_ro(db, rel_id, pe->arity);
+    if (!base_rel) {
+        /* Fixed relation of a different arity, or a variadic variant that
+         * does not exist: build an EMPTY index (an absent variant reads as
+         * an empty relation everywhere else too). */
+        if (pe->pidx_rel) rel_free(pe->pidx_rel);
+        pe->pidx_rel = rel_create(pe->arity);
+        pe->dirty = 0;
+        return pe->pidx_rel ? 0 : -1;
+    }
 
     ar = pe->arity;
 

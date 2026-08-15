@@ -548,7 +548,10 @@ static long exec_range(dl_db *db, const compiled_rule *cr,
                 memcpy(f->tuples.data, ov_ts->data,
                        (size_t)ov_ts->count * ov_ts->arity * sizeof(uint32_t));
             } else {
-                void *r = db_rel(db, in->a);
+                /* v2: in->b is the atom's static arity — resolve the
+                 * variant (absent variant = NULL = empty relation, which
+                 * kills the rule here, exactly like an empty scan). */
+                void *r = db_rel_at_arity_ro(db, in->a, in->b);
                 if (!r) { ip = end; break; }
                 f->tuples.arity = in->b;
                 rel_prefix((const void *)r, NULL, 0, tbuf_cb, &f->tuples);
@@ -587,7 +590,9 @@ static long exec_range(dl_db *db, const compiled_rule *cr,
             }
             regex_dfa *dfa = cr->patterns[pat_idx];
 
-            void *r = db_rel(db, in->a);
+            /* v2: kind-aware variant resolution for the pattern walk
+             * (in->b = static arity; absent variant = empty = no tuples). */
+            void *r = db_rel_at_arity_ro(db, in->a, in->b);
             if (!r) { ip = end; break; }
             f->tuples.arity = in->b;
 
@@ -647,7 +652,7 @@ static long exec_range(dl_db *db, const compiled_rule *cr,
                        ov_ts->data + (size_t)first * ov_ts->arity,
                        (size_t)cnt * ov_ts->arity * sizeof(uint32_t));
             } else {
-                void *r = db_rel(db, in->a);
+                void *r = db_rel_at_arity_ro(db, in->a, in->c);
                 if (!r) {
                     if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
                     break;
@@ -797,7 +802,8 @@ static long exec_range(dl_db *db, const compiled_rule *cr,
                            ov_ts->data + (size_t)ci * ov_ts->arity);
                 }
             } else {
-                void *r = db_rel(db, rel_id);
+                /* v2: ar is the atom's static arity — resolve the variant. */
+                void *r = db_rel_at_arity_ro(db, rel_id, (uint8_t)ar);
                 if (!r) {
                     ts_free(&all_ts);
                     if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
@@ -971,9 +977,12 @@ static long exec_range(dl_db *db, const compiled_rule *cr,
 
         /* ── OP_NEG_CHECK: stratified negation ────────────────────── */
         case OP_NEG_CHECK: {
-            void *r = db_rel(db, in->a);
+            /* v2: in->b is the atom's static arity; resolve the variant.
+             * NULL (absent variant) reads as an EMPTY relation, so the
+             * negation succeeds: advance. */
+            void *r = db_rel_at_arity_ro(db, in->a, in->b);
             if (!r) {
-                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
+                ip++;
                 break;
             }
             uint32_t cols[8];
@@ -1213,7 +1222,10 @@ static long exec_range(dl_db *db, const compiled_rule *cr,
                 if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
                 break;
             }
-            void *r = db_rel(db, in->a);
+            /* v2: in->b is the head atom's static arity; the WRITE path
+             * materializes variant[in->b] on demand (fixed heads resolve
+             * to their relation exactly as before). */
+            void *r = db_rel_at_arity_rw(db, in->a, in->b);
             if (!r) { ip = end; break; }
             uint32_t cols[8];
             int j;
@@ -1326,7 +1338,11 @@ static long exec_range(dl_db *db, const compiled_rule *cr,
                 rc++;
                 if (acc.cb && acc.cb(cols, acc.head_arity, acc.user)) break;
             } else {
-                void *r = db_rel(db, acc.head_rel_id);
+                /* v2 defensive: aggregate heads are compile-rejected
+                 * over variadic relations, so this is always fixed — but
+                 * resolve by arity anyway (never guess the kind). */
+                void *r = db_rel_at_arity_rw(db, acc.head_rel_id,
+                                             acc.head_arity);
                 if (r) {
                     int rr = rel_add((void *)r, cols);
                     if (rr < 0) break;
@@ -2156,6 +2172,15 @@ static int vm_execute_mode(dl_db *db, compiled_rule **rules, int n_rules,
             if (hid >= MAX_RELS) return -1;
             if (seen[hid]) continue;
             seen[hid] = 1;
+            /* v2: a VARIADIC head resets (and first-splits) EVERY present
+             * variant — each variant is its own base/view pair.  Variants
+             * of a head are materialized at compile time, so they are all
+             * visible here. */
+            if (db->rels[hid].kind == RELK_VARIADIC) {
+                if (vrel_reset_views(db->rels[hid].vrel) != 0) return -1;
+                permindex_mark_dirty(db, hid);
+                continue;
+            }
             r = db_rel(db, hid);
             if (!r) return -1;
             if (rel_reset_view(r) != 0) return -1;
@@ -2243,6 +2268,10 @@ long vm_query(dl_db *db, compiled_rule **rules, int n_rules,
 
     int gri = db_find(db, goal_rel);
     if (gri >= 0 && cb) {
+        /* v2: stream every variant (the cb carries each tuple's arity). */
+        if (db->rels[gri].kind == RELK_VARIADIC)
+            return vrel_prefix(db->rels[gri].vrel, NULL, 0,
+                               (rel_enum_cb)cb, user);
         void *r = db_rel(db, gri);
         if (r) {
             long n = rel_prefix((const void *)r, NULL, 0,
@@ -2299,7 +2328,10 @@ int vm_ivm_eligible(dl_db *db)
     uint8_t is_rec_head[MAX_RELS];
     int     rec_stratum[MAX_RELS];
 
-    if (!db) return 0;
+    /* v2: any program containing a variadic relation is OUTSIDE the
+     * incremental classes (mixed-arity facts defeat the single-arity
+     * delta_pending model) — always route to the full fixpoint. */
+    if (!db || db_has_variadic(db)) return 0;
 
     memset(is_rule_head, 0, sizeof(is_rule_head));
     memset(is_rec_head, 0, sizeof(is_rec_head));
@@ -2568,7 +2600,8 @@ fail:
 int vm_dred_eligible(dl_db *db)
 {
     int i, k;
-    if (!db) return 0;
+    /* v2: variadic programs are outside DRed (see vm_ivm_eligible). */
+    if (!db || db_has_variadic(db)) return 0;
     for (i = 0; i < db->n_crules; i++) {
         const compiled_rule *cr = db->crules[i];
         /* Recursion: retracting a recursive SCC's mutually-dependent tuples
@@ -3064,7 +3097,9 @@ int vm_agg_eligible(dl_db *db)
     uint8_t agg_head[MAX_RELS];
     int i, k, has_agg = 0;
 
-    if (!db) return 0;
+    /* v2: variadic programs are outside aggregate IVM (aggregates over a
+     * variadic relation are additionally a COMPILE error). */
+    if (!db || db_has_variadic(db)) return 0;
 
     memset(is_head, 0, sizeof(is_head));
     memset(agg_head, 0, sizeof(agg_head));

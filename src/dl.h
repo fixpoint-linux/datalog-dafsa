@@ -42,14 +42,40 @@ dl_db  *dl_open2(const char *dir, int *err_out);
 
 /* Declare a relation with a fixed arity (1-8).  Creates an empty DAFSA
  * for the relation.  Idempotent: if the relation already exists with the
- * same arity it is a no-op; if arity mismatches or arity > 8, returns -1. */
+ * same arity it is a no-op; if arity mismatches or arity > 8, returns -1.
+ *
+ * v2 VARIABLE ARITY: passing arity == 0 declares a VARIADIC relation
+ * (equivalent to dl_declare_relation_variadic below) — facts of any arity
+ * 1..8 may be added, each arity stored as its own fixed-width DAFSA
+ * variant (<name>.<a>.dafsa).  Arity 0 was an error before v2, so no
+ * existing program changes meaning. */
 int dl_declare_relation(dl_db *db, const char *name, uint8_t arity);
+
+/* Declare a VARIADIC relation: facts of any arity 1..8 are accepted
+ * (dl_add_fact / dl_load_facts route by each fact's own arity; rule atoms
+ * resolve to the variant matching their syntactic argument count).
+ * Storage is per-arity fixed-width — the fixed-width key encoding is
+ * unchanged, and this is a strict on-disk superset (rels.txt gains a
+ * 'name:*:edb|idb' marker line that older binaries simply skip).
+ * Idempotent on an existing variadic relation; -1 if the name exists as a
+ * fixed-arity relation (or vice versa).  Mixed with rules: variadic heads
+ * must be declared BEFORE dl_load_rules; aggregates over a variadic
+ * relation and recursive variadic heads are compile errors; programs
+ * containing a variadic relation are excluded from incremental
+ * maintenance (IVM/DRed/aggregates) and magic-sets queries — they always
+ * evaluate via the full fixpoint (never silently mis-evaluated). */
+int dl_declare_relation_variadic(dl_db *db, const char *name);
 
 /* ─── Fact loading ────────────────────────────────────────────────────── */
 
 /* Load ground facts from a headerless CSV file into a declared relation.
  * Values: quoted strings (interned) or bare integers (stored raw as u32).
- * Returns number of facts loaded, or -1 on error. */
+ * Returns number of facts loaded, or -1 on error.
+ *
+ * v2 VARIABLE ARITY: for a VARIADIC relation the CSV rows may have
+ * VARIABLE WIDTH — each row's field count (1..8) IS that fact's arity, and
+ * it is routed to the matching variant.  Rows with 0 or >8 fields are
+ * skipped.  Returns the total facts loaded across all arities. */
 int dl_load_facts(dl_db *db, const char *rel, const char *csv_path);
 
 /* ─── Incremental fact API (M7) ────────────────────────────────────────── */

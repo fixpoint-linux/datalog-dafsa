@@ -220,8 +220,8 @@ void *view_open_cached(view_cache_slot *vcache,
 
 /* ─── manifest_find_rel ────────────────────────────────────────────────── */
 
-int manifest_find_rel(const char *sdir, const char *rel_name,
-                             uint8_t *arity_out)
+int manifest_find_rel_ex(const char *sdir, const char *rel_name,
+                         uint8_t *arity_out, int *variadic_out)
 {
     char path[8192];
     FILE *f;
@@ -249,18 +249,90 @@ int manifest_find_rel(const char *sdir, const char *rel_name,
         *colon = '\0';
 
         if (strcmp(line, rel_name) == 0) {
-            int a = atoi(colon + 1);
-            if (a >= 1 && a <= 8) {
-                *arity_out = (uint8_t)a;
-                found = 1;
-                break;
+            char *rest = colon + 1;
+            if (rest[0] == '*') {
+                /* v2 variadic marker: 'name:*:edb|idb'. */
+                if (variadic_out) {
+                    *variadic_out = 1;
+                    *arity_out = 0;
+                    found = 1;
+                    break;
+                }
+                /* Legacy caller semantics: not found as a fixed relation. */
+                continue;
             }
+            {
+                int a = atoi(rest);
+                if (a >= 1 && a <= 8) {
+                    *arity_out = (uint8_t)a;
+                    if (variadic_out) *variadic_out = 0;
+                    found = 1;
+                    break;
+                }
+            }
+        }
+    }
+
+    /* Not the plain name: a variadic caller detects the '*' marker above;
+     * a per-variant 'name.<a>' line never matches the plain goal name
+     * because strcmp compares the whole left side. */
+    free(line);
+    fclose(f);
+    return found;
+}
+
+int manifest_find_rel(const char *sdir, const char *rel_name,
+                      uint8_t *arity_out)
+{
+    return manifest_find_rel_ex(sdir, rel_name, arity_out, NULL);
+}
+
+/* v2: scan the manifest for per-variant lines 'name.<a>:<a>:...' of the
+ * variadic relation `rel_name` and mark present[a]=1. */
+void manifest_find_variants(const char *sdir, const char *rel_name,
+                            uint8_t present[9])
+{
+    char path[8192];
+    FILE *f;
+    char *line = NULL;
+    size_t cap = 0;
+    ssize_t len;
+    size_t nlen = strlen(rel_name);
+
+    memset(present, 0, 9);
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+    snprintf(path, sizeof(path), "%s/manifest.txt", sdir);
+#pragma GCC diagnostic pop
+    f = fopen(path, "r");
+    if (!f) return;
+
+    while ((len = getline(&line, &cap, f)) > 0) {
+        char *colon;
+        if (len > 0 && line[len-1] == '\n') line[--len] = '\0';
+        if (len > 0 && line[len-1] == '\r') line[--len] = '\0';
+
+        if (line[0] == '#' || line[0] == 'D') continue;
+
+        colon = strchr(line, ':');
+        if (!colon) continue;
+        *colon = '\0';
+
+        /* Match '<rel_name>.<d>' with d a single digit 1..8. */
+        if ((size_t)(colon - line) == nlen + 2 &&
+            strncmp(line, rel_name, nlen) == 0 &&
+            line[nlen] == '.' &&
+            line[nlen + 1] >= '1' && line[nlen + 1] <= '8') {
+            int a = line[nlen + 1] - '0';
+            int parsed = atoi(colon + 1);
+            if (parsed == a)   /* sanity: variant line carries its arity */
+                present[a] = 1;
         }
     }
 
     free(line);
     fclose(f);
-    return found;
 }
 
 /* ─── snapshot_query_scan ──────────────────────────────────────────────── */
@@ -273,14 +345,44 @@ long snapshot_query_scan(const char *db_dir, uint32_t snap_version,
 {
     char sdir[8192];
     uint8_t arity = 0;
+    int variadic = 0;
     dafsa_view *v;
 
     /* Build snapshot dir path */
     snprintf(sdir, sizeof(sdir), "%s/snapshots/%u", db_dir, snap_version);
 
-    /* Resolve arity from manifest */
-    if (!manifest_find_rel(sdir, goal_rel, &arity))
+    /* Resolve arity (and variadic-ness) from the manifest */
+    if (!manifest_find_rel_ex(sdir, goal_rel, &arity, &variadic))
         return -1;
+
+    if (variadic) {
+        /* v2: prefix enumeration fanned out over every PRESENT variant
+         * a >= max(k,1) — each variant view walk is the existing mmap'd
+         * fixed-width prefix walk (view_prefix); the cb's arity parameter
+         * disambiguates tuples across arities. */
+        uint8_t present[MAX_ARITY + 1];
+        long total = 0;
+        uint8_t a;
+
+        if (k > MAX_ARITY) return -1;
+        if (k > 0 && !leading) return -1;
+
+        manifest_find_variants(sdir, goal_rel, present);
+        for (a = (k > 0 ? k : 1); a <= MAX_ARITY; a++) {
+            char vname[384];
+            long n;
+            if (!present[a]) continue;
+            if (snprintf(vname, sizeof(vname), "%s.%d",
+                         goal_rel, (int)a) >= (int)sizeof(vname))
+                return -1;
+            v = view_open_cached(vcache, vname, sdir);
+            if (!v) return -1;
+            n = view_prefix(v, a, leading, k, cb, user);
+            if (n < 0) return -1;
+            total += n;
+        }
+        return total;
+    }
 
     if (k > arity) return -1;
     if (k > 0 && !leading) return -1;

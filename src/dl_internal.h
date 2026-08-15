@@ -23,6 +23,7 @@
 #include "dl.h"
 #include "intern.h"
 #include "relation.h"
+#include "vrelation.h"
 #include "snapshot.h"
 #include "permindex.h"
 #include "compiler.h"   /* compiled_rule (anonymous-struct typedef — cannot
@@ -36,11 +37,23 @@
 
 #define MAX_RELS 64  /* enough for M0 */
 
+/* ─── rel_entry kinds (v2 variable arity) ──────────────────────────────── */
+
+#define RELK_FIXED    0  /* rel_entry.rel is the single fixed-width relation */
+#define RELK_VARIADIC 1  /* rel_entry.vrel holds one variant per arity 1..8  */
+
 /* ─── Authoritative dl_db layout ───────────────────────────────────────── */
 
+/* Kind-tagged entry: exactly one of rel / vrel is non-NULL, per `kind`.
+ * The FIXED path is byte-identical to v1 (same relation, same files); a
+ * variadic relation is a NEW kind with its own <name>.<a>.* files — a strict
+ * on-disk superset, no migration. */
 typedef struct {
-    char     *name;
-    relation *rel;
+    char      *name;
+    uint8_t    kind;    /* RELK_FIXED or RELK_VARIADIC */
+    uint8_t    arity;   /* RELK_FIXED: the fixed arity; RELK_VARIADIC: 0 */
+    relation  *rel;     /* RELK_FIXED only (NULL for variadic) */
+    vrelation *vrel;    /* RELK_VARIADIC only (NULL for fixed) */
 } rel_entry;
 
 struct dl_db {
@@ -92,5 +105,35 @@ struct dl_db {
                                                     full def in tupleset.h */
     struct tuple_set  *del_pending[MAX_RELS];    /* pending -deltas (Slice 3) */
 };
+
+/* ─── rel_entry dispatch helpers (defined in dl.c) ─────────────────────── */
+
+/* 1 if the entry is a variadic relation, else 0. */
+int db_entry_is_variadic(const rel_entry *e);
+
+/* 1 if ANY relation in the db is variadic (the incremental-maintenance and
+ * magic-sets exclusion test: such programs route to the full fixpoint). */
+int db_has_variadic(const dl_db *db);
+
+/* READ resolution: for a fixed entry, the relation iff arity matches (else
+ * NULL); for a variadic entry, variant[arity] WITHOUT materializing it
+ * (NULL = absent variant, which callers treat as an EMPTY relation). */
+relation *db_entry_variant_ro(const rel_entry *e, uint8_t arity);
+
+/* WRITE resolution: like db_entry_variant_ro, but a variadic entry with no
+ * variant[arity] gets a fresh IN-MEMORY variant (rel_create — no WAL; the
+ * durable open is dl.c's variadic_open_variant / dl_ensure_variant).  Used
+ * by OP_PROJECT to commit derived tuples of a new arity. */
+relation *db_entry_variant_rw(rel_entry *e, uint8_t arity);
+
+/* (db, rel_id, arity)-flavored wrappers — the VM/permindex call shape. */
+relation *db_rel_at_arity_ro(const dl_db *db, int rel_id, uint8_t arity);
+relation *db_rel_at_arity_rw(dl_db *db, int rel_id, uint8_t arity);
+
+/* Get-or-open (durable, WAL-backed) variant `arity` of relation rel_id.
+ * For a fixed relation this just returns the fixed relation iff the arity
+ * matches.  On a filesystem-less eval clone (dir==NULL) the variant is
+ * created in memory instead.  Returns the relation or NULL on error. */
+relation *dl_ensure_variant(dl_db *db, int rel_id, uint8_t arity);
 
 #endif /* DL_INTERNAL_H */

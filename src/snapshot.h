@@ -66,4 +66,18 @@ long view_pattern(void *view_handle, uint8_t arity,
 int manifest_find_rel(const char *sdir, const char *rel_name,
                       uint8_t *arity_out);
 
+/* v2 extended lookup: also reports whether the entry is the VARIADIC
+ * marker line ('name:*:...'), in which case *arity_out is 0 and the
+ * relation is enumerated via manifest_find_variants.  *variadic_out may
+ * be NULL (then behaves like manifest_find_rel and returns 0 for a
+ * variadic entry). */
+int manifest_find_rel_ex(const char *sdir, const char *rel_name,
+                         uint8_t *arity_out, int *variadic_out);
+
+/* v2: collect which arity variants of a variadic relation are present in
+ * the manifest (per-variant lines 'name.<a>:<a>:edb|idb').
+ * present[a] = 1 for each present variant a in 1..8; zeroed on entry. */
+void manifest_find_variants(const char *sdir, const char *rel_name,
+                            uint8_t present[9]);
+
 #endif /* SNAPSHOT_H */
