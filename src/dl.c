@@ -22,6 +22,7 @@
 #include "tupleset.h"
 #include "permindex.h"
 #include "magic.h"
+#include "topdown.h"
 #include "util.h"
 
 #include <stdlib.h>
@@ -2376,6 +2377,230 @@ out_free_crules:
         int i;
         for (i = 0; i < n_magic; i++) compiled_rule_free(magic_crules[i]);
         free(magic_crules);
+    }
+out_free_edb:
+    eval_db_free(&edb, n_aliased);
+    return result;
+}
+
+/* ─── top-down / QSQ bound query (opt-in 4th path) ─────────────────────── */
+
+long dl_query_topdown(dl_db *db, const char *goal_rel,
+                      const uint32_t *leading, uint8_t k,
+                      dl_tuple_cb cb, void *user)
+{
+    int goal_idx;
+    uint8_t goal_arity;
+    char adorn[9];
+    uint8_t i;
+
+    if (!db || !goal_rel || !cb) return -1;
+
+    if (db_has_variadic(db)) {
+        fprintf(stderr, "dl_query_topdown: rejected: program contains a "
+                "variadic relation (outside the magic-sets class)\n");
+        return -1;
+    }
+    if (db_has_list_builtin(db)) {
+        fprintf(stderr, "dl_query_topdown: rejected: program uses a list "
+                "builtin (outside the magic-sets class)\n");
+        return -1;
+    }
+
+    goal_idx = find_rel(db, goal_rel);
+    if (goal_idx < 0) return -1;
+    goal_arity = rel_arity(db->rels[goal_idx].rel);
+    if (k > goal_arity) return -1;
+    if (k == 0)
+        return dl_query(db, goal_rel, cb, user);
+
+    for (i = 0; i < k; i++) adorn[i] = 'b';
+    for (i = k; i < goal_arity; i++) adorn[i] = 'f';
+    adorn[goal_arity] = '\0';
+
+    return dl_query_topdown_adorn(db, goal_rel, adorn, leading, k, cb, user);
+}
+
+long dl_query_topdown_adorn(dl_db *db, const char *goal_rel,
+                            const char *adorn, const uint32_t *vals, uint8_t nvals,
+                            dl_tuple_cb cb, void *user)
+{
+    int goal_idx;
+    uint8_t goal_arity;
+    size_t alen;
+    size_t xi;
+    int nb = 0;
+    magic_program prog;
+    char reject[256];
+    dl_db edb;
+    compiled_rule **td_crules = NULL;
+    int n_td = 0;
+    size_t n_aliased;
+    int d;
+    long result = -1;
+    int goal_variant_id = -1;
+
+    if (!db || !goal_rel || !adorn || !cb) return -1;
+
+    /* 1. Validate + resolve goal. */
+    goal_idx = find_rel(db, goal_rel);
+    if (goal_idx < 0) return -1;
+    goal_arity = rel_arity(db->rels[goal_idx].rel);
+
+    if (db_has_variadic(db)) {
+        fprintf(stderr, "dl_query_topdown: rejected: program contains a "
+                "variadic relation (outside the magic-sets class)\n");
+        return -1;
+    }
+    if (db_has_list_builtin(db)) {
+        fprintf(stderr, "dl_query_topdown: rejected: program uses a list "
+                "builtin (outside the magic-sets class)\n");
+        return -1;
+    }
+
+    /* 2. Validate the adornment (mirrors dl_query_magic_adorn). */
+    alen = strlen(adorn);
+    if (alen != goal_arity) {
+        fprintf(stderr, "dl_query_topdown: adornment length %zu != goal arity %u\n",
+                alen, goal_arity);
+        return -1;
+    }
+    for (xi = 0; xi < alen; xi++) {
+        if (adorn[xi] != 'b' && adorn[xi] != 'f') {
+            fprintf(stderr, "dl_query_topdown: bad adornment char '%c'\n",
+                    adorn[xi]);
+            return -1;
+        }
+        if (adorn[xi] == 'b') nb++;
+    }
+    if (nb != (int)nvals) {
+        fprintf(stderr, "dl_query_topdown: nvals=%u != count_b(adorn)=%d\n",
+                nvals, nb);
+        return -1;
+    }
+
+    /* All-free adorn → route to dl_query. */
+    if (nvals == 0)
+        return dl_query(db, goal_rel, cb, user);
+
+    /* EDB goal → direct full-scan + per-position filter. */
+    if (!ast_has_head(db, goal_rel)) {
+        magic_filter_ctx ctx;
+        memset(&ctx, 0, sizeof(ctx));
+        ctx.user_cb = cb;
+        ctx.user = user;
+        ctx.arity = goal_arity;
+        memcpy(ctx.adorn, adorn, alen);
+        ctx.adorn[alen] = '\0';
+        memcpy(ctx.vals, vals, (size_t)nvals * sizeof(uint32_t));
+        if (rel_prefix(db->rels[goal_idx].rel, NULL, 0,
+                       magic_filter_cb, &ctx) < 0)
+            return -1;
+        return ctx.matched;
+    }
+
+    if (db->n_ast_rules <= 0) return -1;
+
+    /* Negation/aggregate soundness (mirrors dl_query_magic_adorn). */
+    if (db->fixpoint_dirty) {
+        int ri;
+        for (ri = 0; ri < db->n_ast_rules; ri++) {
+            const rule *R = db->ast_rules[ri];
+            if (R && (R->has_negation || R->has_aggregate)) {
+                if (dl_compile(db) != 0) return -1;
+                break;
+            }
+        }
+    }
+
+    /* 3. Clone (Option C). */
+    eval_db_clone(db, &edb);
+    n_aliased = edb.nrels;
+    memset(&prog, 0, sizeof(prog));
+
+    /* 4. Transform. */
+    if (magic_transform_adorn((const rule *const *)db->ast_rules,
+                              db->n_ast_rules, goal_rel, goal_arity,
+                              adorn, vals, nvals, db->nrels, db->ir, &prog,
+                              reject, sizeof(reject)) != 0) {
+        fprintf(stderr, "dl_query_topdown: rejected: %s\n", reject);
+        goto out_free_edb;
+    }
+
+    /* 5. Pre-declare ALL head relations (adorned + magic). */
+    for (d = 0; d < prog.n_decls; d++) {
+        if (eval_db_declare_inmem(&edb, prog.decls[d].name,
+                                  prog.decls[d].arity) != 0) {
+            fprintf(stderr, "dl_query_topdown: cannot pre-declare '%s'\n",
+                    prog.decls[d].name);
+            magic_program_free(&prog);
+            goto out_free_edb;
+        }
+    }
+
+    /* 6. Compile with g_reorder=0 / g_bushy=0 so compiled body_idx == AST
+     *    body position and recursive atoms stay override-compatible. */
+    {
+        int saved_reorder = g_reorder;
+        int saved_bushy = g_bushy;
+        int compile_rc;
+        g_reorder = 0;
+        g_bushy = 0;
+        compile_rc = compile_rules(&edb, prog.rules, prog.n_rules,
+                                   &td_crules, &n_td);
+        g_reorder = saved_reorder;
+        g_bushy = saved_bushy;
+        if (compile_rc != 0) {
+            fprintf(stderr, "dl_query_topdown: compile of adorned program failed\n");
+            magic_program_free(&prog);
+            goto out_free_edb;
+        }
+    }
+
+    /* Build the permutation indices the compiler declared (OP_LOOKUP_PERM
+     * over EDB atoms — non-leading adornments).  The forward fixpoint builds
+     * these inside vm_execute; the top-down driver uses vm_exec_rule directly,
+     * so it must build them explicitly or an EDB OP_LOOKUP_PERM reads a NULL
+     * perm DAFSA (silent empty result). */
+    if (permindex_build_dirty(&edb) != 0) {
+        fprintf(stderr, "dl_query_topdown: perm index build failed\n");
+        magic_program_free(&prog);
+        goto out_free_crules;
+    }
+
+    /* Filesystem-trap backstop. */
+    if (edb.dir != NULL ||
+        edb.nrels != n_aliased + (size_t)prog.n_decls) {
+        fprintf(stderr, "dl_query_topdown: internal error: compile_rules grew "
+                "the eval clone's relation table\n");
+        magic_program_free(&prog);
+        goto out_free_crules;
+    }
+
+    /* 7. Locate the goal variant (adorned_goal among the decl pairs). */
+    for (d = 0; d < prog.n_decls; d += 2) {
+        if (strcmp(prog.decls[d].name, prog.adorned_goal) == 0) {
+            goal_variant_id = d / 2;
+            break;
+        }
+    }
+    if (goal_variant_id < 0) {
+        fprintf(stderr, "dl_query_topdown: internal: adorned goal '%s' missing\n",
+                prog.adorned_goal);
+        magic_program_free(&prog);
+        goto out_free_crules;
+    }
+
+    /* 8. Top-down / QSQ evaluation (streams the goal memo directly). */
+    result = td_eval(&edb, &prog, td_crules, n_td,
+                     goal_variant_id, vals, cb, user);
+
+    magic_program_free(&prog);
+out_free_crules:
+    {
+        int i;
+        for (i = 0; i < n_td; i++) compiled_rule_free(td_crules[i]);
+        free(td_crules);
     }
 out_free_edb:
     eval_db_free(&edb, n_aliased);

@@ -29,6 +29,24 @@ int vm_execute(dl_db *db, compiled_rule **rules, int n_rules);
 long vm_query(dl_db *db, compiled_rule **rules, int n_rules,
               const char *goal_rel, dl_tuple_cb cb, void *user);
 
+/* ─── top-down QSQ support (expose the body-atom override + rule entry) ── */
+
+struct tuple_set;  /* full def in tupleset.h */
+
+typedef struct {
+    int              body_idx;   /* which body atom to override */
+    const struct tuple_set *ts;  /* tuple_set to enumerate (NULL = DAFSA) */
+    int              perm_id;    /* perm_id for perm shadow, -1 if none */
+} vm_override;
+
+/* Run ONE compiled rule body with overrides, collecting projected head
+ * tuples via cb when dry==1 (no DAFSA commit).  This is the body-evaluation
+ * primitive the top-down driver (src/topdown.c) reuses; it is a thin wrapper
+ * over the existing static exec_rule. */
+long vm_exec_rule(dl_db *db, const compiled_rule *cr,
+                  const vm_override *ov, int n_ov,
+                  int dry, dl_tuple_cb cb, void *user);
+
 /* ─── IVM Slice 1/2: insert-only incremental maintenance ──────────────── */
 
 /* 1 if EVERY compiled rule is IVM-insert-eligible: negation-free,

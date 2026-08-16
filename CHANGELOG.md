@@ -5,6 +5,21 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **v2 top-down / QSQ magic evaluation** (`dl_query_topdown` /
+  `dl_query_topdown_adorn`): a goal-driven, memoized 4th per-query path that
+  reuses the forward-magic adornment machinery (`magic_transform_adorn` +
+  `compile_rules` + `exec_rule` via a new `vm_exec_rule` body-primitive
+  wrapper) but drives the bytecode demand-first instead of by fixpoint.  The
+  SLG-style driver (`src/topdown.{h,c}`) maintains a per-variant memo/bound-set
+  and uses a worklist (no C recursion), so a chain N=10000 single-source query
+  terminates without stack overflow.  Rejects the same program classes as
+  forward magic (negation-on-closure, aggregates, cross-predicate mutual
+  recursion, closure blow-up).  Correctness oracle: byte-for-byte
+  `top_down == filter(full_materialize)` and `== dl_query_magic_adorn`.
+  Honest benchmark (vs `dl_query_magic_adorn`, opt-in via `RUN_BENCH=1`):
+  chain TC ~0.9x (the plan's material correction — not the originally-advertised
+  600x), but ~5x faster on dense graphs.  `make test` stays fast (benchmark is
+  gated off the default path).
 - **v2 Datalog lists — Phase 2 (patterns, member, list-length)**:
   - **`[X|Xs]` pattern destructuring** in positive body atoms (`p([a, X|Xs])`):
     lowered inline during the relational phase to the existing

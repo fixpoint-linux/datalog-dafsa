@@ -194,6 +194,32 @@ long dl_query_magic_adorn(dl_db *db, const char *goal_rel,
                           const char *adorn, const uint32_t *vals, uint8_t nvals,
                           dl_tuple_cb cb, void *user);
 
+/* Top-down / QSQ bound query (opt-in 4th per-query path).
+ *
+ * Evaluates the SAME adorned + magic program as dl_query_magic, but scheduled
+ * DEMAND-DRIVEN (SLG worklist over subqueries) instead of as a forward
+ * semi-naive fixpoint.  Invariant: the result is byte-for-byte identical to
+ * dl_query_magic / dl_query_magic_adorn (and to filtering the full
+ * materialization of the goal on the bound positions).  Returns tuple count,
+ * or -1 on error (same rejection list as the magic path — variadic, list
+ * builtins, negation on a closure predicate, aggregates over one,
+ * cross-predicate mutual recursion, adornment-closure blow-up).  Leaves `db`
+ * unmutated.  Not a speedup over forward magic for dense closures (both are
+ * scoped evaluations of the same program); it is the architecture-of-record
+ * for future selective-query / early-termination workloads. */
+long dl_query_topdown(dl_db *db, const char *goal_rel,
+                      const uint32_t *leading, uint8_t k,
+                      dl_tuple_cb cb, void *user);
+
+/* Top-down/QSQ with an ARBITRARY adornment (mirrors dl_query_magic_adorn's
+ * signature and rejection semantics; `vals` are packed in left-to-right
+ * bound-position order).  Routes all-free adornments to dl_query and EDB
+ * goals to a direct full-scan + per-position filter, exactly like the magic
+ * path. */
+long dl_query_topdown_adorn(dl_db *db, const char *goal_rel,
+                            const char *adorn, const uint32_t *vals,
+                            uint8_t nvals, dl_tuple_cb cb, void *user);
+
 /* ─── Regex pattern query ─────────────────────────────────────────────── */
 
 /* Forward declaration (full struct in regexwalk.h) */

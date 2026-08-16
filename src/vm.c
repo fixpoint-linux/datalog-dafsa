@@ -274,12 +274,7 @@ typedef struct {
 } vm_frame;
 
 /* ─── Override ────────────────────────────────────────────────────────── */
-
-typedef struct {
-    int              body_idx;  /* which body atom to override */
-    const tuple_set *ts;        /* tuple_set to enumerate from (NULL = DAFSA) */
-    int              perm_id;   /* M6: perm_id for perm shadow, -1 if none */
-} vm_override;
+/* vm_override is declared in vm.h (exposed for the top-down QSQ driver). */
 
 static const tuple_set *find_ov(int body_idx, const vm_override *ov, int n_ov)
 {
@@ -1545,6 +1540,14 @@ static long exec_rule(dl_db *db, const compiled_rule *cr,
         free(pool);
     }
     return rc;
+}
+
+/* Non-static wrapper over exec_rule for the top-down driver. */
+long vm_exec_rule(dl_db *db, const compiled_rule *cr,
+                  const vm_override *ov, int n_ov,
+                  int dry, dl_tuple_cb cb, void *user)
+{
+    return exec_rule(db, cr, ov, n_ov, dry, cb, user);
 }
 
 /* ─── Candidate collector callback ────────────────────────────────────── */
