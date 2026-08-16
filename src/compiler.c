@@ -1999,22 +1999,17 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
                      * negation, mirroring the car/cdr desugaring. */
                     continue;
                 }
-                /* equality X = Y binds at most ONE new side (OP_EQ binds Y
-                 * from X when X is bound, and is a NO-OP when both are
-                 * unbound).  So propagate binding only when at least one side
-                 * is already bound — otherwise a later negated atom reading X
-                 * would silently run NEG_CHECK against the UNBOUND sentinel
-                 * (0xFFFFFFFF) instead of being rejected as unsafe. */
-                int vi0 = (ba->nargs >= 1 && ba->args[0]->kind == TOK_VAR)
-                              ? v_find(&vt, ba->args[0]->text) : -1;
-                int vi1 = (ba->nargs >= 2 && ba->args[1]->kind == TOK_VAR)
-                              ? v_find(&vt, ba->args[1]->text) : -1;
-                int b0 = (vi0 >= 0) && bound_vars[vi0];
-                int b1 = (vi1 >= 0) && bound_vars[vi1];
-                if (b0 || b1) {
-                    if (vi0 >= 0) bound_vars[vi0] = 1;
-                    if (vi1 >= 0) bound_vars[vi1] = 1;
-                }
+                /* Equality X = Y is lowered in the EQUALITY phase, which runs
+                 * AFTER the relational join AND its interleaved NEG_CHECK
+                 * instructions.  So its vars are NOT bound during negation —
+                 * a negated atom cannot safely read a var that is only bound
+                 * by an equality (it would NEG_CHECK the UNBOUND sentinel and
+                 * silently backtrack to a wrong empty result).  Do NOT
+                 * propagate binding here: a negated atom reading an
+                 * equality-bound var is rejected as unsafe, matching the
+                 * other post-relational builtins (arith/str/list).  (Note: a
+                 * var that is ALSO bound by a positive relational atom is
+                 * already marked bound by that atom's own pass.) */
                 continue;
             }
             if (is_arith(ba) || is_comparison(ba) || is_str_builtin(ba) ||
@@ -2337,7 +2332,27 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
          * member drives — first_pos stays -1, so the loop is empty). */
         for (bi = 0; bi < first_pos; bi++) {
             atom *na = r->body[bi];
-            vm_instr *neg = i_emit(&ib);
+            uint8_t cslot[8];
+            vm_instr *neg;
+            /* Materialize any CONSTANT arg into a fresh temp slot FIRST (an
+             * OP_EQ_CONST), so OP_NEG_CHECK below reads the slot already
+             * bound — otherwise it would read the UNBOUND sentinel and
+             * silently backtrack to a wrong empty result. */
+            for (j = 0; j < na->nargs; j++) {
+                if (na->args[j]->kind != TOK_VAR) {
+                    char cname[16];
+                    v_fresh_name(&vt, cname, sizeof(cname), &cc, 'k');
+                    int vi = v_add(&vt, cname);
+                    if (vi < 0) goto fail;
+                    cslot[j] = vt.e[vi].slot;
+                    uint32_t cv;
+                    if (token_const(db, na->args[j], &cv)) goto fail;
+                    vm_instr *eq = i_emit(&ib);
+                    if (!eq) goto fail;
+                    eq->op = OP_EQ_CONST; eq->a = cslot[j]; eq->imm = cv;
+                }
+            }
+            neg = i_emit(&ib);
             neg->op = OP_NEG_CHECK;
             neg->a = (uint8_t)bri[bi];
             neg->b = (uint8_t)na->nargs;
@@ -2345,16 +2360,10 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
             for (j = 0; j < na->nargs; j++) {
                 if (na->args[j]->kind == TOK_VAR) {
                     int vi = v_find(&vt, na->args[j]->text);
+                    if (vi < 0) goto fail;
                     neg->slots[j] = vt.e[vi].slot;
                 } else {
-                    char cname[16];
-                    v_fresh_name(&vt, cname, sizeof(cname), &cc, 'k');
-                    int vi = v_add(&vt, cname);
-                    neg->slots[j] = vt.e[vi].slot;
-                    uint32_t cv;
-                    if (token_const(db, na->args[j], &cv)) goto fail;
-                    vm_instr *eq = i_emit(&ib);
-                    eq->op = OP_EQ_CONST; eq->a = neg->slots[j]; eq->imm = cv;
+                    neg->slots[j] = cslot[j];
                 }
             }
         }
@@ -2402,7 +2411,27 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
             if (is_builtin_pred(curr)) continue; /* equality/builtins (arith, comparison, string) emitted below */
 
             if (curr->negated) {
-                vm_instr *neg = i_emit(&ib);
+                uint8_t cslot[8];
+                vm_instr *neg;
+                /* Materialize any CONSTANT arg into a fresh temp slot FIRST
+                 * (an OP_EQ_CONST), so OP_NEG_CHECK below reads the slot
+                 * already bound — otherwise it would read the UNBOUND
+                 * sentinel and silently backtrack to a wrong empty result. */
+                for (j = 0; j < curr->nargs; j++) {
+                    if (curr->args[j]->kind != TOK_VAR) {
+                        char cname[16];
+                        v_fresh_name(&vt, cname, sizeof(cname), &cc, 'k');
+                        int vi = v_add(&vt, cname);
+                        if (vi < 0) goto fail;
+                        cslot[j] = vt.e[vi].slot;
+                        uint32_t cv;
+                        if (token_const(db, curr->args[j], &cv)) goto fail;
+                        vm_instr *eq = i_emit(&ib);
+                        if (!eq) goto fail;
+                        eq->op = OP_EQ_CONST; eq->a = cslot[j]; eq->imm = cv;
+                    }
+                }
+                neg = i_emit(&ib);
                 neg->op = OP_NEG_CHECK;
                 neg->a = (uint8_t)bri[bi];
                 neg->b = (uint8_t)curr->nargs;
@@ -2410,16 +2439,10 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
                 for (j = 0; j < curr->nargs; j++) {
                     if (curr->args[j]->kind == TOK_VAR) {
                         int vi = v_find(&vt, curr->args[j]->text);
+                        if (vi < 0) goto fail;
                         neg->slots[j] = vt.e[vi].slot;
                     } else {
-                        char cname[16];
-                        v_fresh_name(&vt, cname, sizeof(cname), &cc, 'k');
-                        int vi = v_add(&vt, cname);
-                        neg->slots[j] = vt.e[vi].slot;
-                        uint32_t cv;
-                        if (token_const(db, curr->args[j], &cv)) goto fail;
-                        vm_instr *eq = i_emit(&ib);
-                        eq->op = OP_EQ_CONST; eq->a = neg->slots[j]; eq->imm = cv;
+                        neg->slots[j] = cslot[j];
                     }
                 }
                 continue;

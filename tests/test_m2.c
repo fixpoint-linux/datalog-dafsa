@@ -530,7 +530,83 @@ static void test_reject_unsafe_negation(void)
     PASS();
 }
 
-/* ─── Test 6: Property test — random graphs TC fixpoint ──────────────── */
+/* ─── Regression: constant-arg negated atom (BUG 2) ─────────────────── */
+
+static void test_neg_const_arg(void)
+{
+    dl_db *db;
+    tuple_set result;
+
+    TEST("negation with a CONSTANT arg computes correctly: !blocked(X, 5)");
+
+    setup_db(&db);
+    {
+        uint32_t p[] = {1, 2, 3};
+        load_rows(db, "edge", 1, p, 3);
+    }
+    {
+        uint32_t b[] = {2, 5};
+        load_rows(db, "blocked", 2, b, 1);
+    }
+
+    /* edge={1,2,3}; blocked={(2,5)}.  q(X):-edge(X),!blocked(X,5).
+     * blocked(X,5) matches X=2, so q = {1,3}. */
+    assert(dl_load_rules(db, "q(X):-edge(X),!blocked(X,5).") == 0);
+    assert(dl_compile(db) == 0);
+
+    memset(&result, 0, sizeof(result));
+    dl_query(db, "q", tset_cb, &result);
+
+    if (result.count != 2 || result.arity != 1) {
+        printf("  got %ld tuples, expected 2\n", result.count);
+        tset_free(&result); teardown_db(db);
+        FAIL("const-arg negation: wrong count");
+        return;
+    }
+    {
+        int has1 = 0, has3 = 0;
+        long j;
+        for (j = 0; j < result.count; j++) {
+            if (result.data[j] == 1) has1 = 1;
+            if (result.data[j] == 3) has3 = 1;
+        }
+        if (!has1 || !has3) {
+            printf("  missing expected tuples\n");
+            tset_free(&result); teardown_db(db);
+            FAIL("const-arg negation: missing tuple");
+            return;
+        }
+    }
+    tset_free(&result);
+    teardown_db(db);
+    PASS();
+}
+
+/* ─── Regression: equality + negation rejected loudly (BUG 1) ───────── */
+
+static void test_neg_equality_reject(void)
+{
+    dl_db *db;
+    const char *rule = "q(Y):-edge(Y),X=Y,!blocked(X).";
+
+    TEST("reject: equality-bound var in negated atom (X=Y, !blocked(X))");
+
+    setup_db(&db);
+    assert(dl_declare_relation(db, "edge", 1) == 0);
+    assert(dl_declare_relation(db, "blocked", 1) == 0);
+
+    /* OP_EQ runs in the equality phase, AFTER NEG_CHECK — so X is not bound
+     * during negation.  Must reject loudly (never silently mis-evaluate). */
+    int ret = dl_load_rules(db, rule);
+    if (ret == 0) {
+        teardown_db(db);
+        FAIL("expected rejection of equality-bound negated var, got success");
+        return;
+    }
+
+    teardown_db(db);
+    PASS();
+}
 
 static void test_property_tc(void)
 {
@@ -1118,6 +1194,8 @@ int main(void)
     test_reject_clique();
     test_reject_neg_in_recursion();
     test_reject_unsafe_negation();
+    test_neg_const_arg();
+    test_neg_equality_reject();
     test_property_tc();
     test_property_negation();
     test_tc_empty_graph();
