@@ -153,6 +153,11 @@ uint64_t rel_count(const relation *rel)
     return (uint64_t)st.n_final;
 }
 
+const dafsa *rel_dafsa(const relation *rel)
+{
+    return rel ? rel->d : NULL;
+}
+
 /* ─── Order statistics (Tier-2) ────────────────────────────────────────── */
 
 /* #distinct tuples strictly lexicographically < cols (O(1) amortized: the

@@ -18,6 +18,7 @@
 /* Opaque */
 typedef struct relation relation;
 typedef struct dafsa_wal dafsa_wal;
+typedef struct dafsa dafsa;
 
 /* Forward declaration — full definition in tupleset.h */
 struct tuple_set;
@@ -60,6 +61,12 @@ uint8_t rel_arity(const relation *rel);
  * Used by the compiler's join-order heuristics (a perf hint only: any value
  * is semantically safe, since it only permutes join emission order). */
 uint64_t rel_count(const relation *rel);
+
+/* Borrow the VIEW DAFSA (base ∪ derived) for read-only traversal.  Returns
+ * NULL if rel is NULL.  The DAFSA is owned by the relation (and the db) —
+ * the caller must not free it or outlive the relation.  Used by the pull
+ * iterator (src/iter.c) to walk the in-memory relation directly. */
+const dafsa *rel_dafsa(const relation *rel);
 
 /* ─── Order statistics (Tier-2) ───────────────────────────────────────── */
 

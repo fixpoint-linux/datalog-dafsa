@@ -110,6 +110,63 @@ long dl_prefix(dl_db *db, const char *rel,
                const uint32_t *leading, uint8_t k,
                dl_tuple_cb cb, void *user);
 
+/* ─── Pull-based sorted iterator (range-index follow-up #5) ────────────── */
+
+/* Opaque RESUMABLE cursor over the tuples of a relation in ascending key
+ * order (u32BE key encoding => numeric order == lex order).  Reads from the
+ * mmap snapshot view when a snapshot is current (db->snap_version > 0), else
+ * the in-memory relation.  VARIADIC relations are rejected (NULL / -1).
+ *
+ * A DAFSA is a minimal acyclic DFA with per-state transitions sorted by
+ * symbol, so pre-order DFS == byte/lex == u32BE numeric order; from a bound
+ * state every final state sits at the same fixed depth with no outgoing
+ * edges, so emit-then-backtrack yields exactly one tuple per dl_iter_next. */
+typedef struct dl_iter dl_iter;
+
+/* Open a cursor bound to the first k leading columns == `leading`
+ * (k == 0: no bound — enumerate all tuples).  Returns NULL on any error:
+ * NULL db/rel, unknown relation, VARIADIC relation, k > arity, k > 0 &&
+ * !leading, or an open/view-open/OOM failure.  An ABSENT leading prefix
+ * yields a VALID EMPTY iterator (first dl_iter_next returns 0), not NULL.
+ *
+ * LIFETIME: in LIVE mode the cursor borrows the relation's in-memory view
+ * (rel->d) from db, so the iterator MUST NOT outlive db (same contract as
+ * dl_prefix).  In VIEW (snapshot) mode the cursor OWNS an mmap dafsa_view
+ * and is independent of db; it is closed by dl_iter_close. */
+dl_iter *dl_iter_open(dl_db *db, const char *rel,
+                      const uint32_t *leading, uint8_t k);
+
+/* Re-bind the cursor to a new leading prefix (k columns == `leading`).
+ * Returns 0 on success, -1 on error (NULL it, k > arity, k > 0 && !leading).
+ * An absent prefix yields an empty iterator (dl_iter_next returns 0). */
+int dl_iter_seek(dl_iter *it, const uint32_t *leading, uint8_t k);
+
+/* Fetch the next tuple in ascending order into cols_out (arity u32 values).
+ * Returns 1 on success, 0 at the end of the enumeration, -1 on error (NULL
+ * it/cols_out, or a DAFSA depth overflow).  End (0) and error (-1) are
+ * never conflated. */
+int dl_iter_next(dl_iter *it, uint32_t *cols_out);
+
+/* The relation's arity, or 0 for a NULL/error cursor. */
+uint8_t dl_iter_arity(const dl_iter *it);
+
+/* Close the cursor (NULL-safe).  Closes an OWNED mmap snapshot view. */
+void dl_iter_close(dl_iter *it);
+
+/* Merge-join callback: l has la columns, r has ra columns; user is the
+ * opaque pointer passed to dl_merge_join.  Return non-zero to stop early. */
+typedef int (*dl_join_cb)(const uint32_t *l, uint8_t la,
+                          const uint32_t *r, uint8_t ra, void *user);
+
+/* Equi-join two sorted iterators on their first jcols columns (cross-product
+ * semantics, preserving duplicates), streaming the result in sorted order via
+ * cb.  Returns the number of pairs emitted, or -1 on error (NULL it/cb,
+ * jcols == 0, or jcols > either arity).  Both iterators are left EXHAUSTED
+ * on return.  If cb returns non-zero the join stops early and returns the
+ * count emitted so far. */
+long dl_merge_join(dl_iter *l, dl_iter *r, uint8_t jcols,
+                   dl_join_cb cb, void *user);
+
 /* ─── Order statistics (Tier-2) ───────────────────────────────────────── */
 
 /* Number of distinct tuples strictly lexicographically smaller than `cols`.
