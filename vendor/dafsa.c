@@ -88,6 +88,7 @@ void dafsa_free(dafsa *d)
     free(d->inodes);
     free(d->reg_keys);
     free(d->reg_vals);
+    free(d->subtree);
     free(d);
 }
 

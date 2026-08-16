@@ -379,6 +379,8 @@ int dafsa_add_n(dafsa *d, const unsigned char *key, size_t len)
     unsigned int current;
     unsigned int pos;
 
+    if (d) d->subtree_valid = 0;   /* coarse invalidation: DAG restructured below */
+
     if (len == 0) {
         /* Empty string: the initial state becomes final */
         if (d->states[d->initial].is_final) {
@@ -513,6 +515,8 @@ int dafsa_delete_n(dafsa *d, const unsigned char *key, size_t len)
     unsigned int current;
     unsigned int i;
     int di;
+
+    if (d) d->subtree_valid = 0;   /* coarse invalidation: DAG restructured below */
 
     if (len == 0) {
         if (!d->states[d->initial].is_final) {

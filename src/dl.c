@@ -1646,6 +1646,69 @@ long dl_prefix(dl_db *db, const char *rel_name,
     return rel_prefix(db->rels[idx].rel, leading, k, cb, user);
 }
 
+/* ─── Order statistics (Tier-2) ───────────────────────────────────────── */
+
+/* Resolve a FIXED-arity relation for the order-statistics API.  Returns NULL
+ * on any error (NULL/unknown rel, variadic relation, arity mismatch) — these
+ * all map to a -1/0/sentinel rejection at the call site (never silently
+ * mis-evaluated). */
+static relation *ordstats_rel_ro(const dl_db *db, const char *rel_name,
+                                 uint8_t arity)
+{
+    int idx;
+
+    if (!db || !rel_name) return NULL;
+    idx = find_rel((dl_db *)db, rel_name);
+    if (idx < 0) return NULL;
+    if (db->rels[idx].kind == RELK_VARIADIC) return NULL;      /* rejected this slice */
+    if (db->rels[idx].arity != arity) return NULL;             /* arity mismatch */
+    return db->rels[idx].rel;
+}
+
+uint64_t dl_rank(dl_db *db, const char *rel_name, const uint32_t *cols,
+                 uint8_t arity)
+{
+    relation *rel;
+    if (!cols) return UINT64_MAX;
+    rel = ordstats_rel_ro(db, rel_name, arity);
+    if (!rel) return UINT64_MAX;
+    return rel_rank(rel, cols);
+}
+
+int dl_select(dl_db *db, const char *rel_name, uint64_t k,
+              uint32_t *cols_out, uint8_t arity)
+{
+    relation *rel;
+    if (!cols_out) return -1;
+    rel = ordstats_rel_ro(db, rel_name, arity);
+    if (!rel) return -1;
+    return rel_select(rel, k, cols_out);
+}
+
+uint64_t dl_range_count(dl_db *db, const char *rel_name, const uint32_t *lo,
+                        const uint32_t *hi, uint8_t arity)
+{
+    relation *rel;
+    if (!lo || !hi) return UINT64_MAX;
+    rel = ordstats_rel_ro(db, rel_name, arity);
+    if (!rel) return UINT64_MAX;
+    return rel_range_count(rel, lo, hi);
+}
+
+uint64_t dl_count(dl_db *db, const char *rel_name)
+{
+    relation *rel;
+
+    if (!db || !rel_name) return UINT64_MAX;
+    {
+        int idx = find_rel(db, rel_name);
+        if (idx < 0) return UINT64_MAX;
+        if (db->rels[idx].kind == RELK_VARIADIC) return UINT64_MAX;
+        rel = db->rels[idx].rel;
+    }
+    return rel_count_subtree(rel);
+}
+
 /* ─── Rule loading & compilation (M1) ──────────────────────────────────── */
 
 /* ─── M8: AST deep-copy — retain rules for the magic-sets transform ───── */

@@ -61,6 +61,24 @@ uint8_t rel_arity(const relation *rel);
  * is semantically safe, since it only permutes join emission order). */
 uint64_t rel_count(const relation *rel);
 
+/* ─── Order statistics (Tier-2) ───────────────────────────────────────── */
+
+/* #distinct tuples strictly lexicographically < cols (u32BE key ordering,
+ * so numeric order == lex order).  O(1) amortized; subtree counts build
+ * lazily on first call.  UINT64_MAX on error. */
+uint64_t rel_rank(const relation *rel, const uint32_t *cols);
+
+/* k-th tuple (0-indexed, lex order) into cols_out (arity columns).
+ * 0 on success, -1 if k >= count or on error. */
+int rel_select(const relation *rel, uint64_t k, uint32_t *cols_out);
+
+/* #distinct tuples in the half-open range [lo, hi).  UINT64_MAX on error. */
+uint64_t rel_range_count(const relation *rel, const uint32_t *lo,
+                         const uint32_t *hi);
+
+/* O(1) distinct-tuple count via the memoized subtree array.  0 on error/OOM. */
+uint64_t rel_count_subtree(const relation *rel);
+
 /* ─── Fact operations ─────────────────────────────────────────────────── */
 /* A relation holds TWO DAFSAs after it becomes a rule head (see rel_is_idb):
  *   base — durable EDB facts (written by dl_add_fact/dl_delete_fact/

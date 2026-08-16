@@ -153,6 +153,60 @@ uint64_t rel_count(const relation *rel)
     return (uint64_t)st.n_final;
 }
 
+/* ─── Order statistics (Tier-2) ────────────────────────────────────────── */
+
+/* #distinct tuples strictly lexicographically < cols (O(1) amortized: the
+ * subtree counts build lazily once).  Returns UINT64_MAX on error. */
+uint64_t rel_rank(const relation *rel, const uint32_t *cols)
+{
+    unsigned char key[MAX_KEY_LEN];
+    size_t key_len;
+
+    if (!rel || !rel->d || !cols) return UINT64_MAX;
+    key_len = encode_key(key, cols, rel->arity);
+    return dafsa_rank_n(rel->d, key, key_len);
+}
+
+/* k-th tuple (0-indexed, lex order) into cols_out (arity columns).
+ * Returns 0 on success, -1 if k >= count or on error. */
+int rel_select(const relation *rel, uint64_t k, uint32_t *cols_out)
+{
+    unsigned char key[MAX_KEY_LEN];
+    int key_len;
+
+    if (!rel || !rel->d || !cols_out) return -1;
+    key_len = dafsa_select_n(rel->d, k, key, MAX_KEY_LEN);
+    if (key_len < 0) return -1;
+    read_cols_be(cols_out, key, rel->arity);
+    return 0;
+}
+
+/* #distinct tuples in the half-open range [lo, hi).  Returns UINT64_MAX on
+ * error. */
+uint64_t rel_range_count(const relation *rel, const uint32_t *lo,
+                         const uint32_t *hi)
+{
+    unsigned char lo_key[MAX_KEY_LEN], hi_key[MAX_KEY_LEN];
+    size_t lo_len, hi_len;
+
+    if (!rel || !rel->d || !lo || !hi) return UINT64_MAX;
+    lo_len = encode_key(lo_key, lo, rel->arity);
+    hi_len = encode_key(hi_key, hi, rel->arity);
+    return dafsa_range_count_n(rel->d, lo_key, lo_len, hi_key, hi_len);
+}
+
+/* O(1) distinct-tuple count via the memoized subtree array (builds lazily).
+ * Returns 0 on error/OOM. */
+uint64_t rel_count_subtree(const relation *rel)
+{
+    uint64_t n;
+
+    if (!rel || !rel->d) return 0;
+    n = dafsa_ensure_subtree(rel->d);
+    if (!rel->d->subtree_valid) return 0;   /* OOM during build: degrade to 0 */
+    return n;
+}
+
 /* ─── Fact operations ─────────────────────────────────────────────────── */
 
 static int rel_add_d(relation *rel, dafsa *d, const uint32_t *cols)

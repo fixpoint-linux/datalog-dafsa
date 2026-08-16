@@ -110,6 +110,35 @@ long dl_prefix(dl_db *db, const char *rel,
                const uint32_t *leading, uint8_t k,
                dl_tuple_cb cb, void *user);
 
+/* ─── Order statistics (Tier-2) ───────────────────────────────────────── */
+
+/* Number of distinct tuples strictly lexicographically smaller than `cols`.
+ * `cols` has `arity` u32 values; for a fixed-arity relation `arity` must equal
+ * the declared arity.  u32BE key encoding => numeric order == lex order.
+ * Returns the rank, or UINT64_MAX on error (NULL db/rel/cols, unknown rel,
+ * arity mismatch, or a VARIADIC relation — variadic is rejected in this slice).
+ * Operates on the in-memory relation (rel->d), NOT a published snapshot; when a
+ * snapshot has been published the result reflects the current in-memory view
+ * (the snapshot mmap path is not covered here). */
+uint64_t dl_rank(dl_db *db, const char *rel, const uint32_t *cols, uint8_t arity);
+
+/* The k-th tuple (0-indexed, lex order) written into cols_out (`arity` u32
+ * values).  Returns 0 on success, -1 on error (NULL/unknown rel, arity
+ * mismatch, VARIADIC relation) or if k >= the number of tuples. */
+int dl_select(dl_db *db, const char *rel, uint64_t k,
+              uint32_t *cols_out, uint8_t arity);
+
+/* Number of distinct tuples in the half-open range [lo, hi), i.e.
+ * rank(hi) - rank(lo).  lo and hi each have `arity` u32 values.  Returns the
+ * count, or UINT64_MAX on error (as dl_rank). */
+uint64_t dl_range_count(dl_db *db, const char *rel, const uint32_t *lo,
+                        const uint32_t *hi, uint8_t arity);
+
+/* O(1) distinct-tuple count for a fixed-arity relation (memoized subtree
+ * array).  Returns the count, or UINT64_MAX on error (NULL/unknown rel,
+ * VARIADIC relation), or 0 for an empty relation. */
+uint64_t dl_count(dl_db *db, const char *rel);
+
 /* ─── Rule loading & compilation (M1) ──────────────────────────────────── */
 
 /* Parse and compile Datalog rules from a source string.

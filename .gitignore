@@ -27,6 +27,7 @@ build-tmp/
 /tests/test_m5_review
 /tests/test_vararity
 /tests/test_lists
+/tests/test_m10_rank
 
 # scratch db dirs
 dl-test-*/

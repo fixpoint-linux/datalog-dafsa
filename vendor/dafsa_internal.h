@@ -102,6 +102,16 @@ struct dafsa {
     /* Orphan-state free-list. Freed slots are chained via their `sig` field
      * (reused as a `next` pointer).  0 = empty list. */
     unsigned int   free_head;
+
+    /* Tier-2 order-statistics: per-state DISTINCT-complete-keys-reachable
+     * subtree counts (u64 — cross-product relations can exceed 2^32 keys
+     * with few states).  Built lazily on first rank/select by
+     * dafsa_ensure_subtree (vendor/dafsa_rank.c), invalidated coarsely at the
+     * top of dafsa_add_n / dafsa_delete_n.  subtree_valid is 0 until a build
+     * completes; 0 also means "OOM'd last build, rebuild on next use". */
+    uint64_t       *subtree;
+    size_t          subtree_cap;
+    int             subtree_valid;
 };
 
 /* ─── Write-ahead log (M5) ─────────────────────────────────────────────── */
@@ -204,6 +214,15 @@ int           mb_u32(const uint8_t **p, const uint8_t *end, uint32_t *out);
 int           mb_uvarint(const uint8_t **p, const uint8_t *end, uint32_t *out);
 int           mb_skipvarint(const uint8_t **p, const uint8_t *end);
 dafsa        *dafsa_load_impl(const char *path, int mutable);
+
+/* dafsa_rank.c — Tier-2 order-statistics (rank/select/range_count) */
+uint64_t      dafsa_ensure_subtree(dafsa *d);
+uint64_t      dafsa_rank_n(dafsa *d, const unsigned char *key, size_t len);
+int           dafsa_select_n(dafsa *d, uint64_t k, unsigned char *key_out,
+                             size_t key_cap);
+uint64_t      dafsa_range_count_n(dafsa *d,
+                                  const unsigned char *lo, size_t lo_len,
+                                  const unsigned char *hi, size_t hi_len);
 
 /* dafsa_crc32.c */
 extern const uint32_t crc32_table[256];

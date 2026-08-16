@@ -19,7 +19,8 @@ VENDOR_OBJS = vendor/dafsa.o \
               vendor/dafsa_view.o \
               vendor/dafsa_crc32.o \
               vendor/dafsa_wal.o \
-              vendor/dafsa_build.o
+              vendor/dafsa_build.o \
+              vendor/dafsa_rank.o
 
 # ─── Our library objects ─────────────────────────────────────────────────
 
@@ -137,6 +138,9 @@ tests/test_vararity: tests/test_vararity.c $(ALL_OBJS)
 tests/test_lists: tests/test_lists.c $(ALL_OBJS)
 	$(CC) $(CFLAGS) $(INC) -static -o $@ tests/test_lists.c $(ALL_OBJS)
 
+tests/test_m10_rank: tests/test_m10_rank.c $(ALL_OBJS)
+	$(CC) $(CFLAGS) $(INC) -static -o $@ tests/test_m10_rank.c $(ALL_OBJS)
+
 tests/bench: tests/bench.c $(ALL_OBJS)
 	$(CC) $(CFLAGS) $(INC) -static -o $@ tests/bench.c $(ALL_OBJS)
 
@@ -144,7 +148,7 @@ bench: tests/bench
 	@echo "=== Running demonstration benchmark ==="
 	LD_LIBRARY_PATH=. ./tests/bench
 
-test: tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4 tests/test_m4_review tests/test_bulk tests/test_m5 tests/test_m5_review tests/test_m6 tests/test_m6_review tests/test_m6_deep_review tests/test_m7 tests/test_m8_magic tests/test_topdown tests/test_m9_arith tests/test_m9_str tests/test_ivm tests/test_bushy tests/test_vararity tests/test_lists dl build-tmp
+test: tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4 tests/test_m4_review tests/test_bulk tests/test_m5 tests/test_m5_review tests/test_m6 tests/test_m6_review tests/test_m6_deep_review tests/test_m7 tests/test_m8_magic tests/test_topdown tests/test_m9_arith tests/test_m9_str tests/test_ivm tests/test_bushy tests/test_vararity tests/test_lists tests/test_m10_rank dl build-tmp
 	@echo "=== Running M0 unit tests ==="
 	LD_LIBRARY_PATH=. ./tests/test_m0
 	@echo ""
@@ -208,6 +212,9 @@ test: tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4 test
 	@echo "=== Running v2 lists tests ==="
 	LD_LIBRARY_PATH=. ./tests/test_lists
 	@echo ""
+	@echo "=== Running M10 order-statistics (rank/select/range_count) tests ==="
+	LD_LIBRARY_PATH=. ./tests/test_m10_rank
+	@echo ""
 	@echo "=== Running CLI smoke test ==="
 	@sh tests/smoke.sh
 
@@ -229,5 +236,5 @@ clean:
 	      tests/test_m6_review tests/test_bulk \
 	      tests/test_m6_deep_review tests/test_m7 tests/test_m8_magic tests/test_topdown tests/test_m9_arith \
 	      tests/test_m9_str tests/test_ivm tests/test_bushy tests/test_vararity \
-	      tests/test_lists tests/bench
-	rm -rf /tmp/dl-test-db build-tmp/smoke build-tmp/m1 build-tmp/vararity build-tmp/lists
+	      tests/test_lists tests/test_m10_rank tests/bench
+	rm -rf /tmp/dl-test-db build-tmp/smoke build-tmp/m1 build-tmp/vararity build-tmp/lists build-tmp/rank
