@@ -4,7 +4,7 @@ _Design note. Status: **Tier 2 (order-statistics) implemented** — commit `20e9
 **prefix-bound rank/select implemented** — commit `1b46922` (2026-08-16),
 **permuted order-statistics (`dl_*_perm`) implemented** — commit `3a9d448` (2026-08-16),
 **`range(X,Rel,Lo,Hi)` / `OP_RANGE` implemented** — commit `2724e31` (2026-08-16),
-**snapshot (`dafsa_view`) rank/select implemented** — (2026-08-16).
+**snapshot (`dafsa_view`) rank/select implemented** — commit `0df6004` (2026-08-16).
 The full feature remains partly proposed; this doc records the options, the recommended path, and
 the deferred follow-ups._
 
