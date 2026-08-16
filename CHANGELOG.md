@@ -5,6 +5,41 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **v2 Datalog lists — Phase 2 (patterns, member, list-length)**:
+  - **`[X|Xs]` pattern destructuring** in positive body atoms (`p([a, X|Xs])`):
+    lowered inline during the relational phase to the existing
+    `OP_LIST_CAR`/`OP_LIST_CDR`/`OP_EQ`/`OP_EQ_CONST` opcodes — no new
+    opcode. Each variable element binds (bind-or-filter), each constant
+    element filters, a `|Tail` binds the remaining sublist, and an absent
+    tail requires `cdr^n == NIL`. Pattern-bound vars are visible to
+    subsequent relational atoms (unlike post-join builtins). The
+    assignment form `[X|Xs] = L` stays deferred (use `X = car(L), Xs = cdr(L)`).
+  - **`member(X, L)`** filter atom → new `OP_LIST_MEMBER` opcode: `X` bound
+    → linear-scan membership test; `X` unbound → a generator `vm_frame`
+    (mirroring `OP_MAT_JOIN`) enumerating `L`'s elements.  A lone
+    `member(X, L)` with a bound-or-constant `L` may drive a rule with no
+    positive relational atom (`r(X) :- member(X, [1,2,3]).`).
+  - **`length`** runtime dispatch: `OP_STR_LEN` now dispatches a list handle
+    to `term_length` before the `strlen` path (`length([])` == 0,
+    `length("s")` unchanged).
+  - **Loud compile-time rejects** (never silently mis-evaluated): list
+    patterns in rule heads/facts, negated atoms, and list-builtin / member /
+    length operands; `member`/`length` operands that are ungrounded or
+    malformed. `member` and `length` are reserved predicate names — and, like
+    the list/string builtins, are now rejected loudly as rule HEADS too
+    (`member(1,2).` reports "reserved builtin predicate name" rather than the
+    misleading "rule member has no body").
+  - **`_` is a plain named var, not anonymous**: `[X|_]` binds the tail to a
+    variable literally named `_`, so two `_`s in one rule unify.  This is
+    consistent with the dialect's existing `dummy(_)` semantics (there is no
+    separate anonymous-var token); use distinct names for distinct tails.
+  - **Gating**: `OP_LIST_MEMBER` joins the `db_has_list_builtin` exclusion
+    (IVM/DRed/agg/magic-sets route to the full fixpoint); `length` stays
+    un-flagged (a pure read, preserving string-IVM eligibility).
+  - Tests `tests/test_lists` T9 (patterns + car/cdr equivalence), T10
+    (member generator/filter), T11 (length dispatch), plus expanded T8
+    reject cases.
+
 - **v2 variable-arity relations**: a relation declared variadic
   (`dl_declare_relation_variadic`, or `dl_declare_relation` with arity 0)
   holds facts of ANY arity 1..8. Storage is PER-ARITY-VARIANT DAFSAs: each

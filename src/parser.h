@@ -42,7 +42,7 @@ typedef enum {
     TOK_STRING,      /* 'quoted string' — for regex patterns */
     TOK_LBRACKET,    /* [  (v2 lists) */
     TOK_RBRACKET,    /* ]  (v2 lists) */
-    TOK_PIPE,        /* |  (v2 lists — [X|Xs] deferred to Phase 2) */
+    TOK_PIPE,        /* |  (v2 lists — [X|Xs] head/tail pattern) */
     TOK_LIST,        /* [e1,e2,...] literal — a single argument token whose
                         children are the element tokens */
 } token_kind;
@@ -53,6 +53,8 @@ typedef struct token {
     uint32_t    ival;       /* integer value (TOK_INT only) */
     struct token **children;/* TOK_LIST: owned element tokens (NULL otherwise) */
     int          nchildren; /* TOK_LIST: element count (0 = NIL) */
+    struct token *tail;     /* TOK_LIST: the token after '|' in a [X|Xs]
+                               pattern (NULL = no pipe = empty tail) */
 } token;
 
 /* ─── Arithmetic expression tree (M9) ─────────────────────────────────── */
@@ -73,7 +75,8 @@ expr *expr_clone(const expr *e);
 /* Free an expression tree (NULL-safe). */
 void  expr_free(expr *e);
 
-/* An atom: predicate(args...). args are tokens (TOK_IDENT/TOK_VAR/TOK_INT). */
+/* An atom: predicate(args...). args are tokens (TOK_IDENT/TOK_VAR/TOK_INT/
+ * TOK_STRING/TOK_LIST). */
 typedef struct {
     char   *pred;          /* predicate name */
     token **args;          /* array of argument tokens */

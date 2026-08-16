@@ -132,7 +132,8 @@ int db_has_list_builtin(const dl_db *db)
         for (k = 0; k < cr->n_instrs; k++) {
             uint8_t op = cr->instrs[k].op;
             if (op == OP_LIST_CONS || op == OP_LIST_CAR ||
-                op == OP_LIST_CDR || op == OP_LIST_APPEND)
+                op == OP_LIST_CDR || op == OP_LIST_APPEND ||
+                op == OP_LIST_MEMBER)
                 return 1;
         }
     }
@@ -1678,6 +1679,10 @@ static token *ast_tok_clone(const token *t)
             if (!n->children[i]) { ast_tok_free(n); return NULL; }
         }
     }
+    if (t->tail) {
+        n->tail = ast_tok_clone(t->tail);
+        if (!n->tail) { ast_tok_free(n); return NULL; }
+    }
     return n;
 }
 
@@ -1690,6 +1695,7 @@ static void ast_tok_free(token *t)
             ast_tok_free(t->children[i]);
         free(t->children);
     }
+    ast_tok_free(t->tail);
     free(t->text);
     free(t);
 }

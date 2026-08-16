@@ -91,6 +91,10 @@ static token *tok_dup(const token *t)
             if (!n->children[i]) { tok_free(n); return NULL; }
         }
     }
+    if (t->tail) {
+        n->tail = tok_dup(t->tail);
+        if (!n->tail) { tok_free(n); return NULL; }
+    }
     return n;
 }
 
@@ -103,6 +107,7 @@ static void tok_free(token *t)
             tok_free(t->children[i]);
         free(t->children);
     }
+    tok_free(t->tail);
     free(t->text);
     free(t);
 }
@@ -455,28 +460,22 @@ static token *parse_arg(parser *p)
     return NULL;
 }
 
-/* Parse one list element (constants only in Phase 1).  Nested lists are
- * recursed; a TOK_VAR inside a list is the Phase-2 [X|Xs] pattern, REJECTED
- * here with a loud diagnostic. */
+/* Parse one list element.  A TOK_VAR element (or a '|' tail, handled in
+ * parse_list) marks this list as a Phase-2 PATTERN; constants + nested list
+ * literals are the Phase-1 constant-list forms. */
 static token *parse_list_element(parser *p)
 {
     token *t = peek(p);
     if (!t) return NULL;
-    if (t->kind == TOK_INT || t->kind == TOK_IDENT || t->kind == TOK_STRING)
+    if (t->kind == TOK_INT || t->kind == TOK_IDENT || t->kind == TOK_STRING ||
+        t->kind == TOK_VAR)
         return tok_dup(advance(p));
     if (t->kind == TOK_LBRACKET)
         return parse_list(p);
-    if (t->kind == TOK_VAR) {
-        fprintf(stderr,
-                "parser: variable '%s' inside a list literal is a Phase-2 "
-                "[X|Xs] pattern and is not supported yet\n",
-                t->text ? t->text : "?");
-        return NULL;
-    }
     if (t->kind == TOK_PIPE) {
         fprintf(stderr,
-                "parser: '[X|Xs]' head/tail pattern syntax is deferred to "
-                "Phase 2 (constants only in list literals)\n");
+                "parser: unexpected '|' in list — it must follow at least one "
+                "element ([X|Xs] head/tail pattern)\n");
         return NULL;
     }
     fprintf(stderr, "parser: unexpected token kind %d in list literal\n",
@@ -521,10 +520,23 @@ static token *parse_list(parser *p)
             if (sep->kind == TOK_COMMA) { advance(p); continue; }
             if (sep->kind == TOK_RBRACKET) { advance(p); break; }
             if (sep->kind == TOK_PIPE) {
-                fprintf(stderr,
-                        "parser: '[X|Xs]' head/tail pattern syntax is "
-                        "deferred to Phase 2\n");
-                goto fail;
+                /* [X|Xs] head/tail pattern: exactly ONE tail token, which
+                 * MUST be a variable (no [a|[b]] sugar). */
+                token *tl;
+                advance(p);
+                tl = peek(p);
+                if (!tl || tl->kind != TOK_VAR) {
+                    fprintf(stderr,
+                            "parser: the tail after '|' in a list pattern "
+                            "must be a variable (got kind %d)\n",
+                            tl ? (int)tl->kind : -1);
+                    goto fail;
+                }
+                advance(p);
+                lst->tail = tok_dup(tl);
+                if (!lst->tail) goto fail;
+                if (!expect(p, TOK_RBRACKET)) goto fail;
+                break;
             }
             fprintf(stderr, "parser: expected ',' or ']' in list literal, "
                     "got kind %d\n", (int)sep->kind);
@@ -740,7 +752,8 @@ static int is_str_producing_name(const char *s)
 
 /* M9/v2-lists: LIST-producing builtin names, recognized only in the
  * `VAR = name(...)` form.  cons(H,T)/car(L)/cdr(L)/append(A,B).  (length(L)
- * is deferred to Phase 2 — the name collides with the string `length`.) */
+ * is a STRING-producing name but its operand parser additionally accepts a
+ * list literal — see is_len above.) */
 static int is_list_producing_name(const char *s)
 {
     return s && (strcmp(s, "cons") == 0 || strcmp(s, "car") == 0 ||
@@ -854,6 +867,7 @@ static atom *parse_body_atom(parser *p)
                 advance(p);                /* = */
                 token *nm  = advance(p);   /* builtin name */
                 int   is_list = is_list_producing_name(nm->text);
+                int   is_len  = (nm->text && strcmp(nm->text, "length") == 0);
                 if (!expect(p, TOK_LPAREN)) return NULL;
 
                 atom *a = atom_new();
@@ -873,8 +887,8 @@ static atom *parse_body_atom(parser *p)
                     token *op = peek(p);
                     if (!op) { fail = 1; break; }
                     if (op->kind == TOK_RPAREN) { advance(p); break; }
-                    if (is_list && op->kind == TOK_LBRACKET) {
-                        /* nested list-literal operand */
+                    if ((is_list || is_len) && op->kind == TOK_LBRACKET) {
+                        /* nested list-literal operand (list builtins + length) */
                         if (nargs >= cap) {
                             int nc = cap * 2;
                             token **na = realloc(args, (size_t)nc * sizeof(token *));

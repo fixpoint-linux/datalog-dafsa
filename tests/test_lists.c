@@ -21,7 +21,17 @@
  *       parser (31-bit literal cap).  (CSV bulk-data keeps legacy raw-u32
  *       behavior — see the termstore.h / dl.c notes.)
  *   T8  compile-time rejects: comparison over a list literal; a negated list
- *       builtin; a variable inside a list literal (Phase-2 pattern).
+ *       builtin; a variable inside a list literal (Phase-2 pattern); the
+ *       [X|Xs] assignment form (deferred); list patterns in heads/facts and
+ *       negated atoms; malformed member/length operands; a lone member with an
+ *       UNBOUND L; a reserved builtin name used as a rule head.
+ *   T9  [X|Xs] pattern destructuring in a positive body atom (head/tail +
+ *       constant-element + empty-tail), with a car/cdr equivalence check.
+ *   T10 member(X, L): generator (X unbound → enumerate) + filter (X bound),
+ *       plus a lone member over a constant list driving a rule (no relational
+ *       body atom).
+ *   T11 length runtime dispatch: list, constant-list, empty-list, and the
+ *       string path (regression).
  */
 #include "dl.h"
 #include "vm.h"           /* vm_*_runs counters, eligibility fns */
@@ -494,11 +504,259 @@ static void t8_rejects(void)
     /* variable inside a list literal (Phase-2 pattern). */
     if (dl_load_rules(db, "q(X) :- p(X), [X|_] = [1,2].\n") == 0) pass = 0;
 
+    /* [X|Xs] ASSIGNMENT form stays deferred/rejected (Phase 2 sugar). */
+    if (dl_load_rules(db, "q(X) :- p(X), [X|Xs] = [1,2].\n") == 0) pass = 0;
+
+    /* list pattern in a rule head/fact (use cons(...) to construct). */
+    if (dl_load_rules(db, "qh([X|Xs]) :- p(X).\n") == 0) pass = 0;
+
+    /* list pattern in a negated atom (patterns cannot bind under negation). */
+    if (dl_load_rules(db, "q(X) :- p(X), !r([Y|Ys]).\n") == 0) pass = 0;
+
+    /* member with a non-variable element position. */
+    if (dl_load_rules(db, "q(X) :- p(X), member(5, [1,2]).\n") == 0) pass = 0;
+
+    /* member with a list-pattern operand. */
+    if (dl_load_rules(db, "q(X) :- p(X), member(Y, [Z|Zs]).\n") == 0) pass = 0;
+
+    /* member with an unbound list operand. */
+    if (dl_load_rules(db, "q(X) :- p(X), member(Y, L).\n") == 0) pass = 0;
+
+    /* a lone member with an UNBOUND L still errors loudly (no relational
+     * driver, no constant list to generate from). */
+    if (dl_load_rules(db, "r(X) :- member(X, L).\n") == 0) pass = 0;
+
+    /* a reserved builtin name cannot be a rule HEAD (clear diagnostic, not the
+     * misleading "rule member has no body"). */
+    if (dl_load_rules(db, "member(1,2).\n") == 0) pass = 0;
+    if (dl_load_rules(db, "length(X) :- p(X).\n") == 0) pass = 0;
+
+    /* length over a list pattern. */
+    if (dl_load_rules(db, "q(X) :- p(X), N = length([Y|Ys]).\n") == 0) pass = 0;
+
     /* control: a valid pure-data list rule still compiles. */
     if (dl_load_rules(db, "q([1,2]) :- p(X).\n") != 0) pass = 0;
 
     dl_close(db);
     if (pass) PASS(); else FAIL("expected compile error not raised");
+}
+
+/* ─── T9: [X|Xs] pattern destructuring (argument form) ─────────────────── */
+
+static void t9_pattern(void)
+{
+    char dir[256];
+    dl_db *db;
+    uint32_t l123[3] = {1, 2, 3};
+    uint32_t l78[2]  = {7, 8};
+    uint32_t t23[2]  = {2, 3};
+    uint32_t t8v[1]  = {8};
+    uint32_t h1, h2, f[1];
+    tset got;
+    int pass = 1;
+
+    TEST("T9 [X|Xs] pattern destructuring (argument form)");
+    db = fresh_db(dir, sizeof(dir), "t9");
+    assert(db);
+    assert(dl_declare_relation(db, "p", 1) == 0);
+    h1 = mk_list(db->terms, l123, 3);
+    h2 = mk_list(db->terms, l78, 2);
+    f[0] = h1; addf(db, "p", f, 1);
+    f[0] = h2; addf(db, "p", f, 1);
+
+    /* q = head/tail destructure; qq = the car/cdr equivalence. */
+    assert(dl_load_rules(db,
+        "q(H, T) :- p([H|T]).\n"
+        "qq(H, T) :- p(L), H = car(L), T = cdr(L).\n"
+        "r(X) :- p([7, X]).\n") == 0);
+    if (dl_publish_snapshot(db) != 0) pass = 0;
+
+    /* q: (1,[2,3]) and (7,[8]) */
+    memset(&got, 0, sizeof(got));
+    if (dl_query(db, "q", tcb, &got) != 2 || got.arity != 2) pass = 0;
+    if (got.count == 2) {
+        long i;
+        for (i = 0; i < got.count; i++) {
+            const uint32_t *row = got.data + (size_t)i * 2;
+            if (row[0] == 1) {
+                if (row[1] != mk_list(db->terms, t23, 2)) pass = 0;
+            } else if (row[0] == 7) {
+                if (row[1] != mk_list(db->terms, t8v, 1)) pass = 0;
+            } else pass = 0;
+        }
+    } else pass = 0;
+    tset_free(&got);
+
+    /* qq must equal q (pattern == car/cdr lowering). */
+    memset(&got, 0, sizeof(got));
+    if (dl_query(db, "qq", tcb, &got) != 2 || got.arity != 2) pass = 0;
+    if (got.count == 2) {
+        long i;
+        for (i = 0; i < got.count; i++) {
+            const uint32_t *row = got.data + (size_t)i * 2;
+            if (row[0] == 1) {
+                if (row[1] != mk_list(db->terms, t23, 2)) pass = 0;
+            } else if (row[0] == 7) {
+                if (row[1] != mk_list(db->terms, t8v, 1)) pass = 0;
+            } else pass = 0;
+        }
+    } else pass = 0;
+    tset_free(&got);
+
+    /* r: constant element 7 + var X + empty tail → only [7,8] matches, X=8. */
+    memset(&got, 0, sizeof(got));
+    if (dl_query(db, "r", tcb, &got) != 1 || got.arity != 1) pass = 0;
+    if (got.count == 1 && got.data[0] != 8) pass = 0;
+    tset_free(&got);
+
+    dl_close(db);
+    if (pass) PASS(); else FAIL("pattern destructuring produced wrong tuples");
+}
+
+/* ─── T10: member(X, L) generator + filter ──────────────────────────────── */
+
+static void t10_member(void)
+{
+    char dir[256];
+    dl_db *db;
+    uint32_t l123[3] = {1, 2, 3};
+    uint32_t l78[2]  = {7, 8};
+    uint32_t h1, h2, f[1];
+    tset got;
+    int pass = 1;
+
+    TEST("T10 member(X, L) generator + filter");
+    db = fresh_db(dir, sizeof(dir), "t10");
+    assert(db);
+    assert(dl_declare_relation(db, "p", 1) == 0);
+    assert(dl_declare_relation(db, "num", 1) == 0);
+    h1 = mk_list(db->terms, l123, 3);
+    h2 = mk_list(db->terms, l78, 2);
+    f[0] = h1; addf(db, "p", f, 1);
+    f[0] = h2; addf(db, "p", f, 1);
+    f[0] = 1;  addf(db, "num", f, 1);
+    f[0] = 5;  addf(db, "num", f, 1);
+    f[0] = 7;  addf(db, "num", f, 1);
+
+    assert(dl_load_rules(db,
+        "r(X) :- p(L), member(X, L).\n"          /* generator */
+        "s(X) :- num(X), p(L), member(X, L).\n"  /* filter */
+        "pure(X) :- member(X, [1,2,3]).\n"       /* lone member drives (FIX-1) */
+        ) == 0);
+    if (dl_publish_snapshot(db) != 0) pass = 0;
+
+    /* generator: every element of every list = {1,2,3,7,8}. */
+    memset(&got, 0, sizeof(got));
+    if (dl_query(db, "r", tcb, &got) != 5 || got.arity != 1) pass = 0;
+    if (got.count == 5) {
+        long i, seen = 0;
+        for (i = 0; i < got.count; i++) {
+            uint32_t x = got.data[i];
+            if (x == 1 || x == 2 || x == 3 || x == 7 || x == 8)
+                seen |= (1u << (int)x);
+            else pass = 0;
+        }
+        if (seen != ((1u << 1) | (1u << 2) | (1u << 3) | (1u << 7) | (1u << 8)))
+            pass = 0;
+    } else pass = 0;
+    tset_free(&got);
+
+    /* filter: num values that are members of some list = {1, 7}. */
+    memset(&got, 0, sizeof(got));
+    if (dl_query(db, "s", tcb, &got) != 2 || got.arity != 1) pass = 0;
+    if (got.count == 2) {
+        long i, seen = 0;
+        for (i = 0; i < got.count; i++) {
+            uint32_t x = got.data[i];
+            if (x == 1 || x == 7) seen |= (1u << (int)x);
+            else pass = 0;
+        }
+        if (seen != ((1u << 1) | (1u << 7))) pass = 0;
+    } else pass = 0;
+    tset_free(&got);
+
+    /* pure: a lone member over a constant list drives the rule (FIX-1) —
+     * enumerates every element of [1,2,3] = {1,2,3}, independent of p/num. */
+    memset(&got, 0, sizeof(got));
+    if (dl_query(db, "pure", tcb, &got) != 3 || got.arity != 1) pass = 0;
+    if (got.count == 3) {
+        long i, seen = 0;
+        for (i = 0; i < got.count; i++) {
+            uint32_t x = got.data[i];
+            if (x == 1 || x == 2 || x == 3) seen |= (1u << (int)x);
+            else pass = 0;
+        }
+        if (seen != ((1u << 1) | (1u << 2) | (1u << 3))) pass = 0;
+    } else pass = 0;
+    tset_free(&got);
+
+    dl_close(db);
+    if (pass) PASS(); else FAIL("member generator/filter produced wrong tuples");
+}
+
+/* ─── T11: length runtime dispatch (list + string) ──────────────────────── */
+
+static void t11_length(void)
+{
+    char dir[256];
+    dl_db *db;
+    uint32_t l123[3] = {1, 2, 3};
+    uint32_t l78[2]  = {7, 8};
+    uint32_t h1, h2, f[1];
+    tset got;
+    int pass = 1;
+
+    TEST("T11 length runtime dispatch (list + string)");
+    db = fresh_db(dir, sizeof(dir), "t11");
+    assert(db);
+    assert(dl_declare_relation(db, "p", 1) == 0);
+    h1 = mk_list(db->terms, l123, 3);
+    h2 = mk_list(db->terms, l78, 2);
+    f[0] = h1; addf(db, "p", f, 1);
+    f[0] = h2; addf(db, "p", f, 1);
+
+    assert(dl_load_rules(db,
+        "r(N) :- p(L), N = length(L).\n"          /* list length */
+        "s(N) :- p(L), N = length([9,9,9,9]).\n"  /* constant-list length */
+        "t(N) :- p(L), N = length([]).\n"         /* empty-list length */
+        "u(N) :- p(L), N = length(\"hello\").\n"    /* string length regression */
+        ) == 0);
+    if (dl_publish_snapshot(db) != 0) pass = 0;
+
+    /* r: list lengths {3, 2}. */
+    memset(&got, 0, sizeof(got));
+    if (dl_query(db, "r", tcb, &got) != 2 || got.arity != 1) pass = 0;
+    if (got.count == 2) {
+        long i, seen = 0;
+        for (i = 0; i < got.count; i++) {
+            uint32_t n = got.data[i];
+            if (n == 2 || n == 3) seen |= (1u << (int)n);
+            else pass = 0;
+        }
+        if (seen != ((1u << 2) | (1u << 3))) pass = 0;
+    } else pass = 0;
+    tset_free(&got);
+
+    /* s: length([9,9,9,9]) == 4 (dedup from two p facts). */
+    memset(&got, 0, sizeof(got));
+    if (dl_query(db, "s", tcb, &got) != 1 || got.arity != 1) pass = 0;
+    if (got.count == 1 && got.data[0] != 4) pass = 0;
+    tset_free(&got);
+
+    /* t: length([]) == 0. */
+    memset(&got, 0, sizeof(got));
+    if (dl_query(db, "t", tcb, &got) != 1 || got.arity != 1) pass = 0;
+    if (got.count == 1 && got.data[0] != 0) pass = 0;
+    tset_free(&got);
+
+    /* u: length("hello") == 5 (string path preserved). */
+    memset(&got, 0, sizeof(got));
+    if (dl_query(db, "u", tcb, &got) != 1 || got.arity != 1) pass = 0;
+    if (got.count == 1 && got.data[0] != 5) pass = 0;
+    tset_free(&got);
+
+    dl_close(db);
+    if (pass) PASS(); else FAIL("length dispatch produced wrong tuples");
 }
 
 /* ─── main ─────────────────────────────────────────────────────────────── */
@@ -515,6 +773,9 @@ int main(void)
     t6_persistence();
     t7_boundary();
     t8_rejects();
+    t9_pattern();
+    t10_member();
+    t11_length();
 
     printf("\n%d tests run, %d failed.\n", tests_run, tests_failed);
     return tests_failed ? 1 : 0;

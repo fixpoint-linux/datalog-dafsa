@@ -221,10 +221,14 @@ static token *tok_dup(const token *t)
             if (!n->children[i]) { tok_free_local(n); return NULL; }
         }
     }
+    if (t->tail) {
+        n->tail = tok_dup(t->tail);
+        if (!n->tail) { tok_free_local(n); return NULL; }
+    }
     return n;
 }
 
-/* Recursively free a token (text + list children). */
+/* Recursively free a token (text + list children + tail). */
 static void tok_free_local(token *t)
 {
     int i;
@@ -234,6 +238,7 @@ static void tok_free_local(token *t)
             tok_free_local(t->children[i]);
         free(t->children);
     }
+    tok_free_local(t->tail);
     free(t->text);
     free(t);
 }

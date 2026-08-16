@@ -174,6 +174,90 @@ static vm_instr *i_emit(i_buf *b) {
     return &b->b[b->n++];
 }
 
+/* ─── v2-lists: list-pattern helpers ──────────────────────────────────── */
+
+/* 1 iff t is a list PATTERN: it has a '|' tail, or any element is a
+ * variable, or (recursively) any nested element is a pattern.  A list with
+ * no tail and only constant elements is a plain constant literal. */
+static int list_is_pattern(const token *t)
+{
+    int i;
+    if (!t || t->kind != TOK_LIST) return 0;
+    if (t->tail) return 1;
+    for (i = 0; i < t->nchildren; i++) {
+        const token *e = t->children[i];
+        if (e->kind == TOK_VAR) return 1;
+        if (list_is_pattern(e)) return 1;
+    }
+    return 0;
+}
+
+/* OR every variable slot referenced by token t (recursing into list
+ * patterns) into *m.  Used by atom_var_mask so a list-pattern atom connects
+ * its element/tail vars to the bushy/left-deep join planner. */
+static void mask_token_vars(uint64_t *m, const token *t, v_tab *vt)
+{
+    int i;
+    if (!t) return;
+    if (t->kind == TOK_VAR) {
+        int vi = v_find(vt, t->text);
+        if (vi >= 0 && vi < 64) *m |= (1ULL << vi);
+        return;
+    }
+    if (t->kind == TOK_LIST) {
+        for (i = 0; i < t->nchildren; i++)
+            mask_token_vars(m, t->children[i], vt);
+        mask_token_vars(m, t->tail, vt);
+    }
+}
+
+/* 1 iff token t (recursing into list patterns) references variable `name`. */
+static int token_contains_var(const token *t, const char *name)
+{
+    int i;
+    if (!t) return 0;
+    if (t->kind == TOK_VAR) return t->text && strcmp(t->text, name) == 0;
+    if (t->kind == TOK_LIST) {
+        for (i = 0; i < t->nchildren; i++)
+            if (token_contains_var(t->children[i], name)) return 1;
+        if (token_contains_var(t->tail, name)) return 1;
+    }
+    return 0;
+}
+
+/* v_add every variable referenced by token t (recursing into list patterns).
+ * Returns 0 on success, -1 on OOM / MAX_VARS overflow. */
+static int collect_token_vars(const token *t, v_tab *vt)
+{
+    int i;
+    if (!t) return 0;
+    if (t->kind == TOK_VAR) return v_add(vt, t->text) < 0 ? -1 : 0;
+    if (t->kind == TOK_LIST) {
+        for (i = 0; i < t->nchildren; i++)
+            if (collect_token_vars(t->children[i], vt) < 0) return -1;
+        if (collect_token_vars(t->tail, vt) < 0) return -1;
+    }
+    return 0;
+}
+
+/* Mark every variable referenced by token t (recursing into list patterns)
+ * as bound in bound_vars[]. */
+static void mark_token_vars_bound(const token *t, v_tab *vt, int *bound_vars)
+{
+    int i;
+    if (!t) return;
+    if (t->kind == TOK_VAR) {
+        int vi = v_find(vt, t->text);
+        if (vi >= 0) bound_vars[vi] = 1;
+        return;
+    }
+    if (t->kind == TOK_LIST) {
+        for (i = 0; i < t->nchildren; i++)
+            mark_token_vars_bound(t->children[i], vt, bound_vars);
+        mark_token_vars_bound(t->tail, vt, bound_vars);
+    }
+}
+
 /* ─── Parse a constant from a token ─────────────────────────────────── */
 
 static int token_const(dl_db *db, const token *t, uint32_t *out)
@@ -218,6 +302,15 @@ static int token_const(dl_db *db, const token *t, uint32_t *out)
         return 0;
     }
     if (t->kind == TOK_LIST) {
+        /* A list PATTERN must never reach a constant position — the compiler
+         * lowers patterns via emit_pattern during the relational phase.  This
+         * is a safety net for a nested pattern or a pattern in a head/fact. */
+        if (list_is_pattern(t)) {
+            fprintf(stderr, "compile error: internal: list pattern reached a "
+                    "constant position (nested list patterns are not "
+                    "supported)\n");
+            return -1;
+        }
         /* [e1, e2, ..., en] = cons(e1, cons(e2, ... cons(en, NIL) ...)).
          * Right-fold to NIL so element order is preserved (head = e1). */
         uint32_t acc = TERM_NIL;
@@ -238,6 +331,107 @@ static int token_const(dl_db *db, const token *t, uint32_t *out)
     fprintf(stderr, "compile error: internal: unexpected token kind %d in a "
             "constant position\n", (int)t->kind);
     return -1;
+}
+
+/* Emit car/cdr/equality destructuring for a list PATTERN already bound to
+ * src_slot (the column-value slot from SCAN/LOOKUP/LOOKUP_PERM).  Uses only
+ * existing opcodes; each var element binds via b_try (bind-or-filter), each
+ * constant element filters via OP_EQ_CONST, tail var binds via OP_EQ, and an
+ * absent tail (empty-tail) requires cdr^n == TERM_NIL. */
+static int emit_pattern(dl_db *db, const token *pat, uint8_t src_slot,
+                        v_tab *vt, i_buf *ib, int *cc, const char *head_pred)
+{
+    uint8_t cur = src_slot;
+    int i;
+    for (i = 0; i < pat->nchildren; i++) {
+        const token *e = pat->children[i];
+        if (e->kind == TOK_VAR) {
+            int vi = v_find(vt, e->text);
+            vm_instr *op;
+            if (vi < 0) return -1;
+            op = i_emit(ib);
+            if (!op) return -1;
+            op->op = OP_LIST_CAR;
+            op->a = cur;
+            op->c = vt->e[vi].slot;   /* bind-or-filter head element */
+        } else {
+            /* constant element: car into a fresh temp, then EQ_CONST */
+            char cname[16]; uint32_t cv;
+            int vi; vm_instr *op, *eq;
+            v_fresh_name(vt, cname, sizeof(cname), cc, 'p');
+            vi = v_add(vt, cname);
+            if (vi < 0) return -1;
+            if (token_const(db, e, &cv)) return -1;
+            op = i_emit(ib);
+            if (!op) return -1;
+            op->op = OP_LIST_CAR;
+            op->a = cur;
+            op->c = vt->e[vi].slot;
+            eq = i_emit(ib);
+            if (!eq) return -1;
+            eq->op = OP_EQ_CONST;
+            eq->a = vt->e[vi].slot;
+            eq->imm = cv;
+        }
+        {   /* advance: cur = cdr(cur) into a fresh temp */
+            char cname[16]; int vi; vm_instr *op;
+            v_fresh_name(vt, cname, sizeof(cname), cc, 'p');
+            vi = v_add(vt, cname);
+            if (vi < 0) return -1;
+            op = i_emit(ib);
+            if (!op) return -1;
+            op->op = OP_LIST_CDR;
+            op->a = cur;
+            op->c = vt->e[vi].slot;
+            cur = vt->e[vi].slot;
+        }
+    }
+    if (pat->tail) {
+        int vi = v_find(vt, pat->tail->text);
+        vm_instr *eq;
+        if (vi < 0) return -1;
+        eq = i_emit(ib);
+        if (!eq) return -1;
+        eq->op = OP_EQ;              /* bind-or-filter the tail var */
+        eq->a = vt->e[vi].slot;
+        eq->b = cur;
+    } else {
+        vm_instr *eq = i_emit(ib);
+        if (!eq) return -1;
+        eq->op = OP_EQ_CONST;        /* empty-tail: cdr^n must be NIL */
+        eq->a = cur;
+        eq->imm = TERM_NIL;
+    }
+    (void)head_pred;
+    return 0;
+}
+
+/* Emit post-join arg handling for atom a: each non-var arg j is either a
+ * constant (OP_EQ_CONST filter) or a list PATTERN (destructured from the
+ * column-value slot slots[j] via emit_pattern).  slots[] is indexed by
+ * ORIGINAL column.  Returns 0 on success, -1 on error. */
+static int emit_const_or_pattern(dl_db *db, const atom *a, const uint8_t *slots,
+                                 v_tab *vt, i_buf *ib, int *cc,
+                                 const char *head_pred)
+{
+    int j;
+    for (j = 0; j < a->nargs; j++) {
+        const token *t = a->args[j];
+        if (t->kind == TOK_VAR) continue;
+        if (t->kind == TOK_LIST && list_is_pattern(t)) {
+            if (emit_pattern(db, t, slots[j], vt, ib, cc, head_pred))
+                return -1;
+            continue;
+        }
+        {
+            uint32_t cv;
+            if (token_const(db, t, &cv)) return -1;
+            vm_instr *eq = i_emit(ib);
+            if (!eq) return -1;
+            eq->op = OP_EQ_CONST; eq->a = slots[j]; eq->imm = cv;
+        }
+    }
+    return 0;
 }
 
 /* ─── M9: builtin atom classification + arithmetic lowering ──────────── */
@@ -311,9 +505,18 @@ static int is_list_producing(const atom *a)
            strcmp(a->pred, "append") == 0;
 }
 
+/* v2-lists: list FILTER builtin `member(X, L)` — a bare function-call atom
+ * (NOT `VAR = member(...)`).  args[0] is the member variable X (which the VM
+ * either tests or GENERATES), args[1] is the list operand L. */
+static int is_list_filter(const atom *a)
+{
+    if (!a || !a->pred) return 0;
+    return strcmp(a->pred, "member") == 0;
+}
+
 static int is_list_builtin(const atom *a)
 {
-    return is_list_producing(a);
+    return is_list_producing(a) || is_list_filter(a);
 }
 
 /* any non-relational builtin (equality / comparison / arithmetic / string /
@@ -322,6 +525,24 @@ static int is_builtin_pred(const atom *a)
 {
     return is_equality(a) || is_comparison(a) || is_arith(a) ||
            is_str_builtin(a) || is_list_builtin(a);
+}
+
+/* v2-lists FIX-2: is `name` a reserved BUILTIN predicate name?  These names
+ * are always classified as builtins in body position (never a relation
+ * reference), so a rule/fact HEAD with one of these names is a user error —
+ * the body would silently ignore any declared relation of the same name (or,
+ * for a fact, produce the misleading "rule X has no body").  Reserve them
+ * loudly at the head so the diagnostic is clear. */
+static int is_reserved_builtin_name(const char *name)
+{
+    if (!name) return 0;
+    return strcmp(name, "member") == 0 ||
+           strcmp(name, "car") == 0 || strcmp(name, "cons") == 0 ||
+           strcmp(name, "cdr") == 0 || strcmp(name, "append") == 0 ||
+           strcmp(name, "concat") == 0 || strcmp(name, "length") == 0 ||
+           strcmp(name, "lower") == 0 || strcmp(name, "upper") == 0 ||
+           strcmp(name, "prefix") == 0 || strcmp(name, "suffix") == 0 ||
+           strcmp(name, "contains") == 0;
 }
 
 /* A string-builtin operand token must be TOK_VAR or TOK_IDENT (a string
@@ -344,8 +565,16 @@ static int str_builtin_valid(const atom *a)
         need = strcmp(a->pred, "concat") == 0 ? 3 : 2;
         if (a->nargs != need) return 0;
         if (a->args[0]->kind != TOK_VAR) return 0;
-        for (i = 1; i < need; i++)
-            if (!str_operand_ok(a->args[i])) return 0;
+        for (i = 1; i < need; i++) {
+            token *t = a->args[i];
+            /* length(S) additionally accepts a CONSTANT list literal
+             * (v2 list-length); a list PATTERN is rejected (never a string). */
+            if (strcmp(a->pred, "length") == 0 && t->kind == TOK_LIST) {
+                if (list_is_pattern(t)) return 0;
+                continue;
+            }
+            if (!str_operand_ok(t)) return 0;
+        }
         return 1;
     }
     if (is_str_filter(a)) {
@@ -363,9 +592,15 @@ static int str_builtin_valid(const atom *a)
  * a non-list) — a constant is never "wrong", just possibly non-list. */
 static int list_operand_ok(const token *t)
 {
-    return t && (t->kind == TOK_VAR || t->kind == TOK_INT ||
-                 t->kind == TOK_IDENT || t->kind == TOK_STRING ||
-                 t->kind == TOK_LIST);
+    if (!t) return 0;
+    if (t->kind == TOK_VAR || t->kind == TOK_INT ||
+        t->kind == TOK_IDENT || t->kind == TOK_STRING)
+        return 1;
+    /* a list literal operand must be a CONSTANT list — never a [X|Xs]
+     * pattern (patterns are destructured only in relational atom args). */
+    if (t->kind == TOK_LIST)
+        return !list_is_pattern(t);
+    return 0;
 }
 
 /* Validate the arity + operand/result kinds of a list builtin.  Returns 1 if
@@ -374,6 +609,13 @@ static int list_builtin_valid(const atom *a)
 {
     int i, need;
     if (!a || !a->pred) return 0;
+    if (is_list_filter(a)) {
+        /* member(X, L): 2 args, X a variable, L a variable-or-constant. */
+        if (a->nargs != 2) return 0;
+        if (a->args[0]->kind != TOK_VAR) return 0;
+        if (!list_operand_ok(a->args[1])) return 0;
+        return 1;
+    }
     need = (strcmp(a->pred, "cons") == 0 ||
             strcmp(a->pred, "append") == 0) ? 3 : 2;
     if (a->nargs != need) return 0;
@@ -604,6 +846,26 @@ static int list_producing_operands_bound(const atom *a, v_tab *vt,
                 return 0;
             }
         }
+    }
+    return 1;
+}
+
+/* require the LIST operand (args[1]) of `member(X, L)` to be bound.  X
+ * (args[0]) may be unbound — the VM then GENERATES it from L's elements. */
+static int member_operand_bound(const atom *a, v_tab *vt,
+                                const int *bound_vars,
+                                const char *head_pred)
+{
+    token *t = a->args[1];
+    int vi;
+    if (t->kind != TOK_VAR) return 1;   /* constant L is always bound */
+    vi = v_find(vt, t->text);
+    if (vi < 0 || !bound_vars[vi]) {
+        fprintf(stderr,
+                "compile error: ungrounded member operand — list variable "
+                "'%s' in 'member' is not bound by a positive body atom "
+                "(rule '%s')\n", t->text, head_pred);
+        return 0;
     }
     return 1;
 }
@@ -1026,11 +1288,8 @@ static uint64_t atom_var_mask(const rule *r, int bi, v_tab *vt)
     const atom *a = r->body[bi];
     uint64_t m = 0;
     int j;
-    for (j = 0; j < a->nargs; j++) {
-        if (a->args[j]->kind != TOK_VAR) continue;
-        int vi = v_find(vt, a->args[j]->text);
-        if (vi >= 0 && vi < 64) m |= (1ULL << vi);
-    }
+    for (j = 0; j < a->nargs; j++)
+        mask_token_vars(&m, a->args[j], vt);
     return m;
 }
 
@@ -1235,14 +1494,9 @@ static int emit_pos_atom(dl_db *db, const rule *r, int bi, const int *bri,
                     ip->slots[j] = vt->e[vi].slot;
                 }
             }
-            for (j = 0; j < curr->nargs; j++) {
-                if (curr->args[j]->kind == TOK_VAR) continue;
-                uint32_t cv;
-                if (token_const(db, curr->args[j], &cv)) return -1;
-                vm_instr *eq = i_emit(ib);
-                if (!eq) return -1;
-                eq->op = OP_EQ_CONST; eq->a = ip->slots[j]; eq->imm = cv;
-            }
+            if (emit_const_or_pattern(db, curr, ip->slots, vt, ib, cc,
+                                      r->head->pred))
+                return -1;
         } else {
             /* OP_SCAN (first atom, or no shared columns at all) */
             uint8_t ts[8];
@@ -1262,14 +1516,8 @@ static int emit_pos_atom(dl_db *db, const rule *r, int bi, const int *bri,
                 }
             }
             for (j = 0; j < curr->nargs; j++) ip->slots[j] = ts[j];
-            for (j = 0; j < curr->nargs; j++) {
-                if (curr->args[j]->kind == TOK_VAR) continue;
-                uint32_t cv;
-                if (token_const(db, curr->args[j], &cv)) return -1;
-                vm_instr *eq = i_emit(ib);
-                if (!eq) return -1;
-                eq->op = OP_EQ_CONST; eq->a = ts[j]; eq->imm = cv;
-            }
+            if (emit_const_or_pattern(db, curr, ts, vt, ib, cc, r->head->pred))
+                return -1;
         }
     } else {
         /* Leading shared columns: OP_LOOKUP */
@@ -1300,14 +1548,9 @@ static int emit_pos_atom(dl_db *db, const rule *r, int bi, const int *bri,
             }
             si++;
         }
-        for (j = 0; j < curr->nargs; j++) {
-            if (curr->args[j]->kind == TOK_VAR) continue;
-            uint32_t cv;
-            if (token_const(db, curr->args[j], &cv)) return -1;
-            vm_instr *eq = i_emit(ib);
-            if (!eq) return -1;
-            eq->op = OP_EQ_CONST; eq->a = slot_map[j]; eq->imm = cv;
-        }
+        if (emit_const_or_pattern(db, curr, slot_map, vt, ib, cc,
+                                  r->head->pred))
+            return -1;
     }
     return 0;
 }
@@ -1536,7 +1779,31 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
         }
     }
 
-    /* ── 2. resolve head ─────────────────────────────────────────── */
+    /* ── 1b. v2-lists: reject list PATTERNS in the head/fact.  A head arg may
+     * be a CONSTANT list literal (interning a list value) but never a
+     * [X|Xs] pattern — construct lists with cons(...) instead.  Reject here,
+     * BEFORE collect-vars, so a pattern var never enters the var table. */
+    for (i = 0; i < r->head->nargs; i++) {
+        if (list_is_pattern(r->head->args[i])) {
+            fprintf(stderr, "compile error: list pattern in head/fact of '%s' "
+                    "— use cons(...) to construct lists\n", r->head->pred);
+            goto fail;
+        }
+    }
+
+    /* 1c. v2-lists FIX-2: a reserved BUILTIN name cannot be a rule HEAD.
+     * These names are always classified as builtins in body position, so a
+     * head of the same name would either silently shadow a declared relation
+     * or (for a fact) fall through to the misleading "rule X has no body".
+     * Reject loudly here with a clear diagnostic BEFORE head resolution. */
+    if (is_reserved_builtin_name(r->head->pred)) {
+        fprintf(stderr, "compile error: '%s' is a reserved builtin predicate "
+                "name and cannot be used as a rule head (rule '%s')\n",
+                r->head->pred, r->head->pred);
+        goto fail;
+    }
+
+    /* 2. resolve head */
     head_ri = db_find_rel(db, r->head->pred);
     if (head_ri < 0) {
         if (r->head->nargs < 1 || r->head->nargs > MAX_ARITY) {
@@ -1618,6 +1885,19 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
             }
             bri[bi] = -1; continue;
         }
+        /* v2-lists: a NEGATED relational atom cannot destructure a list
+         * pattern (it never binds vars under negation) — reject loudly. */
+        if (ba->negated) {
+            for (j = 0; j < ba->nargs; j++) {
+                if (list_is_pattern(ba->args[j])) {
+                    fprintf(stderr, "compile error: list pattern in negated "
+                            "atom '%s' (patterns cannot bind vars under "
+                            "negation) (rule '%s')\n",
+                            ba->pred, r->head->pred);
+                    goto fail;
+                }
+            }
+        }
         int ri = db_find_rel(db, ba->pred);
         if (ri < 0) {
             fprintf(stderr, "compile error: unknown predicate '%s'\n",
@@ -1667,6 +1947,12 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
     for (i = 0; i < r->nbody; i++)
         for (j = 0; j < r->body[i]->nargs; j++)
             if (r->body[i]->args[j]->kind == TOK_VAR && v_add(&vt, r->body[i]->args[j]->text) < 0) goto fail;
+    /* v2-lists: vars nested inside a list PATTERN (element vars + tail var)
+     * must also be in the var table so v_find resolves them during the safety
+     * passes and lowering. */
+    for (i = 0; i < r->nbody; i++)
+        for (j = 0; j < r->body[i]->nargs; j++)
+            if (collect_token_vars(r->body[i]->args[j], &vt) < 0) goto fail;
     /* M9: arithmetic operand vars referenced only inside an expr tree must
      * also be in the var table (so v_find resolves them during safety checks
      * and lowering). */
@@ -1735,12 +2021,8 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
                     }
                 }
             } else {
-                for (j = 0; j < ba->nargs; j++) {
-                    if (ba->args[j]->kind == TOK_VAR) {
-                        int vi = v_find(&vt, ba->args[j]->text);
-                        if (vi >= 0) bound_vars[vi] = 1;
-                    }
-                }
+                for (j = 0; j < ba->nargs; j++)
+                    mark_token_vars_bound(ba->args[j], &vt, bound_vars);
             }
         }
     }
@@ -1760,10 +2042,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
             atom *ba = r->body[bi];
             if (ba->negated || ba->aggregate || is_builtin_pred(ba)) continue;
             for (j = 0; j < ba->nargs; j++)
-                if (ba->args[j]->kind == TOK_VAR) {
-                    int vi = v_find(&vt, ba->args[j]->text);
-                    if (vi >= 0) bound_vars[vi] = 1;
-                }
+                mark_token_vars_bound(ba->args[j], &vt, bound_vars);
         }
         /* (b) equality propagation (equality runs before arithmetic).  An
          * equality X = Y binds at most ONE new side: OP_EQ binds Y from X when
@@ -1810,6 +2089,16 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
             } else if (is_list_producing(ba)) {
                 if (!list_producing_operands_bound(ba, &vt, bound_vars,
                                                    r->head->pred))
+                    goto fail;
+                {
+                    int vi = v_find(&vt, ba->args[0]->text);
+                    if (vi >= 0) bound_vars[vi] = 1;
+                }
+            } else if (is_list_filter(ba)) {
+                /* member(X, L): L must be bound (X may be unbound → generated
+                 * by the VM).  Member runs in the producer phase (it binds X)
+                 * so X is bound for any LATER producer/filter. */
+                if (!member_operand_bound(ba, &vt, bound_vars, r->head->pred))
                     goto fail;
                 {
                     int vi = v_find(&vt, ba->args[0]->text);
@@ -1880,8 +2169,8 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
         int ok = 0;
         for (bi = 0; bi < r->nbody && !ok; bi++)
             for (j = 0; j < r->body[bi]->nargs; j++)
-                if (r->body[bi]->args[j]->kind == TOK_VAR &&
-                    !strcmp(r->body[bi]->args[j]->text, a->text)) { ok = 1; break; }
+                if (token_contains_var(r->body[bi]->args[j], a->text))
+                    { ok = 1; break; }
         if (!ok) {
             fprintf(stderr, "compile error: ungrounded variable '%s' in head of '%s'\n",
                     a->text, r->head->pred); goto fail;
@@ -1899,7 +2188,6 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
                                 sizeof(uint64_t));
         int n_pos = 0;
         int any_pattern = 0;
-        emit_ctx ec;
 
         if (!pos || !mask) { free(pos); free(mask); goto fail; }
         for (bi = 0; bi < r->nbody; bi++) {
@@ -1908,25 +2196,50 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
             if (is_builtin_pred(ba)) continue;
             pos[n_pos++] = bi;
             mask[bi] = atom_var_mask(r, bi, &vt);
+            /* FIX-3 (defense-in-depth): a list PATTERN in a positive atom also
+             * gates bushy.  [X|Xs] destructuring binds vars INLINE during the
+             * relational phase (emit_pattern), so bushy+pattern is CORRECT
+             * today (the shared-column mask-to-slots math holds — pattern vars
+             * are in atom_var_mask).  But that is an implicit invariant: if
+             * pattern lowering ever became non-inline (deferred to a post-join
+             * phase), a bushy plan could silently misjoin on a pattern-bound
+             * var.  Disable bushy for any rule carrying a list pattern so a
+             * future lowering change can never mis-evaluate. */
+            for (j = 0; j < ba->nargs; j++)
+                if (list_is_pattern(ba->args[j])) { any_pattern = 1; break; }
             if (pat_idx[bi] != 0xFF) any_pattern = 1;
         }
         if (n_pos == 0) {
-            free(pos); free(mask);
-            fprintf(stderr, "compile error: rule '%s' has no positive body atom\n",
-                    r->head->pred);
-            goto fail;
-        }
-        if (g_reorder)
-            reorder_pos_atoms(db, bri, mask, pos, n_pos);
+            /* v2-lists FIX-1: a lone member(X,L) list-filter atom whose list
+             * operand L is bound-or-constant is a legitimate positive DRIVER —
+             * the producer phase emits OP_LIST_MEMBER, which GENERATES X from
+             * L's elements.  (An UNBOUND L was already rejected loudly by
+             * member_operand_bound in the 5b safety pass.)  Emit NO relational
+             * join: skip the join below and let the member generator drive the
+             * head. */
+            int member_driver = 0;
+            for (bi = 0; bi < r->nbody; bi++)
+                if (is_list_filter(r->body[bi])) { member_driver = 1; break; }
+            if (!member_driver) {
+                free(pos); free(mask);
+                fprintf(stderr, "compile error: rule '%s' has no positive body atom\n",
+                        r->head->pred);
+                goto fail;
+            }
+        } else {
+            emit_ctx ec;
+            if (g_reorder)
+                reorder_pos_atoms(db, bri, mask, pos, n_pos);
 
-        memset(&ec, 0, sizeof(ec));
-        ec.db = db; ec.r = r; ec.bri = bri; ec.pat_idx = pat_idx;
-        ec.vt = &vt; ec.ib = &ib; ec.cc = &cc; ec.mask = mask;
-        ec.do_bushy = g_bushy && (agg == NULL) && !any_pattern;
-        ec.next_buf = 0;
-        if (emit_join(&ec, pos, n_pos, NULL, 0) != 0) {
-            free(pos); free(mask);
-            goto fail;
+            memset(&ec, 0, sizeof(ec));
+            ec.db = db; ec.r = r; ec.bri = bri; ec.pat_idx = pat_idx;
+            ec.vt = &vt; ec.ib = &ib; ec.cc = &cc; ec.mask = mask;
+            ec.do_bushy = g_bushy && (agg == NULL) && !any_pattern;
+            ec.next_buf = 0;
+            if (emit_join(&ec, pos, n_pos, NULL, 0) != 0) {
+                free(pos); free(mask);
+                goto fail;
+            }
         }
         free(pos); free(mask);
     } else {
@@ -1939,12 +2252,27 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
             first_pos = bi; break;
         }
         if (first_pos < 0) {
-            fprintf(stderr, "compile error: rule '%s' has no positive body atom\n",
-                    r->head->pred);
-            goto fail;
+            /* v2-lists FIX-1: a lone member(X,L) list-filter atom with a
+             * bound-or-constant L is a legitimate positive DRIVER even in a
+             * rule with negation — the producer phase emits OP_LIST_MEMBER,
+             * which GENERATES X from L's elements.  (An unbound L was already
+             * rejected loudly by member_operand_bound in the 5b safety pass.)
+             * In this case there is NO positive relational atom to scan: we
+             * still emit NEG_CHECK for the negated atoms (handled below by the
+             * "remaining body atoms" loop, which starts at bi==0 when
+             * first_pos<0), but we skip the first-positive SCAN/WALK block. */
+            int member_driver = 0;
+            for (bi = 0; bi < r->nbody; bi++)
+                if (is_list_filter(r->body[bi])) { member_driver = 1; break; }
+            if (!member_driver) {
+                fprintf(stderr, "compile error: rule '%s' has no positive body atom\n",
+                        r->head->pred);
+                goto fail;
+            }
         }
 
-        /* NEG_CHECK for negated atoms before first positive */
+        /* NEG_CHECK for negated atoms before first positive (none when a lone
+         * member drives — first_pos stays -1, so the loop is empty). */
         for (bi = 0; bi < first_pos; bi++) {
             atom *na = r->body[bi];
             vm_instr *neg = i_emit(&ib);
@@ -1969,7 +2297,10 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
             }
         }
 
-        /* First positive body atom → SCAN or WALK */
+        /* First positive body atom → SCAN or WALK (skipped when a lone member
+         * drives the rule — there is no relational atom to scan; the member
+         * generator in the producer phase drives X). */
+        if (first_pos >= 0) {
         {
             atom *a0 = r->body[first_pos];
             vm_instr *ip = i_emit(&ib);
@@ -1995,15 +2326,11 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
             }
             for (j = 0; j < a0->nargs; j++) ip->slots[j] = ts[j];
 
-            for (j = 0; j < a0->nargs; j++) {
-                token *a = a0->args[j];
-                if (a->kind == TOK_VAR) continue;
-                uint32_t cv;
-                if (token_const(db, a, &cv)) { fprintf(stderr, "compile: bad constant\n"); goto fail; }
-                vm_instr *eq = i_emit(&ib);
-                eq->op = OP_EQ_CONST; eq->a = ts[j]; eq->imm = cv;
-            }
+            if (emit_const_or_pattern(db, a0, ts, &vt, &ib, &cc,
+                                      r->head->pred))
+                goto fail;
         }
+        } /* if (first_pos >= 0) */
 
         /* Remaining body atoms */
         for (bi = first_pos + 1; bi < r->nbody; bi++) {
@@ -2108,13 +2435,9 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
                     }
                     si++;
                 }
-                for (j = 0; j < curr->nargs; j++) {
-                    if (curr->args[j]->kind == TOK_VAR) continue;
-                    uint32_t cv;
-                    if (token_const(db, curr->args[j], &cv)) goto fail;
-                    vm_instr *eq = i_emit(&ib);
-                    eq->op = OP_EQ_CONST; eq->a = slot_map[j]; eq->imm = cv;
-                }
+                if (emit_const_or_pattern(db, curr, slot_map, &vt, &ib, &cc,
+                                          r->head->pred))
+                    goto fail;
             } else {
                 /* No leading shared columns.  Check for non-leading join. */
                 int any_shared = 0;
@@ -2166,14 +2489,10 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
                         }
                     }
 
-                    /* Emit EQ_CONST for any constant args */
-                    for (j = 0; j < curr->nargs; j++) {
-                        if (curr->args[j]->kind == TOK_VAR) continue;
-                        uint32_t cv;
-                        if (token_const(db, curr->args[j], &cv)) goto fail;
-                        vm_instr *eq = i_emit(&ib);
-                        eq->op = OP_EQ_CONST; eq->a = ip->slots[j]; eq->imm = cv;
-                    }
+                    /* Emit EQ_CONST / destructure for any constant/pattern args */
+                    if (emit_const_or_pattern(db, curr, ip->slots, &vt, &ib,
+                                              &cc, r->head->pred))
+                        goto fail;
                 } else {
                     /* No shared columns at all: OP_SCAN */
                     ip->op = OP_SCAN; ip->a = (uint8_t)bri[bi]; ip->b = (uint8_t)curr->nargs;
@@ -2191,12 +2510,9 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
                         }
                     }
                     for (j = 0; j < curr->nargs; j++) ip->slots[j] = ts[j];
-                    for (j = 0; j < curr->nargs; j++) {
-                        if (curr->args[j]->kind == TOK_VAR) continue;
-                        uint32_t cv; if (token_const(db, curr->args[j], &cv)) goto fail;
-                        vm_instr *eq = i_emit(&ib);
-                        eq->op = OP_EQ_CONST; eq->a = ts[j]; eq->imm = cv;
-                    }
+                    if (emit_const_or_pattern(db, curr, ts, &vt, &ib, &cc,
+                                              r->head->pred))
+                        goto fail;
                 }
             }
         }
@@ -2267,8 +2583,8 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
                 op->c = vt.e[vi].slot;
                 op->imm = (uint32_t)str_bind_imm(ba->pred);
                 op->body_idx = (uint8_t)bi;
-            } else {  /* length */
-                ls = cmp_operand_slot(db, ba->args[1], &vt, &ib, &cc, 0);
+            } else {  /* length (string OR list — runtime dispatch) */
+                ls = cmp_operand_slot(db, ba->args[1], &vt, &ib, &cc, 1);
                 if (ls < 0) goto fail;
                 op = i_emit(&ib);
                 if (!op) goto fail;
@@ -2346,6 +2662,26 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
             eq->a = vt.e[rvi].slot;
             eq->b = vt.e[vi].slot;
             eq->body_idx = (uint8_t)bi;
+        } else if (is_list_filter(ba)) {
+            /* member(X, L): a=the list operand slot, b=the member var slot.
+             * L is materialized (a constant list/other constant) or bound by
+             * an earlier relational atom; the VM tests X against L's elements
+             * when X is bound, else generates X from each element. */
+            if (ba->negated) continue;  /* negated builtin already rejected */
+            int ls = cmp_operand_slot(db, ba->args[1], &vt, &ib, &cc, 1);
+            if (ls < 0) goto fail;
+            {
+                int xvi = v_find(&vt, ba->args[0]->text);
+                vm_instr *m;
+                if (xvi < 0) goto fail;
+                m = i_emit(&ib);
+                if (!m) goto fail;
+                m->op = OP_LIST_MEMBER;
+                m->a = (uint8_t)ls;             /* list operand slot */
+                m->b = vt.e[xvi].slot;          /* member var slot */
+                m->slots[0] = vt.e[xvi].slot;   /* generator bind target */
+                m->body_idx = (uint8_t)bi;
+            }
         }
     }
 

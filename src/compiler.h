@@ -82,6 +82,12 @@ typedef enum {
     OP_LIST_APPEND = 23, /* LISTS (v2): a,b=operand slots, c=result slot.
                              !is_list(a) or !is_list(b) -> backtrack; else
                              bind c = append(a,b) via b_try. */
+    OP_LIST_MEMBER = 24, /* LISTS (v2): a=list operand slot, b=member var slot.
+                             L (a) must be bound; if b is bound this is a
+                             linear-scan FILTER (b in L?), else a GENERATOR
+                             pushing a frame that binds b to each element of
+                             L in turn (mirrors OP_MAT_JOIN's frame).  L not a
+                             list -> backtrack. */
 } vm_opcode;
 
 typedef struct {

@@ -1129,6 +1129,16 @@ static long exec_range(dl_db *db, const compiled_rule *cr,
          * intern_str_of -> backtrack; writes BYTE length (strlen) via
          * b_try.  No interning. */
         case OP_STR_LEN: {
+            uint32_t v = b_get(&b, in->a);
+            if (term_is_list(db->terms, v)) {
+                uint32_t len = term_length(db->terms, v);
+                if (!b_try(&b, in->c, len)) {
+                    if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
+                    break;
+                }
+                ip++;
+                break;
+            }
             const char *s = intern_str_of(db->ir, b_get(&b, in->a));
             if (!s) {
                 if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
@@ -1274,6 +1284,80 @@ static long exec_range(dl_db *db, const compiled_rule *cr,
             }
             ip++;
             break;
+        }
+
+        /* ── OP_LIST_MEMBER: list membership test / generator (v2) ──
+         * a=list operand slot, b=member var slot.  L (a) must be bound
+         * (compiler guarantees); if b is bound this is a linear-scan FILTER
+         * (b in L?), else a GENERATOR pushing a frame (mirror OP_MAT_JOIN)
+         * that binds b to each element of L in turn.  L not a list (or NIL)
+         * yields no members -> backtrack. */
+        case OP_LIST_MEMBER: {
+            uint32_t lv = b_get(&b, in->a);
+            if (!b_ok(&b, in->a) || !term_is_list(db->terms, lv)) {
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
+                break;
+            }
+            if (b_ok(&b, in->b)) {
+                /* X bound: linear-scan membership FILTER. */
+                uint32_t xv = b_get(&b, in->b);
+                uint32_t cur = lv;
+                int found = 0;
+                while (term_is_list(db->terms, cur) && cur != TERM_NIL) {
+                    if (term_car(db->terms, cur) == xv) { found = 1; break; }
+                    cur = term_cdr(db->terms, cur);
+                }
+                if (!found) {
+                    if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
+                    break;
+                }
+                ip++;
+                break;
+            }
+            /* X unbound: GENERATOR — push a frame of the list's elements. */
+            if (sp >= MAX_FRAMES) return -1;
+            {
+                vm_frame *f = &frames[sp];
+                uint32_t cur = lv;
+                long cnt = 0;
+                f->ip = ip;
+                f->op = OP_LIST_MEMBER;   /* backtrack treats sc == 0 */
+                f->idx = 0;
+                f->perm = NULL;
+                memset(&f->tuples, 0, sizeof(f->tuples));
+                f->tuples.arity = 1;
+                f->tuples.cap = (long)term_length(db->terms, lv);
+                if (f->tuples.cap < 1) f->tuples.cap = 1;
+                f->tuples.data = malloc((size_t)f->tuples.cap * sizeof(uint32_t));
+                if (!f->tuples.data) return -1;
+                while (term_is_list(db->terms, cur) && cur != TERM_NIL) {
+                    if (cnt >= f->tuples.cap) {
+                        long nc = f->tuples.cap * 2;
+                        uint32_t *nd = realloc(f->tuples.data,
+                            (size_t)nc * sizeof(uint32_t));
+                        if (!nd) return -1;
+                        f->tuples.data = nd;
+                        f->tuples.cap = nc;
+                    }
+                    f->tuples.data[cnt++] = term_car(db->terms, cur);
+                    cur = term_cdr(db->terms, cur);
+                }
+                f->tuples.count = cnt;
+                if (f->tuples.count == 0) {
+                    tbuf_free(&f->tuples);
+                    if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
+                    break;
+                }
+                b_save(&f->saved, &b);
+                if (!seek_valid(f, in, 0, 1, &b)) {
+                    tbuf_free(&f->tuples);
+                    if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
+                    break;
+                }
+                sp++;
+                ip++;
+                break;
+            }
         }
 
         /* ── OP_PROJECT: emit / commit tuple ──────────────────────── */
