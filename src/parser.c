@@ -780,8 +780,56 @@ static atom *parse_body_atom(parser *p)
      *   VAR = VAR         equality
      *   VAR = agg(args)   aggregate
      *   VAR = E           arithmetic assignment (E is an expression)
-     *   VAR <op> operand  comparison (< <= > >=: VAR/INT; !=: also IDENT) */
+     *   VAR <op> operand  comparison (< <= > >=: VAR/INT; !=: also IDENT)
+     *   [pat] = RHS       list assignment (sugar over X=car(L), Xs=cdr(L)) */
     t = peek(p);
+    if (t && t->kind == TOK_LBRACKET) {
+        /* list assignment [X|Xs] = L: parse the list pattern, then require
+         * '=' and a variable/constant RHS (the list VALUE being destructured).
+         * The compiler lowers it to emit_pattern (car/cdr/equality). */
+        token *lst = parse_list(p);
+        if (!lst) return NULL;
+        {
+            token *eq = peek(p);
+            if (eq && eq->kind == TOK_EQ) {
+                advance(p);          /* = */
+                token *rhs = peek(p);
+                if (!rhs || (rhs->kind != TOK_VAR &&
+                             rhs->kind != TOK_INT &&
+                             rhs->kind != TOK_IDENT &&
+                             rhs->kind != TOK_STRING &&
+                             rhs->kind != TOK_LBRACKET)) {
+                    fprintf(stderr,
+                        "parser: expected variable or constant after '=' in "
+                        "list assignment\n");
+                    tok_free(lst); return NULL;
+                }
+                token *rv;
+                if (rhs->kind == TOK_LBRACKET)
+                    rv = parse_list(p);         /* [X|_] = [1,2] */
+                else
+                    rv = tok_dup(advance(p));
+                if (!rv) { tok_free(lst); return NULL; }
+                atom *a = atom_new();
+                if (!a) { tok_free(lst); tok_free(rv); return NULL; }
+                a->pred = strdup("=");
+                a->args = malloc(2 * sizeof(token *));
+                if (!a->pred || !a->args) {
+                    atom_free(a); tok_free(lst); tok_free(rv); return NULL;
+                }
+                a->args[0] = lst;    /* the pattern (may contain vars/tail) */
+                a->args[1] = rv;
+                a->nargs = 2;
+                a->negated = negated;
+                return a;
+            }
+        }
+        /* a bare list literal is not a valid body atom on its own */
+        fprintf(stderr, "parser: expected '=' after list pattern (list "
+                "assignment [X|Xs] = L)\n");
+        tok_free(lst);
+        return NULL;
+    }
     if (t && t->kind == TOK_VAR) {
         token *op = peek_at(p, 1);
         if (op && op->kind == TOK_EQ) {

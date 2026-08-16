@@ -12,8 +12,15 @@ All notable changes to this project are documented in this file.
     opcode. Each variable element binds (bind-or-filter), each constant
     element filters, a `|Tail` binds the remaining sublist, and an absent
     tail requires `cdr^n == NIL`. Pattern-bound vars are visible to
-    subsequent relational atoms (unlike post-join builtins). The
-    assignment form `[X|Xs] = L` stays deferred (use `X = car(L), Xs = cdr(L)`).
+    subsequent relational atoms (unlike post-join builtins).
+  - **`[X|Xs] = L` assignment form** (sugar over `X = car(L), Xs = cdr(L)`):
+    a body atom whose LHS is a list pattern destructures the RHS list value
+    via the same `emit_pattern` lowering, binding the pattern vars. The RHS
+    may be a bound variable or a constant list literal; a lone `[X|_] = [1,2]`
+    with a constant RHS drives a rule (no positive relational atom needed).
+    Rejected loudly: a negated assignment form, and an assignment form with an
+    unbound RHS list var (never silently destructure the UNBOUND sentinel).
+    Nested-tail sugar `[a|[b]]` remains unsupported.
   - **`member(X, L)`** filter atom → new `OP_LIST_MEMBER` opcode: `X` bound
     → linear-scan membership test; `X` unbound → a generator `vm_frame`
     (mirroring `OP_MAT_JOIN`) enumerating `L`'s elements.  A lone

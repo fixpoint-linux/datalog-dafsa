@@ -21,10 +21,10 @@
  *       parser (31-bit literal cap).  (CSV bulk-data keeps legacy raw-u32
  *       behavior — see the termstore.h / dl.c notes.)
  *   T8  compile-time rejects: comparison over a list literal; a negated list
- *       builtin; a variable inside a list literal (Phase-2 pattern); the
- *       [X|Xs] assignment form (deferred); list patterns in heads/facts and
- *       negated atoms; malformed member/length operands; a lone member with an
- *       UNBOUND L; a reserved builtin name used as a rule head.
+ *       builtin; list patterns in heads/facts and negated atoms; malformed
+ *       member/length operands; a lone member with an UNBOUND L; a reserved
+ *       builtin name used as a rule head; a negated assignment form; an
+ *       assignment form with an UNBOUND RHS list var.
  *   T9  [X|Xs] pattern destructuring in a positive body atom (head/tail +
  *       constant-element + empty-tail), with a car/cdr equivalence check.
  *   T10 member(X, L): generator (X unbound → enumerate) + filter (X bound),
@@ -32,6 +32,9 @@
  *       body atom).
  *   T11 length runtime dispatch: list, constant-list, empty-list, and the
  *       string path (regression).
+ *   T12 [X|Xs] = L assignment form (sugar over car/cdr): empty-tail + tail
+ *       pattern + constant element, RHS from a relation var, and a lone
+ *       constant-RHS assignment driving a rule.
  */
 #include "dl.h"
 #include "vm.h"           /* vm_*_runs counters, eligibility fns */
@@ -501,11 +504,19 @@ static void t8_rejects(void)
     /* negated list builtin (range restriction). */
     if (dl_load_rules(db, "q(X) :- p(X), !(L = cons(X, [])).\n") == 0) pass = 0;
 
-    /* variable inside a list literal (Phase-2 pattern). */
-    if (dl_load_rules(db, "q(X) :- p(X), [X|_] = [1,2].\n") == 0) pass = 0;
+    /* variable inside a list literal is now a valid [X|Xs] PATTERN — the
+     * [X|_] = [1,2] assignment form is SUPPORTED (see T12); a bare relational
+     * arg `p([X])` is the argument form (T9).  What still rejects is a list
+     * literal in a comparison (above) or a [X|_] that is not an assignment. */
+    if (dl_load_rules(db, "q(X) :- p(X), [X|_] = [1,2].\n") != 0) pass = 0;
 
-    /* [X|Xs] ASSIGNMENT form stays deferred/rejected (Phase 2 sugar). */
-    if (dl_load_rules(db, "q(X) :- p(X), [X|Xs] = [1,2].\n") == 0) pass = 0;
+    /* [X|Xs] ASSIGNMENT form is SUPPORTED (T12); a negated assignment form is
+     * rejected (negated builtin, range restriction). */
+    if (dl_load_rules(db, "q(X) :- p(X), !([X|Xs] = [1,2]).\n") == 0) pass = 0;
+
+    /* assignment form with an UNBOUND RHS list var is rejected loudly (never
+     * silently destructure the UNBOUND sentinel). */
+    if (dl_load_rules(db, "q(X) :- p(X), [X|Xs] = L.\n") == 0) pass = 0;
 
     /* list pattern in a rule head/fact (use cons(...) to construct). */
     if (dl_load_rules(db, "qh([X|Xs]) :- p(X).\n") == 0) pass = 0;
@@ -759,6 +770,84 @@ static void t11_length(void)
     if (pass) PASS(); else FAIL("length dispatch produced wrong tuples");
 }
 
+/* ─── T12: [X|Xs] = L assignment form (sugar over car/cdr) ─────────────── */
+
+static void t12_assignment(void)
+{
+    char dir[256];
+    dl_db *db;
+    uint32_t t23[2]  = {2, 3};
+    uint32_t t3v[1]  = {3};
+    uint32_t l123[3] = {1, 2, 3};
+    uint32_t h, f[1];
+    tset got;
+    int pass = 1;
+
+    TEST("T12 [X|Xs] = L assignment form (destructure)");
+    db = fresh_db(dir, sizeof(dir), "t12");
+    assert(db);
+    assert(dl_declare_relation(db, "p", 1) == 0);
+    h = mk_list(db->terms, l123, 3);
+    f[0] = h; addf(db, "p", f, 1);
+
+    assert(dl_load_rules(db,
+        "empty_tail(A, B) :- [A, B] = [1, 2].\n"
+        "tail_pat(H, T) :- [H | T] = [1, 2, 3].\n"
+        "const_el(X, Y) :- [1, X | Y] = [1, 2, 3].\n"
+        "from_var(H, T) :- p(L), [H | T] = L.\n"
+        "driver(H, T) :- [H | T] = [7, 8].\n") == 0);
+    if (dl_publish_snapshot(db) != 0) pass = 0;
+
+    /* empty_tail: [1,2] destructures to A=1, B=2 (two constant elems). */
+    memset(&got, 0, sizeof(got));
+    if (dl_query(db, "empty_tail", tcb, &got) != 1 || got.arity != 2) pass = 0;
+    if (got.count == 1) {
+        if (got.data[0] != 1 || got.data[1] != 2) pass = 0;
+    } else pass = 0;
+    tset_free(&got);
+
+    /* tail_pat: [H|T] = [1,2,3] → H=1, T=[2,3]. */
+    memset(&got, 0, sizeof(got));
+    if (dl_query(db, "tail_pat", tcb, &got) != 1 || got.arity != 2) pass = 0;
+    if (got.count == 1) {
+        if (got.data[0] != 1 ||
+            got.data[1] != mk_list(db->terms, t23, 2)) pass = 0;
+    } else pass = 0;
+    tset_free(&got);
+
+    /* const_el: [1,X|Y] = [1,2,3] → X=2, Y=[3]. */
+    memset(&got, 0, sizeof(got));
+    if (dl_query(db, "const_el", tcb, &got) != 1 || got.arity != 2) pass = 0;
+    if (got.count == 1) {
+        if (got.data[0] != 2 ||
+            got.data[1] != mk_list(db->terms, t3v, 1)) pass = 0;
+    } else pass = 0;
+    tset_free(&got);
+
+    /* from_var: [H|T] = L destructures the relation's list value. */
+    memset(&got, 0, sizeof(got));
+    if (dl_query(db, "from_var", tcb, &got) != 1 || got.arity != 2) pass = 0;
+    if (got.count == 1) {
+        if (got.data[0] != 1 ||
+            got.data[1] != mk_list(db->terms, t23, 2)) pass = 0;
+    } else pass = 0;
+    tset_free(&got);
+
+    /* driver: lone [H|T] = [7,8] (constant RHS) drives the rule.
+     * H=7, T=[8] (the tail is a list handle, not the bare int 8). */
+    memset(&got, 0, sizeof(got));
+    if (dl_query(db, "driver", tcb, &got) != 1 || got.arity != 2) pass = 0;
+    if (got.count == 1) {
+        uint32_t l8[1] = {8};
+        if (got.data[0] != 7 ||
+            got.data[1] != mk_list(db->terms, l8, 1)) pass = 0;
+    } else pass = 0;
+    tset_free(&got);
+
+    dl_close(db);
+    if (pass) PASS(); else FAIL("assignment form produced wrong tuples");
+}
+
 /* ─── main ─────────────────────────────────────────────────────────────── */
 
 int main(void)
@@ -776,6 +865,7 @@ int main(void)
     t9_pattern();
     t10_member();
     t11_length();
+    t12_assignment();
 
     printf("\n%d tests run, %d failed.\n", tests_run, tests_failed);
     return tests_failed ? 1 : 0;

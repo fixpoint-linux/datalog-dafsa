@@ -458,6 +458,16 @@ static int is_equality(const atom *a)
            a->nargs == 2 && a->arith == NULL;
 }
 
+/* v2-lists: list ASSIGNMENT form `[X|Xs] = L` — an equality atom whose LHS
+ * (args[0]) is a TOK_LIST pattern.  The compiler lowers it to emit_pattern
+ * (car/cdr/equality destructuring) against the RHS value, binding the pattern
+ * vars.  Distinct from a plain `VAR = VAR` equality (both sides TOK_VAR). */
+static int is_list_assign(const atom *a)
+{
+    return is_equality(a) &&
+           a->args[0] && a->args[0]->kind == TOK_LIST;
+}
+
 /* M9-strings: string builtin classification.  The lowercase builtin names
  * are RESERVED — a body atom whose pred matches one is ALWAYS treated as a
  * builtin, never as a relation reference.  In scope: concat + length
@@ -1978,6 +1988,21 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
             atom *ba = r->body[bi];
             if (ba->aggregate) continue;          /* computed after body */
             if (is_equality(ba)) {
+                if (is_list_assign(ba)) {
+                    /* [X|Xs] = L binds the pattern vars (args[0]) from the
+                     * RHS value L (args[1]) — but only when L is bound.
+                     * Destructuring an unbound L produces nothing (car/cdr of
+                     * the UNBOUND sentinel backtracks), so do NOT mark the
+                     * pattern vars bound unless L is bound — otherwise a later
+                     * negated atom reading X would silently NEG_CHECK against
+                     * the sentinel. */
+                    int vi1 = (ba->nargs >= 2 && ba->args[1]->kind == TOK_VAR)
+                                  ? v_find(&vt, ba->args[1]->text) : -1;
+                    int b1 = (vi1 >= 0) && bound_vars[vi1];
+                    if (b1 || ba->args[1]->kind != TOK_VAR)
+                        mark_token_vars_bound(ba->args[0], &vt, bound_vars);
+                    continue;
+                }
                 /* equality X = Y binds at most ONE new side (OP_EQ binds Y
                  * from X when X is bound, and is a NO-OP when both are
                  * unbound).  So propagate binding only when at least one side
@@ -2053,8 +2078,32 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
          * silently reading the UNBOUND sentinel (0xFFFFFFFF). */
         for (bi = 0; bi < r->nbody; bi++) {
             atom *ba = r->body[bi];
-            int vi0, vi1, b0, b1;
             if (!is_equality(ba)) continue;
+            if (is_list_assign(ba)) {
+                /* [X|Xs] = L: the RHS value L must be bound (it is the list
+                 * being destructured; destructuring an unbound L would
+                 * silently produce nothing).  When L is bound, the pattern
+                 * vars (args[0]) become bound. */
+                int vi1 = (ba->nargs >= 2 && ba->args[1]->kind == TOK_VAR)
+                              ? v_find(&vt, ba->args[1]->text) : -1;
+                int b1 = (vi1 >= 0) && bound_vars[vi1];
+                if (ba->args[1]->kind == TOK_VAR) {
+                    if (!b1) {
+                        fprintf(stderr, "compile error: ungrounded list "
+                                "assignment — list variable '%s' in '[X|Xs] = "
+                                "%s' is not bound by a positive body atom "
+                                "(rule '%s')\n",
+                                ba->args[1]->text, ba->args[1]->text,
+                                r->head->pred);
+                        goto fail;
+                    }
+                    bound_vars[vi1] = 1;
+                }
+                mark_token_vars_bound(ba->args[0], &vt, bound_vars);
+                continue;
+            }
+            {
+            int vi0, vi1, b0, b1;
             vi0 = (ba->nargs >= 1 && ba->args[0]->kind == TOK_VAR)
                       ? v_find(&vt, ba->args[0]->text) : -1;
             vi1 = (ba->nargs >= 2 && ba->args[1]->kind == TOK_VAR)
@@ -2064,6 +2113,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
             if (b0 || b1) {
                 if (vi0 >= 0) bound_vars[vi0] = 1;
                 if (vi1 >= 0) bound_vars[vi1] = 1;
+            }
             }
         }
         /* (c) PRODUCERS in body order: arithmetic + string-producing.  Require
@@ -2213,14 +2263,22 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
             /* v2-lists FIX-1: a lone member(X,L) list-filter atom whose list
              * operand L is bound-or-constant is a legitimate positive DRIVER —
              * the producer phase emits OP_LIST_MEMBER, which GENERATES X from
-             * L's elements.  (An UNBOUND L was already rejected loudly by
-             * member_operand_bound in the 5b safety pass.)  Emit NO relational
-             * join: skip the join below and let the member generator drive the
-             * head. */
-            int member_driver = 0;
-            for (bi = 0; bi < r->nbody; bi++)
-                if (is_list_filter(r->body[bi])) { member_driver = 1; break; }
-            if (!member_driver) {
+             * L's elements.  Similarly, a lone [X|Xs] = L list ASSIGNMENT
+             * whose RHS is a CONSTANT is a driver — the equality phase
+             * materializes the constant RHS and emit_pattern destructures it,
+             * binding X/Xs.  (An UNBOUND var L was already rejected loudly by
+             * member_operand_bound / the 5b list-assign check.)  Emit NO
+             * relational join: skip the join below and let the member
+             * generator / constant-list destructuring drive the head. */
+            int list_driver = 0;
+            for (bi = 0; bi < r->nbody; bi++) {
+                atom *ba = r->body[bi];
+                if (is_list_filter(ba)) { list_driver = 1; break; }
+                if (is_list_assign(ba) && ba->args[1]->kind != TOK_VAR) {
+                    list_driver = 1; break;
+                }
+            }
+            if (!list_driver) {
                 free(pos); free(mask);
                 fprintf(stderr, "compile error: rule '%s' has no positive body atom\n",
                         r->head->pred);
@@ -2262,8 +2320,13 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
              * "remaining body atoms" loop, which starts at bi==0 when
              * first_pos<0), but we skip the first-positive SCAN/WALK block. */
             int member_driver = 0;
-            for (bi = 0; bi < r->nbody; bi++)
-                if (is_list_filter(r->body[bi])) { member_driver = 1; break; }
+            for (bi = 0; bi < r->nbody; bi++) {
+                atom *ba = r->body[bi];
+                if (is_list_filter(ba)) { member_driver = 1; break; }
+                if (is_list_assign(ba) && ba->args[1]->kind != TOK_VAR) {
+                    member_driver = 1; break;
+                }
+            }
             if (!member_driver) {
                 fprintf(stderr, "compile error: rule '%s' has no positive body atom\n",
                         r->head->pred);
@@ -2526,6 +2589,20 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
         if (ba->aggregate) continue;
         if (!is_equality(ba)) continue;
         if (ba->negated) continue;  /* negated builtin already rejected */
+        if (is_list_assign(ba)) {
+            /* [X|Xs] = L: materialize the RHS value into a slot (var → its
+             * bound slot; constant/list-literal → interned via OP_EQ_CONST),
+             * then destructure the LHS pattern from it with emit_pattern
+             * (OP_LIST_CAR/CDR + equality + tail/NIL check).  Runs in the
+             * equality phase (after the relational join), so a var RHS is
+             * already bound. */
+            int rs = cmp_operand_slot(db, ba->args[1], &vt, &ib, &cc, 1);
+            if (rs < 0) goto fail;
+            if (emit_pattern(db, ba->args[0], (uint8_t)rs, &vt, &ib, &cc,
+                             r->head->pred))
+                goto fail;
+            continue;
+        }
         int vi_l = v_find(&vt, ba->args[0]->text);
         int vi_r = v_find(&vt, ba->args[1]->text);
         if (vi_l < 0 || vi_r < 0) goto fail;
