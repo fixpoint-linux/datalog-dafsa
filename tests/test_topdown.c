@@ -1,5 +1,5 @@
 /*
- * test_topdown.c — top-down / QSQ evaluator tests (STAGE A + B)
+ * test_topdown.c — top-down / QSQ evaluator tests (STAGE A + B + C)
  *
  * Correctness backstop (non-negotiable):
  *   dl_query_topdown(...)        == dl_query_bound(...)      (full-materialize
@@ -11,7 +11,17 @@
  * STAGE A: single-goal leading-prefix self-recursive TC (chain/star/dense/
  *          absent/EDB-goal/equality/multi-rule) + 200-random-graph property.
  * STAGE B: multi-predicate closures, non-leading adornments (fb/fbf),
- *          multi-variant (bf/bb/fb).  STAGE C (negation/aggregates) deferred.
+ *          multi-variant (bf/bb/fb).
+ * STAGE C (implemented+verified, no engine change): negation + aggregates in
+ *          dl_query_topdown, mirroring the forward-magic matrix (test_m8_magic
+ *          T34-T38 + T9).  T16-T23 cover negated-EDB, negated non-closure IDB
+ *          (empty !tc and non-empty !bad, incl. the auto-compile guard),
+ *          aggregates over EDB (group-by count/sum/min/max + global k=0),
+ *          mixed negation+recursion, aggregate head -> downstream, non-leading
+ *          fb-adorn negation, a random-graph property, and REJECT parity
+ *          (negated closure IDB / negated closure const / aggregate over a
+ *          closure or non-recursive IDB).  Every accepted case asserts
+ *          topdown == bound == magic byte-for-byte.
  *
  * Also: chain N=10000 single-source stack-safety check (iterative driver,
  *       returns N-1 tuples), and an HONEST benchmark vs dl_query_magic_adorn.
@@ -829,6 +839,429 @@ static void test_t15_memo_dependent_discovery(void)
     teardown_db(db, "t15");
 }
 
+/* ─── STAGE C: negation + aggregates (T16-T23) ─────────────────────────── */
+
+/* T16: negated EDB.
+ *   ntc(X,Y):-edge(X,Y),!blocked(X,Y).
+ * blocked is a pure EDB predicate; !blocked reads the clone's materialized
+ * blocked DAFSA.  topdown == bound == magic on every source. */
+static void test_t16_negated_edb(void)
+{
+    dl_db *db;
+    uint32_t e[] = {1,2, 2,3, 3,4, 1,5};
+    uint32_t b[] = {1,2, 3,4};
+    uint32_t sources[3] = {1, 2, 3};
+    int i;
+
+    TEST("T16: negated-EDB ntc — topdown==bound==magic");
+    setup_db(&db, "t16");
+    load_rows(db, "edge", 2, e, 4, "t16");
+    load_rows(db, "blocked", 2, b, 2, "t16");
+    assert(dl_load_rules(db,
+        "ntc(X,Y):-edge(X,Y),!blocked(X,Y).\n") == 0);
+    assert(dl_compile(db) == 0);
+
+    for (i = 0; i < 3; i++) {
+        if (!cmp_bound_topdown_rel(db, "ntc", sources[i])) {
+            FAIL("T16 ntc bound vs topdown mismatch");
+            teardown_db(db, "t16"); return;
+        }
+        if (!cmp_topdown_magic_rel(db, "ntc", sources[i])) {
+            FAIL("T16 ntc topdown vs magic mismatch");
+            teardown_db(db, "t16"); return;
+        }
+    }
+    PASS();
+    teardown_db(db, "t16");
+}
+
+/* T17: negated non-closure IDB (empty !tc AND non-empty !bad), with the
+ * auto-compile guard exercised (no explicit dl_compile).  The first
+ * dl_query_topdown on a fresh db must trigger dl_compile so !tc sees the FULL
+ * materialization (else ntc would wrongly equal edge). */
+static void test_t17_negated_nonclosure_idb(void)
+{
+    dl_db *db;
+    uint32_t e[] = {1,2, 2,3, 1,4, 3,4};
+    uint32_t sources[3] = {1, 2, 3};
+
+    TEST("T17: negated non-closure IDB (!tc empty, !bad non-empty) — auto-compile guard");
+    setup_db(&db, "t17");
+    load_rows(db, "edge", 2, e, 4, "t17");
+    assert(dl_load_rules(db,
+        "tc(X,Y):-edge(X,Y).\n"
+        "tc(X,Y):-edge(X,Z),tc(Z,Y).\n"
+        "ntc(X,Y):-edge(X,Y),!tc(X,Y).\n"     /* empty: every edge is in tc */
+        "bad(X):-edge(X,4).\n"                /* bad = {1,3} */
+        "q(X,Y):-edge(X,Y),!bad(X).\n") == 0);/* q = {(2,3)} (non-empty) */
+
+    /* NO dl_compile: the negation guard must auto-compile the source db. */
+    {
+        tuple_set rt;
+        uint32_t leading[1] = {2};
+        long nt;
+        memset(&rt, 0, sizeof(rt));
+        nt = dl_query_topdown(db, "q", leading, 1, tset_cb, &rt);
+        if (nt != 1 || rt.count != 1 || rt.arity != 2 ||
+            rt.data[0] != 2 || rt.data[1] != 3) {
+            printf("  got %ld rows, expected {(2,3)}\n", nt);
+            tset_free(&rt); FAIL("T17 !bad non-empty wrong");
+            teardown_db(db, "t17"); return;
+        }
+        tset_free(&rt);
+    }
+    /* !tc must be empty (auto-compile materialized tc). */
+    {
+        tuple_set rt;
+        uint32_t leading[1] = {1};
+        memset(&rt, 0, sizeof(rt));
+        if (dl_query_topdown(db, "ntc", leading, 1, tset_cb, &rt) != 0) {
+            FAIL("T17 !tc not empty (auto-compile guard broken)");
+            tset_free(&rt); teardown_db(db, "t17"); return;
+        }
+        tset_free(&rt);
+    }
+    /* db is now compiled by the guard; full oracle parity holds. */
+    for (int i = 0; i < 3; i++) {
+        if (!cmp_bound_topdown_rel(db, "q", sources[i]) ||
+            !cmp_topdown_magic_rel(db, "q", sources[i])) {
+            FAIL("T17 q mismatch (bound/magic)");
+            teardown_db(db, "t17"); return;
+        }
+        if (!cmp_bound_topdown_rel(db, "ntc", sources[i]) ||
+            !cmp_topdown_magic_rel(db, "ntc", sources[i])) {
+            FAIL("T17 ntc mismatch (bound/magic)");
+            teardown_db(db, "t17"); return;
+        }
+    }
+    PASS();
+    teardown_db(db, "t17");
+}
+
+/* T18: aggregate over EDB — group-by count / sum / min / max + global k=0. */
+static void test_t18_aggregate_edb(void)
+{
+    dl_db *db;
+    uint32_t w[] = {1,5, 1,3, 2,10, 2,20, 2,30};
+    uint32_t sources[2] = {1, 2};
+    int i;
+
+    TEST("T18: aggregate over EDB (count/sum/min/max + global k=0) — topdown==bound==magic");
+    setup_db(&db, "t18");
+    load_rows(db, "edge", 2, w, 5, "t18");
+    assert(dl_load_rules(db,
+        "cnt(X,N):-edge(X,Y),N=count().\n"
+        "sump(X,S):-edge(X,Y),S=sum(Y).\n"
+        "minp(X,M):-edge(X,Y),M=min(Y).\n"
+        "maxp(X,M):-edge(X,Y),M=max(Y).\n"
+        "gcnt(N):-edge(X,Y),N=count().\n") == 0);
+    assert(dl_compile(db) == 0);
+
+    for (i = 0; i < 2; i++) {
+        const char *rels[4] = {"cnt", "sump", "minp", "maxp"};
+        int r;
+        for (r = 0; r < 4; r++) {
+            if (!cmp_bound_topdown_rel(db, rels[r], sources[i])) {
+                printf("  %s src %u bound vs topdown mismatch\n", rels[r], sources[i]);
+                FAIL("T18 aggregate bound vs topdown");
+                teardown_db(db, "t18"); return;
+            }
+            if (!cmp_topdown_magic_rel(db, rels[r], sources[i])) {
+                printf("  %s src %u topdown vs magic mismatch\n", rels[r], sources[i]);
+                FAIL("T18 aggregate topdown vs magic");
+                teardown_db(db, "t18"); return;
+            }
+        }
+    }
+    /* global count (k=0, arity-1 goal): all three routes agree. */
+    {
+        tuple_set rb, rt, rm;
+        memset(&rb, 0, sizeof(rb));
+        memset(&rt, 0, sizeof(rt));
+        memset(&rm, 0, sizeof(rm));
+        long nb = dl_query_bound(db, "gcnt", NULL, 0, tset_cb, &rb);
+        long nt = dl_query_topdown(db, "gcnt", NULL, 0, tset_cb, &rt);
+        long nm = dl_query_magic(db, "gcnt", NULL, 0, tset_cb, &rm);
+        if (nb < 0 || nt < 0 || nm < 0 || nb != 1 ||
+            !tset_sorted_eq(&rb, &rt) || !tset_sorted_eq(&rb, &rm)) {
+            printf("  global count bound=%ld topdown=%ld magic=%ld\n", nb, nt, nm);
+            tset_free(&rb); tset_free(&rt); tset_free(&rm);
+            FAIL("T18 global count mismatch");
+            teardown_db(db, "t18"); return;
+        }
+        /* edge has 5 rows, so the global count must be 5 (not just consistent
+         * across the three routes). */
+        if (rb.count != 1 || rb.data[0] != 5) {
+            printf("  global count value=%u (expect 5)\n", rb.data[0]);
+            tset_free(&rb); tset_free(&rt); tset_free(&rm);
+            FAIL("T18 global count wrong value");
+            teardown_db(db, "t18"); return;
+        }
+        tset_free(&rb); tset_free(&rt); tset_free(&rm);
+    }
+    PASS();
+    teardown_db(db, "t18");
+}
+
+/* T19: mixed negation + recursion.
+ *   r(X,Y):-r(X,Z),edge(Z,Y),!blocked(Z,Y).
+ * A negated-EDB guard INSIDE a recursive closure rule. */
+static void test_t19_mixed_neg_recursion(void)
+{
+    dl_db *db;
+    uint32_t e[] = {1,2, 2,3, 3,4, 1,3};
+    uint32_t b[] = {3,4};
+    uint32_t sources[3] = {1, 2, 3};
+    int i;
+
+    TEST("T19: mixed negation+recursion r — topdown==bound==magic");
+    setup_db(&db, "t19");
+    load_rows(db, "edge", 2, e, 4, "t19");
+    load_rows(db, "blocked", 2, b, 1, "t19");
+    assert(dl_load_rules(db,
+        "r(X,Y):-edge(X,Y),!blocked(X,Y).\n"
+        "r(X,Y):-r(X,Z),edge(Z,Y),!blocked(Z,Y).\n") == 0);
+    assert(dl_compile(db) == 0);
+
+    for (i = 0; i < 3; i++) {
+        if (!cmp_bound_topdown_rel(db, "r", sources[i])) {
+            FAIL("T19 r bound vs topdown mismatch");
+            teardown_db(db, "t19"); return;
+        }
+        if (!cmp_topdown_magic_rel(db, "r", sources[i])) {
+            FAIL("T19 r topdown vs magic mismatch");
+            teardown_db(db, "t19"); return;
+        }
+    }
+    PASS();
+    teardown_db(db, "t19");
+}
+
+/* T20: aggregate head feeding a downstream rule.
+ *   cnt(X,N):-edge(X,Y),N=count().
+ *   big(X):-cnt(X,N),N>=2.
+ * big is an arity-1 IDB over the aggregate head cnt. */
+static void test_t20_agg_head_downstream(void)
+{
+    dl_db *db;
+    uint32_t e[] = {1,2, 1,3, 2,4, 3,5, 3,6};
+    uint32_t sources[4] = {1, 2, 3, 7};
+    int i;
+
+    TEST("T20: aggregate head -> downstream big(X):-cnt(X,N),N>=2 — topdown==bound==magic");
+    setup_db(&db, "t20");
+    load_rows(db, "edge", 2, e, 5, "t20");
+    assert(dl_load_rules(db,
+        "cnt(X,N):-edge(X,Y),N=count().\n"
+        "big(X):-cnt(X,N),N>=2.\n") == 0);
+    assert(dl_compile(db) == 0);
+
+    for (i = 0; i < 4; i++) {
+        tuple_set rb, rt, rm;
+        uint32_t leading[1] = { sources[i] };
+        memset(&rb, 0, sizeof(rb));
+        memset(&rt, 0, sizeof(rt));
+        memset(&rm, 0, sizeof(rm));
+        long nb = dl_query_bound(db, "big", leading, 1, tset_cb, &rb);
+        long nt = dl_query_topdown(db, "big", leading, 1, tset_cb, &rt);
+        long nm = dl_query_magic(db, "big", leading, 1, tset_cb, &rm);
+        if (nb < 0 || nt < 0 || nm < 0 || nb != nt || nb != nm ||
+            !tset_sorted_eq(&rb, &rt) || !tset_sorted_eq(&rb, &rm)) {
+            printf("  src %u bound=%ld topdown=%ld magic=%ld\n",
+                   sources[i], nb, nt, nm);
+            tset_free(&rb); tset_free(&rt); tset_free(&rm);
+            FAIL("T20 big mismatch");
+            teardown_db(db, "t20"); return;
+        }
+        tset_free(&rb); tset_free(&rt); tset_free(&rm);
+    }
+    PASS();
+    teardown_db(db, "t20");
+}
+
+/* T21: REJECT parity — negation/aggregate over a closure or non-recursive IDB
+ * must return -1 from BOTH dl_query_topdown AND dl_query_magic.  Each program
+ * is confirmed valid via dl_query_bound >= 0 (full materialization handles
+ * stratified negation / aggregates over IDBs). */
+static int reject_parity(dl_db *db, const char *rel, uint32_t src, const char *what)
+{
+    tuple_set r;
+    uint32_t leading[1] = { src };
+    memset(&r, 0, sizeof(r));
+    if (dl_query_bound(db, rel, leading, 1, tset_cb, &r) < 0) {
+        FAIL("program unexpectedly invalid (dl_query_bound < 0)");
+        tset_free(&r); return 0;
+    }
+    tset_free(&r);
+
+    memset(&r, 0, sizeof(r));
+    if (dl_query_topdown(db, rel, leading, 1, tset_cb, &r) != -1) {
+        printf("  topdown did not reject (%s)\n", what);
+        tset_free(&r); return 0;
+    }
+    tset_free(&r);
+
+    memset(&r, 0, sizeof(r));
+    if (dl_query_magic(db, rel, leading, 1, tset_cb, &r) != -1) {
+        printf("  magic did not reject (%s)\n", what);
+        tset_free(&r); return 0;
+    }
+    tset_free(&r);
+    return 1;
+}
+
+static void test_t21_reject_parity(void)
+{
+    dl_db *db;
+    uint32_t e[] = {1,2, 2,3};
+    int ok = 1;
+
+    TEST("T21: REJECT parity (neg closure IDB / const / agg over closure / agg over IDB)");
+
+    /* (a) negation on closure IDB: !p where p is in the adorned closure. */
+    setup_db(&db, "t21a");
+    load_rows(db, "edge", 2, e, 2, "t21a");
+    assert(dl_load_rules(db,
+        "g(X,Y):-edge(X,Y),!p(X,Y).\n"
+        "g(X,Y):-p(X,Y).\n"
+        "p(X,Y):-edge(X,Y).\n") == 0);
+    assert(dl_compile(db) == 0);
+    if (!reject_parity(db, "g", 1, "negated closure IDB !p"))
+        ok = 0;
+    teardown_db(db, "t21a");
+
+    /* (b) negation on closure with constant: !tc(X,2). */
+    setup_db(&db, "t21b");
+    load_rows(db, "edge", 2, e, 2, "t21b");
+    assert(dl_load_rules(db,
+        "tc(X,Y):-edge(X,Y).\n"
+        "tc(X,Y):-edge(X,Z),tc(Z,Y).\n"
+        "q(X):-tc(X,Y),!tc(X,2).\n") == 0);
+    assert(dl_compile(db) == 0);
+    if (!reject_parity(db, "q", 1, "negated closure const !tc(X,2)"))
+        ok = 0;
+    teardown_db(db, "t21b");
+
+    /* (c) aggregate over closure IDB: count(tc). */
+    setup_db(&db, "t21c");
+    load_rows(db, "edge", 2, e, 2, "t21c");
+    assert(dl_load_rules(db,
+        "tc(X,Y):-edge(X,Y).\n"
+        "tc(X,Y):-edge(X,Z),tc(Z,Y).\n"
+        "cnt(X,N):-tc(X,Y),N=count().\n") == 0);
+    assert(dl_compile(db) == 0);
+    if (!reject_parity(db, "cnt", 1, "aggregate over closure count(tc)"))
+        ok = 0;
+    teardown_db(db, "t21c");
+
+    /* (d) aggregate over a non-recursive IDB d. */
+    setup_db(&db, "t21d");
+    load_rows(db, "edge", 2, e, 2, "t21d");
+    assert(dl_load_rules(db,
+        "d(X,Y):-edge(X,Y).\n"
+        "cnt(X,N):-d(X,Y),N=count().\n") == 0);
+    assert(dl_compile(db) == 0);
+    if (!reject_parity(db, "cnt", 1, "aggregate over non-rec IDB d"))
+        ok = 0;
+    teardown_db(db, "t21d");
+
+    if (!ok) { FAIL("T21 one or more reject cases failed parity"); return; }
+    PASS();
+}
+
+/* T22: property — N random graphs x 3 sources, negated-EDB. */
+static void test_t22_negated_edb_property(void)
+{
+    int iter;
+    TEST("T22: property — 40 random graphs x 3 sources, negated-EDB");
+
+    for (iter = 0; iter < 40; iter++) {
+        dl_db *db;
+        char suffix[32];
+        int N = 8 + (int)(iter % 12);
+        int M = 20 + (int)((iter * 7) % 60);
+        uint32_t *edges, *blocked;
+        int ei, si;
+        uint32_t sources[3];
+
+        snprintf(suffix, sizeof(suffix), "negprop_%d", iter);
+        setup_db(&db, suffix);
+
+        edges = malloc((size_t)M * 2 * sizeof(uint32_t));
+        for (ei = 0; ei < M; ei++) {
+            edges[ei*2]     = rng_rand((uint32_t)N) + 1;
+            edges[ei*2 + 1] = rng_rand((uint32_t)N) + 1;
+        }
+        load_rows(db, "edge", 2, edges, M, suffix);
+        free(edges);
+
+        {
+            int nb = (int)(rng_rand((uint32_t)M) + 1);
+            blocked = malloc((size_t)nb * 2 * sizeof(uint32_t));
+            for (ei = 0; ei < nb; ei++) {
+                blocked[ei*2]     = rng_rand((uint32_t)N) + 1;
+                blocked[ei*2 + 1] = rng_rand((uint32_t)N) + 1;
+            }
+            load_rows(db, "blocked", 2, blocked, nb, suffix);
+            free(blocked);
+        }
+
+        assert(dl_load_rules(db,
+            "ntc(X,Y):-edge(X,Y),!blocked(X,Y).\n") == 0);
+        assert(dl_compile(db) == 0);
+
+        for (si = 0; si < 3; si++) {
+            sources[si] = rng_rand((uint32_t)(N + 2)) + 1;
+            if (!cmp_bound_topdown_rel(db, "ntc", sources[si])) {
+                printf("  iter %d source %u bound/topdown mismatch\n", iter, sources[si]);
+                FAIL("T22 negated-EDB bound vs topdown");
+                teardown_db(db, suffix); return;
+            }
+            if (!cmp_topdown_magic_rel(db, "ntc", sources[si])) {
+                printf("  iter %d source %u topdown/magic mismatch\n", iter, sources[si]);
+                FAIL("T22 negated-EDB topdown vs magic");
+                teardown_db(db, suffix); return;
+            }
+        }
+        teardown_db(db, suffix);
+    }
+    PASS();
+}
+
+/* T23: non-leading fb-adorn negation via cmp_adorn_topdown /
+ * cmp_adorn_topdown_magic (ground-truth = filter of full materialization). */
+static void test_t23_fb_adorn_negation(void)
+{
+    dl_db *db;
+    uint32_t e[] = {1,42, 1,7, 2,42, 3,9, 3,42};
+    uint32_t b[] = {1,7, 3,9};
+    uint32_t targets[3] = {42, 7, 9};
+    int ti;
+
+    TEST("T23: non-leading fb-adorn negated-EDB — topdown==full-filter==magic");
+    setup_db(&db, "t23");
+    load_rows(db, "edge", 2, e, 5, "t23");
+    load_rows(db, "blocked", 2, b, 2, "t23");
+    assert(dl_load_rules(db,
+        "ntc(X,Y):-edge(X,Y),!blocked(X,Y).\n") == 0);
+    assert(dl_compile(db) == 0);
+
+    for (ti = 0; ti < 3; ti++) {
+        uint32_t vals[1] = { targets[ti] };
+        if (!cmp_adorn_topdown(db, "ntc", "fb", vals, 1)) {
+            printf("  target %u full-filter mismatch\n", targets[ti]);
+            FAIL("T23 fb negated-EDB topdown != full-filter");
+            teardown_db(db, "t23"); return;
+        }
+        if (!cmp_adorn_topdown_magic(db, "ntc", "fb", vals, 1)) {
+            FAIL("T23 fb negated-EDB topdown != magic");
+            teardown_db(db, "t23"); return;
+        }
+    }
+    PASS();
+    teardown_db(db, "t23");
+}
+
 /* ─── Benchmark: topdown vs dl_query_magic_adorn ───────────────────────── */
 
 static double now_sec(void)
@@ -920,7 +1353,7 @@ static void test_benchmark(void)
 
 int main(void)
 {
-    printf("Top-down / QSQ Evaluator Tests (STAGE A + B)\n");
+    printf("Top-down / QSQ Evaluator Tests (STAGE A + B + C)\n");
     printf("=============================================\n\n");
 
     test_t1_chain();
@@ -938,6 +1371,14 @@ int main(void)
     test_t13_rejections();
     test_t15_memo_dependent_discovery();
     test_t14_chain_10000();
+    test_t16_negated_edb();
+    test_t17_negated_nonclosure_idb();
+    test_t18_aggregate_edb();
+    test_t19_mixed_neg_recursion();
+    test_t20_agg_head_downstream();
+    test_t21_reject_parity();
+    test_t22_negated_edb_property();
+    test_t23_fb_adorn_negation();
 
     /* Honest benchmark (topdown vs dl_query_magic) is OPT-IN to keep the
      * default `make test` fast (~3min if it runs: chain N=10000 twice ≈ 90s).

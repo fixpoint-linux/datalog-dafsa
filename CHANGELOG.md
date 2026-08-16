@@ -5,6 +5,18 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **v2 top-down STAGE C verification (tests only — no engine change)**: the
+  negation + aggregate correctness matrix for `dl_query_topdown` (T16-T23 in
+  `tests/test_topdown.c`), mirroring the forward-magic suite.  Covers negated
+  EDB, negated non-closure IDB (empty `!tc` and non-empty `!bad`, incl. the
+  auto-compile guard path), aggregates over EDB (group-by count/sum/min/max +
+  global k=0), mixed negation+recursion, aggregate head → downstream rule,
+  non-leading fb-adorn negation, a 40-graph property, and REJECT parity
+  (negated closure IDB / negated closure const / aggregate over a closure or
+  non-recursive IDB).  Every accepted case asserts
+  `topdown == bound == magic` byte-for-byte.  This confirms the previously
+  `deferred` STAGE C was already correct through the shared
+  `magic_transform_adorn` + `dl_compile` + `vm_exec_rule` path.
 - **v2 top-down / QSQ magic evaluation** (`dl_query_topdown` /
   `dl_query_topdown_adorn`): a goal-driven, memoized 4th per-query path that
   reuses the forward-magic adornment machinery (`magic_transform_adorn` +
