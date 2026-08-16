@@ -207,6 +207,101 @@ uint64_t rel_count_subtree(const relation *rel)
     return n;
 }
 
+/* ─── Prefix-bound order statistics (Tier-2 follow-up #1) ──────────────── */
+
+/* Walk the k*4-byte prefix of `leading` (u32BE each) from the root via
+ * trans_find to the DAFSA state representing that bound.  Returns the state
+ * index, or -1 if the prefix is not a prefix of any key.  k must be <= arity
+ * and (when k > 0) leading non-NULL — validated by the caller. */
+static int rel_prefix_state(const relation *rel, const uint32_t *leading,
+                            uint8_t k)
+{
+    unsigned int current;
+    uint8_t i;
+
+    if (rel->arity == 0) return -1;
+    current = rel->d->initial;
+    for (i = 0; i < k; i++) {
+        unsigned char col_be[4];
+        uint32_t v = leading[i];
+        int b;
+        col_be[0] = (unsigned char)((v >> 24) & 0xFF);
+        col_be[1] = (unsigned char)((v >> 16) & 0xFF);
+        col_be[2] = (unsigned char)((v >> 8)  & 0xFF);
+        col_be[3] = (unsigned char)(v & 0xFF);
+        for (b = 0; b < 4; b++) {
+            int tr = trans_find(&rel->d->states[current], col_be[b]);
+            if (tr < 0) return -1;   /* bound prefix not present in any key */
+            current = trans_arr_c(&rel->d->states[current])[tr].target;
+        }
+    }
+    return (int)current;
+}
+
+/* #distinct tuples with leading==`leading` (first k columns) AND full tuple
+ * strictly lexicographically < cols (arity columns; first k must equal
+ * leading).  If the leading prefix is absent (no tuple has it), returns 0.
+ * UINT64_MAX on error. */
+uint64_t rel_rank_bound(const relation *rel, const uint32_t *leading,
+                        uint8_t k, const uint32_t *cols)
+{
+    unsigned char key[MAX_KEY_LEN];
+    size_t key_len;
+    int s;
+
+    if (!rel || !rel->d || !cols) return UINT64_MAX;
+    if (k > rel->arity) return UINT64_MAX;
+    if (k > 0 && !leading) return UINT64_MAX;
+    s = rel_prefix_state(rel, leading, k);
+    if (s < 0) return 0;   /* bound absent: rank 0 within the (empty) bound */
+    key_len = encode_key(key, &cols[k], (uint8_t)(rel->arity - k));
+    return dafsa_rank_from(rel->d, (unsigned int)s, key, key_len);
+}
+
+/* idx-th tuple (0-indexed) among those with leading==`leading`, writing the
+ * FULL tuple (arity columns; leading cols are copied through).  0 on success,
+ * -1 if the bound is absent, idx >= the bound's count, or on error. */
+int rel_select_bound(const relation *rel, const uint32_t *leading, uint8_t k,
+                     uint64_t idx, uint32_t *cols_out)
+{
+    unsigned char key[MAX_KEY_LEN];
+    int key_len;
+    int s;
+
+    if (!rel || !rel->d || !cols_out) return -1;
+    if (k > rel->arity) return -1;
+    if (k > 0 && !leading) return -1;
+    s = rel_prefix_state(rel, leading, k);
+    if (s < 0) return -1;   /* bound absent */
+    key_len = dafsa_select_from(rel->d, (unsigned int)s, idx, key, MAX_KEY_LEN);
+    if (key_len < 0) return -1;
+    if (k > 0) memcpy(cols_out, leading, (size_t)k * sizeof(uint32_t));
+    read_cols_be(&cols_out[k], key, (uint8_t)(rel->arity - k));
+    return 0;
+}
+
+/* #distinct tuples with leading==`leading` AND full tuple in the half-open
+ * range [lo, hi) (arity columns each; first k of lo/hi must equal leading).
+ * If the leading prefix is absent, returns 0.  UINT64_MAX on error. */
+uint64_t rel_range_count_bound(const relation *rel, const uint32_t *leading,
+                               uint8_t k, const uint32_t *lo,
+                               const uint32_t *hi)
+{
+    unsigned char lo_key[MAX_KEY_LEN], hi_key[MAX_KEY_LEN];
+    size_t lo_len, hi_len;
+    int s;
+
+    if (!rel || !rel->d || !lo || !hi) return UINT64_MAX;
+    if (k > rel->arity) return UINT64_MAX;
+    if (k > 0 && !leading) return UINT64_MAX;
+    s = rel_prefix_state(rel, leading, k);
+    if (s < 0) return 0;   /* bound absent */
+    lo_len = encode_key(lo_key, &lo[k], (uint8_t)(rel->arity - k));
+    hi_len = encode_key(hi_key, &hi[k], (uint8_t)(rel->arity - k));
+    return dafsa_range_count_from(rel->d, (unsigned int)s,
+                                  lo_key, lo_len, hi_key, hi_len);
+}
+
 /* ─── Fact operations ─────────────────────────────────────────────────── */
 
 static int rel_add_d(relation *rel, dafsa *d, const uint32_t *cols)

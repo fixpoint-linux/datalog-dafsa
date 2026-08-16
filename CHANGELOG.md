@@ -5,6 +5,14 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **v2 DAFSA order-statistics — prefix-bound rank/select** (`dl_rank_bound` /
+  `dl_select_bound` / `dl_range_count_bound`): restrict rank/select/range_count
+  to tuples whose leading `k` columns equal a bound, applied to the remaining
+  suffix columns.  Implements deferred follow-up #1 of the range-index design.
+  The DAFSA `*_n` primitives are generalized to start-state (`_from`) forms
+  (the shipped `*_n` are unchanged thin wrappers); `rel_prefix_state` walks the
+  leading bound, then the `_from` variant runs on the encoded suffix key.
+  Absent prefix → 0 / -1; rejects variadic/arity-mismatch/NULL.
 - **v2 top-down STAGE C verification (tests only — no engine change)**: the
   negation + aggregate correctness matrix for `dl_query_topdown` (T16-T23 in
   `tests/test_topdown.c`), mirroring the forward-magic suite.  Covers negated

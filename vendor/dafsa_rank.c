@@ -10,6 +10,12 @@
  *   dafsa_select_n       — k-th complete key (0-indexed, lex order).
  *   dafsa_range_count_n  — half-open [lo, hi) key count.
  *
+ * Each order-statistic has a PREFIX-BOUND (start-state) twin used by the
+ * relation layer's *_bound API: dafsa_rank_from / dafsa_select_from /
+ * dafsa_range_count_from take a start state `s` (the state reached by walking
+ * a bound prefix) and rank/select/count within that state's subtree.  The
+ * plain *_n variants are thin wrappers over the same core with s = d->initial.
+ *
  * Correctness of the recurrence (count(s) = is_final(s) + sum over s's
  * OUTGOING transitions of count(target)): within a state every transition has
  * a DISTINCT symbol, so the per-transition key sets are disjoint; a state
@@ -79,20 +85,20 @@ uint64_t dafsa_ensure_subtree(dafsa *d)
     return d->subtree[d->initial];
 }
 
-/* rank(key) = number of complete keys strictly lexicographically < key.
- * O(len * ntrans).  Correct for absent keys (returns insertion position).
- * OOM during the lazy build degrades to 0 (never abort). */
-uint64_t dafsa_rank_n(dafsa *d, const unsigned char *key, size_t len)
+/* rank within the subtree rooted at state `s` = number of complete keys
+ * reachable from `s` strictly lexicographically < key.  O(len * ntrans).
+ * Correct for absent keys (returns insertion position).  OOM during the lazy
+ * build degrades to 0 (never abort). */
+static uint64_t rank_core(dafsa *d, unsigned int s, const unsigned char *key,
+                          size_t len)
 {
-    unsigned int s;
     size_t i;
     uint64_t r = 0;
 
-    if (!d || !key) return 0;
+    if (!d || !key || s == 0 || s >= d->nstates) return 0;
     dafsa_ensure_subtree(d);
     if (!d->subtree_valid) return 0;   /* OOM during build: degrade to 0 */
 
-    s = d->initial;
     for (i = 0; i < len; i++) {
         unsigned char c = key[i];
         const State *st = &d->states[s];
@@ -126,23 +132,39 @@ uint64_t dafsa_rank_n(dafsa *d, const unsigned char *key, size_t len)
     return r;
 }
 
-/* select(k) = the k-th complete key in lex order (0-indexed), written to
- * key_out (up to key_cap bytes).  Returns the key length on success, or -1 if
- * k >= total count or on OOM (never aborts). */
-int dafsa_select_n(dafsa *d, uint64_t k, unsigned char *key_out, size_t key_cap)
+/* rank(key) = number of complete keys strictly lexicographically < key
+ * (start state = d->initial).  See rank_core. */
+uint64_t dafsa_rank_n(dafsa *d, const unsigned char *key, size_t len)
 {
-    unsigned int s;
+    if (!d) return 0;
+    return rank_core(d, d->initial, key, len);
+}
+
+/* Prefix-bound form: rank within the subtree rooted at `s` (the state reached
+ * by walking the bound prefix).  See rank_core. */
+uint64_t dafsa_rank_from(dafsa *d, unsigned int s, const unsigned char *key,
+                         size_t len)
+{
+    return rank_core(d, s, key, len);
+}
+
+/* select within the subtree rooted at state `s`: the k-th complete key in lex
+ * order (0-indexed), written to key_out (up to key_cap bytes).  Returns the key
+ * length on success, or -1 if k >= total count of the subtree or on OOM (never
+ * aborts). */
+static int select_core(dafsa *d, unsigned int s, uint64_t k,
+                       unsigned char *key_out, size_t key_cap)
+{
     size_t pos = 0;
     uint64_t total;
 
-    if (!d || !key_out) return -1;
+    if (!d || !key_out || s == 0 || s >= d->nstates) return -1;
     dafsa_ensure_subtree(d);
     if (!d->subtree_valid) return -1;   /* OOM during build: degrade to -1 */
 
-    total = d->subtree[d->initial];
+    total = d->subtree[s];
     if (k >= total) return -1;          /* out of range */
 
-    s = d->initial;
     for (;;) {
         const State *st = &d->states[s];
         unsigned int j;
@@ -168,15 +190,50 @@ int dafsa_select_n(dafsa *d, uint64_t k, unsigned char *key_out, size_t key_cap)
     }
 }
 
+/* select(k) = the k-th complete key in lex order (0-indexed), written to
+ * key_out (up to key_cap bytes).  Returns the key length on success, or -1 if
+ * k >= total count or on OOM (never aborts). */
+int dafsa_select_n(dafsa *d, uint64_t k, unsigned char *key_out, size_t key_cap)
+{
+    if (!d) return -1;
+    return select_core(d, d->initial, k, key_out, key_cap);
+}
+
+/* Prefix-bound form: select within the subtree rooted at `s`.  See select_core. */
+int dafsa_select_from(dafsa *d, unsigned int s, uint64_t k,
+                      unsigned char *key_out, size_t key_cap)
+{
+    return select_core(d, s, k, key_out, key_cap);
+}
+
+/* range_count within the subtree rooted at `s` = number of complete keys in the
+ * half-open interval [lo, hi), i.e. rank(hi) - rank(lo).  Returns 0 on
+ * error/OOM (never abort). */
+static uint64_t range_count_core(dafsa *d, unsigned int s,
+                                 const unsigned char *lo, size_t lo_len,
+                                 const unsigned char *hi, size_t hi_len)
+{
+    uint64_t rhi, rlo;
+
+    if (!d || !lo || !hi) return 0;
+    rhi = rank_core(d, s, hi, hi_len);
+    rlo = rank_core(d, s, lo, lo_len);
+    return (rhi > rlo) ? (rhi - rlo) : 0;
+}
+
 /* range_count = number of complete keys in the half-open interval [lo, hi),
  * i.e. rank(hi) - rank(lo).  Returns 0 on error/OOM (never abort). */
 uint64_t dafsa_range_count_n(dafsa *d, const unsigned char *lo, size_t lo_len,
                              const unsigned char *hi, size_t hi_len)
 {
-    uint64_t rhi, rlo;
+    if (!d) return 0;
+    return range_count_core(d, d->initial, lo, lo_len, hi, hi_len);
+}
 
-    if (!d || !lo || !hi) return 0;
-    rhi = dafsa_rank_n(d, hi, hi_len);
-    rlo = dafsa_rank_n(d, lo, lo_len);
-    return (rhi > rlo) ? (rhi - rlo) : 0;
+/* Prefix-bound form: range_count within the subtree rooted at `s`. */
+uint64_t dafsa_range_count_from(dafsa *d, unsigned int s,
+                                const unsigned char *lo, size_t lo_len,
+                                const unsigned char *hi, size_t hi_len)
+{
+    return range_count_core(d, s, lo, lo_len, hi, hi_len);
 }

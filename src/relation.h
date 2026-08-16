@@ -79,6 +79,34 @@ uint64_t rel_range_count(const relation *rel, const uint32_t *lo,
 /* O(1) distinct-tuple count via the memoized subtree array.  0 on error/OOM. */
 uint64_t rel_count_subtree(const relation *rel);
 
+/* ─── Prefix-bound order statistics (Tier-2 follow-up #1) ──────────────── */
+
+/* The *_bound family restricts to tuples whose first k columns equal the
+ * `leading` bound, then applies rank/select/range_count to the suffix (the
+ * remaining arity-k columns).  `cols`/`lo`/`hi` are FULL arity-length tuples
+ * (their first k entries must equal `leading`, which is what the bound is
+ * applied to).  k==0 means no bound
+ * (equivalent to the plain rel_rank/rel_select/rel_range_count).  An absent
+ * leading prefix (no tuple has those first k columns) yields 0 (rank /
+ * range_count) or -1 (select). */
+
+/* #distinct tuples with leading==`leading` AND full tuple strictly < cols.
+ * UINT64_MAX on error (NULL, k > arity, k>0 && !leading). */
+uint64_t rel_rank_bound(const relation *rel, const uint32_t *leading,
+                        uint8_t k, const uint32_t *cols);
+
+/* idx-th tuple (0-indexed) among those with leading==`leading`, writing the
+ * FULL arity-length tuple into cols_out.  0 on success, -1 on error/absent
+ * bound / idx >= the bound's tuple count. */
+int rel_select_bound(const relation *rel, const uint32_t *leading, uint8_t k,
+                     uint64_t idx, uint32_t *cols_out);
+
+/* #distinct tuples with leading==`leading` AND full tuple in [lo, hi).
+ * UINT64_MAX on error. */
+uint64_t rel_range_count_bound(const relation *rel, const uint32_t *leading,
+                               uint8_t k, const uint32_t *lo,
+                               const uint32_t *hi);
+
 /* ─── Fact operations ─────────────────────────────────────────────────── */
 /* A relation holds TWO DAFSAs after it becomes a rule head (see rel_is_idb):
  *   base — durable EDB facts (written by dl_add_fact/dl_delete_fact/

@@ -224,6 +224,16 @@ uint64_t      dafsa_range_count_n(dafsa *d,
                                   const unsigned char *lo, size_t lo_len,
                                   const unsigned char *hi, size_t hi_len);
 
+/* Prefix-bound (start-state) forms: rank/select/range_count within the subtree
+ * rooted at state `s` (typically reached by walking a bound prefix). */
+uint64_t      dafsa_rank_from(dafsa *d, unsigned int s,
+                              const unsigned char *key, size_t len);
+int           dafsa_select_from(dafsa *d, unsigned int s, uint64_t k,
+                                unsigned char *key_out, size_t key_cap);
+uint64_t      dafsa_range_count_from(dafsa *d, unsigned int s,
+                                     const unsigned char *lo, size_t lo_len,
+                                     const unsigned char *hi, size_t hi_len);
+
 /* dafsa_crc32.c */
 extern const uint32_t crc32_table[256];
 uint32_t      crc32_init(void);

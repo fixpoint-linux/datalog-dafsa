@@ -139,6 +139,35 @@ uint64_t dl_range_count(dl_db *db, const char *rel, const uint32_t *lo,
  * VARIADIC relation), or 0 for an empty relation. */
 uint64_t dl_count(dl_db *db, const char *rel);
 
+/* ─── Prefix-bound order statistics (Tier-2 follow-up #1) ──────────────── */
+
+/* The *_bound family restricts to tuples whose first k columns equal the
+ * `leading` bound, then applies rank/select/range_count to the suffix (the
+ * remaining arity-k columns).  `cols`/`lo`/`hi` are FULL arity-length tuples
+ * (their first k entries must equal `leading`, which is what the bound is
+ * applied to).  k==0 means no bound.
+ * Semantics otherwise mirror dl_rank/dl_select/dl_range_count; error handling
+ * (NULL/unknown rel, arity mismatch, VARIADIC) is identical. */
+
+/* #distinct tuples with leading==`leading` AND full tuple strictly < cols.
+ * UINT64_MAX on error; 0 if the leading prefix is absent from the relation. */
+uint64_t dl_rank_bound(dl_db *db, const char *rel, const uint32_t *leading,
+                       uint8_t k, const uint32_t *cols, uint8_t arity);
+
+/* idx-th tuple (0-indexed) among those with leading==`leading`, writing the
+ * FULL arity-length tuple into cols_out.  0 on success; -1 on error, absent
+ * leading prefix, or idx >= the bound's tuple count. */
+int dl_select_bound(dl_db *db, const char *rel, const uint32_t *leading,
+                    uint8_t k, uint64_t idx, uint32_t *cols_out,
+                    uint8_t arity);
+
+/* #distinct tuples with leading==`leading` AND full tuple in the half-open
+ * range [lo, hi).  UINT64_MAX on error; 0 if the leading prefix is absent. */
+uint64_t dl_range_count_bound(dl_db *db, const char *rel,
+                              const uint32_t *leading, uint8_t k,
+                              const uint32_t *lo, const uint32_t *hi,
+                              uint8_t arity);
+
 /* ─── Rule loading & compilation (M1) ──────────────────────────────────── */
 
 /* Parse and compile Datalog rules from a source string.

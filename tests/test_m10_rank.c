@@ -410,6 +410,156 @@ out:
     dl_close(db);
 }
 
+static void t9_prefix_bound(char *dir, size_t cap)
+{
+    dl_db *db = fresh_db(dir, cap, "t9");
+    uint32_t leading[1];
+    uint32_t cols[2];
+    uint32_t out[MAXA];
+    long a, b;
+    uint64_t r;
+
+    TEST("T9 prefix-bound rank/select/range_count (leading col0)");
+
+    assert(dl_declare_relation(db, "r", 2) == 0);
+    /* Cross-product arity-2: 20 col0 x 100 col1 (heavy suffix sharing). */
+    for (a = 0; a < 20; a++) {
+        for (b = 0; b < 100; b++) {
+            cols[0] = (uint32_t)a;
+            cols[1] = (uint32_t)b;
+            dl_add_fact(db, "r", cols, 2);
+        }
+    }
+
+    /* rank_bound(leading={a}, k=1, (a,b)) == b: within the bound the suffixes
+     * are the complete set 0..99, so the suffix rank is exactly b. */
+    for (a = 0; a < 20; a++) {
+        for (b = 0; b < 100; b++) {
+            leading[0] = (uint32_t)a;
+            cols[0] = (uint32_t)a;
+            cols[1] = (uint32_t)b;
+            r = dl_rank_bound(db, "r", leading, 1, cols, 2);
+            if (r != (uint64_t)b) { FAIL("rank_bound == b"); goto out; }
+        }
+    }
+
+    /* Round-trip: select_bound(idx) then rank_bound of that tuple == idx. */
+    for (a = 0; a < 20; a++) {
+        leading[0] = (uint32_t)a;
+        for (b = 0; b < 100; b++) {
+            if (dl_select_bound(db, "r", leading, 1, (uint64_t)b, out, 2) != 0) {
+                FAIL("select_bound error"); goto out;
+            }
+            if (dl_rank_bound(db, "r", leading, 1, out, 2) != (uint64_t)b) {
+                FAIL("select_bound->rank_bound round-trip"); goto out;
+            }
+        }
+    }
+
+    /* select_bound within bound: idx-th tuple == (a, idx), full tuple out. */
+    for (a = 0; a < 20; a++) {
+        leading[0] = (uint32_t)a;
+        for (b = 0; b < 100; b++) {
+            if (dl_select_bound(db, "r", leading, 1, (uint64_t)b, out, 2) != 0) {
+                FAIL("select_bound error"); goto out;
+            }
+            if (out[0] != (uint32_t)a || out[1] != (uint32_t)b) {
+                FAIL("select_bound tuple"); goto out;
+            }
+        }
+        /* idx == bound count -> -1 (out of range). */
+        if (dl_select_bound(db, "r", leading, 1, 100, out, 2) != -1) {
+            FAIL("select_bound(count) != -1"); goto out;
+        }
+    }
+
+    /* range_count_bound within bound: tuples (a, 5..10) == 5. */
+    for (a = 0; a < 20; a++) {
+        leading[0] = (uint32_t)a;
+        cols[0] = (uint32_t)a;
+        cols[1] = 5;
+        out[0] = (uint32_t)a;
+        out[1] = 10;
+        r = dl_range_count_bound(db, "r", leading, 1, cols, out, 2);
+        if (r != 5) { FAIL("range_count_bound == 5"); goto out; }
+    }
+
+    /* Unmatched prefix: leading value not present as a col0 (>=20) -> 0 / -1. */
+    leading[0] = 20;
+    cols[0] = 20; cols[1] = 0;
+    if (dl_rank_bound(db, "r", leading, 1, cols, 2) != 0) {
+        FAIL("unmatched rank_bound != 0"); goto out;
+    }
+    if (dl_select_bound(db, "r", leading, 1, 0, out, 2) != -1) {
+        FAIL("unmatched select_bound != -1"); goto out;
+    }
+    if (dl_range_count_bound(db, "r", leading, 1, cols, cols, 2) != 0) {
+        FAIL("unmatched range_count_bound != 0"); goto out;
+    }
+
+    PASS();
+out:
+    dl_close(db);
+}
+
+static void t10_bound_empty_reject(char *dir, size_t cap)
+{
+    dl_db *db = fresh_db(dir, cap, "t10");
+    uint32_t leading[1] = {7};
+    uint32_t cols[2] = {7, 0};
+    uint32_t out[MAXA];
+
+    TEST("T10 prefix-bound empty + reject matrix");
+
+    assert(dl_declare_relation(db, "e", 2) == 0);     /* empty arity-2 */
+    assert(dl_declare_relation(db, "r", 2) == 0);
+    assert(dl_declare_relation_variadic(db, "v") == 0);
+    dl_add_fact(db, "r", cols, 2);
+
+    /* Empty relation: rank_bound 0, select_bound -1, range_count_bound 0. */
+    if (dl_rank_bound(db, "e", leading, 1, cols, 2) != 0) { FAIL("empty rank_bound"); goto out; }
+    if (dl_select_bound(db, "e", leading, 1, 0, out, 2) != -1) { FAIL("empty select_bound"); goto out; }
+    if (dl_range_count_bound(db, "e", leading, 1, cols, cols, 2) != 0) { FAIL("empty range_count_bound"); goto out; }
+
+    /* NULL rel name. */
+    if (dl_rank_bound(db, NULL, leading, 1, cols, 2) != UINT64_MAX) { FAIL("rank_bound NULL rel"); goto out; }
+    if (dl_select_bound(db, NULL, leading, 1, 0, out, 2) != -1) { FAIL("select_bound NULL rel"); goto out; }
+
+    /* NULL cols / out / lo-hi. */
+    if (dl_rank_bound(db, "r", leading, 1, NULL, 2) != UINT64_MAX) { FAIL("rank_bound NULL cols"); goto out; }
+    if (dl_select_bound(db, "r", leading, 1, 0, NULL, 2) != -1) { FAIL("select_bound NULL out"); goto out; }
+    if (dl_range_count_bound(db, "r", leading, 1, NULL, cols, 2) != UINT64_MAX) { FAIL("range_count_bound NULL lo"); goto out; }
+    if (dl_range_count_bound(db, "r", leading, 1, cols, NULL, 2) != UINT64_MAX) { FAIL("range_count_bound NULL hi"); goto out; }
+
+    /* k > 0 but leading NULL -> rejected. */
+    if (dl_rank_bound(db, "r", NULL, 1, cols, 2) != UINT64_MAX) { FAIL("rank_bound NULL leading"); goto out; }
+    if (dl_select_bound(db, "r", NULL, 1, 0, out, 2) != -1) { FAIL("select_bound NULL leading"); goto out; }
+    if (dl_range_count_bound(db, "r", NULL, 1, cols, cols, 2) != UINT64_MAX) { FAIL("range_count_bound NULL leading"); goto out; }
+
+    /* Unknown rel. */
+    if (dl_rank_bound(db, "nope", leading, 1, cols, 2) != UINT64_MAX) { FAIL("rank_bound unknown rel"); goto out; }
+    if (dl_select_bound(db, "nope", leading, 1, 0, out, 2) != -1) { FAIL("select_bound unknown rel"); goto out; }
+
+    /* Arity mismatch. */
+    if (dl_rank_bound(db, "r", leading, 1, cols, 3) != UINT64_MAX) { FAIL("rank_bound arity mismatch"); goto out; }
+    if (dl_select_bound(db, "r", leading, 1, 0, out, 3) != -1) { FAIL("select_bound arity mismatch"); goto out; }
+    if (dl_range_count_bound(db, "r", leading, 1, cols, cols, 3) != UINT64_MAX) { FAIL("range_count_bound arity mismatch"); goto out; }
+
+    /* k > arity rejected at the relation layer. */
+    if (dl_rank_bound(db, "r", leading, 3, cols, 2) != UINT64_MAX) { FAIL("rank_bound k>arity"); goto out; }
+    if (dl_select_bound(db, "r", leading, 3, 0, out, 2) != -1) { FAIL("select_bound k>arity"); goto out; }
+    if (dl_range_count_bound(db, "r", leading, 3, cols, cols, 2) != UINT64_MAX) { FAIL("range_count_bound k>arity"); goto out; }
+
+    /* Variadic rejected. */
+    if (dl_rank_bound(db, "v", leading, 1, cols, 2) != UINT64_MAX) { FAIL("rank_bound variadic"); goto out; }
+    if (dl_select_bound(db, "v", leading, 1, 0, out, 2) != -1) { FAIL("select_bound variadic"); goto out; }
+    if (dl_range_count_bound(db, "v", leading, 1, cols, cols, 2) != UINT64_MAX) { FAIL("range_count_bound variadic"); goto out; }
+
+    PASS();
+out:
+    dl_close(db);
+}
+
 /* ─── main ─────────────────────────────────────────────────────────────── */
 
 int main(void)
@@ -425,6 +575,8 @@ int main(void)
     t6_empty(dir, sizeof(dir));
     t7_cross_product(dir, sizeof(dir));
     t8_rejection(dir, sizeof(dir));
+    t9_prefix_bound(dir, sizeof(dir));
+    t10_bound_empty_reject(dir, sizeof(dir));
 
     printf("\n%d tests run, %d failed.\n", tests_run, tests_failed);
     return tests_failed ? 1 : 0;

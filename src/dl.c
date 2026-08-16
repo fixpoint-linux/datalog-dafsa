@@ -1709,6 +1709,43 @@ uint64_t dl_count(dl_db *db, const char *rel_name)
     return rel_count_subtree(rel);
 }
 
+uint64_t dl_rank_bound(dl_db *db, const char *rel_name,
+                       const uint32_t *leading, uint8_t k,
+                       const uint32_t *cols, uint8_t arity)
+{
+    relation *rel;
+    if (!cols) return UINT64_MAX;
+    if (k > 0 && !leading) return UINT64_MAX;
+    rel = ordstats_rel_ro(db, rel_name, arity);
+    if (!rel) return UINT64_MAX;
+    return rel_rank_bound(rel, leading, k, cols);
+}
+
+int dl_select_bound(dl_db *db, const char *rel_name,
+                    const uint32_t *leading, uint8_t k, uint64_t idx,
+                    uint32_t *cols_out, uint8_t arity)
+{
+    relation *rel;
+    if (!cols_out) return -1;
+    if (k > 0 && !leading) return -1;
+    rel = ordstats_rel_ro(db, rel_name, arity);
+    if (!rel) return -1;
+    return rel_select_bound(rel, leading, k, idx, cols_out);
+}
+
+uint64_t dl_range_count_bound(dl_db *db, const char *rel_name,
+                              const uint32_t *leading, uint8_t k,
+                              const uint32_t *lo, const uint32_t *hi,
+                              uint8_t arity)
+{
+    relation *rel;
+    if (!lo || !hi) return UINT64_MAX;
+    if (k > 0 && !leading) return UINT64_MAX;
+    rel = ordstats_rel_ro(db, rel_name, arity);
+    if (!rel) return UINT64_MAX;
+    return rel_range_count_bound(rel, leading, k, lo, hi);
+}
+
 /* ─── Rule loading & compilation (M1) ──────────────────────────────────── */
 
 /* ─── M8: AST deep-copy — retain rules for the magic-sets transform ───── */

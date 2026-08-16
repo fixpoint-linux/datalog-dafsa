@@ -1,6 +1,7 @@
 # Range path index & join/range workloads
 
-_Design note. Status: **Tier 2 (order-statistics) implemented** — commit `20e93bb` (2026-08-16).
+_Design note. Status: **Tier 2 (order-statistics) implemented** — commit `20e93bb` (2026-08-16),
+**prefix-bound rank/select implemented** — commit `20e93bb`+ (2026-08-16).
 The full feature remains partly proposed; this doc records the options, the recommended path, and
 the deferred follow-ups._
 
@@ -145,11 +146,13 @@ Per-state **distinct-subtree-key counts** on the DAFSA, giving `rank` / `select`
 
 ### Deferred follow-ups (not yet implemented)
 
-In rough priority order:
+In rough priority order. ~~struck-through~~ items are implemented (commit noted).
 
-1. **Prefix-bound rank/select** (`dl_rank_bound` / `dl_range_count_bound`) —
-   walk a leading-column prefix to a state, then rank/select within that
-   subtree. ~30-line additive extension of the same primitives.
+1. ~~**Prefix-bound rank/select** (`dl_rank_bound` / `dl_select_bound` /
+   `dl_range_count_bound`)~~ — **implemented** (commit `20e93bb`+). Walk a
+   leading-column prefix to a state, then rank/select within that subtree.
+   The DAFSA `*_n` primitives were generalized to start-state (`_from`) forms;
+   `rel_prefix_state` + suffix-key encoding expose the bound.
 2. **`dl_rank_perm` / order-by on a non-leading column** — perm relations are
    just relations with their own `dafsa`, so they get subtree counts for free;
    a thin wrapper over the perm relation's dafsa gives order-by on any column
