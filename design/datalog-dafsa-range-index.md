@@ -1,7 +1,7 @@
 # Range path index & join/range workloads
 
 _Design note. Status: **Tier 2 (order-statistics) implemented** — commit `20e93bb` (2026-08-16),
-**prefix-bound rank/select implemented** — commit `20e93bb`+ (2026-08-16).
+**prefix-bound rank/select implemented** — commit `1b46922` (2026-08-16).
 The full feature remains partly proposed; this doc records the options, the recommended path, and
 the deferred follow-ups._
 
@@ -149,7 +149,7 @@ Per-state **distinct-subtree-key counts** on the DAFSA, giving `rank` / `select`
 In rough priority order. ~~struck-through~~ items are implemented (commit noted).
 
 1. ~~**Prefix-bound rank/select** (`dl_rank_bound` / `dl_select_bound` /
-   `dl_range_count_bound`)~~ — **implemented** (commit `20e93bb`+). Walk a
+   `dl_range_count_bound`)~~ — **implemented** (commit `1b46922`). Walk a
    leading-column prefix to a state, then rank/select within that subtree.
    The DAFSA `*_n` primitives were generalized to start-state (`_from`) forms;
    `rel_prefix_state` + suffix-key encoding expose the bound.
