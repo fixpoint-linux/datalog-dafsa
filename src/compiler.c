@@ -1989,18 +1989,14 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
             if (ba->aggregate) continue;          /* computed after body */
             if (is_equality(ba)) {
                 if (is_list_assign(ba)) {
-                    /* [X|Xs] = L binds the pattern vars (args[0]) from the
-                     * RHS value L (args[1]) — but only when L is bound.
-                     * Destructuring an unbound L produces nothing (car/cdr of
-                     * the UNBOUND sentinel backtracks), so do NOT mark the
-                     * pattern vars bound unless L is bound — otherwise a later
-                     * negated atom reading X would silently NEG_CHECK against
-                     * the sentinel. */
-                    int vi1 = (ba->nargs >= 2 && ba->args[1]->kind == TOK_VAR)
-                                  ? v_find(&vt, ba->args[1]->text) : -1;
-                    int b1 = (vi1 >= 0) && bound_vars[vi1];
-                    if (b1 || ba->args[1]->kind != TOK_VAR)
-                        mark_token_vars_bound(ba->args[0], &vt, bound_vars);
+                    /* [X|Xs] = L is lowered in the EQUALITY phase, which runs
+                     * AFTER the relational join AND its interleaved NEG_CHECK
+                     * instructions.  So the pattern vars (args[0]) are NOT
+                     * bound during negation — a negated atom cannot safely
+                     * read them (it would NEG_CHECK the UNBOUND sentinel and
+                     * silently backtrack).  Do NOT mark them bound here: a
+                     * negated atom reading a pattern var is rejected as unsafe
+                     * negation, mirroring the car/cdr desugaring. */
                     continue;
                 }
                 /* equality X = Y binds at most ONE new side (OP_EQ binds Y
@@ -2313,21 +2309,24 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
             /* v2-lists FIX-1: a lone member(X,L) list-filter atom with a
              * bound-or-constant L is a legitimate positive DRIVER even in a
              * rule with negation — the producer phase emits OP_LIST_MEMBER,
-             * which GENERATES X from L's elements.  (An unbound L was already
-             * rejected loudly by member_operand_bound in the 5b safety pass.)
+             * which GENERATES X from L's elements.  A lone [X|_] = [1,2] list
+             * ASSIGNMENT with a constant RHS is likewise a driver (the
+             * equality phase destructures the constant, binding the pattern
+             * vars).  (An unbound var operand was already rejected loudly by
+             * member_operand_bound / the 5b list-assign check.)
              * In this case there is NO positive relational atom to scan: we
              * still emit NEG_CHECK for the negated atoms (handled below by the
              * "remaining body atoms" loop, which starts at bi==0 when
              * first_pos<0), but we skip the first-positive SCAN/WALK block. */
-            int member_driver = 0;
+            int list_driver = 0;
             for (bi = 0; bi < r->nbody; bi++) {
                 atom *ba = r->body[bi];
-                if (is_list_filter(ba)) { member_driver = 1; break; }
+                if (is_list_filter(ba)) { list_driver = 1; break; }
                 if (is_list_assign(ba) && ba->args[1]->kind != TOK_VAR) {
-                    member_driver = 1; break;
+                    list_driver = 1; break;
                 }
             }
-            if (!member_driver) {
+            if (!list_driver) {
                 fprintf(stderr, "compile error: rule '%s' has no positive body atom\n",
                         r->head->pred);
                 goto fail;
