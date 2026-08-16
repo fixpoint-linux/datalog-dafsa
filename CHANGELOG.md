@@ -5,6 +5,19 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **v2 DAFSA order-statistics — permuted rank/select** (`dl_rank_perm` /
+  `dl_select_perm` / `dl_range_count_perm`): rank/select/range_count over a
+  PERMUTED view of a relation (order-by on a non-leading column).  The
+  permuted relation is just the base relation re-encoded via a declared
+  permutation (perm[j] = original column at permuted position j), so its
+  DAFSA subtree counts give order statistics for free.  Rank/range_count
+  FORWARD-map the original-order input to permuted order (pcols[j] =
+  cols[perm[j]]); select INVERSE-maps its permuted result back to original
+  order (cols_out[perm[j]] = pcols_out[j]); a select→rank round-trip is the
+  identity.  The permuted DAFSA is built on demand (permindex_build) if NULL
+  or dirty — never silently mis-evaluated.  Implements deferred follow-up #2
+  of the range-index design.  Rejects bad perm_id / wrong-rel perm /
+  arity-mismatch / variadic / NULL.
 - **v2 DAFSA order-statistics — prefix-bound rank/select** (`dl_rank_bound` /
   `dl_select_bound` / `dl_range_count_bound`): restrict rank/select/range_count
   to tuples whose leading `k` columns equal a bound, applied to the remaining

@@ -1,7 +1,8 @@
 # Range path index & join/range workloads
 
 _Design note. Status: **Tier 2 (order-statistics) implemented** — commit `20e93bb` (2026-08-16),
-**prefix-bound rank/select implemented** — commit `1b46922` (2026-08-16).
+**prefix-bound rank/select implemented** — commit `1b46922` (2026-08-16),
+**permuted order-statistics (`dl_*_perm`) implemented** — (2026-08-16).
 The full feature remains partly proposed; this doc records the options, the recommended path, and
 the deferred follow-ups._
 
@@ -153,10 +154,11 @@ In rough priority order. ~~struck-through~~ items are implemented (commit noted)
    leading-column prefix to a state, then rank/select within that subtree.
    The DAFSA `*_n` primitives were generalized to start-state (`_from`) forms;
    `rel_prefix_state` + suffix-key encoding expose the bound.
-2. **`dl_rank_perm` / order-by on a non-leading column** — perm relations are
-   just relations with their own `dafsa`, so they get subtree counts for free;
-   a thin wrapper over the perm relation's dafsa gives order-by on any column
-   prefix. ~15 lines.
+2. ~~**`dl_rank_perm` / order-by on a non-leading column**~~ — **implemented**
+   (`dl_rank_perm` / `dl_select_perm` / `dl_range_count_perm`). Perm relations
+   are just relations with their own `dafsa`, so they get subtree counts for
+   free; a thin wrapper over the perm relation's dafsa gives order-by on any
+   column prefix. `dl_db_declare_perm` now validates the perm is a bijection.
 3. **`OP_RANGE` VM opcode / range-aware aggregate** — consumes the
    `dl_rank`/`dl_select` primitives for range predicates in Datalog rules.
 4. **Snapshot (mmap `dafsa_view`) rank/select** — the published-read path uses a

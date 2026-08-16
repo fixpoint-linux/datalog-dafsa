@@ -168,6 +168,38 @@ uint64_t dl_range_count_bound(dl_db *db, const char *rel,
                               const uint32_t *lo, const uint32_t *hi,
                               uint8_t arity);
 
+/* ─── Permuted order statistics (Tier-2 follow-up #2) ──────────────────── */
+
+/* The *_perm family evaluates order statistics over a PERMUTED view of a
+ * relation (order-by on a non-leading column).  perm_id is a permutation
+ * index previously returned by dl_db_declare_perm(db, rel_id, arity, perm),
+ * where perm[j] is the ORIGINAL column that appears at permuted position j
+ * (so perm = {1,0} over an arity-2 relation orders tuples by col1, then col0
+ * as the tiebreaker — the permuted relation's DAFSA sorts the re-encoded
+ * keys lexicographically).
+ *
+ * `cols`/`lo`/`hi` are FULL arity-length tuples in the ORIGINAL column order
+ * (as read by dl_select/dl_lookup).  Rank/range_count FORWARD-map the input
+ * to permuted order (pcols[j] = cols[perm[j]]) before ranking; select
+ * INVERSE-maps its permuted-order result back to original order
+ * (cols_out[perm[j]] = pcols_out[j]).  A select→rank round-trip over the
+ * same permuted relation is therefore the identity.
+ *
+ * The permuted relation is built on demand (permindex_build) if it is not
+ * yet materialized or is dirty — a stale/NULL index is never silently used.
+ *
+ * Error handling mirrors dl_rank/dl_select/dl_range_count (NULL db/rel/input,
+ * unknown rel, VARIADIC relation, arity mismatch) plus bad perm_id or a perm
+ * that does not belong to rel/arity: rank/range_count return UINT64_MAX and
+ * select returns -1. */
+uint64_t dl_rank_perm(dl_db *db, const char *rel, int perm_id,
+                      const uint32_t *cols, uint8_t arity);
+int dl_select_perm(dl_db *db, const char *rel, int perm_id, uint64_t k,
+                   uint32_t *cols_out, uint8_t arity);
+uint64_t dl_range_count_perm(dl_db *db, const char *rel, int perm_id,
+                             const uint32_t *lo, const uint32_t *hi,
+                             uint8_t arity);
+
 /* ─── Rule loading & compilation (M1) ──────────────────────────────────── */
 
 /* Parse and compile Datalog rules from a source string.

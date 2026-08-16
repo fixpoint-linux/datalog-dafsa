@@ -25,7 +25,9 @@ struct relation;
 typedef struct {
     int             rel_id;
     uint8_t         arity;
-    uint8_t         perm[8];     /* column permutation: original col c appears at perm[c] */
+    uint8_t         perm[8];     /* permutation: prow[j] = row[perm[j]] — i.e.
+                                    perm[j] is the ORIGINAL column that appears
+                                    at permuted position j */
     struct relation *pidx_rel;   /* the permuted DAFSA */
     int             dirty;       /* 1 if needs rebuild */
 } perm_index_entry;

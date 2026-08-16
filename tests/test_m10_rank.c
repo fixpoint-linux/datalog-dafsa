@@ -17,10 +17,16 @@
  *          path count), rank/select/range_count exact over the whole range.
  *   T8  rejection:         NULL/unknown rel/arity-mismatch/variadic all
  *                          return -1 (select) / UINT64_MAX (rank/count).
+ *   T11 permuted stats:    rank/select/range_count over a permuted view
+ *                          (order-by on a non-leading column) vs brute-force
+ *                          sort by the permuted key; select->rank round-trip
+ *                          is the identity; bad perm_id / wrong-rel perm /
+ *                          arity-mismatch / unknown-rel / NULL all reject.
  *
  * Build: make tests/test_m10_rank (link ALL_OBJS) — see Makefile.
  */
 #include "dl.h"
+#include "permindex.h"   /* dl_db_declare_perm */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -560,6 +566,176 @@ out:
     dl_close(db);
 }
 
+/* ─── T11: permuted order statistics (order-by on non-leading column) ─── */
+
+/* Globals for the qsort comparator that reorders facts by permuted key. */
+static const uint8_t *g_perm;   /* perm under test */
+static int            g_perm_arity;
+
+static int perm_order_cmp(const void *pa, const void *pb)
+{
+    const uint32_t *a = (const uint32_t *)pa;
+    const uint32_t *b = (const uint32_t *)pb;
+    int j;
+    for (j = 0; j < g_perm_arity; j++) {
+        uint32_t va = a[g_perm[j]];
+        uint32_t vb = b[g_perm[j]];
+        if (va < vb) return -1;
+        if (va > vb) return 1;
+    }
+    return 0;
+}
+
+/* Verify rank/select/range_count over a permuted relation against a
+ * brute-force sort of the facts by the permuted column order. */
+static void check_perm_invariants(dl_db *db, const char *rel, int perm_id,
+                                  const uint8_t *perm, const tset *facts)
+{
+    long i;
+    uint32_t *sorted;          /* facts reordered by permuted key (orig cols) */
+    uint32_t out[MAXA];
+    uint64_t r;
+    int ok = 1;
+
+    g_perm = perm;
+    g_perm_arity = facts->arity;
+
+    sorted = malloc((size_t)facts->count * facts->arity * sizeof(uint32_t));
+    if (!sorted) { FAIL("OOM sorted"); return; }
+    memcpy(sorted, facts->data,
+           (size_t)facts->count * facts->arity * sizeof(uint32_t));
+    qsort(sorted, (size_t)facts->count, (size_t)facts->arity * sizeof(uint32_t),
+          perm_order_cmp);
+
+    /* select_perm(i) == i-th tuple in PERMUTED order (original cols restored
+     * by the inverse mapping), and rank_perm of it round-trips to i. */
+    for (i = 0; i < facts->count; i++) {
+        const uint32_t *exp = sorted + (size_t)i * facts->arity;
+        if (dl_select_perm(db, rel, perm_id, (uint64_t)i, out, facts->arity) != 0) {
+            FAIL("select_perm error"); ok = 0; goto out;
+        }
+        if (memcmp(out, exp, (size_t)facts->arity * sizeof(uint32_t)) != 0) {
+            FAIL("select_perm tuple mismatch"); ok = 0; goto out;
+        }
+        r = dl_rank_perm(db, rel, perm_id, out, facts->arity);
+        if (r != (uint64_t)i) { FAIL("select_perm->rank_perm round-trip"); ok = 0; goto out; }
+    }
+
+    /* select_perm(count) out of range -> -1. */
+    if (dl_select_perm(db, rel, perm_id, (uint64_t)facts->count, out,
+                       facts->arity) != -1) {
+        FAIL("select_perm(count) != -1"); ok = 0; goto out;
+    }
+
+    /* rank_perm of each tuple == its permuted index. */
+    for (i = 0; i < facts->count; i++) {
+        const uint32_t *exp = sorted + (size_t)i * facts->arity;
+        r = dl_rank_perm(db, rel, perm_id, exp, facts->arity);
+        if (r != (uint64_t)i) { FAIL("rank_perm == permuted index"); ok = 0; goto out; }
+    }
+
+    /* range_count_perm over permuted order: [sorted[a], sorted[b]) == b-a. */
+    for (i = 0; i < 200 && facts->count > 1; i++) {
+        long a = (long)(rand() % (unsigned)facts->count);
+        long b = (long)(rand() % (unsigned)facts->count);   /* < count: valid tuple */
+        if (a > b) { long t = a; a = b; b = t; }
+        if (a >= facts->count) a = facts->count - 1;
+        if (b >= facts->count) b = facts->count - 1;
+        if (a < b) {
+            const uint32_t *lo = sorted + (size_t)a * facts->arity;
+            const uint32_t *hi = sorted + (size_t)b * facts->arity;
+            r = dl_range_count_perm(db, rel, perm_id, lo, hi, facts->arity);
+            if (r != (uint64_t)(b - a)) { FAIL("range_count_perm [a,b)"); ok = 0; goto out; }
+        }
+    }
+
+out:
+    free(sorted);
+    if (ok) PASS();
+}
+
+static void t11_perm(char *dir, size_t cap)
+{
+    dl_db *db = fresh_db(dir, cap, "t11");
+    tset facts;
+    int i;
+    uint32_t cols[3];
+    uint32_t out[MAXA];
+    int perm_a2, perm_a3;
+    uint8_t perm2[8] = {1, 0, 0, 0, 0, 0, 0, 0};   /* order by col1, then col0 */
+    uint8_t perm3[8] = {1, 0, 2, 0, 0, 0, 0, 0};   /* order by col1, then col0, col2 */
+
+    memset(&facts, 0, sizeof(facts));
+    TEST("T11 permuted order statistics (order-by on non-leading column)");
+
+    assert(dl_declare_relation(db, "r", 2) == 0);   /* rel_id 0 */
+    assert(dl_declare_relation(db, "r3", 3) == 0);  /* rel_id 1 */
+
+    for (i = 0; i < 400; i++) {
+        cols[0] = (uint32_t)(rand() % 50);
+        cols[1] = (uint32_t)(rand() % 50);
+        dl_add_fact(db, "r", cols, 2);
+    }
+    for (i = 0; i < 300; i++) {
+        cols[0] = (uint32_t)(rand() % 30);
+        cols[1] = (uint32_t)(rand() % 30);
+        cols[2] = (uint32_t)(rand() % 30);
+        dl_add_fact(db, "r3", cols, 3);
+    }
+
+    /* Declare perms (built lazily on the first perm query). */
+    perm_a2 = dl_db_declare_perm(db, 0, 2, perm2);
+    perm_a3 = dl_db_declare_perm(db, 1, 3, perm3);
+    if (perm_a2 < 0 || perm_a3 < 0) { FAIL("declare perm"); goto out; }
+
+    /* Arity-2: order by col1 (non-leading). */
+    facts.arity = 2;
+    if (collect(db, "r", 2, &facts) < 0) { FAIL("collect r"); goto out; }
+    check_perm_invariants(db, "r", perm_a2, perm2, &facts);
+    if (tests_failed) goto out;
+    tset_free(&facts); memset(&facts, 0, sizeof(facts));
+
+    /* Arity-3: order by col1 (non-leading). */
+    facts.arity = 3;
+    if (collect(db, "r3", 3, &facts) < 0) { FAIL("collect r3"); goto out; }
+    check_perm_invariants(db, "r3", perm_a3, perm3, &facts);
+    if (tests_failed) goto out;
+    tset_free(&facts); memset(&facts, 0, sizeof(facts));
+
+    /* Validation matrix: bad/negative perm_id, perm of another rel, perm
+     * arity mismatch, rel arity mismatch, unknown rel, NULL inputs. */
+    cols[0] = 1; cols[1] = 2; cols[2] = 3;
+    if (dl_rank_perm(db, "r", 999, cols, 2) != UINT64_MAX) { FAIL("rank_perm bad perm_id"); goto out; }
+    if (dl_select_perm(db, "r", 999, 0, out, 2) != -1) { FAIL("select_perm bad perm_id"); goto out; }
+    if (dl_range_count_perm(db, "r", 999, cols, cols, 2) != UINT64_MAX) { FAIL("range_count_perm bad perm_id"); goto out; }
+    if (dl_rank_perm(db, "r", -1, cols, 2) != UINT64_MAX) { FAIL("rank_perm neg perm_id"); goto out; }
+
+    /* perm_a3 belongs to r3 (rel_id 1), not r (rel_id 0). */
+    if (dl_rank_perm(db, "r", perm_a3, cols, 2) != UINT64_MAX) { FAIL("rank_perm wrong rel"); goto out; }
+    if (dl_select_perm(db, "r", perm_a3, 0, out, 2) != -1) { FAIL("select_perm wrong rel"); goto out; }
+    if (dl_range_count_perm(db, "r", perm_a3, cols, cols, 2) != UINT64_MAX) { FAIL("range_count_perm wrong rel"); goto out; }
+
+    /* Perm arity mismatch: perm_a2 is arity-2, asked against arity-3 r3. */
+    if (dl_rank_perm(db, "r3", perm_a2, cols, 3) != UINT64_MAX) { FAIL("rank_perm perm arity mismatch"); goto out; }
+    if (dl_select_perm(db, "r3", perm_a2, 0, out, 3) != -1) { FAIL("select_perm perm arity mismatch"); goto out; }
+
+    /* Rel arity mismatch: r is arity-2, asked arity-3. */
+    if (dl_rank_perm(db, "r", perm_a2, cols, 3) != UINT64_MAX) { FAIL("rank_perm rel arity mismatch"); goto out; }
+
+    /* Unknown rel / NULL inputs. */
+    if (dl_rank_perm(db, "nope", perm_a2, cols, 2) != UINT64_MAX) { FAIL("rank_perm unknown rel"); goto out; }
+    if (dl_rank_perm(db, NULL, perm_a2, cols, 2) != UINT64_MAX) { FAIL("rank_perm NULL rel"); goto out; }
+    if (dl_rank_perm(db, "r", perm_a2, NULL, 2) != UINT64_MAX) { FAIL("rank_perm NULL cols"); goto out; }
+    if (dl_select_perm(db, "r", perm_a2, 0, NULL, 2) != -1) { FAIL("select_perm NULL out"); goto out; }
+    if (dl_range_count_perm(db, "r", perm_a2, NULL, cols, 2) != UINT64_MAX) { FAIL("range_count_perm NULL lo"); goto out; }
+    if (dl_range_count_perm(db, "r", perm_a2, cols, NULL, 2) != UINT64_MAX) { FAIL("range_count_perm NULL hi"); goto out; }
+
+    PASS();
+out:
+    tset_free(&facts);
+    dl_close(db);
+}
+
 /* ─── main ─────────────────────────────────────────────────────────────── */
 
 int main(void)
@@ -577,6 +753,7 @@ int main(void)
     t8_rejection(dir, sizeof(dir));
     t9_prefix_bound(dir, sizeof(dir));
     t10_bound_empty_reject(dir, sizeof(dir));
+    t11_perm(dir, sizeof(dir));
 
     printf("\n%d tests run, %d failed.\n", tests_run, tests_failed);
     return tests_failed ? 1 : 0;

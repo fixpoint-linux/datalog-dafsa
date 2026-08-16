@@ -1695,6 +1695,94 @@ uint64_t dl_range_count(dl_db *db, const char *rel_name, const uint32_t *lo,
     return rel_range_count(rel, lo, hi);
 }
 
+/* ─── M6 follow-up #2: permuted order statistics ──────────────────────── */
+
+/* Resolve the (built) permuted relation for rel_name + perm_id + arity.
+ * Validates the relation (fixed, arity matches, exists) and that the perm
+ * belongs to that rel at that arity; builds the permuted DAFSA on demand if
+ * it is NULL or dirty (never silently use a stale index).  Returns the perm
+ * relation, or NULL on any validation/build error. */
+static relation *perm_rel_ro(dl_db *db, const char *rel_name, int perm_id,
+                             uint8_t arity)
+{
+    int idx;
+    relation *pidx;
+
+    if (!db || !rel_name) return NULL;
+    if (perm_id < 0 || perm_id >= db->n_perms) return NULL;
+    idx = find_rel(db, rel_name);
+    if (idx < 0) return NULL;
+    if (db->rels[idx].kind == RELK_VARIADIC) return NULL;   /* rejected this slice */
+    if (db->rels[idx].arity != arity) return NULL;          /* arity mismatch */
+    if (db->perms[perm_id].rel_id != idx) return NULL;      /* perm of another rel */
+    if (db->perms[perm_id].arity != arity) return NULL;     /* perm arity mismatch */
+
+    pidx = db->perms[perm_id].pidx_rel;
+    if (!pidx || db->perms[perm_id].dirty) {
+        if (permindex_build(db, idx, perm_id) != 0)
+            return NULL;
+        pidx = db->perms[perm_id].pidx_rel;
+        if (!pidx) return NULL;
+    }
+    return pidx;
+}
+
+uint64_t dl_rank_perm(dl_db *db, const char *rel_name, int perm_id,
+                      const uint32_t *cols, uint8_t arity)
+{
+    relation *pidx;
+    const uint8_t *perm;
+    uint32_t pcols[8];
+    int j;
+
+    if (!cols) return UINT64_MAX;
+    pidx = perm_rel_ro(db, rel_name, perm_id, arity);
+    if (!pidx) return UINT64_MAX;
+    perm = db->perms[perm_id].perm;
+    for (j = 0; j < (int)arity; j++)
+        pcols[j] = cols[perm[j]];   /* FORWARD map: original order -> permuted */
+    return rel_rank(pidx, pcols);
+}
+
+int dl_select_perm(dl_db *db, const char *rel_name, int perm_id, uint64_t k,
+                   uint32_t *cols_out, uint8_t arity)
+{
+    relation *pidx;
+    const uint8_t *perm;
+    uint32_t pcols[8];
+    int j;
+
+    if (!cols_out) return -1;
+    pidx = perm_rel_ro(db, rel_name, perm_id, arity);
+    if (!pidx) return -1;
+    if (rel_select(pidx, k, pcols) != 0) return -1;
+    perm = db->perms[perm_id].perm;
+    for (j = 0; j < (int)arity; j++)
+        cols_out[perm[j]] = pcols[j];   /* INVERSE map: permuted -> original */
+    return 0;
+}
+
+uint64_t dl_range_count_perm(dl_db *db, const char *rel_name, int perm_id,
+                             const uint32_t *lo, const uint32_t *hi,
+                             uint8_t arity)
+{
+    relation *pidx;
+    const uint8_t *perm;
+    uint32_t plo[8], phi[8];
+    int j;
+
+    if (!lo || !hi) return UINT64_MAX;
+    pidx = perm_rel_ro(db, rel_name, perm_id, arity);
+    if (!pidx) return UINT64_MAX;
+    perm = db->perms[perm_id].perm;
+    for (j = 0; j < (int)arity; j++) {
+        plo[j] = lo[perm[j]];   /* FORWARD map both bounds */
+        phi[j] = hi[perm[j]];
+    }
+    return rel_range_count(pidx, plo, phi);
+}
+
+
 uint64_t dl_count(dl_db *db, const char *rel_name)
 {
     relation *rel;
@@ -3044,6 +3132,19 @@ int dl_db_declare_perm(dl_db *db, int rel_id, uint8_t arity,
 
     if (!db || rel_id < 0 || arity == 0 || arity > 8) return -1;
     if (db->n_perms >= MAX_PERMS) return -1;
+
+    /* Validate perm is a bijection of {0..arity-1}: each original column
+     * appears exactly once at a permuted position, and no entry may reference
+     * a column >= arity (prevents OOB reads and silent wrong answers in
+     * permindex_build and the dl_*_perm wrappers). */
+    {
+        uint8_t seen[8] = {0,0,0,0,0,0,0,0};
+        int pi;
+        for (pi = 0; pi < (int)arity; pi++) {
+            if (perm[pi] >= arity || seen[perm[pi]]) return -1;
+            seen[perm[pi]] = 1;
+        }
+    }
 
     /* Check for duplicate: same rel_id + same perm */
     for (i = 0; i < db->n_perms; i++) {
