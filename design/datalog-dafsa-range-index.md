@@ -1,6 +1,8 @@
 # Range path index & join/range workloads
 
-_Design note. Status: proposal / assessment, not yet implemented. Author-date: 2026-08-16._
+_Design note. Status: **Tier 2 (order-statistics) implemented** — commit `20e93bb` (2026-08-16).
+The full feature remains partly proposed; this doc records the options, the recommended path, and
+the deferred follow-ups._
 
 ## TL;DR
 
@@ -109,6 +111,71 @@ DAFSA rather than bending the DAFSA into a B-tree.
 - Update-on-mutation for subtree path-counts at the `add`/`delete` points.
 - Test: merge-join over two sorted iterators; range-count over a permuted
   relation; order-by on a non-leading column prefix.
+
+## Implementation status & deferred follow-ups
+
+### Implemented (commit `20e93bb`, 2026-08-16) — Tier 2 order-statistics
+
+Per-state **distinct-subtree-key counts** on the DAFSA, giving `rank` / `select` /
+`range_count` / `count`:
+
+- `vendor/dafsa_rank.c`: `dafsa_ensure_subtree` (lazy one-time bottom-up DFS,
+  memoized) + `dafsa_rank_n` / `dafsa_select_n` / `dafsa_range_count_n`.
+  Count recurrence = **DISTINCT complete keys reachable** from a state:
+  `count(s) = is_final(s) + Σ count(target)` over outgoing transitions —
+  correct on a minimized DAG (disjoint symbols per state ⇒ disjoint key sets;
+  a state shared by N parents is counted N times at the root, which is correct).
+  Counts are **`uint64_t`** (not the u32 suggested below) — a cross-product
+  relation exceeds 2³² keys with few states; u32 would silently mis-evaluate.
+- `struct dafsa` (vendor/dafsa_internal.h) gains `subtree` / `subtree_cap` /
+  `subtree_valid`; coarse invalidation at the top of `dafsa_add_n` and
+  `dafsa_delete_n`; freed in `dafsa_free`. OOM degrades to 0/-1, never aborts.
+- Public API (src/dl.h): `dl_rank`, `dl_select`, `dl_range_count`, `dl_count`.
+  Reject NULL / unknown rel / arity-mismatch / variadic (UINT64_MAX/-1).
+- Tests: `tests/test_m10_rank.c` (6/6) — lex-order rank, select roundtrip,
+  range_count, absent-key insertion position, interleaved add/delete
+  (dirty/rebuild), empty relation, cross-product stress (distinct-key not
+  path-count), rejection matrix. Reviewer: SAFE TO SHIP, `ESCALATE=none`,
+  39,161 independent adversarial checks, 0 failures.
+
+> **Note (do not conflate):** `dl_count` returns the *distinct* tuple count via
+> the subtree array. The pre-existing `rel_count` returns `n_final` (the count of
+> *final states*, which under-counts distinct tuples under suffix sharing) and is
+> used only as a join-order hint. They are intentionally different.
+
+### Deferred follow-ups (not yet implemented)
+
+In rough priority order:
+
+1. **Prefix-bound rank/select** (`dl_rank_bound` / `dl_range_count_bound`) —
+   walk a leading-column prefix to a state, then rank/select within that
+   subtree. ~30-line additive extension of the same primitives.
+2. **`dl_rank_perm` / order-by on a non-leading column** — perm relations are
+   just relations with their own `dafsa`, so they get subtree counts for free;
+   a thin wrapper over the perm relation's dafsa gives order-by on any column
+   prefix. ~15 lines.
+3. **`OP_RANGE` VM opcode / range-aware aggregate** — consumes the
+   `dl_rank`/`dl_select` primitives for range predicates in Datalog rules.
+4. **Snapshot (mmap `dafsa_view`) rank/select** — the published-read path uses a
+   different layout (CSR + `state_off` + `final_bits`); needs a separate
+   subtree-count walk over the view. Until then `dl_rank`/`dl_select` operate
+   on the in-memory path only (materialize or `-1` when a snapshot is current).
+5. **Pull-based sorted iterator + merge-join** (`dl_iter_open` /
+   `iter_seek` / `iter_next` / `iter_close`) — the doc's original "concrete next
+   slice" and biggest lever for range scans / merge joins / order-by. It is
+   **independent** of Tier 2 (no seek primitive was needed for rank/select).
+6. **Automatic perm-index selection** — planner/cost pass; perms already exist,
+   arity ≤ 8 caps candidate combinatorics at 2⁸.
+7. **Tier 1 sparse checkpoint index** and **Tier 3 succinct sorted array**
+   (Elias-Fano) — only if a true B-tree point-seek / random-access is ever
+   needed; the doc's honest ceiling is that the DAFSA cannot give O(log n)
+   arbitrary-value B-tree semantics, so prefer a complementary sorted structure
+   rather than bending the DAFSA.
+8. **Fine-grained invalidation** — currently coarse (rebuilds on any add/delete,
+   including duplicate-add / absent-delete / bad-arg). A precision improvement
+   would track only real structural changes; deferred because a DAFSA merge
+   restructures the DAG wholesale (incremental maintenance is infeasible in the
+   general case).
 
 ## References
 
