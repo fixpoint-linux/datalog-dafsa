@@ -100,6 +100,26 @@ Absent (a)/(b)/(c), the publish-once + `dl_query_bound` path is the right strate
 
 **Stage C — defer:** negation/aggregates (require full materialization of the negated/aggregated predicate).
 
+> **Status update (2026-08-16):** STAGE A + B are IMPLEMENTED and shipped as `dl_query_topdown` /
+> `dl_query_topdown_adorn` (commit `5cab7cf`), and STAGE C's *basic* negation/aggregates are verified
+> correct (tests only, commit `de8e991`) — the shared `magic_transform_adorn` soundness boundary +
+> the eval-clone's `dl_compile` materialization + `vm_exec_rule`'s `OP_NEG_CHECK`/`OP_AGG_*` execution
+> handle negation on EDB/non-closure-IDB and aggregates over EDB, agreeing with forward magic.  What
+> remains **deferred in STAGE C**:
+>
+> **ROADMAP (deferred): pointwise / stratified negation over recursive predicates.**
+> Negation (or an aggregate) whose body atom reads a predicate *in the adorned closure* is currently
+> REJECTED (both `dl_query_topdown` and `dl_query_magic` return -1), because a magic-seeded slice is
+> *not* the full complement of the predicate.  Making this work requires the SLG extension that
+> **evaluates the negated subquery to completion before the enclosing rule proceeds** — i.e. a
+> pointwise (SLG-style, per-subquery) negation where the complement is computed against the *finished*
+> memo of the negated closure predicate, not an in-progress partial.  This is a genuinely hard
+> top-down/SLG state-machine extension (cycle bookkeeping across the negation boundary; the negated
+> predicate's memo must be fully settled before any rule fires against it).  It is NOT the current
+> conservative REJECT, which is sound (an adorned-closure slice is not the full complement) and must
+> not be silently relaxed.  Do not attempt without (a) a concrete workload showing negated-recursive
+> queries matter, and (b) a design that preserves the never-silently-mis-evaluate invariant.
+
 **Correctness backstop (unchanged):** `top_down(Q) == filter(full_materialize(Q), Q)` byte-for-byte; property test over random graphs × random sources (200+ cases). Never silently mis-evaluate.
 
 **IMPLEMENTER TIER:** `pro-coder` (the design is the hard part; implementation is multi-step and correctness-sensitive — cycle bookkeeping, override stability, memo sort invariants are exactly the silent-wrong-answer risks this project prioritizes).

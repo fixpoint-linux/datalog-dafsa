@@ -373,4 +373,4 @@ Each milestone is independently testable. The first vertical slice (M0+M1) is on
 8. **Joins:** index-nested-loop via prefix-binding (primary), hash-join (fallback), **sort-merge rejected**.
 9. **Evaluation:** bottom-up semi-naive to fixpoint once per snapshot; point-lookup queries against materialized goal relations.
 10. **Lifecycle:** load -> declare -> compile -> publish-snapshot -> serve-reads; single writer, multi reader.
-11. **Deferred (v2):** magic-sets/QSQ top-down, bushy plans, time-travel, variable arity, negation/aggregates interaction. (IVM SHIPPED v2 Slices 0-5; trace/JIT REJECTED — see §10.8.)
+11. **Deferred (v2):** bushy plans, time-travel, variable arity, negation/aggregates interaction; and **pointwise / stratified negation over recursive predicates** (negation reading an adorned-closure predicate is currently REJECTED as unsound in both magic-sets paths — see `design/datalog-dafsa-topdown-magic.md` STAGE C). (IVM SHIPPED v2 Slices 0-5; magic-sets/QSQ top-down SHIPPED v2 as `dl_query_topdown`/`_adorn`, STAGE A+B+C verified; trace/JIT REJECTED — see §10.8.)

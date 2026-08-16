@@ -17,6 +17,14 @@ All notable changes to this project are documented in this file.
   `topdown == bound == magic` byte-for-byte.  This confirms the previously
   `deferred` STAGE C was already correct through the shared
   `magic_transform_adorn` + `dl_compile` + `vm_exec_rule` path.
+- **Roadmap: pointwise / stratified negation over recursive predicates
+  (deferred).**  Negation or an aggregate reading a predicate *in the adorned
+  closure* is currently REJECTED as unsound in both `dl_query_magic` and
+  `dl_query_topdown` (a magic-seeded slice is not the full complement).  Making
+  it work requires an SLG extension that evaluates the negated subquery to
+  completion before the enclosing rule proceeds.  Recorded in
+  `design/datalog-dafsa-topdown-magic.md` (STAGE C) and the architecture
+  roadmap; do not silently relax the current REJECT.
 - **v2 top-down / QSQ magic evaluation** (`dl_query_topdown` /
   `dl_query_topdown_adorn`): a goal-driven, memoized 4th per-query path that
   reuses the forward-magic adornment machinery (`magic_transform_adorn` +
