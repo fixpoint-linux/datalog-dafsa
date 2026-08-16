@@ -174,10 +174,16 @@ In rough priority order. ~~struck-through~~ items are implemented (commit noted)
    mirroring `dl_query`/`dl_query_bound`/`dl_pattern`).  A view-level
    subtree-count walk (`vendor/dafsa_view_rank.c`) covers the CSR + `final_bits`
    layout.  `dl_*_bound`/`dl_*_perm` remain in-memory-only (deferred).
-5. **Pull-based sorted iterator + merge-join** (`dl_iter_open` /
-   `iter_seek` / `iter_next` / `iter_close`) — the doc's original "concrete next
-   slice" and biggest lever for range scans / merge joins / order-by. It is
-   **independent** of Tier 2 (no seek primitive was needed for rank/select).
+5. ~~**Pull-based sorted iterator + merge-join**~~ — **implemented** (commit
+   `3a08ef2`). `dl_iter_open` / `dl_iter_seek` / `dl_iter_next` /
+   `dl_iter_arity` / `dl_iter_close` (src/iter.c) replace the callback
+   fire-and-forget `rel_prefix` with a **resumable explicit-stack DFS cursor**
+   yielding one lex-sorted tuple per `dl_iter_next` (end `0` vs error `-1`
+   never conflated; absent prefix ⇒ valid empty iterator; variadic rejected).
+   `dl_merge_join` is an O(n+m+out) equi-join on the first J columns
+   (one-token lookahead + right-run buffering, duplicate-preserving, sorted,
+   drains both iterators).  Snapshot path owns an mmap `dafsa_view`; live path
+   borrows `rel->d`.  Not yet wired into the VM (no OP code / order-by).
 6. **Automatic perm-index selection** — planner/cost pass; perms already exist,
    arity ≤ 8 caps candidate combinatorics at 2⁸.
 7. **Tier 1 sparse checkpoint index** and **Tier 3 succinct sorted array**

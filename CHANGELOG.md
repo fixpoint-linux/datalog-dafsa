@@ -5,6 +5,21 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **v2 DAFSA order-statistics — pull-based sorted iterator + merge-join**:
+  resumable pull cursor replacing the callback fire-and-forget `rel_prefix`
+  enumeration.  `dl_iter_open` / `dl_iter_seek` / `dl_iter_next` /
+  `dl_iter_arity` / `dl_iter_close` (new `src/iter.c`) walk the minimized DAFSA
+  with an explicit stack, yielding ONE lex-sorted (u32BE) tuple per
+  `dl_iter_next` (end `0` vs error `-1` never conflated; absent prefix ⇒ valid
+  empty iterator; variadic rejected loudly).  `dl_merge_join` is an
+  O(n+m+out) equi-join on the first J columns — one-token lookahead +
+  right-run buffering, duplicate-preserving, sorted output, drains both
+  iterators, early-stop returns partial count.  Snapshot routing: owns an mmap
+  `dafsa_view` (manifest_find_rel_ex + `dafsa_view_open`, not the LRU vcache);
+  live path borrows `rel->d` via the new `rel_dafsa` accessor.  Tests:
+  test_m13_iter.c (6/6) — pull==dl_prefix sorted, prefix bound k∈{0,1,2,arity},
+  re-seek, snapshot publish/mutate-live, error matrix, merge-join vs
+  brute-force with duplicates.
 - **v2 DAFSA order-statistics — snapshot (mmap `dafsa_view`) rank/select**:
   `dl_rank` / `dl_select` / `dl_range_count` / `dl_count` now route to the
   published mmap snapshot view when `db->snap_version > 0` (exclusive with the
