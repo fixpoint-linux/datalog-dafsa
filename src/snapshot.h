@@ -59,6 +59,24 @@ long view_pattern(void *view_handle, uint8_t arity,
                   const struct regex_dfa *dfa,
                   dl_tuple_cb cb, void *user);
 
+/* ─── View order-statistics (rank/select/range_count/count) ───────────── */
+
+/* Rank of a tuple (number of keys strictly lexicographically less than it)
+ * in the view's total order.  Returns 0 on error. */
+uint64_t view_rank(void *view_handle, uint8_t arity, const uint32_t *cols);
+
+/* Select the k-th (0-indexed) key; decode into cols_out.  Returns 0 on
+ * success, -1 on error (mirrors dl_select's 0/-1 contract). */
+int view_select(void *view_handle, uint8_t arity, uint64_t k,
+                uint32_t *cols_out);
+
+/* Number of keys in the half-open range [lo, hi).  Returns 0 on error. */
+uint64_t view_range_count(void *view_handle, uint8_t arity,
+                          const uint32_t *lo, const uint32_t *hi);
+
+/* Total number of keys in the view.  Returns 0 on error. */
+uint64_t view_count(void *view_handle);
+
 /* ─── Manifest helpers ────────────────────────────────────────────────── */
 
 /* Find a relation in a snapshot's manifest.txt, return arity in *arity_out.

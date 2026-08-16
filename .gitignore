@@ -29,6 +29,7 @@ build-tmp/
 /tests/test_lists
 /tests/test_m10_rank
 /tests/test_m11_range
+/tests/test_m12_snap_rank
 
 # scratch db dirs
 dl-test-*/

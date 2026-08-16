@@ -3,7 +3,8 @@
 _Design note. Status: **Tier 2 (order-statistics) implemented** — commit `20e93bb` (2026-08-16),
 **prefix-bound rank/select implemented** — commit `1b46922` (2026-08-16),
 **permuted order-statistics (`dl_*_perm`) implemented** — commit `3a9d448` (2026-08-16),
-**`range(X,Rel,Lo,Hi)` / `OP_RANGE` implemented** — commit `2724e31` (2026-08-16).
+**`range(X,Rel,Lo,Hi)` / `OP_RANGE` implemented** — commit `2724e31` (2026-08-16),
+**snapshot (`dafsa_view`) rank/select implemented** — (2026-08-16).
 The full feature remains partly proposed; this doc records the options, the recommended path, and
 the deferred follow-ups._
 
@@ -167,10 +168,12 @@ In rough priority order. ~~struck-through~~ items are implemented (commit noted)
    rank/select via `rel_range_each` (not the deferred pull-iterator).
    Two gates: `range` excluded from IVM/DRed/agg/magic/topdown, and `range`
    over a recursive-SCC relation rejected (stale-read).
-4. **Snapshot (mmap `dafsa_view`) rank/select** — the published-read path uses a
-   different layout (CSR + `state_off` + `final_bits`); needs a separate
-   subtree-count walk over the view. Until then `dl_rank`/`dl_select` operate
-   on the in-memory path only (materialize or `-1` when a snapshot is current).
+4. ~~**Snapshot (mmap `dafsa_view`) rank/select**~~ — **implemented**.
+   `dl_rank`/`dl_select`/`dl_range_count`/`dl_count` route to the published
+   mmap view when `db->snap_version > 0` (exclusive with the in-memory path,
+   mirroring `dl_query`/`dl_query_bound`/`dl_pattern`).  A view-level
+   subtree-count walk (`vendor/dafsa_view_rank.c`) covers the CSR + `final_bits`
+   layout.  `dl_*_bound`/`dl_*_perm` remain in-memory-only (deferred).
 5. **Pull-based sorted iterator + merge-join** (`dl_iter_open` /
    `iter_seek` / `iter_next` / `iter_close`) — the doc's original "concrete next
    slice" and biggest lever for range scans / merge joins / order-by. It is

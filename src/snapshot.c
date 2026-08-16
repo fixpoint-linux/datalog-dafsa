@@ -441,3 +441,82 @@ long view_pattern(void *view_handle, uint8_t arity,
     if (n < 0) return -1;
     return ctx.count;
 }
+
+/* ─── View order-statistics (rank/select/range_count/count) ───────────── */
+
+/* Encode arity u32 cols as u32BE + trailing 0x00 (4*arity+1 bytes),
+ * identical to relation.c encode_key. */
+static size_t view_encode_key(unsigned char *buf, const uint32_t *cols,
+                              uint8_t arity)
+{
+    uint8_t i;
+    for (i = 0; i < arity; i++) {
+        uint32_t v = cols[i];
+        buf[4*i]     = (unsigned char)((v >> 24) & 0xFF);
+        buf[4*i + 1] = (unsigned char)((v >> 16) & 0xFF);
+        buf[4*i + 2] = (unsigned char)((v >> 8)  & 0xFF);
+        buf[4*i + 3] = (unsigned char)(v & 0xFF);
+    }
+    buf[4 * arity] = 0x00;
+    return (size_t)(4 * arity + 1);
+}
+
+/* Rank of a tuple in the view's total order: the number of keys strictly
+ * lexicographically less than `cols`. */
+uint64_t view_rank(void *view_handle, uint8_t arity, const uint32_t *cols)
+{
+    dafsa_view *v = (dafsa_view *)view_handle;
+    unsigned char key[MAX_KEY_LEN];
+    size_t len;
+
+    if (!v || !cols) return 0;
+    if (arity > MAX_ARITY) return 0;
+    len = view_encode_key(key, cols, arity);
+    return dafsa_view_rank_n(v, key, len);
+}
+
+/* Select the k-th (0-indexed) key in the view's total order, decoding its
+ * u32 columns into cols_out.  Returns 0 on success, or -1 if k is out of
+ * range / on OOM (mirrors dl_select's 0/-1 contract). */
+int view_select(void *view_handle, uint8_t arity, uint64_t k,
+                uint32_t *cols_out)
+{
+    dafsa_view *v = (dafsa_view *)view_handle;
+    unsigned char key[MAX_KEY_LEN];
+    int n;
+
+    if (!v || !cols_out) return -1;
+    if (arity > MAX_ARITY) return -1;
+    n = dafsa_view_select_n(v, k, key, sizeof(key));
+    if (n < 0) return -1;
+    read_cols_be(cols_out, key, arity);
+    return 0;
+}
+
+/* Number of keys in the half-open range [lo, hi). */
+uint64_t view_range_count(void *view_handle, uint8_t arity,
+                          const uint32_t *lo, const uint32_t *hi)
+{
+    dafsa_view *v = (dafsa_view *)view_handle;
+    unsigned char lo_key[MAX_KEY_LEN], hi_key[MAX_KEY_LEN];
+    size_t lo_len, hi_len;
+
+    if (!v || !lo || !hi) return 0;
+    if (arity > MAX_ARITY) return 0;
+    lo_len = view_encode_key(lo_key, lo, arity);
+    hi_len = view_encode_key(hi_key, hi, arity);
+    return dafsa_view_range_count_n(v, lo_key, lo_len, hi_key, hi_len);
+}
+
+/* Total number of keys in the view (subtree count of the root). */
+uint64_t view_count(void *view_handle)
+{
+    dafsa_view *v = (dafsa_view *)view_handle;
+    uint64_t *counts = NULL;
+    uint64_t n;
+
+    if (!v) return 0;
+    n = dafsa_view_subtree_counts(v, &counts);
+    free(counts);
+    return n;
+}

@@ -1682,11 +1682,46 @@ static relation *ordstats_rel_ro(const dl_db *db, const char *rel_name,
     return db->rels[idx].rel;
 }
 
+/* Resolve the mmap snapshot view for a fixed-arity relation under the current
+ * snapshot (db->snap_version > 0).  Builds sdir = <db->dir>/snapshots/<ver>,
+ * looks the relation up in the manifest, and opens (or finds in the cache) its
+ * view.  Sets *arity_out and *variadic_out from the manifest.  Returns the
+ * view, or NULL on any error (NULL db/dir/rel_name, unknown rel).  Variadic is
+ * rejected by the caller. */
+static dafsa_view *snapshot_view_open_rel(dl_db *db, const char *rel_name,
+                                          uint8_t *arity_out,
+                                          int *variadic_out)
+{
+    char sdir[8192];
+
+    if (!db || !db->dir || !rel_name || !arity_out || !variadic_out)
+        return NULL;
+
+    snprintf(sdir, sizeof(sdir), "%s/snapshots/%u",
+             db->dir, db->snap_version);
+
+    if (!manifest_find_rel_ex(sdir, rel_name, arity_out, variadic_out))
+        return NULL;
+
+    return view_open_cached(db->vcache, rel_name, sdir);
+}
+
 uint64_t dl_rank(dl_db *db, const char *rel_name, const uint32_t *cols,
                  uint8_t arity)
 {
     relation *rel;
     if (!cols) return UINT64_MAX;
+
+    /* Snapshot path: route to the mmap view when a snapshot is current. */
+    if (db && db->snap_version > 0) {
+        dafsa_view *v;
+        uint8_t v_arity = 0;
+        int variadic = 0;
+        v = snapshot_view_open_rel(db, rel_name, &v_arity, &variadic);
+        if (!v || variadic || v_arity != arity) return UINT64_MAX;
+        return view_rank(v, arity, cols);
+    }
+
     rel = ordstats_rel_ro(db, rel_name, arity);
     if (!rel) return UINT64_MAX;
     return rel_rank(rel, cols);
@@ -1697,6 +1732,17 @@ int dl_select(dl_db *db, const char *rel_name, uint64_t k,
 {
     relation *rel;
     if (!cols_out) return -1;
+
+    /* Snapshot path: route to the mmap view when a snapshot is current. */
+    if (db && db->snap_version > 0) {
+        dafsa_view *v;
+        uint8_t v_arity = 0;
+        int variadic = 0;
+        v = snapshot_view_open_rel(db, rel_name, &v_arity, &variadic);
+        if (!v || variadic || v_arity != arity) return -1;
+        return view_select(v, arity, k, cols_out);
+    }
+
     rel = ordstats_rel_ro(db, rel_name, arity);
     if (!rel) return -1;
     return rel_select(rel, k, cols_out);
@@ -1707,6 +1753,17 @@ uint64_t dl_range_count(dl_db *db, const char *rel_name, const uint32_t *lo,
 {
     relation *rel;
     if (!lo || !hi) return UINT64_MAX;
+
+    /* Snapshot path: route to the mmap view when a snapshot is current. */
+    if (db && db->snap_version > 0) {
+        dafsa_view *v;
+        uint8_t v_arity = 0;
+        int variadic = 0;
+        v = snapshot_view_open_rel(db, rel_name, &v_arity, &variadic);
+        if (!v || variadic || v_arity != arity) return UINT64_MAX;
+        return view_range_count(v, arity, lo, hi);
+    }
+
     rel = ordstats_rel_ro(db, rel_name, arity);
     if (!rel) return UINT64_MAX;
     return rel_range_count(rel, lo, hi);
@@ -1805,6 +1862,18 @@ uint64_t dl_count(dl_db *db, const char *rel_name)
     relation *rel;
 
     if (!db || !rel_name) return UINT64_MAX;
+
+    /* Snapshot path: route to the mmap view when a snapshot is current. */
+    if (db->snap_version > 0) {
+        dafsa_view *v;
+        uint8_t v_arity = 0;
+        int variadic = 0;
+        v = snapshot_view_open_rel(db, rel_name, &v_arity, &variadic);
+        if (!v || variadic) return UINT64_MAX;
+        (void)v_arity;
+        return view_count(v);
+    }
+
     {
         int idx = find_rel(db, rel_name);
         if (idx < 0) return UINT64_MAX;

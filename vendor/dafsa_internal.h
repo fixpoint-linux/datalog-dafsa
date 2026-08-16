@@ -253,4 +253,15 @@ int           view_enum_dfs(const dafsa_view *v, uint32_t state,
                              unsigned char *buf, size_t depth,
                              dafsa_enum_cb cb, void *user, long *count);
 
+/* dafsa_view_rank.c — order-statistics over a zero-copy dafsa_view */
+uint64_t      dafsa_view_subtree_counts(const dafsa_view *v,
+                                        uint64_t **counts_out);
+uint64_t      dafsa_view_rank_n(const dafsa_view *v,
+                                const unsigned char *key, size_t len);
+int           dafsa_view_select_n(const dafsa_view *v, uint64_t k,
+                                  unsigned char *key_out, size_t key_cap);
+uint64_t      dafsa_view_range_count_n(const dafsa_view *v,
+                                       const unsigned char *lo, size_t lo_len,
+                                       const unsigned char *hi, size_t hi_len);
+
 #endif /* DAFSA_INTERNAL_H */

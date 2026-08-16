@@ -117,9 +117,10 @@ long dl_prefix(dl_db *db, const char *rel,
  * the declared arity.  u32BE key encoding => numeric order == lex order.
  * Returns the rank, or UINT64_MAX on error (NULL db/rel/cols, unknown rel,
  * arity mismatch, or a VARIADIC relation — variadic is rejected in this slice).
- * Operates on the in-memory relation (rel->d), NOT a published snapshot; when a
- * snapshot has been published the result reflects the current in-memory view
- * (the snapshot mmap path is not covered here). */
+ * When a snapshot has been published (db->snap_version > 0) this reads the
+ * mmap snapshot view, so the result reflects the PUBLISHED state even if the
+ * live in-memory relation has since been mutated; otherwise it reads the
+ * in-memory relation (rel->d). */
 uint64_t dl_rank(dl_db *db, const char *rel, const uint32_t *cols, uint8_t arity);
 
 /* The k-th tuple (0-indexed, lex order) written into cols_out (`arity` u32

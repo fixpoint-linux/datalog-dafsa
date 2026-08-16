@@ -5,6 +5,21 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **v2 DAFSA order-statistics — snapshot (mmap `dafsa_view`) rank/select**:
+  `dl_rank` / `dl_select` / `dl_range_count` / `dl_count` now route to the
+  published mmap snapshot view when `db->snap_version > 0` (exclusive with the
+  in-memory `rel->d` path, mirroring `dl_query`/`dl_query_bound`/`dl_pattern`),
+  so order-statistics work over a published snapshot.  New additive
+  `vendor/dafsa_view_rank.c` walks the view's CSR + `final_bits` with the same
+  distinct-key subtree-count recurrence (u64, state-0 sink, OOM-degrade);
+  `src/snapshot.c` `view_rank`/`view_select`/`view_range_count`/`view_count`
+  wrappers; `src/dl.c` `snapshot_view_open_rel` + `snap_version>0` routing.
+  Routing lives only at the public `dl_*` layer (internal VM-at-publish
+  evaluation of `rel_*` is untouched).  Tests: test_m12_snap_rank.c (6/6) —
+  publish rank/select/range/count over arities 1-4 + suffix-sharing
+  cross-product, snapshot-vs-live divergence + re-publish, empty snapshot,
+  rejections, no-publish in-memory routing.  `dl_*_bound`/`dl_*_perm` remain
+  in-memory-only (deferred).
 - **v2 DAFSA order-statistics — `range(X, Rel, Lo, Hi)` predicate / `OP_RANGE`**:
   a reserved builtin (the `member(X,L)` analog for relations) that is a
   GENERATOR (X unbound → bind X to each DISTINCT leading-column value of Rel in
