@@ -88,6 +88,15 @@ typedef enum {
                              pushing a frame that binds b to each element of
                              L in turn (mirrors OP_MAT_JOIN's frame).  L not a
                              list -> backtrack. */
+    OP_RANGE       = 25, /* RANGE (v2): a=lo slot, b=hi slot, c=X slot,
+                             imm=rel_id.  Rel must be EDB or NON-recursive IDB
+                             (rejected at compile time if in a recursive SCC —
+                             OP_RANGE reads db->rels[rel].rel directly, which
+                             the recursive fixpoint never updates).  If X (c)
+                             is bound: FILTER — Lo<=X<Hi AND rel_has_col0(rel,X);
+                             else: GENERATOR — push a frame binding X to each
+                             DISTINCT col0 value of Rel in [Lo,Hi), lex order
+                             (mirrors OP_LIST_MEMBER's frame). */
 } vm_opcode;
 
 typedef struct {

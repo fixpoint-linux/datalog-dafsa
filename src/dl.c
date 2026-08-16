@@ -140,6 +140,23 @@ int db_has_list_builtin(const dl_db *db)
     }
     return 0;
 }
+/* v2-range: 1 if ANY compiled rule emits the range predicate (OP_RANGE).
+ * Such programs are excluded from the incremental-maintenance classes
+ * (IVM/DRed/aggregates) and magic/topdown queries and always route to the
+ * full fixpoint — never silently mis-evaluated. */
+int db_has_range_builtin(const dl_db *db)
+{
+    int i, k;
+    if (!db) return 0;
+    for (i = 0; i < db->n_crules; i++) {
+        const compiled_rule *cr = db->crules[i];
+        for (k = 0; k < cr->n_instrs; k++) {
+            if (cr->instrs[k].op == OP_RANGE)
+                return 1;
+        }
+    }
+    return 0;
+}
 
 relation *db_entry_variant_ro(const rel_entry *e, uint8_t arity)
 {
@@ -2299,7 +2316,7 @@ long dl_query_magic(dl_db *db, const char *goal_rel,
     }
     /* v2-lists: list-builtin programs are outside the magic-sets class
      * (never silently mis-evaluated) — route to the full fixpoint. */
-    if (db_has_list_builtin(db)) {
+    if (db_has_list_builtin(db) || db_has_range_builtin(db)) {
         fprintf(stderr, "dl_query_magic: rejected: program uses a list "
                 "builtin (outside the magic-sets class)\n");
         return -1;
@@ -2358,7 +2375,7 @@ long dl_query_magic_adorn(dl_db *db, const char *goal_rel,
     }
     /* v2-lists: list-builtin programs are outside the magic-sets class
      * (never silently mis-evaluated) — route to the full fixpoint. */
-    if (db_has_list_builtin(db)) {
+    if (db_has_list_builtin(db) || db_has_range_builtin(db)) {
         fprintf(stderr, "dl_query_magic: rejected: program uses a list "
                 "builtin (outside the magic-sets class)\n");
         return -1;
@@ -2589,7 +2606,7 @@ long dl_query_topdown(dl_db *db, const char *goal_rel,
                 "variadic relation (outside the magic-sets class)\n");
         return -1;
     }
-    if (db_has_list_builtin(db)) {
+    if (db_has_list_builtin(db) || db_has_range_builtin(db)) {
         fprintf(stderr, "dl_query_topdown: rejected: program uses a list "
                 "builtin (outside the magic-sets class)\n");
         return -1;
@@ -2640,7 +2657,7 @@ long dl_query_topdown_adorn(dl_db *db, const char *goal_rel,
                 "variadic relation (outside the magic-sets class)\n");
         return -1;
     }
-    if (db_has_list_builtin(db)) {
+    if (db_has_list_builtin(db) || db_has_range_builtin(db)) {
         fprintf(stderr, "dl_query_topdown: rejected: program uses a list "
                 "builtin (outside the magic-sets class)\n");
         return -1;

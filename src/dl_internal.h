@@ -124,6 +124,10 @@ int db_has_variadic(const dl_db *db);
  * mis-evaluated.  List VALUES as pure data (a fact column holding a list
  * handle, with no list builtin) do NOT set this flag. */
 int db_has_list_builtin(const dl_db *db);
+/* 1 if ANY compiled rule emits OP_RANGE.  Such programs are excluded from
+ * the incremental-maintenance classes (IVM/DRed/aggregates) and magic/
+ * topdown queries and always route to the full fixpoint. */
+int db_has_range_builtin(const dl_db *db);
 
 /* READ resolution: for a fixed entry, the relation iff arity matches (else
  * NULL); for a variadic entry, variant[arity] WITHOUT materializing it

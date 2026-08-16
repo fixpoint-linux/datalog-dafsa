@@ -2,7 +2,8 @@
 
 _Design note. Status: **Tier 2 (order-statistics) implemented** — commit `20e93bb` (2026-08-16),
 **prefix-bound rank/select implemented** — commit `1b46922` (2026-08-16),
-**permuted order-statistics (`dl_*_perm`) implemented** — commit `3a9d448` (2026-08-16).
+**permuted order-statistics (`dl_*_perm`) implemented** — commit `3a9d448` (2026-08-16),
+**`range(X,Rel,Lo,Hi)` / `OP_RANGE` implemented** — (2026-08-16).
 The full feature remains partly proposed; this doc records the options, the recommended path, and
 the deferred follow-ups._
 
@@ -159,8 +160,13 @@ In rough priority order. ~~struck-through~~ items are implemented (commit noted)
    are just relations with their own `dafsa`, so they get subtree counts for
    free; a thin wrapper over the perm relation's dafsa gives order-by on any
    column prefix. `dl_db_declare_perm` now validates the perm is a bijection.
-3. **`OP_RANGE` VM opcode / range-aware aggregate** — consumes the
-   `dl_rank`/`dl_select` primitives for range predicates in Datalog rules.
+3. ~~**`OP_RANGE` VM opcode / range-aware aggregate**~~ — **implemented** as the
+   `range(X, Rel, Lo, Hi)` reserved builtin (a `member(X,L)` analog for
+   relations) lowered to an `OP_RANGE` opcode: generator (bind X to distinct
+   leading-column values in `[Lo,Hi)`) or filter.  Enumeration reuses
+   rank/select via `rel_range_each` (not the deferred pull-iterator).
+   Two gates: `range` excluded from IVM/DRed/agg/magic/topdown, and `range`
+   over a recursive-SCC relation rejected (stale-read).
 4. **Snapshot (mmap `dafsa_view`) rank/select** — the published-read path uses a
    different layout (CSR + `state_off` + `final_bits`); needs a separate
    subtree-count walk over the view. Until then `dl_rank`/`dl_select` operate

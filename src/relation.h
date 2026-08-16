@@ -214,6 +214,18 @@ long rel_prefix_base(const relation *rel,
                      const uint32_t *leading, uint8_t k,
                      rel_enum_cb cb, void *user);
 
+/* ─── Leading-column range enumeration ────────────────────────────────── */
+
+/* 1 iff the relation has a tuple whose FIRST column equals x, else 0. */
+int rel_has_col0(const relation *rel, uint32_t x);
+
+/* Enumerate each DISTINCT tuple whose first column v satisfies lo <= v < hi
+ * (half-open), calling cb(cols, arity, user) for each in lex order.  Returns
+ * the number of tuples enumerated, or -1 on error.  The caller dedups col0
+ * if it wants distinct col0 values (a relation is a set). */
+long rel_range_each(const relation *rel, uint32_t lo, uint32_t hi,
+                    rel_enum_cb cb, void *user);
+
 /* ─── Regex pattern walk ──────────────────────────────────────────────── */
 
 /* Forward declaration (full struct in regexwalk.h) */

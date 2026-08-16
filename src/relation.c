@@ -213,8 +213,8 @@ uint64_t rel_count_subtree(const relation *rel)
  * trans_find to the DAFSA state representing that bound.  Returns the state
  * index, or -1 if the prefix is not a prefix of any key.  k must be <= arity
  * and (when k > 0) leading non-NULL — validated by the caller. */
-static int rel_prefix_state(const relation *rel, const uint32_t *leading,
-                            uint8_t k)
+int rel_prefix_state(const relation *rel, const uint32_t *leading,
+                     uint8_t k)
 {
     unsigned int current;
     uint8_t i;
@@ -482,6 +482,57 @@ long rel_prefix_base(const relation *rel,
 {
     return rel_prefix_d(rel, rel ? rel->base : NULL, leading, k, cb, user);
 }
+
+/* ─── Leading-column range enumeration ─────────────────────────────────── */
+
+/* 1 iff the relation has a tuple whose FIRST column equals x.  Because col0
+ * is the most-significant u32BE bytes of every key, "some tuple has col0==x"
+ * ⟺ the 4-byte prefix [x] is a prefix of some fixed-width key ⟺
+ * rel_prefix_state(rel, &x, 1) >= 0. */
+int rel_has_col0(const relation *rel, uint32_t x)
+{
+    return rel_prefix_state(rel, &x, 1) >= 0;
+}
+
+/* Enumerate each DISTINCT tuple whose first column v satisfies lo <= v < hi
+ * (half-open), calling cb(cols, arity, user) for each in lex order.  Only the
+ * leading (col0) column is constrained; the remaining columns are free, so
+ * this enumerates full tuples — the caller dedups col0 if it wants distinct
+ * values.  Returns the number of tuples enumerated, or -1 on error (NULL
+ * rel/cb, or rank failure).  An empty range (hi <= lo) yields 0. */
+long rel_range_each(const relation *rel, uint32_t lo, uint32_t hi,
+                    rel_enum_cb cb, void *user)
+{
+    uint32_t lo_key[MAX_ARITY], hi_key[MAX_ARITY];
+    uint64_t r0, r1, k;
+    uint64_t count = 0;
+
+    if (!rel || !rel->d || !cb) return -1;
+    if (hi <= lo) return 0;
+
+    /* The half-open leading-column range [lo,hi) maps exactly to the full-key
+     * lex range [{lo,0,...,0},{hi,0,...,0}): col0 is the most-significant
+     * u32BE bytes, so all tuples with col0==v lex between those two keys. */
+    memset(lo_key, 0, sizeof(lo_key));
+    memset(hi_key, 0, sizeof(hi_key));
+    lo_key[0] = lo;
+    hi_key[0] = hi;
+
+    r0 = rel_rank(rel, lo_key);
+    r1 = rel_rank(rel, hi_key);
+    if (r0 == UINT64_MAX || r1 == UINT64_MAX) return -1;
+    if (r1 <= r0) return 0;
+
+    for (k = r0; k < r1; k++) {
+        uint32_t cols[MAX_ARITY];
+        if (rel_select(rel, k, cols) != 0) return -1;
+        count++;
+        if (cb(cols, rel->arity, user) != 0)
+            return (long)count;   /* early stop requested */
+    }
+    return (long)count;
+}
+
 
 /* ─── Bulk build from tuple set ──────────────────────────────────────── */
 

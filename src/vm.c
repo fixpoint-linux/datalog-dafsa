@@ -103,6 +103,33 @@ static void tbuf_free(tuple_buf *tb)
     free(tb->data);
     memset(tb, 0, sizeof(*tb));
 }
+/* OP_RANGE generator callback: push DISTINCT cols[0] values.  rel_range_each
+ * enumerates in lex order, so equal col0 values are CONTIGUOUS — dedup = skip
+ * any value equal to the last pushed.  Returns non-zero to stop (OOM). */
+struct range_ctx {
+    tuple_buf *tb;
+    uint32_t   last;
+    int        have;
+    int        oom;
+};
+static int range_col0_cb(const uint32_t *cols, uint8_t arity, void *user)
+{
+    struct range_ctx *rc = (struct range_ctx *)user;
+    uint32_t v = cols[0];
+    (void)arity;
+    if (rc->have && v == rc->last) return 0;   /* duplicate col0 */
+    if (rc->tb->count >= rc->tb->cap) {
+        long nc = rc->tb->cap ? rc->tb->cap * 2 : 4;
+        uint32_t *nd = realloc(rc->tb->data, (size_t)nc * sizeof(uint32_t));
+        if (!nd) { rc->oom = 1; return 1; }
+        rc->tb->data = nd;
+        rc->tb->cap = nc;
+    }
+    rc->tb->data[rc->tb->count++] = v;
+    rc->last = v;
+    rc->have = 1;
+    return 0;
+}
 
 /* ─── Bindings ────────────────────────────────────────────────────────── */
 
@@ -1355,6 +1382,74 @@ static long exec_range(dl_db *db, const compiled_rule *cr,
             }
         }
 
+        /* ── OP_RANGE: leading-column range membership / generator (v2) ──
+         * a=lo slot, b=hi slot, c=X slot, imm=rel_id.  Rel must be EDB or
+         * NON-recursive IDB (compiler gate rejects recursive SCCs —
+         * OP_RANGE reads db->rels[rel].rel directly, which the fixpoint
+         * never updates).  If X (c) is bound: FILTER — Lo<=X<Hi AND
+         * rel_has_col0(rel,X); else GENERATOR pushing a frame (mirror
+         * OP_LIST_MEMBER) that binds X to each DISTINCT col0 value of Rel
+         * in [Lo,Hi), lex order. */
+        case OP_RANGE: {
+            relation *r = (in->imm < (uint32_t)db->nrels &&
+                           db->rels[in->imm].kind == RELK_FIXED)
+                              ? db->rels[in->imm].rel : NULL;
+            if (!r) {
+                if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
+                break;
+            }
+            uint32_t lo = b_get(&b, in->a);
+            uint32_t hi = b_get(&b, in->b);
+            if (b_ok(&b, in->c)) {
+                /* X bound: membership FILTER. */
+                uint32_t xv = b_get(&b, in->c);
+                if (xv < lo || xv >= hi || !rel_has_col0(r, xv)) {
+                    if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
+                    break;
+                }
+                ip++;
+                break;
+            }
+            /* X unbound: GENERATOR — push a frame of distinct col0 values. */
+            if (sp >= MAX_FRAMES) return -1;
+            {
+                vm_frame *f = &frames[sp];
+                struct range_ctx rc;
+                f->ip = ip;
+                f->op = OP_RANGE;   /* backtrack treats sc == 0 */
+                f->idx = 0;
+                f->perm = NULL;
+                memset(&f->tuples, 0, sizeof(f->tuples));
+                f->tuples.arity = 1;
+                f->tuples.cap = 4;
+                f->tuples.data = malloc((size_t)f->tuples.cap * sizeof(uint32_t));
+                if (!f->tuples.data) return -1;
+                rc.tb = &f->tuples;
+                rc.last = 0;
+                rc.have = 0;
+                rc.oom = 0;
+                if (rel_range_each(r, lo, hi, range_col0_cb, &rc) < 0) {
+                    tbuf_free(&f->tuples);
+                    return -1;
+                }
+                if (rc.oom) { tbuf_free(&f->tuples); return -1; }
+                if (f->tuples.count == 0) {
+                    tbuf_free(&f->tuples);
+                    if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
+                    break;
+                }
+                b_save(&f->saved, &b);
+                if (!seek_valid(f, in, 0, 1, &b)) {
+                    tbuf_free(&f->tuples);
+                    if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
+                    break;
+                }
+                sp++;
+                ip++;
+                break;
+            }
+        }
+
         /* ── OP_PROJECT: emit / commit tuple ──────────────────────── */
         case OP_PROJECT: {
             if (capture) {
@@ -1802,6 +1897,52 @@ static int eval_stratum_recursive(dl_db *db, compiled_rule **rules, int n,
             relation *rel = (relation *)db_rel(db, rd[i].rel_id);
             if (rel)
                 rel_prefix(rel, NULL, 0, ts_sink_cb, &rd[i].idb);
+        }
+    }
+
+    /* DEEP-REVIEW FIX (pre-existing ordering bug): non-recursive rules in a
+     * recursive stratum must run to a FIXPOINT, not a single parse-order
+     * pass.  A chain q:-p, p:-e sharing this stratum silently mis-orders
+     * otherwise (q reads p before p's rule has fired), and a RECURSIVE
+     * rule's base seed can read a same-stratum non-recursive producer
+     * before it is materialized.  The M2.1 strict bump guarantees these
+     * rules never depend on the recursive SCC itself, so they form a DAG
+     * over lower strata and this loop converges in at most n passes
+     * (mirrors eval_nonrecursive). */
+    {
+        int pass;
+        for (pass = 0; pass <= n; pass++) {
+            int changed_nr = 0;
+            for (i = 0; i < n; i++) {
+                compiled_rule *cr = rules[i];
+                long m;
+                if (cr->is_recursive) continue;
+                m = exec_rule(db, cr, NULL, 0,
+                              0 /* commit */, NULL, NULL);
+                if (m < 0) {
+                    for (ri = 0; ri < nr; ri++) {
+                        ts_free(&rd[ri].idb);
+                        ts_free(&rd[ri].delta);
+                        ts_free(&rd[ri].next_delta);
+                    }
+                    free(rd);
+                    return -1;
+                }
+                if (m > 0) {
+                    changed_nr = 1;
+                    permindex_mark_dirty(db, cr->head_rel_id);
+                    if (permindex_build_dirty(db) != 0) {
+                        for (ri = 0; ri < nr; ri++) {
+                            ts_free(&rd[ri].idb);
+                            ts_free(&rd[ri].delta);
+                            ts_free(&rd[ri].next_delta);
+                        }
+                        free(rd);
+                        return -1;
+                    }
+                }
+            }
+            if (!changed_nr) break;  /* non-recursive fixpoint reached */
         }
     }
 
@@ -2485,7 +2626,8 @@ int vm_ivm_eligible(dl_db *db)
     /* v2: any program containing a variadic relation is OUTSIDE the
      * incremental classes (mixed-arity facts defeat the single-arity
      * delta_pending model) — always route to the full fixpoint. */
-    if (!db || db_has_variadic(db) || db_has_list_builtin(db)) return 0;
+    if (!db || db_has_variadic(db) || db_has_list_builtin(db) ||
+            db_has_range_builtin(db)) return 0;
 
     memset(is_rule_head, 0, sizeof(is_rule_head));
     memset(is_rec_head, 0, sizeof(is_rec_head));
@@ -2755,7 +2897,8 @@ int vm_dred_eligible(dl_db *db)
 {
     int i, k;
     /* v2: variadic programs are outside DRed (see vm_ivm_eligible). */
-    if (!db || db_has_variadic(db) || db_has_list_builtin(db)) return 0;
+    if (!db || db_has_variadic(db) || db_has_list_builtin(db) ||
+            db_has_range_builtin(db)) return 0;
     for (i = 0; i < db->n_crules; i++) {
         const compiled_rule *cr = db->crules[i];
         /* Recursion: retracting a recursive SCC's mutually-dependent tuples
@@ -3253,7 +3396,8 @@ int vm_agg_eligible(dl_db *db)
 
     /* v2: variadic programs are outside aggregate IVM (aggregates over a
      * variadic relation are additionally a COMPILE error). */
-    if (!db || db_has_variadic(db) || db_has_list_builtin(db)) return 0;
+    if (!db || db_has_variadic(db) || db_has_list_builtin(db) ||
+            db_has_range_builtin(db)) return 0;
 
     memset(is_head, 0, sizeof(is_head));
     memset(agg_head, 0, sizeof(agg_head));

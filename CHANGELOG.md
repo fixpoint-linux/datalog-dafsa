@@ -5,6 +5,35 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **v2 DAFSA order-statistics — `range(X, Rel, Lo, Hi)` predicate / `OP_RANGE`**:
+  a reserved builtin (the `member(X,L)` analog for relations) that is a
+  GENERATOR (X unbound → bind X to each DISTINCT leading-column value of Rel in
+  the half-open range `[Lo,Hi)`, lex order) or FILTER (X bound). Lowered to a
+  new `OP_RANGE` opcode. Enumeration reuses the shipped rank/select via a new
+  `rel_range_each` (bounded scan; does NOT pull in the deferred pull-iterator).
+  Range is on the leading column (col0). Two correctness gates: (1) `range`
+  programs excluded from IVM/DRed/agg/magic/topdown (7 sites); (2) recursive-
+  staleness — `range` over a recursive-SCC relation is REJECTED (OP_RANGE reads
+  `rel->d` directly, which the recursive fixpoint never updates). Tests:
+  test_m11_range.c (6/6) — generator/filter/arity-2 dedup/edge cases/random
+  oracle/reject matrix.
+- **v2 stratification correctness fixes** (found by deep-review of the range
+  feature; both are PRE-EXISTING silent-wrong-answer bugs, now closed):
+  - `range`'s target-Rel dependency was invisible to `compute_strata`
+    (`ba->pred`="range", real read target in `args[1]`) — a range rule over a
+    non-recursive IDB silently mis-evaluated. Fixed: strict (is_neg=1) edge
+    Rel→head for range atoms, so the range rule lands in a strictly higher
+    stratum than its target.
+  - `eval_stratum_recursive` ran non-recursive rules in a SINGLE parse-order
+    pass (no fixpoint) — a non-recursive chain sharing a recursive stratum was
+    silently mis-ordered (reproducible WITHOUT range: `q:-p, p:-e` in a
+    recursive stratum → q empty). Fixed: non-recursive rules in a recursive
+    stratum now loop to a fixpoint (mirrors eval_nonrecursive).
+  - `compute_strata` strict-cycle: a strict edge on a cycle ping-ponged to the
+    10000-iteration cap and exited with changed=1, and the post-hoc check
+    caught it only for SOME rule orders — a strict cycle could be silently
+    mis-evaluated. Fixed: exiting the cap with changed still set is now a loud
+    "unstratifiable program" error (both fixpoint loops).
 - **v2 DAFSA order-statistics — permuted rank/select** (`dl_rank_perm` /
   `dl_select_perm` / `dl_range_count_perm`): rank/select/range_count over a
   PERMUTED view of a relation (order-by on a non-leading column).  The

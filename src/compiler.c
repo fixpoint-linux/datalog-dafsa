@@ -529,12 +529,23 @@ static int is_list_builtin(const atom *a)
     return is_list_producing(a) || is_list_filter(a);
 }
 
+/* v2-range: RANGE builtin `range(X, Rel, Lo, Hi)` — a bare function-call atom
+ * (NOT `VAR = range(...)`).  args[0] is the member variable X (which the VM
+ * either tests or GENERATES from the distinct leading-column values of Rel in
+ * [Lo,Hi)), args[1] is a TOK_IDENT RELATION NAME resolved via db_find_rel,
+ * args[2]/args[3] are the half-open bounds (TOK_VAR|TOK_INT). */
+static int is_range_builtin(const atom *a)
+{
+    if (!a || !a->pred) return 0;
+    return strcmp(a->pred, "range") == 0;
+}
+
 /* any non-relational builtin (equality / comparison / arithmetic / string /
- * list) */
+ * list / range) */
 static int is_builtin_pred(const atom *a)
 {
     return is_equality(a) || is_comparison(a) || is_arith(a) ||
-           is_str_builtin(a) || is_list_builtin(a);
+           is_str_builtin(a) || is_list_builtin(a) || is_range_builtin(a);
 }
 
 /* v2-lists FIX-2: is `name` a reserved BUILTIN predicate name?  These names
@@ -552,7 +563,7 @@ static int is_reserved_builtin_name(const char *name)
            strcmp(name, "concat") == 0 || strcmp(name, "length") == 0 ||
            strcmp(name, "lower") == 0 || strcmp(name, "upper") == 0 ||
            strcmp(name, "prefix") == 0 || strcmp(name, "suffix") == 0 ||
-           strcmp(name, "contains") == 0;
+           strcmp(name, "contains") == 0 || strcmp(name, "range") == 0;
 }
 
 /* A string-builtin operand token must be TOK_VAR or TOK_IDENT (a string
@@ -632,6 +643,32 @@ static int list_builtin_valid(const atom *a)
     if (a->args[0]->kind != TOK_VAR) return 0;
     for (i = 1; i < need; i++)
         if (!list_operand_ok(a->args[i])) return 0;
+    return 1;
+}
+
+/* A range builtin operand token must be a variable or an integer constant. */
+static int range_operand_ok(const token *t)
+{
+    return t && (t->kind == TOK_VAR || t->kind == TOK_INT);
+}
+
+/* Validate the shape of a `range(X, Rel, Lo, Hi)` builtin: exactly 4 args;
+ * X a variable; Rel a TOK_IDENT resolved (via db_find_rel) to a known,
+ * non-variadic relation of arity >= 1; Lo/Hi a variable or int constant.
+ * Returns 1 if well-formed, 0 otherwise (caller rejects loudly). */
+static int range_builtin_valid(dl_db *db, const atom *a)
+{
+    int ri;
+    if (!a || !a->pred || !db) return 0;
+    if (a->nargs != 4) return 0;
+    if (a->args[0]->kind != TOK_VAR) return 0;      /* X must be a variable */
+    if (a->args[1]->kind != TOK_IDENT) return 0;    /* Rel must be a NAME */
+    if (!range_operand_ok(a->args[2])) return 0;    /* Lo bound */
+    if (!range_operand_ok(a->args[3])) return 0;    /* Hi bound */
+    ri = db_find_rel(db, a->args[1]->text);
+    if (ri < 0) return 0;                           /* unknown relation */
+    if (db_rel_is_variadic(db, ri)) return 0;       /* RELK_VARIADIC */
+    if (db_rel_arity(db, ri) < 1) return 0;         /* range needs col0 */
     return 1;
 }
 
@@ -880,6 +917,30 @@ static int member_operand_bound(const atom *a, v_tab *vt,
     return 1;
 }
 
+/* require the Lo (args[2]) and Hi (args[3]) bound operands of `range` to be
+ * bound.  X (args[0]) may be unbound — the VM then GENERATES it from Rel's
+ * distinct col0 values in [Lo,Hi).  args[1] is a relation NAME (never a var). */
+static int range_operands_bound(const atom *a, v_tab *vt,
+                                const int *bound_vars,
+                                const char *head_pred)
+{
+    int j;
+    for (j = 2; j <= 3; j++) {
+        token *t = a->args[j];
+        int vi;
+        if (t->kind != TOK_VAR) continue;   /* int constant is always bound */
+        vi = v_find(vt, t->text);
+        if (vi < 0 || !bound_vars[vi]) {
+            fprintf(stderr,
+                    "compile error: ungrounded range bound — variable "
+                    "'%s' in 'range' is not bound by a positive body atom "
+                    "(rule '%s')\n", t->text, head_pred);
+            return 0;
+        }
+    }
+    return 1;
+}
+
 /* require every VARIABLE operand of a string filter (args[0..1]) to be
  * bound; returns 0 on the first unbound operand (with a diagnostic),
  * 1 if all bound. */
@@ -971,6 +1032,19 @@ static int compute_strata(dl_db *db, rule **rules, int n_rules,
         int bi;
         for (bi = 0; bi < r->nbody; bi++) {
             atom *ba = r->body[bi];
+            /* v2-range: `range(X, Rel, Lo, Hi)` reads Rel via an ARGUMENT,
+             * so ba->pred ("range") is not the relation and the dependency on
+             * Rel is invisible to the edge collection below.  Add a STRICT
+             * (is_neg=1) edge Rel -> head so the range rule lands in a
+             * strictly higher stratum than Rel: Rel is always fully
+             * materialized (rel->d) before OP_RANGE reads it, never stale. */
+            if (is_range_builtin(ba) && ba->nargs >= 2 &&
+                ba->args[1] && ba->args[1]->kind == TOK_IDENT) {
+                int rel_ri = db_find_rel(db, ba->args[1]->text);
+                if (rel_ri >= 0)
+                    ADD_EDGE(rel_ri, head_ri, 1);
+                continue;   /* range is a builtin, not a relational atom */
+            }
             int body_ri = db_find_rel(db, ba->pred);
             if (body_ri < 0) continue;
             ADD_EDGE(body_ri, head_ri, ba->negated);
@@ -1001,6 +1075,22 @@ static int compute_strata(dl_db *db, rule **rules, int n_rules,
         }
         iteration++;
     } while (changed && iteration < 10000);
+
+    /* v2-range / deep-review FIX: the fixpoint only fails to converge when a
+     * STRICT edge (negation, or range's Rel->head edge) sits on a CYCLE —
+     * the ping-pong then runs to the iteration cap and exits with changed=1.
+     * The post-hoc stratum[to]<=stratum[from] check below only catches this
+     * for SOME rule orders (parity of the last update), so a strict cycle
+     * can slip through and be silently mis-evaluated.  Exiting at the cap
+     * with changed still set IS unstratifiable: report it loudly. */
+    if (changed) {
+        fprintf(stderr,
+                "compile error: unstratifiable program — stratification "
+                "fixpoint did not converge (strict dependency cycle through "
+                "negation or range)\n");
+        free(self_loop); free(edges); free(stratum);
+        return -1;
+    }
 
     /* ── Kosaraju SCC on positive subgraph ────────────────────────── */
     /* Build adjacency list for positive edges only */
@@ -1232,6 +1322,20 @@ static int compute_strata(dl_db *db, rule **rules, int n_rules,
             }
             iter2++;
         } while (changed && iter2 < 10000);
+
+        /* v2-range / deep-review FIX (second strict-cycle cap): same as the
+         * first loop — exiting the M2.1 bump at the iteration cap with
+         * changed still set is an unstratifiable strict cycle; report it
+         * loudly rather than silently under-stratifying. */
+        if (changed) {
+            fprintf(stderr,
+                    "compile error: unstratifiable program — stratification "
+                    "fixpoint did not converge (strict dependency cycle "
+                    "through negation or range)\n");
+            free(comp); comp = NULL;
+            free(self_loop); free(edges); free(stratum);
+            return -1;
+        }
     }
 
     free(comp);
@@ -1699,7 +1803,8 @@ static int emit_join(emit_ctx *ec, const int *atoms, int n,
 
 /* ─── Compile one rule ──────────────────────────────────────────────── */
 
-static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
+static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata,
+                                  const int *recursive)
 {
     v_tab vt; i_buf ib; compiled_rule *cr = NULL;
     int head_ri, *bri = NULL, bi, i, j;
@@ -1893,6 +1998,35 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
                         "operand) (rule '%s')\n", ba->pred, r->head->pred);
                 goto fail;
             }
+            /* v2-range: validate `range(X, Rel, Lo, Hi)` — 4 args, X a
+             * variable, Rel a known non-variadic arity>=1 relation name,
+             * Lo/Hi variable-or-int bounds.  Rejects unknown/variadic/empty
+             * relations loudly (never silently mis-evaluate). */
+            if (is_range_builtin(ba) && !range_builtin_valid(db, ba)) {
+                fprintf(stderr, "compile error: malformed range builtin "
+                        "'%s' (expected range(X, Rel, Lo, Hi): X a variable, "
+                        "Rel a known non-variadic arity>=1 relation, Lo/Hi "
+                        "variable-or-int bounds) (rule '%s')\n",
+                        ba->pred, r->head->pred);
+                goto fail;
+            }
+            /* RECURSIVE-STALENESS GATE: OP_RANGE reads db->rels[rel].rel
+             * directly, which the recursive fixpoint NEVER updates (the
+             * idb grows in tuple_sets, not rel->d) — range over a RECURSIVE
+             * relation would read a STALE view and silently mis-evaluate.
+             * Range over EDB and non-recursive IDB is safe (materialized
+             * before the range rule, same read-point as OP_SCAN). */
+            if (is_range_builtin(ba)) {
+                int rr = db_find_rel(db, ba->args[1]->text);
+                if (rr >= 0 && recursive && recursive[rr]) {
+                    fprintf(stderr, "compile error: range over recursive "
+                            "relation '%s' is not supported (OP_RANGE reads "
+                            "the idb directly, which the fixpoint never "
+                            "updates) (rule '%s')\n", ba->args[1]->text,
+                            r->head->pred);
+                    goto fail;
+                }
+            }
             bri[bi] = -1; continue;
         }
         /* v2-lists: a NEGATED relational atom cannot destructure a list
@@ -2013,12 +2147,12 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
                 continue;
             }
             if (is_arith(ba) || is_comparison(ba) || is_str_builtin(ba) ||
-                is_list_builtin(ba)) {
+                is_list_builtin(ba) || is_range_builtin(ba)) {
                 /* builtins execute AFTER the relational phase (NEG_CHECK runs
                  * during it), so their vars are NOT bound for negation-safety
                  * purposes — a negated atom cannot safely read an arithmetic /
-                 * string-builtin result var or a comparison / string-filter
-                 * operand. */
+                 * string-builtin result var or a comparison / string-filter /
+                 * range operand. */
                 continue;
             }
             if (ba->negated) {
@@ -2145,6 +2279,16 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
                     int vi = v_find(&vt, ba->args[0]->text);
                     if (vi >= 0) bound_vars[vi] = 1;
                 }
+            } else if (is_range_builtin(ba)) {
+                /* range(X, Rel, Lo, Hi): Lo/Hi must be bound (X may be unbound
+                 * → GENERATED by the VM from Rel's distinct col0 in [Lo,Hi)).
+                 * Range runs in the producer phase (it binds X). */
+                if (!range_operands_bound(ba, &vt, bound_vars, r->head->pred))
+                    goto fail;
+                {
+                    int vi = v_find(&vt, ba->args[0]->text);
+                    if (vi >= 0) bound_vars[vi] = 1;
+                }
             }
         }
         /* (d) FILTERS: comparisons + string filters.  All variable operands
@@ -2264,7 +2408,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
             int list_driver = 0;
             for (bi = 0; bi < r->nbody; bi++) {
                 atom *ba = r->body[bi];
-                if (is_list_filter(ba)) { list_driver = 1; break; }
+                if (is_list_filter(ba) || is_range_builtin(ba)) { list_driver = 1; break; }
                 if (is_list_assign(ba) && ba->args[1]->kind != TOK_VAR) {
                     list_driver = 1; break;
                 }
@@ -2316,7 +2460,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
             int list_driver = 0;
             for (bi = 0; bi < r->nbody; bi++) {
                 atom *ba = r->body[bi];
-                if (is_list_filter(ba)) { list_driver = 1; break; }
+                if (is_list_filter(ba) || is_range_builtin(ba)) { list_driver = 1; break; }
                 if (is_list_assign(ba) && ba->args[1]->kind != TOK_VAR) {
                     list_driver = 1; break;
                 }
@@ -2781,6 +2925,32 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata)
                 m->slots[0] = vt.e[xvi].slot;   /* generator bind target */
                 m->body_idx = (uint8_t)bi;
             }
+        } else if (is_range_builtin(ba)) {
+            /* range(X, Rel, Lo, Hi): a=lo slot, b=hi slot, c=X slot,
+             * imm=rel_id.  Lo/Hi materialized (constants via OP_EQ_CONST)
+             * or bound by an earlier relational atom; the VM tests X against
+             * Rel's distinct col0 values in [Lo,Hi) when X is bound, else
+             * GENERATES X from them (a producer, like member). */
+            if (ba->negated) continue;  /* negated builtin already rejected */
+            {
+                int los = cmp_operand_slot(db, ba->args[2], &vt, &ib, &cc, 0);
+                int his = cmp_operand_slot(db, ba->args[3], &vt, &ib, &cc, 0);
+                int xvi, rri;
+                vm_instr *m;
+                if (los < 0 || his < 0) goto fail;
+                xvi = v_find(&vt, ba->args[0]->text);
+                rri = db_find_rel(db, ba->args[1]->text);
+                if (xvi < 0 || rri < 0) goto fail;
+                m = i_emit(&ib);
+                if (!m) goto fail;
+                m->op = OP_RANGE;
+                m->a = (uint8_t)los;            /* lo slot */
+                m->b = (uint8_t)his;            /* hi slot */
+                m->c = vt.e[xvi].slot;          /* X var slot */
+                m->imm = (uint32_t)rri;         /* rel_id */
+                m->slots[0] = vt.e[xvi].slot;   /* generator bind target */
+                m->body_idx = (uint8_t)bi;
+            }
         }
     }
 
@@ -2988,7 +3158,7 @@ int compile_rules(dl_db *db, rule **rules, int n_rules,
         if (!c) { free(recursive); free(rel_strata); return -1; }
         *out_n = 0;
         for (i = 0; i < n_rules; i++) {
-            c[i] = compile_one(db, rules[i], rel_strata);
+            c[i] = compile_one(db, rules[i], rel_strata, recursive);
             if (!c[i]) {
                 int j; for (j = 0; j < i; j++) compiled_rule_free(c[j]);
                 free(c); free(recursive); free(rel_strata); return -1;
