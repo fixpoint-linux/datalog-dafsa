@@ -3233,11 +3233,9 @@ int dl_db_declare_perm(dl_db *db, int rel_id, uint8_t arity,
     }
 
     /* Check for duplicate: same rel_id + same perm */
-    for (i = 0; i < db->n_perms; i++) {
-        if (db->perms[i].rel_id == rel_id &&
-            db->perms[i].arity == arity &&
-            memcmp(db->perms[i].perm, perm, arity) == 0)
-            return i;  /* return existing perm_id */
+    {
+        int existing = dl_db_find_perm(db, rel_id, arity, perm);
+        if (existing >= 0) return existing;  /* return existing perm_id */
     }
 
     i = db->n_perms++;
@@ -3247,6 +3245,23 @@ int dl_db_declare_perm(dl_db *db, int rel_id, uint8_t arity,
     db->perms[i].pidx_rel = NULL;
     db->perms[i].dirty    = 1;  /* build on next exec */
     return i;
+}
+
+int dl_db_find_perm(dl_db *db, int rel_id, uint8_t arity, const uint8_t perm[8])
+{
+    int i;
+
+    if (!db || rel_id < 0 || arity == 0 || arity > 8) return -1;
+
+    /* Same dedup predicate as dl_db_declare_perm, but read-only: return the
+     * matching perm_id or -1, never allocating a new table slot. */
+    for (i = 0; i < db->n_perms; i++) {
+        if (db->perms[i].rel_id == rel_id &&
+            db->perms[i].arity == arity &&
+            memcmp(db->perms[i].perm, perm, arity) == 0)
+            return i;
+    }
+    return -1;
 }
 
 const uint8_t *dl_db_get_perm(dl_db *db, int rel_id, int perm_id)
@@ -3261,6 +3276,12 @@ struct relation *dl_db_get_perm_rel(dl_db *db, int rel_id, int perm_id)
     if (!db || perm_id < 0 || perm_id >= db->n_perms) return NULL;
     if (db->perms[perm_id].rel_id != rel_id) return NULL;
     return db->perms[perm_id].pidx_rel;
+}
+
+int dl_db_perm_count(const dl_db *db)
+{
+    if (!db) return 0;
+    return db->n_perms;
 }
 
 /* ─── Fault hook registration ──────────────────────────────────────────── */

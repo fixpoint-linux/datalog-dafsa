@@ -37,6 +37,13 @@ typedef struct {
 int dl_db_declare_perm(struct dl_db *db, int rel_id, uint8_t arity,
                        const uint8_t perm[8]);
 
+/* Look up an existing permutation index (rel_id + arity + perm) WITHOUT
+ * declaring a new one.  Returns the existing perm_id, or -1 if absent
+ * (including on any invalid input).  Never mutates the perm table, so it is
+ * safe to probe for reuse before deciding whether to declare. */
+int dl_db_find_perm(struct dl_db *db, int rel_id, uint8_t arity,
+                    const uint8_t perm[8]);
+
 /* Return the perm array for a given rel_id + perm_id, or NULL. */
 const uint8_t *dl_db_get_perm(struct dl_db *db, int rel_id, int perm_id);
 

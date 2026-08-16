@@ -479,9 +479,9 @@ static void test_t8_publish_with_perms(void)
         assert(loaded == 3);
     }
     {
-        uint32_t rows[] = {10,2, 10,4, 20,6};
-        loaded = load_rows_csv(db, "e", 2, rows, 3);
-        assert(loaded == 3);
+        uint32_t rows[] = {10,2, 10,4, 20,6, 30,8};
+        loaded = load_rows_csv(db, "e", 2, rows, 4);
+        assert(loaded == 4);
     }
 
     assert(dl_load_rules(db,

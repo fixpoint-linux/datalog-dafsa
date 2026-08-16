@@ -152,4 +152,24 @@ void compiled_rule_free(compiled_rule *cr);
 extern int g_bushy;
 extern int g_reorder;
 
+/*
+ * Automatic perm-index selection (M6-permsel).
+ *
+ * g_perm_select (default 1): auto-declare and use OP_LOOKUP_PERM indices for
+ * non-leading-column joins according to the cost model in emit_nonleading_join.
+ * Set to 0 to force the OP_HASH_JOIN fallback (the oracle-equivalence
+ * backstop — never builds a new perm index).  A recursive IDB body atom ALWAYS
+ * uses OP_LOOKUP_PERM regardless of this flag (hash-joining it would read a
+ * stale DAFSA and silently mis-evaluate).
+ *
+ * g_perm_card_threshold (default 4): minimum relation cardinality before a
+ * perm index is deemed worth building.  Below it, non-leading joins use
+ * OP_HASH_JOIN.  Only a performance hint — output is identical either way.
+ *
+ * Both are plain globals so tests can flip them directly, mirroring
+ * g_bushy/g_reorder.  They must be set BEFORE dl_compile; they are read at
+ * compile time and are NOT thread-safe (single-threaded library). */
+extern int g_perm_select;
+extern int g_perm_card_threshold;
+
 #endif

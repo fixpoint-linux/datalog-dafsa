@@ -298,6 +298,8 @@ typedef struct {
     long      idx;      /* current position in tuples */
     bindings  saved;    /* bindings snapshot at frame entry */
     const uint8_t *perm; /* M6: permutation array for OP_LOOKUP_PERM, NULL otherwise */
+    uint8_t   perm_storage[8]; /* M6-permsel: frame-local perm for OP_HASH_JOIN;
+                                  f->perm points here so it survives backtrack() */
 } vm_frame;
 
 /* ─── Override ────────────────────────────────────────────────────────── */
@@ -785,18 +787,17 @@ static long exec_range(dl_db *db, const compiled_rule *cr,
 
         /* ── OP_HASH_JOIN: in-frame hash join (M6) ────────────────── */
         case OP_HASH_JOIN: {
-            /* For now, OP_HASH_JOIN is emitted for recursive IDB body
-             * atoms with non-leading joins when no perm index is available.
-             * We materialize both sides and hash-join.
+            /* M6-permsel: OP_HASH_JOIN is the slot-free fallback for non-leading
+             * joins when no perm index is worth building (small rel) or the perm
+             * table is full.  We materialize the relation and hash-join.
              *
-             * Layout: a=rel_id, b=k (shared cols), c=arity, imm=perm_id,
-             *   slots[c] = slot for original col c. */
+             * Layout: a=rel_id, b=k (shared cols), c=arity, imm=PACKED permutation
+             *   (3 bits/col, LSB-first), slots[c] = slot for original col c. */
             if (sp >= MAX_FRAMES) return -1;
 
             int rel_id = (int)in->a;
             int k = (int)in->b;
             int ar = (int)in->c;
-            int perm_id = (int)in->imm;
 
             vm_frame *f = &frames[sp];
             f->ip = ip;
@@ -841,11 +842,14 @@ static long exec_range(dl_db *db, const compiled_rule *cr,
                 break;
             }
 
-            /* Get perm array for re-encoding */
-            const uint8_t *perm_arr = NULL;
-            if (perm_id >= 0) {
-                perm_arr = dl_db_get_perm(db, rel_id, perm_id);
-            }
+            /* imm holds the PACKED permutation (3 bits/col, LSB-first).  Unpack
+             * into the frame own storage so f->perm stays valid across
+             * backtrack() (compiler always emits arity >= 1 columns here). */
+            uint8_t pj;
+            for (pj = 0; pj < (uint8_t)ar; pj++)
+                f->perm_storage[pj] =
+                    (uint8_t)((in->imm >> (3u * (uint32_t)pj)) & 7u);
+            const uint8_t *perm_arr = f->perm_storage;
 
             /* Filter tuples: only those whose prefix columns match
              * the current bindings.  For each matching tuple, produce

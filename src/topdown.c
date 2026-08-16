@@ -253,8 +253,9 @@ static int build_rule_meta(td_ctx *c, const magic_program *prog)
                         in->op == OP_WALK) {
                         m->op_at[j] = in->op;
                         m->rel_at[j] = in->a;
-                        m->perm_at[j] =
-                            (in->op == OP_LOOKUP_PERM || in->op == OP_HASH_JOIN)
+                        /* OP_HASH_JOIN's imm is now a PACKED permutation, not a
+                         * perm_id, so it must never be read back as one. */
+                        m->perm_at[j] = (in->op == OP_LOOKUP_PERM)
                             ? (int)in->imm : -1;
                         break;
                     }

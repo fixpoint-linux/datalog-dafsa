@@ -84,6 +84,10 @@ static interner *db_get_interner(dl_db *db)
 int g_bushy   = 1;
 int g_reorder = 1;
 
+/* M6-permsel: automatic perm-index selection.  See compiler.h. */
+int g_perm_select         = 1;
+int g_perm_card_threshold = 4;
+
 static uint64_t db_rel_card(dl_db *db, int idx)
 {
     if (idx < 0 || (size_t)idx >= db->nrels) return 0;
@@ -92,6 +96,18 @@ static uint64_t db_rel_card(dl_db *db, int idx)
     if (db->rels[idx].kind == RELK_VARIADIC)
         return vrel_count(db->rels[idx].vrel);
     return rel_count(db->rels[idx].rel);
+}
+
+/* M6-permsel: distinct-tuple estimate for the perm-selection cost gate. */
+/* Uses rel_count_subtree (memoized distinct-key count on rel->d) not rel_count, */
+/* whose dafsa_stats n_final is unreliable for fresh EDBs at compile time (~1). */
+/* Unmaterialized IDB -> 0 -> cost model hash-joins (always semantically safe). */
+static uint64_t db_rel_card_est(dl_db *db, int idx)
+{
+    if (idx < 0 || (size_t)idx >= db->nrels) return 0;
+    if (db->rels[idx].kind == RELK_VARIADIC)
+        return vrel_count(db->rels[idx].vrel);
+    return rel_count_subtree(db->rels[idx].rel);
 }
 
 /* v2: 1 if the relation is variadic. */
@@ -1384,6 +1400,7 @@ typedef struct {
     i_buf         *ib;
     int           *cc;        /* constant-slot counter                        */
     const uint64_t *mask;     /* var mask per positive atom (by body idx)     */
+    const int      *recursive;/* [nrels]: 1 for predicates in a recursive SCC */
     int            do_bushy;  /* 1 = may emit binary-tree plans               */
     int            next_buf;  /* next free intermediate buffer index          */
 } emit_ctx;
@@ -1508,6 +1525,115 @@ static void reorder_pos_atoms(dl_db *db, const int *bri, const uint64_t *mask,
     free(used); free(res);
 }
 
+/* ─── M6-permsel: non-leading join emission ─────────────────────────── */
+
+/* Pack a permutation into a uint32_t: 3 bits per column, LSB-first —
+ * perm[0] occupies bits 0-2, perm[1] bits 3-5, etc.  arity <= 8 => <= 24 bits,
+ * so this is a lossless bijection over every arity-1..8 permutation.  Must
+ * match the unpack in the VM's case OP_HASH_JOIN exactly. */
+static uint32_t pack_perm(const uint8_t *perm, uint8_t arity)
+{
+    uint32_t p = 0;
+    int i;
+    for (i = 0; i < (int)arity; i++)
+        p |= (uint32_t)(perm[i] & 7u) << (3u * (uint32_t)i);
+    return p;
+}
+
+/* Cost-gated emit for a non-leading-column join atom.  Emits either
+ * OP_LOOKUP_PERM (perm index) or OP_HASH_JOIN (slot-free fallback) onto the
+ * already-emitted `ip`, fills slots[] by ORIGINAL column, then emits
+ * EQ_CONST/destructure for any constant/pattern args (mirroring the old
+ * OP_LOOKUP_PERM blocks this replaces).  Returns 0 on success, -1 on a hard
+ * compile error (recursive carve-out with a full perm table).
+ *
+ * Decision model (g_perm_select / g_perm_card_threshold in compiler.h):
+ *   recursive[rel_id]    -> OP_LOOKUP_PERM, MUST declare; declare<0 -> -1.
+ *                           A recursive body atom CANNOT hash-join: the
+ *                           semi-naive override loop only rewrites
+ *                           OP_LOOKUP_PERM, so an OP_HASH_JOIN recursive atom
+ *                           would read a stale DAFSA and silently mis-evaluate.
+ *                           Cap exhaustion here is a genuine no-fallback, so
+ *                           the compile error is kept.
+ *   g_perm_select == 0   -> OP_HASH_JOIN (oracle OFF: never build an index).
+ *   dl_db_find_perm()>=0 -> OP_LOOKUP_PERM reusing an existing index.
+ *   rel_card >= threshold-> declare; >=0 -> OP_LOOKUP_PERM; <0 (cap full)
+ *                           -> OP_HASH_JOIN (slot-free fallback).
+ *   else                 -> OP_HASH_JOIN (small rel; index not worth building). */
+static int emit_nonleading_join(dl_db *db, const rule *r, const atom *curr,
+                                int rel_id, const int *sc,
+                                const int *recursive, v_tab *vt, i_buf *ib,
+                                int *cc, vm_instr *ip, int bi)
+{
+    uint8_t perm_arr[8], n_join = 0, n_other = 0;
+    uint8_t join_cols[8], other_cols[8];
+    int pj, j;
+
+    for (j = 0; j < curr->nargs; j++) {
+        if (sc[j]) join_cols[n_join++] = (uint8_t)j;
+        else       other_cols[n_other++] = (uint8_t)j;
+    }
+    for (pj = 0; pj < n_join; pj++) perm_arr[pj] = join_cols[pj];
+    for (pj = 0; pj < n_other; pj++)
+        perm_arr[(int)n_join + pj] = other_cols[pj];
+
+    int use_perm = 0;
+    int perm_id = -1;
+
+    if (recursive && recursive[rel_id]) {
+        /* Recursive carve-out: never hash-join a recursive IDB body atom. */
+        perm_id = dl_db_declare_perm(db, rel_id, (uint8_t)curr->nargs,
+                                     perm_arr);
+        if (perm_id < 0) {
+            fprintf(stderr, "compile error: too many permutation "
+                    "indices (rule '%s')\n", r->head->pred);
+            return -1;
+        }
+        use_perm = 1;
+    } else if (g_perm_select == 0) {
+        /* Oracle OFF: always hash join, never build an index. */
+        use_perm = 0;
+    } else {
+        int existing = dl_db_find_perm(db, rel_id, (uint8_t)curr->nargs,
+                                       perm_arr);
+        if (existing >= 0) {
+            perm_id = existing;
+            use_perm = 1;
+        } else if (db_rel_card_est(db, rel_id) >=
+                   (uint64_t)g_perm_card_threshold) {
+            perm_id = dl_db_declare_perm(db, rel_id, (uint8_t)curr->nargs,
+                                         perm_arr);
+            if (perm_id >= 0) use_perm = 1;
+            /* else cap full -> use_perm stays 0 -> OP_HASH_JOIN fallback */
+        }
+        /* else: small rel, never declare -> OP_HASH_JOIN */
+    }
+    ip->op   = use_perm ? OP_LOOKUP_PERM : OP_HASH_JOIN;
+    ip->a    = (uint8_t)rel_id;
+    ip->b    = n_join;               /* perm-prefix length / join-col count */
+    ip->c    = (uint8_t)curr->nargs;
+    ip->body_idx = (uint8_t)bi;
+    ip->imm  = use_perm ? (uint32_t)perm_id
+                        : pack_perm(perm_arr, (uint8_t)curr->nargs);
+
+    /* slots indexed by ORIGINAL column: slots[c] = var slot (constants get a
+     * fresh temp slot; a trailing EQ_CONST enforces the value). */
+    for (j = 0; j < curr->nargs; j++) {
+        if (curr->args[j]->kind == TOK_VAR) {
+            int vi = v_find(vt, curr->args[j]->text);
+            ip->slots[j] = vt->e[vi].slot;
+        } else {
+            char cname[16];
+            v_fresh_name(vt, cname, sizeof(cname), cc, 'k');
+            int vi = v_add(vt, cname);
+            ip->slots[j] = vt->e[vi].slot;
+        }
+    }
+    if (emit_const_or_pattern(db, curr, ip->slots, vt, ib, cc, r->head->pred))
+        return -1;
+    return 0;
+}
+
 /* Emit the join instruction for positive body atom `bi`.  `bound` is the
  * bitmask of var slots already bound in the CURRENT scope (subtree): an atom
  * whose only join column is sibling-bound compiles to SCAN not LOOKUP — the
@@ -1515,7 +1641,7 @@ static void reorder_pos_atoms(dl_db *db, const int *bri, const uint64_t *mask,
  * correctness rule).  `is_first` forces a full scan (first atom of a scope). */
 static int emit_pos_atom(dl_db *db, const rule *r, int bi, const int *bri,
                          const uint8_t *pat_idx, uint64_t bound, int is_first,
-                         v_tab *vt, i_buf *ib, int *cc)
+                         v_tab *vt, i_buf *ib, int *cc, const int *recursive)
 {
     const atom *curr = r->body[bi];
     int j;
@@ -1572,44 +1698,9 @@ static int emit_pos_atom(dl_db *db, const rule *r, int bi, const int *bri,
             for (j = 0; j < curr->nargs; j++) if (sc[j]) { any_shared = 1; break; }
         }
         if (!is_first && any_shared) {
-            /* M6: non-leading-column join → OP_LOOKUP_PERM */
-            uint8_t perm_arr[8], n_join = 0, n_other = 0;
-            uint8_t join_cols[8], other_cols[8];
-            int pj;
-            int perm_id;
-            for (j = 0; j < curr->nargs; j++) {
-                if (sc[j]) join_cols[n_join++] = (uint8_t)j;
-                else       other_cols[n_other++] = (uint8_t)j;
-            }
-            for (pj = 0; pj < n_join; pj++) perm_arr[pj] = join_cols[pj];
-            for (pj = 0; pj < n_other; pj++)
-                perm_arr[(int)n_join + pj] = other_cols[pj];
-            perm_id = dl_db_declare_perm(db, bri[bi],
-                (uint8_t)curr->nargs, perm_arr);
-            if (perm_id < 0) {
-                fprintf(stderr, "compile error: too many permutation "
-                        "indices (rule '%s')\n", r->head->pred);
-                return -1;
-            }
-            ip->op = OP_LOOKUP_PERM;
-            ip->a   = (uint8_t)bri[bi];
-            ip->b   = n_join;
-            ip->c   = (uint8_t)curr->nargs;
-            ip->imm = (uint32_t)perm_id;
-            ip->body_idx = (uint8_t)bi;
-            for (j = 0; j < curr->nargs; j++) {
-                if (curr->args[j]->kind == TOK_VAR) {
-                    int vi = v_find(vt, curr->args[j]->text);
-                    ip->slots[j] = vt->e[vi].slot;
-                } else {
-                    char cname[16];
-                    v_fresh_name(vt, cname, sizeof(cname), cc, 'k');
-                    int vi = v_add(vt, cname);
-                    ip->slots[j] = vt->e[vi].slot;
-                }
-            }
-            if (emit_const_or_pattern(db, curr, ip->slots, vt, ib, cc,
-                                      r->head->pred))
+            /* M6-permsel: non-leading-column join — cost-gated perm vs hash */
+            if (emit_nonleading_join(db, r, curr, bri[bi], sc, recursive,
+                                     vt, ib, cc, ip, bi))
                 return -1;
         } else {
             /* OP_SCAN (first atom, or no shared columns at all) */
@@ -1695,7 +1786,7 @@ static int emit_leftdeep_seq(emit_ctx *ec, const int *atoms, int n,
     int i;
     for (i = 0; i < n; i++) {
         if (emit_pos_atom(ec->db, ec->r, atoms[i], ec->bri, ec->pat_idx,
-                          bound, i == 0, ec->vt, ec->ib, ec->cc) != 0)
+                          bound, i == 0, ec->vt, ec->ib, ec->cc, ec->recursive) != 0)
             return -1;
         bound |= ec->mask[atoms[i]];
     }
@@ -2428,6 +2519,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata,
             ec.db = db; ec.r = r; ec.bri = bri; ec.pat_idx = pat_idx;
             ec.vt = &vt; ec.ib = &ib; ec.cc = &cc; ec.mask = mask;
             ec.do_bushy = g_bushy && (agg == NULL) && !any_pattern;
+            ec.recursive = recursive;
             ec.next_buf = 0;
             if (emit_join(&ec, pos, n_pos, NULL, 0) != 0) {
                 free(pos); free(mask);
@@ -2673,54 +2765,9 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata,
                 for (j = 0; j < curr->nargs; j++) if (sc[j]) { any_shared = 1; break; }
 
                 if (any_shared) {
-                    /* M6: non-leading-column join → OP_LOOKUP_PERM */
-                    uint8_t perm_arr[8], n_join = 0, n_other = 0;
-                    uint8_t join_cols[8], other_cols[8];
-                    int pj;
-
-                    /* Collect join columns (sc[j]==1) in increasing order */
-                    for (j = 0; j < curr->nargs; j++) {
-                        if (sc[j]) join_cols[n_join++] = (uint8_t)j;
-                        else       other_cols[n_other++] = (uint8_t)j;
-                    }
-
-                    /* Build perm: join cols first, then other cols */
-                    for (pj = 0; pj < n_join; pj++)
-                        perm_arr[pj] = join_cols[pj];
-                    for (pj = 0; pj < n_other; pj++)
-                        perm_arr[(int)n_join + pj] = other_cols[pj];
-
-                    int perm_id = dl_db_declare_perm(db, bri[bi],
-                        (uint8_t)curr->nargs, perm_arr);
-                    if (perm_id < 0) {
-                        fprintf(stderr, "compile error: too many permutation "
-                                "indices (rule '%s')\n", r->head->pred);
-                        goto fail;
-                    }
-
-                    ip->op = OP_LOOKUP_PERM;
-                    ip->a   = (uint8_t)bri[bi];
-                    ip->b   = n_join;  /* perm-prefix length */
-                    ip->c   = (uint8_t)curr->nargs;
-                    ip->imm = (uint32_t)perm_id;
-                    ip->body_idx = (uint8_t)bi;
-
-                    /* slots indexed by ORIGINAL column: slots[c] = var slot */
-                    for (j = 0; j < curr->nargs; j++) {
-                        if (curr->args[j]->kind == TOK_VAR) {
-                            int vi = v_find(&vt, curr->args[j]->text);
-                            ip->slots[j] = vt.e[vi].slot;
-                        } else {
-                            char cname[16];
-                            v_fresh_name(&vt, cname, sizeof(cname), &cc, 'k');
-                            int vi = v_add(&vt, cname);
-                            ip->slots[j] = vt.e[vi].slot;
-                        }
-                    }
-
-                    /* Emit EQ_CONST / destructure for any constant/pattern args */
-                    if (emit_const_or_pattern(db, curr, ip->slots, &vt, &ib,
-                                              &cc, r->head->pred))
+                    /* M6-permsel: non-leading-column join — cost-gated perm vs hash */
+                    if (emit_nonleading_join(db, r, curr, bri[bi], sc, recursive,
+                                             &vt, &ib, &cc, ip, bi))
                         goto fail;
                 } else {
                     /* No shared columns at all: OP_SCAN */

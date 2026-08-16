@@ -258,6 +258,10 @@ uint64_t dl_range_count_perm(dl_db *db, const char *rel, int perm_id,
                              const uint32_t *lo, const uint32_t *hi,
                              uint8_t arity);
 
+/* Number of permutation indices currently declared on the database (equals
+ * db->n_perms).  Useful for tests of automatic perm-index selection. */
+int dl_db_perm_count(const dl_db *db);
+
 /* ─── Rule loading & compilation (M1) ──────────────────────────────────── */
 
 /* Parse and compile Datalog rules from a source string.
