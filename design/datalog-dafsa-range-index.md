@@ -184,8 +184,18 @@ In rough priority order. ~~struck-through~~ items are implemented (commit noted)
    (one-token lookahead + right-run buffering, duplicate-preserving, sorted,
    drains both iterators).  Snapshot path owns an mmap `dafsa_view`; live path
    borrows `rel->d`.  Not yet wired into the VM (no OP code / order-by).
-6. **Automatic perm-index selection** — planner/cost pass; perms already exist,
-   arity ≤ 8 caps candidate combinatorics at 2⁸.
+6. ~~**Automatic perm-index selection**~~ — **implemented** (commit `b553f2c`).
+   A compile-time cost gate in `emit_nonleading_join` (src/compiler.c) wires up
+   the previously-dead `OP_HASH_JOIN` as a **slot-free fallback**: a perm is
+   declared only when the relation is large enough (`rel_count_subtree` ≥ 4,
+   tunable `g_perm_card_threshold`) or already declared (reuse). Recursive
+   body atoms always use `OP_LOOKUP_PERM` (the semi-naive override can't
+   hash-join a recursive atom). Perm-cap exhaustion degrades to hash-join
+   instead of a hard compile error. `OP_HASH_JOIN`'s `imm` carries a packed
+   3-bit-per-column permutation, unpacked into a frame-local
+   `vm_frame.perm_storage`; pack/unpack symmetry verified over all 46,233
+   perms of arity 1–8. Semantics unchanged — an oracle test asserts
+   `g_perm_select=1` vs `0` produce byte-identical query results.
 7. **Tier 1 sparse checkpoint index** and **Tier 3 succinct sorted array**
    (Elias-Fano) — only if a true B-tree point-seek / random-access is ever
    needed; the doc's honest ceiling is that the DAFSA cannot give O(log n)

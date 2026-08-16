@@ -5,6 +5,23 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **v2 DAFSA order-statistics — automatic perm-index selection**: a compile-time
+  cost gate (`emit_nonleading_join`, src/compiler.c) that wires up the
+  previously-dead `OP_HASH_JOIN` as a slot-free fallback for non-leading joins.
+  A perm index is now declared only when the relation is large enough
+  (`rel_count_subtree` ≥ `g_perm_card_threshold`, default 4) or already
+  declared (reuse/dedup); small relations hash-join without declaring a perm,
+  and perm-cap exhaustion (MAX_PERMS 64) degrades to hash-join instead of a
+  hard compile error. Recursive body atoms always use `OP_LOOKUP_PERM` (the
+  semi-naive override can't hash-join a recursive atom without a stale-DAFSA
+  mis-eval). `OP_HASH_JOIN`'s `imm` now carries a packed 3-bit-per-column
+  permutation, unpacked into a frame-local `vm_frame.perm_storage` (survives
+  backtrack); pack/unpack symmetry verified over all 46,233 perms of arity
+  1–8. New `dl_db_find_perm`/`dl_db_perm_count`. Semantics unchanged — the
+  oracle test (T4) asserts `g_perm_select=1` vs `0` produce byte-identical
+  query results. Tests: test_m14_permsel.c (9/9) — small→hash, large→perm,
+  dedup, oracle (TC/3-col/IDB/negation), cap-exhaustion graceful, recursive
+  non-leading == leading equivalent.
 - **v2 DAFSA order-statistics — pull-based sorted iterator + merge-join**:
   resumable pull cursor replacing the callback fire-and-forget `rel_prefix`
   enumeration.  `dl_iter_open` / `dl_iter_seek` / `dl_iter_next` /
