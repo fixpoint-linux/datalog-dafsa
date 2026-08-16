@@ -2,7 +2,7 @@
 
 _Design note. Status: **Tier 2 (order-statistics) implemented** — commit `20e93bb` (2026-08-16),
 **prefix-bound rank/select implemented** — commit `1b46922` (2026-08-16),
-**permuted order-statistics (`dl_*_perm`) implemented** — (2026-08-16).
+**permuted order-statistics (`dl_*_perm`) implemented** — commit `3a9d448` (2026-08-16).
 The full feature remains partly proposed; this doc records the options, the recommended path, and
 the deferred follow-ups._
 
