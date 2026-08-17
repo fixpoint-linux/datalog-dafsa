@@ -26,28 +26,51 @@ All navigation is plain relative links; there is no build step.
 ## The playground
 
 `playground.html` runs the real C engine — compiled to WebAssembly — entirely
-in the browser. Type facts + rules, pick a goal relation, and press **Run**;
-the engine evaluates the program in memory and streams the result. The
-supported subset is the in-memory feature set (facts, rules/recursion,
-stratified negation, aggregates, arithmetic, comparisons, strings, lists, the
-range predicate, regex walks); disk-backed features (publish/snapshot,
-time-travel, variadic relations, the WAL/incremental-maintenance API) are not
-available in the browser. See the "Supported subset" section on the page for
-the honest list, including the int-vs-symbol rendering caveat.
+in the browser. It uses a **CodeMirror editor**: type facts + rules, pick a
+goal relation, and press **Run**; the engine evaluates the program in memory
+and streams the result. As you type, the editor shows **live diagnostics** and
+**hover** from the real LSP server compiled to WebAssembly (`docs/dl-lsp.js`),
+so syntax and compile errors are underlined inline. The supported subset is the
+in-memory feature set (facts, rules/recursion, stratified negation, aggregates,
+arithmetic, comparisons, strings, lists, the range predicate, regex walks);
+disk-backed features (publish/snapshot, time-travel, variadic relations, the
+WAL/incremental-maintenance API) are not available in the browser. See the
+"Supported subset" section on the page for the honest list, including the
+int-vs-symbol rendering caveat.
 
 To rebuild the WebAssembly bundle from source:
 
 ```sh
-make wasm        # runs scripts/build-wasm.sh then tests/wasm-smoke.js
+make wasm        # runs scripts/build-wasm.sh then the wasm smoke tests
 ```
 
-`scripts/build-wasm.sh` compiles `src/playground-wasm.c` with the full engine
-core via emscripten and emits `docs/playground.js` + `docs/playground.wasm`
-(the MODULARIZE'd `createPlayground` factory + binary).  It requires emscripten
-+ node on the host (see the script header).  The generated files are committed
+`scripts/build-wasm.sh` compiles `src/playground-wasm.c` (evaluation) and
+`src/lsp.c` (the LSP server) with the full engine core via emscripten and emits
+`docs/playground.js`/`.wasm` + `docs/dl-lsp.js`/`.wasm`. It requires emscripten
++ node on the host (see the script header). The generated files are committed
 to `docs/`, so the Pages site itself needs no build toolchain.
-`tests/wasm-smoke.js` asserts the bundle produces byte-identical output to the
-native engine across the supported subset.
+`tests/wasm-smoke.js` asserts the playground produces byte-identical output to
+the native engine; `tests/lsp-wasm-smoke.js` drives the wasm LSP
+(initialize/didOpen/didChange/hover/completion).
+
+## Language Server (IDE support)
+
+A native LSP server for the Datalog language ships as `dl-lsp` (build with
+`make lsp`). It speaks LSP (JSON-RPC 2.0 over stdio with Content-Length
+framing) and reuses the real parser/compiler, so its diagnostics are exactly
+what the engine rejects. Supported: diagnostics-as-you-type, hover (predicate
+arity + IDB/EDB, variables, builtins), and completion (relations + builtins +
+bound variables).
+
+```sh
+make lsp           # build ./dl-lsp
+make test-lsp      # run the end-to-end LSP test harness (tests/lsp.sh)
+```
+
+To use it in an editor, point the editor's Datalog language server at
+`./dl-lsp` (e.g. for Neovim's LSP config: `cmd = { "/abs/path/dl-lsp" }`).
+`tests/lsp.sh` shows a complete JSON-RPC conversation you can replay against any
+client.
 
 ## Enabling GitHub Pages
 
