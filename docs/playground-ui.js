@@ -36,17 +36,36 @@
   var tooltipEl = document.getElementById('tooltip');
 
   var DEFAULT_PROG =
-    '# A transitive-closure example.\n' +
-    '# Facts: the base edges of a small graph.\n' +
-    'edge(a, b).\n' +
-    'edge(b, c).\n' +
-    'edge(c, d).\n' +
+    '# ---- datalog-dafsa in action ----\n' +
+    '# A directed graph, a tag per node, and a numeric signal.\n' +
+    'edge(a, b). edge(b, c). edge(c, d). edge(d, a). edge(a, x). edge(c, z).\n' +
+    'edge(s, a). edge(s, x).\n' +
+    'color(a, red). color(b, blue). color(c, green). color(d, blue).\n' +
+    'color(x, red). color(z, blue).\n' +
+    'signal(5). signal(12). signal(15). signal(20). signal(27).\n' +
     '\n' +
-    '# Rules: path(X,Y) is the transitive closure of edge.\n' +
+    '# Recursion: path(X,Y) is the transitive closure of edge.\n' +
     'path(X, Y) :- edge(X, Y).\n' +
     'path(X, Y) :- path(X, Z), edge(Z, Y).\n' +
     '\n' +
-    '# Type a goal relation below (default "path") and press Run.';
+    '# Join: exactly two hops.\n' +
+    'hop2(X, Y) :- edge(X, Z), edge(Z, Y).\n' +
+    '\n' +
+    '# Negation: nodes with an out-edge but no in-edge.\n' +
+    'reached(X) :- edge(_, X).\n' +
+    'source(X) :- edge(X, _), !reached(X).\n' +
+    '\n' +
+    '# Lists: neighbors of each node from a list-valued fact.\n' +
+    'nb(a, [b, x]). nb(c, [d, z]).\n' +
+    'neighbor(X, Y) :- nb(X, L), member(Y, L).\n' +
+    '\n' +
+    '# Strings: every node whose name contains "b".\n' +
+    'hasb(X) :- edge(X, _), contains(X, "b").\n' +
+    '\n' +
+    '# Range: signals in [10, 25).\n' +
+    'inband(X) :- range(X, signal, 10, 25).\n' +
+    '\n' +
+    '# Pick any of these as the goal: path, hop2, source, neighbor, hasb, inband.';
 
   var LSP_URI = 'file:///playground.dl';
   var lspVersion = 1;

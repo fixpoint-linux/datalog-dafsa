@@ -71,6 +71,49 @@ body {
     text-decoration: underline;
 }
 
+/* Prominent "Playground" nav item (call to action). */
+.site nav a.nav-cta {
+    color: #ffffff;
+    background: #238636;
+    border-radius: 14px;
+    padding: 2px 12px;
+    font-weight: 600;
+}
+.site nav a.nav-cta:hover {
+    background: #2ea043;
+    text-decoration: none;
+}
+
+/* ─── Front-and-center CTA banner ────────────────────────────────────── */
+
+.cta-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    flex-wrap: wrap;
+    background: linear-gradient(135deg, #0d1117, #161b22);
+    color: #e6edf3;
+    border: 1px solid #30363d;
+    border-left: 4px solid #238636;
+    border-radius: 8px;
+    padding: 18px 20px;
+    margin: 1.2em 0;
+    font-size: 1.02em;
+}
+.cta-banner strong { color: #7ee787; }
+.cta-btn {
+    display: inline-block;
+    background: #238636;
+    color: #ffffff;
+    font-weight: 600;
+    padding: 10px 20px;
+    border-radius: 6px;
+    text-decoration: none;
+    white-space: nowrap;
+}
+.cta-btn:hover { background: #2ea043; color: #ffffff; }
+
 /* ─── Typography ────────────────────────────────────────────────────── */
 
 h1 { font-size: 1.9em; margin: 0.5em 0 0.4em; }

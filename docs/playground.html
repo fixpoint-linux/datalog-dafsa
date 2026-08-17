@@ -8,11 +8,25 @@
 <link rel="stylesheet" href="vendor/codemirror.css">
 <style>
   /* LSP live-diagnostics styling (CodeMirror squiggle + tooltip + list). */
-  .CodeMirror { border: 1px solid #ddd; height: 380px; font-size: 14px; }
-  .cm-dl-squiggle { text-decoration: underline wavy #d33; text-decoration-skip-ink: none; }
+  .CodeMirror { border: 1px solid #d0d7de; height: 420px; font-size: 14px; }
+  .CodeMirror, .CodeMirror-scroll { background: #f6f8fa; color: #1f2328; }
+  .CodeMirror-gutters { background: #eaeef2; border-right: 1px solid #d0d7de; }
+  .CodeMirror-linenumber { color: #8b949e; }
+  .CodeMirror-cursor { border-left: 2px solid #0969da; }
+  .CodeMirror-selected { background: #d0e2ff; }
+  .cm-comment { color: #6e7781; font-style: italic; }
+  .cm-string { color: #0a3069; }
+  .cm-number { color: #0550ae; }
+  .cm-keyword { color: #cf222e; font-weight: 600; }
+  .cm-variable-2 { color: #8250df; }
+  .cm-atom { color: #0550ae; }
+  .cm-operator { color: #57606a; }
+  .cm-bracket { color: #57606a; }
+  .cm-def { color: #116329; font-weight: 600; }
+  .cm-dl-squiggle { text-decoration: underline wavy #f85149; text-decoration-skip-ink: none; }
   #diagnostics { margin: 12px 0; font-size: 14px; }
-  #diagnostics .dl-diag { color: #b00020; padding: 2px 0; font-family: monospace; }
-  #diagnostics .dl-ok { color: #2e7d32; }
+  #diagnostics .dl-diag { color: #b62324; padding: 2px 0; font-family: monospace; }
+  #diagnostics .dl-ok { color: #1a7f37; }
   #tooltip {
     position: absolute; z-index: 10; background: #fff8e1; border: 1px solid #e0c36a;
     color: #5d4037; padding: 4px 8px; font-size: 13px; font-family: monospace;
@@ -20,6 +34,32 @@
     box-shadow: 0 2px 6px rgba(0,0,0,0.15);
   }
   #editor-wrap { position: relative; }
+  #output { background: #0d1117; color: #e6edf3; border: 1px solid #30363d; }
+  @media (prefers-color-scheme: dark) {
+    .CodeMirror, .CodeMirror-scroll { background: #0d1117; color: #e6edf3; }
+    .CodeMirror { border-color: #30363d; }
+    .CodeMirror-gutters { background: #161b22; border-right-color: #30363d; }
+    .CodeMirror-linenumber { color: #8b949e; }
+    .CodeMirror-cursor { border-left-color: #58a6ff; }
+    .CodeMirror-selected { background: #264f78; }
+    .cm-comment { color: #8b949e; }
+    .cm-string { color: #a5d6ff; }
+    .cm-number { color: #79c0ff; }
+    .cm-keyword { color: #ff7b72; }
+    .cm-variable-2 { color: #d2a8ff; }
+    .cm-atom { color: #79c0ff; }
+    .cm-operator { color: #e6edf3; }
+    .cm-bracket { color: #e6edf3; }
+    .cm-def { color: #7ee787; }
+    .cm-dl-squiggle { text-decoration-color: #ff7b72; }
+    #diagnostics .dl-diag { color: #ff7b72; }
+    #diagnostics .dl-ok { color: #3fb950; }
+    #tooltip {
+      background: #2d333b; border: 1px solid #57606a; color: #e6edf3;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.5);
+    }
+    #output { border-color: #30363d; }
+  }
 </style>
 </head>
 <body>
