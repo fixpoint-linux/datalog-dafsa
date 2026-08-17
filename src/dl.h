@@ -390,6 +390,35 @@ long dl_pattern(dl_db *db, const char *rel, const struct regex_dfa *dfa,
  * After publish, dl_query reads from mmap instead of the VM. */
 int dl_publish_snapshot(dl_db *db);
 
+/* ─── Time-travel / as-of queries ──────────────────────────────────────── */
+
+/* Enumerate every published snapshot version in ascending order.  Returns the
+ * TOTAL number of versions (even when `cap` is smaller), filling at most
+ * `cap` entries of `out` (out may be NULL to just size).  Returns 0 when no
+ * snapshot has been published, and -1 on a NULL db. */
+long dl_snapshot_versions(const dl_db *db, uint32_t *out, size_t cap);
+
+/* As-of query: stream the tuples of `goal_rel` as of the published snapshot
+ * `version`, bypassing the live/CURRENT routing entirely (db->snap_version is
+ * never mutated).  Reads the version's manifest + mmap view from disk.
+ * Returns tuple count, or -1 on error: NULL db/goal_rel/cb, version == 0, a
+ * nonexistent version, or a goal_rel absent from that version — never a
+ * silently-empty result. */
+long dl_query_version(dl_db *db, uint32_t version, const char *goal_rel,
+                      dl_tuple_cb cb, void *user);
+
+/* As-of prefix query: bind the first k columns of `goal_rel` to `leading`
+ * and stream matching tuples from snapshot `version`.  Same error contract
+ * as dl_query_version. */
+long dl_query_bound_version(dl_db *db, uint32_t version, const char *goal_rel,
+                            const uint32_t *leading, uint8_t k,
+                            dl_tuple_cb cb, void *user);
+
+/* Opt-in snapshot retention: keep at most `n` most-recent versions, pruning
+ * older ones at the end of each successful publish.  n == 0 (the default)
+ * keeps every version.  Returns 0 on success, -1 on a NULL db. */
+int dl_set_snapshot_retain(dl_db *db, unsigned n);
+
 /* ─── Fault-injection hooks (test-only, NULL in production) ────────────── */
 
 typedef enum {

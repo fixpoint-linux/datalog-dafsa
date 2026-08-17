@@ -33,6 +33,7 @@ build-tmp/
 /tests/test_m13_iter
 /tests/test_m14_permsel
 /tests/test_m15_vmiter
+/tests/test_m16_travel
 
 # scratch db dirs
 dl-test-*/

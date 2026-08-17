@@ -325,6 +325,7 @@ dl_db *dl_open2(const char *dir, int *err_out)
     /* M4: set initial snapshot state */
     db->fixpoint_dirty = 0;
     db->snap_version   = 0;
+    db->snapshot_retain = 0;
     memset(db->vcache, 0, sizeof(db->vcache));
     db->fault_hook = NULL;
     db->fault_user = NULL;
@@ -2233,6 +2234,44 @@ long dl_query_bound(dl_db *db, const char *goal_rel,
     }
 }
 
+/* ─── M4: time-travel (as-of) queries ──────────────────────────────────── */
+
+/* As-of reads are PURELY from-disk: they take an EXPLICIT version and never
+ * touch db->snap_version, so the live/CURRENT routing (dl_query/dl_rank/…)
+ * is unaffected.  Each call uses a STACK-LOCAL view cache, NOT db->vcache:
+ * view_open_cached keys by rel_name ONLY (snapshot.c:181), so sharing
+ * db->vcache across versions would return a DIFFERENT version's view for the
+ * same rel_name — a silent wrong answer.  The local cache is invalidated
+ * (views closed) before returning. */
+long dl_query_version(dl_db *db, uint32_t version, const char *goal_rel,
+                      dl_tuple_cb cb, void *user)
+{
+    view_cache_slot local[DL_VIEW_CACHE_SZ] = {0};
+    long r;
+
+    if (!db || version == 0 || !goal_rel || !cb) return -1;
+
+    r = snapshot_query_scan(db->dir, version, local,
+                            goal_rel, NULL, 0, cb, user);
+    vcache_invalidate(local);
+    return r;
+}
+
+long dl_query_bound_version(dl_db *db, uint32_t version, const char *goal_rel,
+                            const uint32_t *leading, uint8_t k,
+                            dl_tuple_cb cb, void *user)
+{
+    view_cache_slot local[DL_VIEW_CACHE_SZ] = {0};
+    long r;
+
+    if (!db || version == 0 || !goal_rel || !cb) return -1;
+
+    r = snapshot_query_scan(db->dir, version, local,
+                            goal_rel, leading, k, cb, user);
+    vcache_invalidate(local);
+    return r;
+}
+
 /* ─── M8: magic-sets bound query (scoped re-eval, clone-and-scope) ─────── */
 
 /*
@@ -2913,6 +2952,142 @@ static void rm_rf(const char *path)
     unlink(path);
 }
 
+/* ─── M4: snapshot version enumeration + retention ─────────────────────── */
+
+static int cmp_u32(const void *a, const void *b)
+{
+    uint32_t x = *(const uint32_t *)a;
+    uint32_t y = *(const uint32_t *)b;
+    return (x > y) - (x < y);
+}
+
+/* Enumerate all published snapshot versions under <db_dir>/snapshots, sorted
+ * ascending.  Accepts ONLY all-digit directory names that parse via strtoul
+ * with full consumption into [1, UINT32_MAX] — this naturally excludes
+ * `CURRENT` (a file, and non-numeric) and `<N>.tmp` staging dirs.  Returns
+ * the count in *count with *out pointing at a malloc'd array (caller frees),
+ * or -1 on allocation failure.  Returns 0 when there is no snapshots/ dir
+ * (opendir ENOENT) or db_dir is NULL. */
+static long snapshot_enumerate(const char *db_dir, uint32_t **out,
+                               size_t *count)
+{
+    char snapshots_dir[4096];
+    DIR *d;
+    struct dirent *e;
+    uint32_t *vers = NULL;
+    size_t n = 0, alloc = 0;
+
+    *out = NULL;
+    *count = 0;
+
+    if (!db_dir) return 0;
+
+    snprintf(snapshots_dir, sizeof(snapshots_dir), "%s/snapshots", db_dir);
+    d = opendir(snapshots_dir);
+    if (!d) return 0;   /* ENOENT → empty, not an error */
+
+    while ((e = readdir(d)) != NULL) {
+        char *endp;
+        unsigned long v;
+        struct stat st;
+
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+            continue;
+        if (e->d_name[0] < '0' || e->d_name[0] > '9')
+            continue;
+
+        errno = 0;
+        v = strtoul(e->d_name, &endp, 10);
+        if (errno != 0 || *endp != '\0')   /* not a clean all-digit parse */
+            continue;
+        if (v < 1 || v > 0xFFFFFFFFUL)
+            continue;
+
+        /* Only real version DIRECTORIES are enumerated — a stray all-digit
+         * FILE (e.g. `touch snapshots/999`) must not be treated as a version,
+         * or retention could unlink it.  fstatat (not d_type) so it is robust
+         * on filesystems that don't populate d_type. */
+        if (fstatat(dirfd(d), e->d_name, &st, 0) != 0 || !S_ISDIR(st.st_mode))
+            continue;
+
+        if (n == alloc) {
+            size_t na = alloc ? alloc * 2 : 16;
+            uint32_t *nv = realloc(vers, na * sizeof(*vers));
+            if (!nv) {
+                free(vers);
+                closedir(d);
+                return -1;
+            }
+            vers = nv;
+            alloc = na;
+        }
+        vers[n++] = (uint32_t)v;
+    }
+    closedir(d);
+
+    if (n > 1)
+        qsort(vers, n, sizeof(*vers), cmp_u32);
+
+    *out = vers;
+    *count = n;
+    return (long)n;
+}
+
+long dl_snapshot_versions(const dl_db *db, uint32_t *out, size_t cap)
+{
+    uint32_t *vers;
+    size_t n;
+    long total;
+
+    if (!db) return -1;
+
+    total = snapshot_enumerate(db->dir, &vers, &n);
+    if (total < 0) return -1;
+
+    if (out && cap > 0 && n > 0) {
+        size_t m = n < cap ? n : cap;
+        memcpy(out, vers, m * sizeof(*out));
+    }
+    free(vers);
+    return total;
+}
+
+int dl_set_snapshot_retain(dl_db *db, unsigned n)
+{
+    if (!db) return -1;
+    db->snapshot_retain = n;
+    return 0;
+}
+
+/* Opt-in retention: keep at most db->snapshot_retain most-recent versions.
+ * Enumerates ascending and rm_rf's the oldest (count - retain) version dirs;
+ * never touches CURRENT (a file, never enumerated).  Called at the end of a
+ * successful publish, under the single-writer lock.  Best-effort/idempotent:
+ * crash mid-prune leaves CURRENT + newest versions intact and the next
+ * publish re-enumerates and re-prunes. */
+static void prune_snapshots(dl_db *db)
+{
+    uint32_t *vers;
+    size_t n, i, drop;
+    long total;
+
+    if (!db || db->snapshot_retain == 0) return;
+
+    total = snapshot_enumerate(db->dir, &vers, &n);
+    if (total < 0 || n <= (size_t)db->snapshot_retain) {
+        free(vers);
+        return;
+    }
+
+    drop = n - (size_t)db->snapshot_retain;
+    for (i = 0; i < drop; i++) {
+        char vdir[4096];
+        snprintf(vdir, sizeof(vdir), "%s/snapshots/%u", db->dir, vers[i]);
+        rm_rf(vdir);
+    }
+    free(vers);
+}
+
 int dl_publish_snapshot(dl_db *db)
 {
     char snapshots_dir[4096];
@@ -3195,6 +3370,11 @@ int dl_publish_snapshot(dl_db *db)
     /* 7. Invalidate cache + update snap_version */
     vcache_invalidate(db->vcache);
     db->snap_version = new_version;
+
+    /* 8. Opt-in retention: prune oldest versions beyond snapshot_retain.
+     * Under the single-writer lock; never touches CURRENT. */
+    if (db->snapshot_retain > 0)
+        prune_snapshots(db);
 
 #pragma GCC diagnostic pop
     return 0;

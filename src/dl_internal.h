@@ -73,6 +73,8 @@ struct dl_db {
     int              fixpoint_dirty;  /* 1 if rules loaded / facts changed
                                          since last compile/publish */
     uint32_t         snap_version;    /* current snapshot version, 0=none */
+    unsigned         snapshot_retain; /* opt-in retention: keep N newest
+                                         versions (0=keep-all) */
     view_cache_slot  vcache[DL_VIEW_CACHE_SZ];
     int            (*fault_hook)(dl_fpoint, void *);
     void            *fault_user;
