@@ -49,6 +49,7 @@ typedef enum {
 
 typedef struct token {
     token_kind  kind;
+    uint32_t    off;        /* byte offset of this token in the source (0-based) */
     char       *text;       /* owned; NULL for punctuation tokens */
     uint32_t    ival;       /* integer value (TOK_INT only) */
     struct token **children;/* TOK_LIST: owned element tokens (NULL otherwise) */
@@ -79,6 +80,7 @@ void  expr_free(expr *e);
  * TOK_STRING/TOK_LIST). */
 typedef struct {
     char   *pred;          /* predicate name */
+    uint32_t off;          /* byte offset of this atom's predicate name (0-based) */
     token **args;          /* array of argument tokens */
     int     nargs;         /* number of arguments */
     int     negated;       /* 1 if preceded by ! */
@@ -92,6 +94,7 @@ typedef struct {
 /* A rule: head :- body1, body2, ..., bodyN. */
 typedef struct {
     atom   *head;
+    uint32_t off;          /* byte offset of this rule's head (0-based) */
     atom  **body;          /* array of body atom pointers */
     int     nbody;
     int     has_negation;  /* any body atom negated? */
@@ -105,6 +108,16 @@ typedef struct parser parser;
 /* Create a parser for a Datalog source string (single rule or .dl file).
  * The source is copied; caller may free the original after this call. */
 parser *parse_create(const char *source);
+
+/* Create a parser that does NOT free itself on a lexer error, so the caller
+ * can read the error position via parse_last_error().  Otherwise identical to
+ * parse_create() (source copied).  LSP-only: the CLI/playground use
+ * parse_create() whose behaviour is unchanged. */
+parser *parse_create_reporting(const char *source);
+
+/* Return the message of the FIRST parse error recorded by this parser (or NULL
+ * if none), and (if off != NULL) its 0-based byte offset in the source. */
+const char *parse_last_error(const parser *p, uint32_t *off);
 
 /* Parse all rules from the source.  Returns array of rules, sets *n_rules.
  * Returns NULL on parse error (messages written to stderr). */

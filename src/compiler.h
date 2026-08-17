@@ -136,6 +136,12 @@ int  compile_rules(dl_db *db, rule **rules, int n_rules,
                    compiled_rule ***out_rules, int *out_n);
 void compiled_rule_free(compiled_rule *cr);
 
+/* LSP error sink: return the message of the FIRST compile error recorded by
+ * the most recent compile_rules() call (or NULL if none), and (if off != NULL)
+ * its 0-based byte offset into the source.  Reset at the top of every
+ * compile_rules() invocation. */
+const char *compile_last_error(uint32_t *off);
+
 /* ─── BUSHY (v2) compile-time toggles ────────────────────────────────────
  *
  * g_bushy (default 1): emit binary-tree (bushy) join plans for eligible

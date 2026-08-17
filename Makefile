@@ -40,14 +40,15 @@ LIB_OBJS = src/intern.o \
            src/dl.o \
            src/iter.o \
            src/magic.o \
-           src/topdown.o
+           src/topdown.o \
+           src/analyze.o
 
 # Combined object list used for static links (tests, CLI).
 ALL_OBJS = $(VENDOR_OBJS) $(LIB_OBJS)
 
 # ─── Targets ─────────────────────────────────────────────────────────────
 
-.PHONY: all clean test bench test-m1 test-m2 wasm
+.PHONY: all clean test bench test-m1 test-m2 wasm lsp test-lsp
 
 all: build-tmp libdatalog.so dl
 
@@ -59,6 +60,17 @@ libdatalog.so: $(VENDOR_OBJS) $(LIB_OBJS)
 
 dl: src/dl_cli.o $(ALL_OBJS)
 	$(CC) $(CFLAGS) -static -o $@ src/dl_cli.o $(ALL_OBJS)
+
+# ─── Language server ──────────────────────────────────────────────────────
+# The native LSP server binary.  src/analyze.o is part of ALL_OBJS (LIB_OBJS);
+# src/lsp.o + src/json.o are LSP-only.  Mirrors the `dl` static link.
+dl-lsp: src/lsp.o src/json.o $(ALL_OBJS)
+	$(CC) $(CFLAGS) -static -o $@ src/lsp.o src/json.o $(ALL_OBJS)
+
+lsp: dl-lsp
+
+test-lsp: dl-lsp
+	@sh tests/lsp.sh ./dl-lsp
 
 # ─── Vendor rules ────────────────────────────────────────────────────────
 
@@ -275,12 +287,13 @@ test-m16: tests/test_m16_travel dl build-tmp
 wasm:
 	./scripts/build-wasm.sh
 	@node tests/wasm-smoke.js
+	@node tests/lsp-wasm-smoke.js
 
 # ─── Clean ───────────────────────────────────────────────────────────────
 
 clean:
 	rm -f vendor/*.o src/*.o
-	rm -f libdatalog.so dl
+	rm -f libdatalog.so dl dl-lsp
 	rm -f tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4 \
 	      tests/test_m4_review tests/test_m5 tests/test_m5_review tests/test_m6 \
 	      tests/test_m6_review tests/test_bulk \

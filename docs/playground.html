@@ -5,6 +5,22 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Playground — datalog-dafsa</title>
 <link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="vendor/codemirror.css">
+<style>
+  /* LSP live-diagnostics styling (CodeMirror squiggle + tooltip + list). */
+  .CodeMirror { border: 1px solid #ddd; height: 380px; font-size: 14px; }
+  .cm-dl-squiggle { text-decoration: underline wavy #d33; text-decoration-skip-ink: none; }
+  #diagnostics { margin: 12px 0; font-size: 14px; }
+  #diagnostics .dl-diag { color: #b00020; padding: 2px 0; font-family: monospace; }
+  #diagnostics .dl-ok { color: #2e7d32; }
+  #tooltip {
+    position: absolute; z-index: 10; background: #fff8e1; border: 1px solid #e0c36a;
+    color: #5d4037; padding: 4px 8px; font-size: 13px; font-family: monospace;
+    max-width: 420px; white-space: pre-wrap; pointer-events: none; border-radius: 3px;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.15);
+  }
+  #editor-wrap { position: relative; }
+</style>
 </head>
 <body>
 
@@ -35,8 +51,13 @@
 
   <p id="status" class="note"></p>
 
-  <textarea id="program" rows="16" spellcheck="false"
-            aria-label="Datalog program"></textarea>
+  <div id="editor-wrap">
+    <textarea id="program" rows="16" spellcheck="false"
+              aria-label="Datalog program"></textarea>
+    <div id="tooltip" hidden></div>
+  </div>
+
+  <div id="diagnostics" class="note"></div>
 
   <div class="playground-controls">
     <label for="goal">Goal relation</label>
@@ -101,6 +122,10 @@
 </footer>
 
 <script src="playground.js"></script>
+<script src="dl-lsp.js"></script>
+<script src="vendor/codemirror.min.js"></script>
+<script src="vendor/codemirror-simple.js"></script>
+<script src="vendor/datalog-mode.js"></script>
 <script src="playground-ui.js"></script>
 
 </body>

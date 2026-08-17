@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdarg.h>
 
 /* ─── Token buffer ────────────────────────────────────────────────────── */
 
@@ -27,7 +28,30 @@ struct parser {
     int         ntok;       /* number of tokens */
     int         cur;        /* current token index */
     char       *src_owned;  /* owned copy of source (for parse_create) */
+    uint32_t    err_off;    /* byte offset of the FIRST recorded error */
+    int         has_err;    /* 1 once an error has been recorded */
+    char        err_msg[256];/* formatted text of the FIRST recorded error */
 };
+
+/* Record a parse error: write the message to stderr BYTE-IDENTICALLY to the
+ * pre-LSP parser (vfprintf), AND capture the offset + formatted message so
+ * parse_last_error() can surface a position.  Only the FIRST error is kept. */
+static void perr(parser *p, uint32_t off, const char *fmt, ...)
+{
+    va_list ap;
+
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+
+    if (p && !p->has_err) {
+        p->has_err = 1;
+        p->err_off = off;
+        va_start(ap, fmt);
+        vsnprintf(p->err_msg, sizeof(p->err_msg), fmt, ap);
+        va_end(ap);
+    }
+}
 
 /* ─── Character classification ────────────────────────────────────────── */
 
@@ -76,6 +100,7 @@ static token *tok_dup(const token *t)
     token *n = calloc(1, sizeof(*n));
     if (!n) return NULL;
     n->kind = t->kind;
+    n->off = t->off;
     n->ival = t->ival;
     if (t->text) {
         n->text = strdup(t->text);
@@ -145,9 +170,15 @@ static int lex(parser *p)
         break;
     }
 
+    /* Token start offset (0-based byte offset in the source), captured BEFORE
+     * the per-kind code below so every token kind — including EOF and
+     * punctuation — carries its position. */
+    const char *tok_start = s;
+
     if (*s == '\0') {
         t = tok_new(TOK_EOF, NULL, 0);
         if (!t) return -1;
+        t->off = (uint32_t)(tok_start - p->src);
         p->tokens[p->ntok++] = t;
         p->pos = s;
         return 0;
@@ -229,7 +260,7 @@ static int lex(parser *p)
         s++;
         while (*s && *s != '\'') s++;
         if (*s != '\'') {
-            fprintf(stderr, "parser: unclosed single-quoted string at position %ld\n",
+            perr(p, (uint32_t)(s - p->src), "parser: unclosed single-quoted string at position %ld\n",
                     (long)(s - p->src));
             return -1;
         }
@@ -241,7 +272,7 @@ static int lex(parser *p)
         s++; /* skip opening quote */
         while (*s && *s != '"') s++;
         if (*s != '"') {
-            fprintf(stderr, "parser: unclosed string at position %ld\n",
+            perr(p, (uint32_t)(s - p->src), "parser: unclosed string at position %ld\n",
                     (long)(s - p->src));
             return -1;
         }
@@ -254,7 +285,7 @@ static int lex(parser *p)
         while (*s >= '0' && *s <= '9') {
             val = val * 10 + (unsigned long)(*s - '0');
             if (val > 0xFFFFFFFFUL) {
-                fprintf(stderr, "parser: integer overflow at position %ld\n",
+                perr(p, (uint32_t)(s - p->src), "parser: integer overflow at position %ld\n",
                         (long)(s - p->src));
                 return -1;
             }
@@ -265,7 +296,7 @@ static int lex(parser *p)
         /* v2-lists boundary: raw int literals are limited to 31 bits so they
          * cannot alias a list handle in [TERM_BASE, ...). */
         if (val >= TERM_BASE) {
-            fprintf(stderr,
+            perr(p, (uint32_t)(s - p->src), 
                     "parser: integer literal %lu is out of range (raw ints "
                     "are limited to 31 bits, < %u, to keep list handles "
                     "distinct)\n",
@@ -287,12 +318,13 @@ static int lex(parser *p)
             t = tok_new(TOK_IDENT, start, (size_t)(s - start));
         }
     } else {
-        fprintf(stderr, "parser: unexpected character '%c' (0x%02x) at position %ld\n",
+        perr(p, (uint32_t)(s - p->src), "parser: unexpected character '%c' (0x%02x) at position %ld\n",
                 *s, (unsigned char)*s, (long)(s - p->src));
         return -1;
     }
 
     if (!t) return -1;
+    t->off = (uint32_t)(tok_start - p->src);
     p->tokens[p->ntok++] = t;
     p->pos = s;
     return 0;
@@ -339,7 +371,7 @@ static token *expect(parser *p, token_kind k)
 {
     token *t = peek(p);
     if (!t || t->kind != k) {
-        fprintf(stderr, "parser: expected token kind %d, got %d\n",
+        perr(p, peek(p) ? peek(p)->off : 0, "parser: expected token kind %d, got %d\n",
                 (int)k, t ? (int)t->kind : -1);
         return NULL;
     }
@@ -455,7 +487,7 @@ static token *parse_arg(parser *p)
         t->kind == TOK_INT || t->kind == TOK_AGGREGATE) {
         return tok_dup(advance(p));
     }
-    fprintf(stderr, "parser: expected argument (ident/var/int/list), got kind %d\n",
+    perr(p, peek(p) ? peek(p)->off : 0, "parser: expected argument (ident/var/int/list), got kind %d\n",
             t->kind);
     return NULL;
 }
@@ -473,12 +505,12 @@ static token *parse_list_element(parser *p)
     if (t->kind == TOK_LBRACKET)
         return parse_list(p);
     if (t->kind == TOK_PIPE) {
-        fprintf(stderr,
+        perr(p, peek(p) ? peek(p)->off : 0, 
                 "parser: unexpected '|' in list — it must follow at least one "
                 "element ([X|Xs] head/tail pattern)\n");
         return NULL;
     }
-    fprintf(stderr, "parser: unexpected token kind %d in list literal\n",
+    perr(p, peek(p) ? peek(p)->off : 0, "parser: unexpected token kind %d in list literal\n",
             (int)t->kind);
     return NULL;
 }
@@ -526,7 +558,7 @@ static token *parse_list(parser *p)
                 advance(p);
                 tl = peek(p);
                 if (!tl || tl->kind != TOK_VAR) {
-                    fprintf(stderr,
+                    perr(p, peek(p) ? peek(p)->off : 0, 
                             "parser: the tail after '|' in a list pattern "
                             "must be a variable (got kind %d)\n",
                             tl ? (int)tl->kind : -1);
@@ -538,7 +570,7 @@ static token *parse_list(parser *p)
                 if (!expect(p, TOK_RBRACKET)) goto fail;
                 break;
             }
-            fprintf(stderr, "parser: expected ',' or ']' in list literal, "
+            perr(p, peek(p) ? peek(p)->off : 0, "parser: expected ',' or ']' in list literal, "
                     "got kind %d\n", (int)sep->kind);
             goto fail;
         }
@@ -569,17 +601,17 @@ static atom *parse_atom(parser *p)
     pred = peek(p);
     if (!pred || pred->kind != TOK_IDENT) {
         if (pred)
-            fprintf(stderr, "parser: expected predicate name, got kind %d\n",
+            perr(p, peek(p) ? peek(p)->off : 0, "parser: expected predicate name, got kind %d\n",
                     pred->kind);
         else
-            fprintf(stderr, "parser: expected predicate name, got EOF\n");
+            perr(p, peek(p) ? peek(p)->off : 0, "parser: expected predicate name, got EOF\n");
         return NULL;
     }
     advance(p);
 
     lp = peek(p);
     if (!lp || lp->kind != TOK_LPAREN) {
-        fprintf(stderr, "parser: expected '(' after predicate, got kind %d\n",
+        perr(p, peek(p) ? peek(p)->off : 0, "parser: expected '(' after predicate, got kind %d\n",
                 lp ? (int)lp->kind : -1);
         return NULL;
     }
@@ -589,6 +621,7 @@ static atom *parse_atom(parser *p)
     if (!a) return NULL;
     a->pred = strdup(pred->text);
     if (!a->pred) { atom_free(a); return NULL; }
+    a->off = pred->off;
 
     /* Parse arguments */
     {
@@ -628,7 +661,7 @@ static atom *parse_atom(parser *p)
                 advance(p);
                 break;
             } else {
-                fprintf(stderr, "parser: expected ',' or ')', got kind %d\n",
+                perr(p, peek(p) ? peek(p)->off : 0, "parser: expected ',' or ')', got kind %d\n",
                         rp->kind);
                 atom_free(a);
                 return NULL;
@@ -712,7 +745,7 @@ static expr *parse_factor(parser *p)
     expr *e;
 
     if (!t) {
-        fprintf(stderr, "parser: unexpected end of input in expression\n");
+        perr(p, peek(p) ? peek(p)->off : 0, "parser: unexpected end of input in expression\n");
         return NULL;
     }
     if (t->kind == TOK_VAR || t->kind == TOK_INT) {
@@ -734,7 +767,7 @@ static expr *parse_factor(parser *p)
         if (!expect(p, TOK_RPAREN)) { expr_free(e); return NULL; }
         return e;
     }
-    fprintf(stderr,
+    perr(p, peek(p) ? peek(p)->off : 0, 
             "parser: expected variable, integer, or '(' in arithmetic "
             "expression, got kind %d\n", (int)t->kind);
     return NULL;
@@ -799,7 +832,7 @@ static atom *parse_body_atom(parser *p)
                              rhs->kind != TOK_IDENT &&
                              rhs->kind != TOK_STRING &&
                              rhs->kind != TOK_LBRACKET)) {
-                    fprintf(stderr,
+                    perr(p, peek(p) ? peek(p)->off : 0, 
                         "parser: expected variable or constant after '=' in "
                         "list assignment\n");
                     tok_free(lst); return NULL;
@@ -825,7 +858,7 @@ static atom *parse_body_atom(parser *p)
             }
         }
         /* a bare list literal is not a valid body atom on its own */
-        fprintf(stderr, "parser: expected '=' after list pattern (list "
+        perr(p, peek(p) ? peek(p)->off : 0, "parser: expected '=' after list pattern (list "
                 "assignment [X|Xs] = L)\n");
         tok_free(lst);
         return NULL;
@@ -880,7 +913,7 @@ static atom *parse_body_atom(parser *p)
                     /* count() requires empty parens */
                     token *rp = peek(p);
                     if (!rp || rp->kind != TOK_RPAREN) {
-                        fprintf(stderr,
+                        perr(p, peek(p) ? peek(p)->off : 0, 
                             "parser: 'count' requires no arguments near '%s'\n",
                             agop->text);
                         atom_free(a); return NULL;
@@ -892,7 +925,7 @@ static atom *parse_body_atom(parser *p)
                     /* sum/min/max require exactly one variable argument */
                     token *src = peek(p);
                     if (!src || src->kind != TOK_VAR) {
-                        fprintf(stderr,
+                        perr(p, peek(p) ? peek(p)->off : 0, 
                             "parser: aggregate '%s' requires one variable argument near '%s'\n",
                             agop->text, agop->text);
                         atom_free(a); return NULL;
@@ -921,6 +954,7 @@ static atom *parse_body_atom(parser *p)
                 atom *a = atom_new();
                 if (!a) return NULL;
                 a->pred = strdup(nm->text);
+                a->off = nm->off;
                 a->negated = negated;
                 if (!a->pred) { atom_free(a); return NULL; }
 
@@ -954,13 +988,13 @@ static atom *parse_body_atom(parser *p)
                             ok = (op->kind == TOK_VAR || op->kind == TOK_IDENT);
                         if (!ok) {
                             if (is_list)
-                                fprintf(stderr,
+                                perr(p, peek(p) ? peek(p)->off : 0, 
                                     "parser: expected variable or constant "
                                     "(int/string/list) operand in list builtin "
                                     "'%s', got kind %d\n",
                                     nm->text, (int)op->kind);
                             else
-                                fprintf(stderr,
+                                perr(p, peek(p) ? peek(p)->off : 0, 
                                     "parser: expected variable or string "
                                     "constant operand in string builtin '%s', "
                                     "got kind %d\n",
@@ -981,7 +1015,7 @@ static atom *parse_body_atom(parser *p)
                     if (!sep) { fail = 1; break; }
                     if (sep->kind == TOK_COMMA) { advance(p); continue; }
                     if (sep->kind == TOK_RPAREN) { advance(p); break; }
-                    fprintf(stderr, "parser: expected ',' or ')' in string "
+                    perr(p, peek(p) ? peek(p)->off : 0, "parser: expected ',' or ')' in string "
                             "builtin '%s', got kind %d\n",
                             nm->text, (int)sep->kind);
                     fail = 1; break;
@@ -1033,11 +1067,11 @@ static atom *parse_body_atom(parser *p)
                 if (rhs->kind != TOK_VAR && rhs->kind != TOK_INT &&
                     !(op->kind == TOK_NE && rhs->kind == TOK_IDENT)) {
                     if (rhs->kind == TOK_IDENT)
-                        fprintf(stderr,
+                        perr(p, peek(p) ? peek(p)->off : 0, 
                             "parser: symbol constant not allowed in ordering "
                             "comparison '%s' (only in =/!=)\n", optext);
                     else
-                        fprintf(stderr,
+                        perr(p, peek(p) ? peek(p)->off : 0, 
                             "parser: expected variable or integer operand for "
                             "comparison '%s', got kind %d\n",
                             optext, (int)rhs->kind);
@@ -1075,7 +1109,7 @@ static atom *parse_body_atom(parser *p)
                 advance(p);
                 t = peek(p);
                 if (!t || t->kind != TOK_STRING) {
-                    fprintf(stderr, "parser: expected pattern string "
+                    perr(p, peek(p) ? peek(p)->off : 0, "parser: expected pattern string "
                             "after '~'\n");
                     atom_free(a);
                     return NULL;
@@ -1143,6 +1177,7 @@ static rule *parse_one_rule(parser *p)
     /* Atom first */
     r->head = parse_atom(p);
     if (!r->head) { rule_free(r); return NULL; }
+    r->off = r->head->off;
 
     t = peek(p);
     if (!t) { rule_free(r); return NULL; }
@@ -1186,6 +1221,41 @@ parser *parse_create(const char *source)
     return p;
 }
 
+/* LSP-only variant: identical to parse_create() EXCEPT that a lexer error does
+ * NOT free the parser — it is returned so the caller can read the error
+ * position via parse_last_error() before freeing it.  The CLI/playground keep
+ * using parse_create(), whose observable behaviour is unchanged. */
+parser *parse_create_reporting(const char *source)
+{
+    parser *p;
+
+    if (!source) return NULL;
+
+    p = calloc(1, sizeof(*p));
+    if (!p) return NULL;
+
+    p->src_owned = strdup(source);
+    if (!p->src_owned) { free(p); return NULL; }
+    p->src = p->src_owned;
+    p->pos = p->src;
+
+    p->tokens = calloc(MAX_TOKENS, sizeof(token *));
+    if (!p->tokens) { free(p->src_owned); free(p); return NULL; }
+
+    if (tokenize(p) != 0)
+        return p;   /* keep the parser: the caller reads parse_last_error() */
+
+    return p;
+}
+
+const char *parse_last_error(const parser *p, uint32_t *off)
+{
+    if (off) *off = 0;
+    if (!p || !p->has_err) return NULL;
+    if (off) *off = p->err_off;
+    return p->err_msg;
+}
+
 rule **parse_rules(parser *p, int *n_rules)
 {
     rule **rules = NULL;
@@ -1213,13 +1283,13 @@ rule **parse_rules(parser *p, int *n_rules)
     {
         token *t = peek(p);
         if (t && t->kind != TOK_EOF) {
-            fprintf(stderr, "parse: trailing tokens\n");
+            perr(p, peek(p) ? peek(p)->off : 0, "parse: trailing tokens\n");
             goto error;
         }
     }
 
     if (nr == 0) {
-        fprintf(stderr, "parse: no rules found\n");
+        perr(p, peek(p) ? peek(p)->off : 0, "parse: no rules found\n");
         free(rules);
         return NULL;
     }

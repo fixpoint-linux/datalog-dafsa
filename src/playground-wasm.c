@@ -12,22 +12,14 @@
  * The returned pointer is a module-global buffer overwritten on the next
  * call — the JS bridge must copy it out (UTF8ToString) immediately.
  *
- * IN-MEMORY INGEST (the crux): the engine's public fact/declare APIs are ALL
- * disk-bound (dl_open requires a dir; dl_declare_relation rewrites rels.txt;
- * dl_add_fact WAL-appends + fsyncs; dl_load_facts reads a CSV path).  So this
- * entry builds a dir==NULL dl_db from scratch and drives the pure in-memory
- * primitives directly: intern_create()/term_create() -> fresh interner +
- * list store; rel_create(arity) -> fresh empty in-memory DAFSA;
- * rel_add_base(rel, cols) -> add an EDB fact (NO WAL, NO disk);
- * compile_rules() PUBLIC -> rule ASTs to bytecode; vm_execute()/rel_prefix()
- * PUBLIC -> run fixpoint + enumerate.  This mirrors exactly what the
- * magic/topdown path does via its static eval_db_clone() +
- * eval_db_declare_inmem() (dl.c:2292 / 2343).
- *
- * KEY SUBTLETY: the compiler only calls dl_declare_relation() for MISSING
- * head relations (db_find_rel < 0).  Because dir==NULL, that call would fail
- * loudly (dl.c:675).  So we pre-declare EVERY head (fact + rule) in-memory
- * before compile_rules, making the compiler skip its declare branch entirely.
+ * IN-MEMORY INGEST: the engine's public fact/declare APIs are ALL disk-bound
+ * (dl_open requires a dir; dl_declare_relation rewrites rels.txt; dl_add_fact
+ * WAL-appends + fsyncs; dl_load_facts reads a CSV path).  The pure in-memory
+ * ingest (build a dir==NULL dl_db, pre-declare every head, add ground facts,
+ * compile the rules) now lives in src/analyze.c::analyze_program() and is
+ * SHARED with the language server — see analyze.h.  This file only renders the
+ * result and maps analyze_program()'s failure stages back to the exact coarse
+ * error strings the browser playground has always produced.
  *
  * SUPPORTED SUBSET (in-memory): facts (incl. double-quoted strings, bare
  * lowercase symbols, integers, list literals), rules with recursion,
@@ -44,10 +36,7 @@
 #include "dl_internal.h"
 #include "intern.h"
 #include "termstore.h"
-#include "relation.h"
-#include "parser.h"
-#include "compiler.h"
-#include "vm.h"
+#include "analyze.h"
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten/emscripten.h>
@@ -159,252 +148,38 @@ static int collect_cb(const uint32_t *cols, uint8_t arity, void *user)
     return 0;
 }
 
-/* ─── In-memory db helpers (mirror eval_db_declare_inmem, dl.c:2343) ──── */
-
-static int mem_find_rel(dl_db *db, const char *name)
-{
-    size_t i;
-    for (i = 0; i < db->nrels; i++)
-        if (strcmp(db->rels[i].name, name) == 0)
-            return (int)i;
-    return -1;
-}
-
-/* Declare a FIXED relation in-memory (rel_create, no WAL/disk).  Idempotent
- * for the same name + arity (like dl_declare_relation_kind's no-op branch). */
-static int mem_declare(dl_db *db, const char *name, uint8_t arity)
-{
-    int idx = mem_find_rel(db, name);
-    relation *rel;
-    if (arity == 0 || arity > 8) return -1;
-    if (idx >= 0) {
-        if (db->rels[idx].kind != RELK_FIXED) return -1;
-        return (rel_arity(db->rels[idx].rel) == arity) ? 0 : -1;
-    }
-    if (db->nrels >= MAX_RELS) return -1;
-    rel = rel_create(arity);
-    if (!rel) return -1;
-    db->rels[db->nrels].name = strdup(name);
-    if (!db->rels[db->nrels].name) { rel_free(rel); return -1; }
-    db->rels[db->nrels].kind  = RELK_FIXED;
-    db->rels[db->nrels].arity = arity;
-    db->rels[db->nrels].rel   = rel;
-    db->rels[db->nrels].vrel  = NULL;
-    db->nrels++;
-    return 0;
-}
-
-/* ─── Ground fact constant → u32 (parser token) ────────────────────────── */
-
-/* Convert a single ground element token to a u32 value.  Returns 1 on
- * success, 0 on error (a TOK_VAR / non-ground token). */
-static int elem_of(dl_db *db, token *t, uint32_t *out)
-{
-    switch (t->kind) {
-    case TOK_INT:
-        *out = t->ival;
-        return 1;
-    case TOK_IDENT:
-    case TOK_STRING:
-        *out = intern_str(db->ir, t->text);
-        return *out != 0;   /* 0 == OOM; a valid interned sym is never 0 */
-    default:
-        return 0;           /* TOK_VAR / TOK_LIST-as-elem (not supported here) */
-    }
-}
-
-/* Build a list handle from a TOK_LIST token's element tokens.  Returns the
- * handle, or 0 on error (unbound element / OOM / non-list tail). */
-static uint32_t list_of(dl_db *db, token *t)
-{
-    uint32_t tail = TERM_NIL;
-    int i;
-    if (t->kind != TOK_LIST) return 0;
-    for (i = t->nchildren - 1; i >= 0; i--) {
-        uint32_t el;
-        if (!elem_of(db, t->children[i], &el)) return 0;
-        tail = term_cons(db->terms, el, tail);
-        if (tail == 0) return 0;   /* OOM or non-list tail */
-    }
-    return tail;
-}
-
-/* Convert a ground fact argument token to a u32 column value.
- * Returns 1 on success (cols_out set), 0 on error (non-ground fact). */
-static int const_of(dl_db *db, token *t, uint32_t *cols_out)
-{
-    uint32_t h;
-    switch (t->kind) {
-    case TOK_INT:
-        *cols_out = t->ival;
-        return 1;
-    case TOK_IDENT:
-    case TOK_STRING:
-        *cols_out = intern_str(db->ir, t->text);
-        return *cols_out != 0;
-    case TOK_LIST:
-        h = list_of(db, t);
-        if (h == 0) return 0;
-        *cols_out = h;
-        return 1;
-    case TOK_VAR:
-    default:
-        return 0;   /* non-ground fact */
-    }
-}
-
-/* Add one ground fact (head-only rule, nbody==0) to its relation's base. */
-static int mem_add_fact(dl_db *db, rule *r)
-{
-    uint32_t cols[MAX_ARITY];
-    int idx;
-    int i;
-    atom *head = r->head;
-    if (!head || head->nargs > MAX_ARITY || head->nargs < 1) return -1;
-    for (i = 0; i < head->nargs; i++) {
-        if (!const_of(db, head->args[i], &cols[i])) return -1;
-    }
-    idx = mem_find_rel(db, head->pred);
-    if (idx < 0) return -1;
-    if (db->rels[idx].kind != RELK_FIXED) return -1;
-    /* rel_add_base returns 1 (added), 0 (dup) or -1 (error).  Any
-     * non-negative result is a successful insert — normalize to 0. */
-    return rel_add_base(db->rels[idx].rel, cols) < 0 ? -1 : 0;
-}
-
-/* ─── Rule loading (compile_rules + append to db->crules) ──────────────── */
-
-static int load_rules_ast(dl_db *db, rule **rules, int n_rules)
-{
-    compiled_rule **new_crules = NULL;
-    int n_compiled = 0;
-    int i;
-    if (n_rules <= 0) return 0;
-    if (compile_rules(db, rules, n_rules, &new_crules, &n_compiled) != 0) {
-        for (i = 0; i < n_compiled; i++) compiled_rule_free(new_crules[i]);
-        free(new_crules);
-        return -1;
-    }
-    {
-        int new_total = db->n_crules + n_compiled;
-        compiled_rule **merged = realloc(db->crules,
-            (size_t)new_total * sizeof(compiled_rule *));
-        if (!merged) {
-            for (i = 0; i < n_compiled; i++) compiled_rule_free(new_crules[i]);
-            free(new_crules);
-            return -1;
-        }
-        memcpy(merged + db->n_crules, new_crules,
-               (size_t)n_compiled * sizeof(compiled_rule *));
-        free(new_crules);
-        db->crules = merged;
-        db->n_crules = new_total;
-    }
-    db->fixpoint_dirty = 1;
-    return 0;
-}
-
-/* ─── Teardown: free everything (no leak across repeated Run clicks) ───── */
-
-static void mem_db_free(dl_db *db)
-{
-    size_t i;
-    if (!db) return;
-    if (db->crules) {
-        for (i = 0; i < (size_t)db->n_crules; i++)
-            compiled_rule_free(db->crules[i]);
-        free(db->crules);
-        db->crules = NULL;
-        db->n_crules = 0;
-    }
-    for (i = 0; i < db->nrels; i++) {
-        if (db->rels[i].kind == RELK_VARIADIC)
-            vrel_free(db->rels[i].vrel);
-        else
-            rel_free(db->rels[i].rel);
-        free(db->rels[i].name);
-    }
-    db->nrels = 0;
-    intern_free(db->ir);
-    term_free(db->terms);
-    memset(db, 0, sizeof(*db));
-    db->lock_fd = -1;
-}
-
 /* ─── Entry point ─────────────────────────────────────────────────────── */
 
 EMSCRIPTEN_KEEPALIVE
 const char *playground_run(const char *program, const char *goal)
 {
-    dl_db db;
-    parser *p = NULL;
-    rule **rules = NULL;
-    int n_rules = 0;
-    int i;
+    dl_db *db = NULL;
+    analyze_error aerr;
     int rc = -1;
     static const char *err = NULL;
 
     out_reset();
 
-    memset(&db, 0, sizeof(db));
-    db.dir = NULL;
-    db.lock_fd = -1;
-    db.ir = intern_create();
-    db.terms = term_create();
-    if (!db.ir || !db.terms) { err = "error: out of memory"; goto cleanup; }
-
-    /* Parse the whole program (facts + rules). */
-    p = parse_create(program);
-    if (!p) { err = "error: parse failed"; goto cleanup; }
-    rules = parse_rules(p, &n_rules);
-    if (!rules) { err = "error: parse failed"; goto cleanup; }
-
-    /* PASS 1: pre-declare EVERY head (facts AND rules) in-memory, so the
-     * compiler's dl_declare_relation branch (which would hit the dir==NULL
-     * guard) is never reached. */
-    for (i = 0; i < n_rules; i++) {
-        atom *head = rules[i]->head;
-        if (!head || !head->pred || head->nargs < 1) {
-            err = "error: malformed rule";
-            goto cleanup;
+    /* Parse + pre-declare + facts + compile (see analyze.c).  On failure the
+     * db is already freed and aerr carries the stage + precise message. */
+    if (analyze_program(program, &db, &aerr) != 0) {
+        switch (aerr.stage) {
+        case ANALYZE_PARSE:     err = "error: parse failed"; break;
+        case ANALYZE_MALFORMED: err = "error: malformed rule"; break;
+        case ANALYZE_DECLARE:   err = "error: cannot declare relation"; break;
+        case ANALYZE_FACT:      err = "error: non-ground fact"; break;
+        case ANALYZE_COMPILE:   err = "error: rule compile failed"; break;
+        case ANALYZE_OOM:
+        default:                err = "error: out of memory"; break;
         }
-        if (mem_declare(&db, head->pred, (uint8_t)head->nargs) != 0) {
-            err = "error: cannot declare relation";
-            goto cleanup;
-        }
-    }
-
-    /* PASS 2: split facts (nbody==0, ground head) from rules. */
-    for (i = 0; i < n_rules; i++) {
-        rule *r = rules[i];
-        if (r->nbody == 0) {
-            if (mem_add_fact(&db, r) != 0) {
-                err = "error: non-ground fact";
-                goto cleanup;
-            }
-        }
-    }
-    /* Compile all RULES (nbody > 0) — facts were handled above. */
-    {
-        rule **r_rules = NULL;
-        int n_r_rules = 0;
-        r_rules = malloc((size_t)(n_rules ? n_rules : 1) * sizeof(rule *));
-        if (!r_rules) { err = "error: out of memory"; goto cleanup; }
-        for (i = 0; i < n_rules; i++)
-            if (rules[i]->nbody > 0) r_rules[n_r_rules++] = rules[i];
-        if (load_rules_ast(&db, r_rules, n_r_rules) != 0) {
-            free(r_rules);
-            err = "error: rule compile failed";
-            goto cleanup;
-        }
-        free(r_rules);
+        goto cleanup;
     }
 
     /* Evaluate (fixpoint) then stream the goal. */
-    if (dl_compile(&db) != 0) { err = "error: evaluation failed"; goto cleanup; }
+    if (dl_compile(db) != 0) { err = "error: evaluation failed"; goto cleanup; }
 
     if (goal && *goal) {
-        long n = dl_query(&db, goal, collect_cb, &db);
+        long n = dl_query(db, goal, collect_cb, db);
         if (n < 0) {
             err = "error: query failed (unknown goal relation?)";
             goto cleanup;
@@ -414,12 +189,7 @@ const char *playground_run(const char *program, const char *goal)
     rc = 0;
 
 cleanup:
-    if (rules) {
-        for (i = 0; i < n_rules; i++) rule_free(rules[i]);
-        free(rules);
-    }
-    if (p) parse_free(p);
-    mem_db_free(&db);
+    analyze_db_free(db);
     if (rc != 0) return err ? err : "error: unknown";
     return g_out ? g_out : "";
 }

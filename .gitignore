@@ -6,6 +6,7 @@ build-tmp/
 
 # binaries
 /dl
+/dl-lsp
 /tests/test_m0
 /tests/test_m1
 /tests/test_m2

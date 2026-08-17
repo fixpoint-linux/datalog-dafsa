@@ -48,6 +48,43 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdarg.h>
+
+/* ─── LSP compile-error sink (parallel capture; stderr text unchanged) ── */
+static uint32_t compile_err_off;
+static char     compile_err_msg[256];
+static int      compile_has_err;
+
+/* Byte offset of the rule currently being compiled by compile_one().  Helper
+ * functions (token_const, the *_operands_bound checks, cmp_operand_slot) don't
+ * carry the `rule *` down, so they attribute their diagnostic to this rule. */
+static uint32_t g_rule_off;
+
+/* Write a compile error to stderr BYTE-IDENTICALLY to the pre-LSP compiler
+ * (vfprintf), AND capture the offset + formatted message.  Only the FIRST
+ * error of a compile_rules() call is kept. */
+static void cerr(uint32_t off, const char *fmt, ...)
+{
+    va_list ap;
+
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+
+    if (!compile_has_err) {
+        compile_has_err = 1;
+        compile_err_off = off;
+        va_start(ap, fmt);
+        vsnprintf(compile_err_msg, sizeof(compile_err_msg), fmt, ap);
+        va_end(ap);
+    }
+}
+
+const char *compile_last_error(uint32_t *off)
+{
+    if (off) *off = compile_err_off;
+    return compile_has_err ? compile_err_msg : NULL;
+}
 
 /* ─── dl_db internals access (authoritative layout in dl_internal.h) ─── */
 
@@ -310,7 +347,7 @@ static int token_const(dl_db *db, const token *t, uint32_t *out)
             pos += 8;
             brief[pos] = '\0';
 
-            fprintf(stderr, "compile error: failed to intern string constant "
+            cerr(g_rule_off, "compile error: failed to intern string constant "
                     "'%s' (out of memory, or string exceeds the %d-byte "
                     "interner key limit)\n", brief, 4096);
             return -1;
@@ -322,7 +359,7 @@ static int token_const(dl_db *db, const token *t, uint32_t *out)
          * lowers patterns via emit_pattern during the relational phase.  This
          * is a safety net for a nested pattern or a pattern in a head/fact. */
         if (list_is_pattern(t)) {
-            fprintf(stderr, "compile error: internal: list pattern reached a "
+            cerr(g_rule_off, "compile error: internal: list pattern reached a "
                     "constant position (nested list patterns are not "
                     "supported)\n");
             return -1;
@@ -336,7 +373,7 @@ static int token_const(dl_db *db, const token *t, uint32_t *out)
             if (token_const(db, t->children[i], &eh)) return -1;
             acc = term_cons(db->terms, eh, acc);
             if (acc == 0) {
-                fprintf(stderr, "compile error: out of memory interning a "
+                cerr(g_rule_off, "compile error: out of memory interning a "
                         "list literal (term store)\n");
                 return -1;
             }
@@ -344,7 +381,7 @@ static int token_const(dl_db *db, const token *t, uint32_t *out)
         *out = acc;
         return 0;
     }
-    fprintf(stderr, "compile error: internal: unexpected token kind %d in a "
+    cerr(g_rule_off, "compile error: internal: unexpected token kind %d in a "
             "constant position\n", (int)t->kind);
     return -1;
 }
@@ -763,7 +800,7 @@ static int expr_vars_bound(const expr *e, v_tab *vt, const int *bound_vars,
     if (e->kind == EX_VAR) {
         int vi = v_find(vt, e->var);
         if (vi < 0 || !bound_vars[vi]) {
-            fprintf(stderr,
+            cerr(g_rule_off, 
                 "compile error: ungrounded arithmetic operand — variable "
                 "'%s' is not bound by a positive body atom (rule '%s')\n",
                 e->var, head_pred);
@@ -837,7 +874,7 @@ static int cmp_operand_slot(dl_db *db, const token *t, v_tab *vt, i_buf *ib,
                             int *cc, int allow_list)
 {
     if (t->kind == TOK_LIST && !allow_list) {
-        fprintf(stderr,
+        cerr(g_rule_off, 
                 "compile error: list literal not allowed in this position "
                 "(lists have no meaningful order; use = / != via variables)\n");
         return -1;
@@ -878,7 +915,7 @@ static int str_producing_operands_bound(const atom *a, v_tab *vt,
         {
             int vi = v_find(vt, t->text);
             if (vi < 0 || !bound_vars[vi]) {
-                fprintf(stderr,
+                cerr(g_rule_off, 
                     "compile error: ungrounded string operand — variable "
                     "'%s' in '%s' is not bound by a positive body atom "
                     "(rule '%s')\n", t->text, a->pred, head_pred);
@@ -902,7 +939,7 @@ static int list_producing_operands_bound(const atom *a, v_tab *vt,
         {
             int vi = v_find(vt, t->text);
             if (vi < 0 || !bound_vars[vi]) {
-                fprintf(stderr,
+                cerr(g_rule_off, 
                     "compile error: ungrounded list operand — variable "
                     "'%s' in '%s' is not bound by a positive body atom "
                     "(rule '%s')\n", t->text, a->pred, head_pred);
@@ -924,7 +961,7 @@ static int member_operand_bound(const atom *a, v_tab *vt,
     if (t->kind != TOK_VAR) return 1;   /* constant L is always bound */
     vi = v_find(vt, t->text);
     if (vi < 0 || !bound_vars[vi]) {
-        fprintf(stderr,
+        cerr(g_rule_off, 
                 "compile error: ungrounded member operand — list variable "
                 "'%s' in 'member' is not bound by a positive body atom "
                 "(rule '%s')\n", t->text, head_pred);
@@ -947,7 +984,7 @@ static int range_operands_bound(const atom *a, v_tab *vt,
         if (t->kind != TOK_VAR) continue;   /* int constant is always bound */
         vi = v_find(vt, t->text);
         if (vi < 0 || !bound_vars[vi]) {
-            fprintf(stderr,
+            cerr(g_rule_off, 
                     "compile error: ungrounded range bound — variable "
                     "'%s' in 'range' is not bound by a positive body atom "
                     "(rule '%s')\n", t->text, head_pred);
@@ -971,7 +1008,7 @@ static int str_filter_operands_bound(const atom *a, v_tab *vt,
         {
             int vi = v_find(vt, t->text);
             if (vi < 0 || !bound_vars[vi]) {
-                fprintf(stderr,
+                cerr(g_rule_off, 
                     "compile error: ungrounded string filter — variable "
                     "'%s' in '%s' is not bound by a positive body atom "
                     "(rule '%s')\n", t->text, a->pred, head_pred);
@@ -1100,7 +1137,7 @@ static int compute_strata(dl_db *db, rule **rules, int n_rules,
      * can slip through and be silently mis-evaluated.  Exiting at the cap
      * with changed still set IS unstratifiable: report it loudly. */
     if (changed) {
-        fprintf(stderr,
+        cerr(0, 
                 "compile error: unstratifiable program — stratification "
                 "fixpoint did not converge (strict dependency cycle through "
                 "negation or range)\n");
@@ -1344,7 +1381,7 @@ static int compute_strata(dl_db *db, rule **rules, int n_rules,
          * changed still set is an unstratifiable strict cycle; report it
          * loudly rather than silently under-stratifying. */
         if (changed) {
-            fprintf(stderr,
+            cerr(0, 
                     "compile error: unstratifiable program — stratification "
                     "fixpoint did not converge (strict dependency cycle "
                     "through negation or range)\n");
@@ -1361,7 +1398,7 @@ static int compute_strata(dl_db *db, rule **rules, int n_rules,
     for (i = 0; i < n_edges; i++) {
         if (edges[i].is_neg) {
             if (stratum[edges[i].to] <= stratum[edges[i].from]) {
-                fprintf(stderr,
+                cerr(0, 
                     "compile error: unstratifiable program — negation "
                     "through recursion: '%s' depends negatively on '%s' "
                     "in the same SCC\n",
@@ -1585,7 +1622,7 @@ static int emit_nonleading_join(dl_db *db, const rule *r, const atom *curr,
         perm_id = dl_db_declare_perm(db, rel_id, (uint8_t)curr->nargs,
                                      perm_arr);
         if (perm_id < 0) {
-            fprintf(stderr, "compile error: too many permutation "
+            cerr(r->off, "compile error: too many permutation "
                     "indices (rule '%s')\n", r->head->pred);
             return -1;
         }
@@ -1898,6 +1935,8 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata,
                                   const int *recursive)
 {
     v_tab vt; i_buf ib; compiled_rule *cr = NULL;
+    g_rule_off = r->off;
+
     int head_ri, *bri = NULL, bi, i, j;
     int cc = 0;  /* counter for unique constant slot names */
     int tc = 0;  /* M9: counter for unique arithmetic temp slot names */
@@ -1921,12 +1960,12 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata,
         atom *ba = r->body[bi];
         if (!ba->pattern) continue;
         if (ba->negated) {
-            fprintf(stderr, "compile error: negated pattern atom not supported "
+            cerr(r->off, "compile error: negated pattern atom not supported "
                     "(rule '%s')\n", r->head->pred); goto fail;
         }
         regex_dfa *dfa = regex_compile(ba->pattern);
         if (dfa->errmsg) {
-            fprintf(stderr, "compile error: bad regex pattern '%s': %s "
+            cerr(r->off, "compile error: bad regex pattern '%s': %s "
                     "(rule '%s')\n",
                     ba->pattern, dfa->errmsg, r->head->pred);
             regex_dfa_free(dfa);
@@ -1948,7 +1987,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata,
     for (bi = 0; bi < r->nbody; bi++) {
         if (r->body[bi]->aggregate) {
             if (agg_body_idx >= 0) {
-                fprintf(stderr, "compile error: multiple aggregates not supported "
+                cerr(r->off, "compile error: multiple aggregates not supported "
                         "(rule '%s')\n", r->head->pred); goto fail;
             }
             agg_body_idx = bi;
@@ -1956,7 +1995,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata,
     }
     atom *agg = (agg_body_idx >= 0) ? r->body[agg_body_idx] : NULL;
     if (agg && agg->negated) {
-        fprintf(stderr, "compile error: aggregate inside negation not supported "
+        cerr(r->off, "compile error: aggregate inside negation not supported "
                 "(rule '%s')\n", r->head->pred); goto fail;
     }
     int agg_op_code = -1;
@@ -1968,17 +2007,17 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata,
         else if (!strcmp(opname, "min"))    agg_op_code = 2;
         else if (!strcmp(opname, "max"))    agg_op_code = 3;
         else {
-            fprintf(stderr, "compile error: unknown aggregate '%s' (rule '%s')\n",
+            cerr(r->off, "compile error: unknown aggregate '%s' (rule '%s')\n",
                     opname, r->head->pred); goto fail;
         }
         if (agg_op_code == 0) {
             if (agg->nargs != 0) {
-                fprintf(stderr, "compile error: 'count' takes no arguments (rule '%s')\n",
+                cerr(r->off, "compile error: 'count' takes no arguments (rule '%s')\n",
                         r->head->pred); goto fail;
             }
         } else {
             if (agg->nargs != 1 || agg->args[0]->kind != TOK_VAR) {
-                fprintf(stderr, "compile error: 'sum/min/max' require a source variable "
+                cerr(r->off, "compile error: 'sum/min/max' require a source variable "
                         "(rule '%s')\n", r->head->pred); goto fail;
             }
             agg_src_var = agg->args[0]->text;
@@ -1991,7 +2030,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata,
      * BEFORE collect-vars, so a pattern var never enters the var table. */
     for (i = 0; i < r->head->nargs; i++) {
         if (list_is_pattern(r->head->args[i])) {
-            fprintf(stderr, "compile error: list pattern in head/fact of '%s' "
+            cerr(r->off, "compile error: list pattern in head/fact of '%s' "
                     "— use cons(...) to construct lists\n", r->head->pred);
             goto fail;
         }
@@ -2003,7 +2042,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata,
      * or (for a fact) fall through to the misleading "rule X has no body".
      * Reject loudly here with a clear diagnostic BEFORE head resolution. */
     if (is_reserved_builtin_name(r->head->pred)) {
-        fprintf(stderr, "compile error: '%s' is a reserved builtin predicate "
+        cerr(r->off, "compile error: '%s' is a reserved builtin predicate "
                 "name and cannot be used as a rule head (rule '%s')\n",
                 r->head->pred, r->head->pred);
         goto fail;
@@ -2013,11 +2052,11 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata,
     head_ri = db_find_rel(db, r->head->pred);
     if (head_ri < 0) {
         if (r->head->nargs < 1 || r->head->nargs > MAX_ARITY) {
-            fprintf(stderr, "compile error: head arity %d for '%s'\n",
+            cerr(r->off, "compile error: head arity %d for '%s'\n",
                     r->head->nargs, r->head->pred); goto fail;
         }
         if (dl_declare_relation(db, r->head->pred, (uint8_t)r->head->nargs))
-        { fprintf(stderr, "compile error: cannot declare '%s/%d'\n",
+        { cerr(r->off, "compile error: cannot declare '%s/%d'\n",
                    r->head->pred, r->head->nargs); goto fail; }
         head_ri = db_find_rel(db, r->head->pred);
         if (head_ri < 0) goto fail;
@@ -2029,17 +2068,17 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata,
          * the user must dl_declare_relation_variadic BEFORE dl_load_rules
          * (an undeclared head is declared fixed, as in v1). */
         if (r->head->nargs < 1 || r->head->nargs > MAX_ARITY) {
-            fprintf(stderr, "compile error: head arity %d for variadic '%s'\n",
+            cerr(r->off, "compile error: head arity %d for variadic '%s'\n",
                     r->head->nargs, r->head->pred); goto fail;
         }
         if (!dl_ensure_variant(db, head_ri, (uint8_t)r->head->nargs)) {
-            fprintf(stderr, "compile error: cannot materialize variant %d "
+            cerr(r->off, "compile error: cannot materialize variant %d "
                     "of variadic '%s'\n",
                     r->head->nargs, r->head->pred); goto fail;
         }
     } else {
         if (db_rel_arity(db, head_ri) != (uint8_t)r->head->nargs) {
-            fprintf(stderr, "compile error: arity mismatch for '%s': %d vs %d\n",
+            cerr(r->off, "compile error: arity mismatch for '%s': %d vs %d\n",
                     r->head->pred, db_rel_arity(db, head_ri), r->head->nargs);
             goto fail;
         }
@@ -2047,7 +2086,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata,
 
     /* ── 3. resolve body ─────────────────────────────────────────── */
     if (r->nbody == 0) {
-        fprintf(stderr, "compile error: rule '%s' has no body\n", r->head->pred);
+        cerr(r->off, "compile error: rule '%s' has no body\n", r->head->pred);
         goto fail;
     }
     /* v1: reject constants in the head of an aggregate rule — all head
@@ -2055,7 +2094,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata,
     if (agg) {
         for (i = 0; i < r->head->nargs; i++) {
             if (r->head->args[i]->kind != TOK_VAR) {
-                fprintf(stderr, "compile error: constants in head of aggregate rule not "
+                cerr(r->off, "compile error: constants in head of aggregate rule not "
                         "supported (rule '%s')\n", r->head->pred); goto fail;
             }
         }
@@ -2069,14 +2108,14 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata,
         if (ba->aggregate) { bri[bi] = -1; continue; }
         if (is_builtin_pred(ba)) {
             if (ba->negated) {
-                fprintf(stderr, "compile error: negated builtin not supported "
+                cerr(r->off, "compile error: negated builtin not supported "
                         "(rule '%s')\n", r->head->pred); goto fail;
             }
             /* M9-strings: validate arity/operand/result kinds so a malformed
              * string builtin (bad arity, INT operand) is rejected loudly
              * rather than silently mis-evaluated. */
             if (is_str_builtin(ba) && !str_builtin_valid(ba)) {
-                fprintf(stderr, "compile error: malformed string builtin "
+                cerr(r->off, "compile error: malformed string builtin "
                         "'%s' (bad arity or non-symbol operand) "
                         "(rule '%s')\n", ba->pred, r->head->pred);
                 goto fail;
@@ -2084,7 +2123,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata,
             /* v2-lists: same validation for list builtins (bad arity / result
              * not a variable / operand not a variable-or-constant). */
             if (is_list_builtin(ba) && !list_builtin_valid(ba)) {
-                fprintf(stderr, "compile error: malformed list builtin "
+                cerr(r->off, "compile error: malformed list builtin "
                         "'%s' (bad arity or non-variable result / non-constant "
                         "operand) (rule '%s')\n", ba->pred, r->head->pred);
                 goto fail;
@@ -2094,7 +2133,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata,
              * Lo/Hi variable-or-int bounds.  Rejects unknown/variadic/empty
              * relations loudly (never silently mis-evaluate). */
             if (is_range_builtin(ba) && !range_builtin_valid(db, ba)) {
-                fprintf(stderr, "compile error: malformed range builtin "
+                cerr(r->off, "compile error: malformed range builtin "
                         "'%s' (expected range(X, Rel, Lo, Hi): X a variable, "
                         "Rel a known non-variadic arity>=1 relation, Lo/Hi "
                         "variable-or-int bounds) (rule '%s')\n",
@@ -2110,7 +2149,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata,
             if (is_range_builtin(ba)) {
                 int rr = db_find_rel(db, ba->args[1]->text);
                 if (rr >= 0 && recursive && recursive[rr]) {
-                    fprintf(stderr, "compile error: range over recursive "
+                    cerr(r->off, "compile error: range over recursive "
                             "relation '%s' is not supported (OP_RANGE reads "
                             "the idb directly, which the fixpoint never "
                             "updates) (rule '%s')\n", ba->args[1]->text,
@@ -2125,7 +2164,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata,
         if (ba->negated) {
             for (j = 0; j < ba->nargs; j++) {
                 if (list_is_pattern(ba->args[j])) {
-                    fprintf(stderr, "compile error: list pattern in negated "
+                    cerr(r->off, "compile error: list pattern in negated "
                             "atom '%s' (patterns cannot bind vars under "
                             "negation) (rule '%s')\n",
                             ba->pred, r->head->pred);
@@ -2135,7 +2174,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata,
         }
         int ri = db_find_rel(db, ba->pred);
         if (ri < 0) {
-            fprintf(stderr, "compile error: unknown predicate '%s'\n",
+            cerr(r->off, "compile error: unknown predicate '%s'\n",
                     ba->pred); goto fail;
         }
         if (db_rel_is_variadic(db, ri)) {
@@ -2143,12 +2182,12 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata,
              * the VM reads variant[nargs] (an absent variant reads as an
              * EMPTY relation — no materialization needed for reads). */
             if (ba->nargs < 1 || ba->nargs > MAX_ARITY) {
-                fprintf(stderr, "compile error: body arity %d for variadic "
+                cerr(r->off, "compile error: body arity %d for variadic "
                         "'%s'\n", ba->nargs, ba->pred);
                 goto fail;
             }
         } else if (db_rel_arity(db, ri) != (uint8_t)ba->nargs) {
-            fprintf(stderr, "compile error: arity mismatch for '%s'\n",
+            cerr(r->off, "compile error: arity mismatch for '%s'\n",
                     ba->pred); goto fail;
         }
         bri[bi] = ri;
@@ -2160,7 +2199,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata,
      * mis-evaluate. */
     if (agg) {
         if (db_rel_is_variadic(db, head_ri)) {
-            fprintf(stderr, "compile error: aggregate over a variadic "
+            cerr(r->off, "compile error: aggregate over a variadic "
                     "relation is not supported (head '%s', rule '%s')\n",
                     r->head->pred, r->head->pred);
             goto fail;
@@ -2168,7 +2207,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata,
         for (bi = 0; bi < r->nbody; bi++) {
             if (bri[bi] < 0) continue;   /* builtin / aggregate atom */
             if (db_rel_is_variadic(db, bri[bi])) {
-                fprintf(stderr, "compile error: aggregate over a variadic "
+                cerr(r->off, "compile error: aggregate over a variadic "
                         "relation is not supported (body '%s', rule '%s')\n",
                         r->body[bi]->pred, r->head->pred);
                 goto fail;
@@ -2251,7 +2290,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata,
                     if (ba->args[j]->kind == TOK_VAR) {
                         int vi = v_find(&vt, ba->args[j]->text);
                         if (vi < 0 || !bound_vars[vi]) {
-                            fprintf(stderr,
+                            cerr(r->off, 
                                 "compile error: unsafe negation — variable "
                                 "'%s' in negated atom '%s' is not bound "
                                 "by a positive body atom (rule '%s')\n",
@@ -2305,7 +2344,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata,
                 int b1 = (vi1 >= 0) && bound_vars[vi1];
                 if (ba->args[1]->kind == TOK_VAR) {
                     if (!b1) {
-                        fprintf(stderr, "compile error: ungrounded list "
+                        cerr(r->off, "compile error: ungrounded list "
                                 "assignment — list variable '%s' in '[X|Xs] = "
                                 "%s' is not bound by a positive body atom "
                                 "(rule '%s')\n",
@@ -2393,7 +2432,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata,
                     if (t->kind != TOK_VAR) continue;
                     int vi = v_find(&vt, t->text);
                     if (vi < 0 || !bound_vars[vi]) {
-                        fprintf(stderr,
+                        cerr(r->off, 
                             "compile error: ungrounded comparison — variable "
                             "'%s' in comparison '%s' is not bound by a positive "
                             "body atom (rule '%s')\n",
@@ -2413,7 +2452,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata,
     for (bi = 0; bi < r->nbody; bi++) {
         atom *ba = r->body[bi];
         if (is_arith(ba) && expr_has_div0(ba->arith)) {
-            fprintf(stderr, "compile error: division/modulo by literal 0 "
+            cerr(r->off, "compile error: division/modulo by literal 0 "
                     "(rule '%s')\n", r->head->pred);
             goto fail;
         }
@@ -2448,7 +2487,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata,
                 if (token_contains_var(r->body[bi]->args[j], a->text))
                     { ok = 1; break; }
         if (!ok) {
-            fprintf(stderr, "compile error: ungrounded variable '%s' in head of '%s'\n",
+            cerr(r->off, "compile error: ungrounded variable '%s' in head of '%s'\n",
                     a->text, r->head->pred); goto fail;
         }
     }
@@ -2506,7 +2545,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata,
             }
             if (!list_driver) {
                 free(pos); free(mask);
-                fprintf(stderr, "compile error: rule '%s' has no positive body atom\n",
+                cerr(r->off, "compile error: rule '%s' has no positive body atom\n",
                         r->head->pred);
                 goto fail;
             }
@@ -2558,7 +2597,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata,
                 }
             }
             if (!list_driver) {
-                fprintf(stderr, "compile error: rule '%s' has no positive body atom\n",
+                cerr(r->off, "compile error: rule '%s' has no positive body atom\n",
                         r->head->pred);
                 goto fail;
             }
@@ -3050,7 +3089,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata,
             if (!dup) group_vars[n_group++] = (int)vt.e[vi].slot;
         }
         if (n_group > 7) {
-            fprintf(stderr, "compile error: too many group-by columns (rule '%s')\n",
+            cerr(r->off, "compile error: too many group-by columns (rule '%s')\n",
                     r->head->pred); goto fail;
         }
         int rvi = v_find(&vt, agg->pred);
@@ -3143,7 +3182,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata,
 
 fail:
     if (vt.err) {
-        fprintf(stderr, "compile error: rule '%s' exceeds the maximum of %d "
+        cerr(r->off, "compile error: rule '%s' exceeds the maximum of %d "
                 "distinct variables / temps / constants in a single rule\n",
                 r->head->pred, MAX_VARS);
     }
@@ -3166,6 +3205,10 @@ int compile_rules(dl_db *db, rule **rules, int n_rules,
     int *rel_strata = NULL;
     size_t nrels;
 
+    compile_has_err = 0;
+    compile_err_off = 0;
+    compile_err_msg[0] = '\0';
+
     if (!db || !rules || n_rules <= 0 || !out_rules || !out_n) return -1;
 
     /* Declare any missing head relations so stratification sees all nodes */
@@ -3174,12 +3217,12 @@ int compile_rules(dl_db *db, rule **rules, int n_rules,
         int ri = db_find_rel(db, r->head->pred);
         if (ri < 0) {
             if (r->head->nargs < 1 || r->head->nargs > MAX_ARITY) {
-                fprintf(stderr, "compile error: head arity %d for '%s'\n",
+                cerr(r->off, "compile error: head arity %d for '%s'\n",
                         r->head->nargs, r->head->pred);
                 return -1;
             }
             if (dl_declare_relation(db, r->head->pred, (uint8_t)r->head->nargs)) {
-                fprintf(stderr, "compile error: cannot declare '%s/%d'\n",
+                cerr(r->off, "compile error: cannot declare '%s/%d'\n",
                         r->head->pred, r->head->nargs);
                 return -1;
             }
@@ -3224,7 +3267,7 @@ int compile_rules(dl_db *db, rule **rules, int n_rules,
              * variadic EDB variants remain fine. */
             if (c[i]->is_recursive &&
                 db_rel_is_variadic(db, c[i]->head_rel_id)) {
-                fprintf(stderr, "compile error: recursive rule over a "
+                cerr(rules[i]->off, "compile error: recursive rule over a "
                         "variadic head is not supported (rule '%s')\n",
                         c[i]->head_pred);
                 int j; for (j = 0; j <= i; j++) compiled_rule_free(c[j]);
@@ -3233,7 +3276,7 @@ int compile_rules(dl_db *db, rule **rules, int n_rules,
 
             /* M3: aggregates only allowed in non-recursive rules */
             if (c[i]->has_aggregate && c[i]->is_recursive) {
-                fprintf(stderr, "compile error: aggregate in recursive rule "
+                cerr(rules[i]->off, "compile error: aggregate in recursive rule "
                         "not supported (rule '%s')\n", c[i]->head_pred);
                 int j; for (j = 0; j <= i; j++) compiled_rule_free(c[j]);
                 free(c); free(recursive); free(rel_strata); return -1;

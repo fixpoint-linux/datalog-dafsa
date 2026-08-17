@@ -42,7 +42,7 @@ RUNTIME='-s EXPORTED_RUNTIME_METHODS=ccall,cwrap,stringToUTF8,UTF8ToString,lengt
 # (which defines main).  dl.c is monolithic and references snapshot.c /
 # vendor/dafsa_view.c / WAL unconditionally — those symbols must resolve at
 # link, but their POSIX/disk paths are dead code in the playground.
-CORE='src/intern.c src/termstore.c src/relation.c src/vrelation.c src/tupleset.c src/parser.c src/compiler.c src/vm.c src/snapshot.c src/regexwalk.c src/permindex.c src/util.c src/dl.c src/iter.c src/magic.c src/topdown.c vendor/dafsa.c vendor/dafsa_state.c vendor/dafsa_core.c vendor/dafsa_persist.c vendor/dafsa_view.c vendor/dafsa_crc32.c vendor/dafsa_wal.c vendor/dafsa_build.c vendor/dafsa_rank.c vendor/dafsa_view_rank.c'
+CORE='src/intern.c src/termstore.c src/relation.c src/vrelation.c src/tupleset.c src/parser.c src/compiler.c src/vm.c src/snapshot.c src/regexwalk.c src/permindex.c src/util.c src/dl.c src/iter.c src/magic.c src/topdown.c src/analyze.c vendor/dafsa.c vendor/dafsa_state.c vendor/dafsa_core.c vendor/dafsa_persist.c vendor/dafsa_view.c vendor/dafsa_crc32.c vendor/dafsa_wal.c vendor/dafsa_build.c vendor/dafsa_rank.c vendor/dafsa_view_rank.c'
 
 EM_CONFIG="$EMCONF" "$EMCC" $COMMON \
     -s EXPORT_NAME=createPlayground \
@@ -51,6 +51,17 @@ EM_CONFIG="$EMCONF" "$EMCC" $COMMON \
     -o "$OUT/playground.js" \
     src/playground-wasm.c $CORE
 
+# (2) LSP server: src/lsp.c + src/json.c.  -DLSP_NO_MAIN drops the stdio main();
+# lsp_handle / lsp_out / lsp_out_len are the wasm entry surface.  src/analyze.c
+# is already part of $CORE (shared with the playground build), so it must not
+# be listed again here (a duplicate source would double-link its symbols).
+EM_CONFIG="$EMCONF" "$EMCC" $COMMON -DLSP_NO_MAIN \
+    -s EXPORT_NAME=createDlLsp \
+    -s EXPORTED_FUNCTIONS=_lsp_handle,_lsp_out,_lsp_out_len,_malloc,_free \
+    $RUNTIME \
+    -o "$OUT/dl-lsp.js" \
+    src/lsp.c src/json.c $CORE
+
 mkdir -p docs
-cp "$OUT/playground.js" "$OUT/playground.wasm" docs/
-echo "built docs/playground.js + docs/playground.wasm"
+cp "$OUT/playground.js" "$OUT/playground.wasm" "$OUT/dl-lsp.js" "$OUT/dl-lsp.wasm" docs/
+echo "built docs/playground.js + docs/playground.wasm + docs/dl-lsp.js + docs/dl-lsp.wasm"
