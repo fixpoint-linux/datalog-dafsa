@@ -1,11 +1,25 @@
 # Dhall-typed schema & Datalog rule typechecking
 
-_Design note. Status: **proposed** (2026-08-16). This documents a user-facing
-**database-project workflow** layered on top of the datalog-dafsa engine: define a
-database schema in Dhall, load data validated against it, and write Datalog rules
-whose relations are typechecked against it before compilation. **No source is
-written yet** — this doc records the architecture for review and is the map for a
-future staged implementation._
+_Design note. Status: **implemented** (2026-08-17). S0–S6 landed as a series of
+commits (08dd2ef, f284602, 83b3e70, 0eefc34, 02821ed, ff31a1d, 78954b5, d4d8b3e);
+this doc now describes the shipped `dlp` tool as built. The gcc core (306 tests)
+is untouched — `dlp` is opt-in via `make dlp DHALLC=<path-to-dhall-c>`._
+
+## What landed
+
+S0–S6 are implemented and committed. The shipped `dlp` binary is a new cosmocc build
+that links the engine + dhall-c in-process; the gcc `make` / `make test` (306 tests)
+are untouched, and `dlp` is opt-in (`make dlp DHALLC=<path-to-dhall-c>`, verified with
+`make dlp-golden`). The default gcc build has **not** absorbed `schema.h/.c` or
+`typecheck.c` — those live only in the `dlp` target, so the core stays gcc-clean and
+portable.
+
+**One documented deviation from this design note:** the DSL uses the **`Bool`-payload
+union value syntax** — `let ColumnType = < Natural : Bool | Text : Bool >` with union
+values written `< Text = True >` — rather than the `{=}` payload sketched below. This
+was the S0 spike finding: dhall-c's typechecker rejects `{=}` as a union-alternative
+type payload, so the mechanical `Bool`-payload fallback (identical DSL structure)
+was adopted instead.
 
 ## TL;DR
 
@@ -287,21 +301,22 @@ Touched existing files (each minimal):
 | `Makefile` | new objs/tests/target |
 | `README.md` + `design/dhall-schema.md` | docs |
 
-Stage order (each independently landable + green):
+Stage order (each independently landable + green; status as of 2026-08-17):
 
-- **S0** — spikes: dhall-c `{=}` parses; dnsd patches (partial-union + type-alias
-  resolution) landed; datalog-dafsa builds under cosmocc.
-- **S1** — parser positions (`line`/`col`) + tests.
-- **S2** — `schema.h/.c` + `dl_attach_schema` no-op hook + `test_schema`.
-- **S3** — `typecheck.c` + fixtures (positive: worked example; negative: int/text
+- **[done] S0** — spikes: dhall-c `{=}` **rejected** by typechecker → adopted the
+  `Bool`-payload fallback (`< Text = True >`); dnsd patches (partial-union +
+  type-alias resolution) landed; datalog-dafsa builds under cosmocc.
+- **[done] S1** — parser positions (`line`/`col`) + tests.
+- **[done] S2** — `schema.h/.c` + `dl_attach_schema` no-op hook + `test_schema`.
+- **[done] S3** — `typecheck.c` + fixtures (positive: worked example; negative: int/text
   mixing, undeclared relation, Text comparison, aggregate on Text, int-const in
   Text col, untyped var) + `test_typecheck`. *(the correctness-dense stage)*
-- **S4** — `dlp` skeleton (cosmocc Makefile target + schema.dhall walker +
+- **[done] S4** — `dlp` skeleton (cosmocc Makefile target + schema.dhall walker +
   declare/attach + `init` template).
-- **S5** — typed CSV loader + `check`/`build`/`query` over the worked example
+- **[done] S5** — typed CSV loader + `check`/`build`/`query` over the worked example
   (golden-output test).
-- **S6** — JSON loader.
-- **S7** — docs + design note.
+- **[done] S6** — JSON loader.
+- **[done] S7** — docs + design note (this document; the README `dlp` section).
 
 ## Risks
 
@@ -323,7 +338,7 @@ Stage order (each independently landable + green):
 
 ## Open decisions (deferred to implementation)
 
-- dhall-c referenced by **path** vs **vendored**.
-- Whether `{=}` parses in dhall-c (S0 spike; `Bool`-payload is the mechanical
-  fallback — DSL structure identical).
+- dhall-c referenced by **path** vs **vendored** (built by path via `DHALLC=..` today).
+- Whether `{=}` parses in dhall-c — **resolved at S0**: it does **not** typecheck;
+  the `Bool`-payload fallback (`< Text = True >`) shipped. See "What landed".
 - `toml` loading is a natural S7+ add once JSON lands (not in v1).

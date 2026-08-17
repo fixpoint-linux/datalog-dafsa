@@ -68,6 +68,60 @@ committing in memory; a `fcntl` single-writer lock guards the database; the inte
 saved durably (and ordered *before* WAL records so crash recovery can decode symbol ids).
 WAL compaction triggers at 25% of the relation size.
 
+## dlp — typed database projects
+
+[`dlp`](design/datalog-dafsa-dhall-schema.md) is a typed database-project workflow
+layered on the engine. A `schema.dhall` file defines the typed relations
+(typechecked + normalized in-process by the dhall-c interpreter); data files are
+validated against it on load; and `.datalog` rules are typechecked against the
+schema *before* compilation. It catches int/text mixing at authoring time — e.g.
+`tc(A,W):-weight(A,W).` is rejected because `weight.w` is Natural while `tc.dst` is
+Text.
+
+```text
+mydb/
+  schema.dhall      # the typed contract (: Schema-annotated)
+  data/*.csv|json   # validated on load (file stem = relation)
+  rules/*.datalog   # concatenated; typechecked against the schema
+  .build/           # dlp-owned: build snapshot, schema.json echo
+```
+
+**Schema DSL (Bool-payload union).** The schema is Dhall-as-data — self-contained
+`let`s with a `: Schema` annotation. `Natural` = raw u32, `Text` = interned symbol:
+
+```dhall
+let ColumnType = < Natural : Bool | Text : Bool >
+let Column = { name : Text, type : ColumnType }
+let Relation = { name : Text, columns : List Column }
+let Schema = { relations : List Relation }
+in { relations =
+     [ { name = "node", columns = [ { name = "id", type = < Text = True > } ] } ]
+   } : Schema
+```
+
+**Commands** (the new `dlp` binary; the low-level `dl` CLI is unchanged):
+
+- `dlp init [dir]` — scaffold a project template (incl. an example).
+- `dlp schema [dir]` — dhall-typecheck + normalize the schema.
+- `dlp check [dir]` — schema + dry-run data validation + parse/typecheck rules.
+  The CI command; **no writes**.
+- `dlp build [dir]` — check + declare relations + load+validate data + compile +
+  publish a snapshot into `.build/`.
+- `dlp query [dir] 'goal'` — build then evaluate a goal and print the rows.
+
+**Data validation.** CSV headers are matched to columns **by name** in any order:
+`Text` accepts any cell verbatim, `Natural` must be `^[0-9]+$` ≤ `4294967295`. JSON
+is strict: array of objects, keys = column names, JSON number → `Natural`, JSON
+string → `Text`; any other value type is an error.
+
+**Closed world.** Rules are closed-world: relations appearing as rule heads are
+IDB, so loading data into a rule-defined relation is an error, and undeclared
+relations are rejected.
+
+**Build.** `dlp` is a cosmocc binary linking the engine + dhall-c (a sibling repo);
+build it with `make dlp DHALLC=../dhall-c`. The default gcc `make` / `make test`
+(306 tests) are unaffected.
+
 ## API Summary
 
 Public C API in [`src/dl.h`](src/dl.h). All value arrays are u32 (raw ints or symbol ids).
@@ -116,6 +170,9 @@ see [`docs/README.md`](docs/README.md) for how to enable Pages.
   storage thesis, encoding linchpin (§0–§1), and system design.
 - [`design/datalog-dafsa-implementation-plan.md`](design/datalog-dafsa-implementation-plan.md)
   — milestone-by-milestone plan with implementation status.
+- [`design/datalog-dafsa-dhall-schema.md`](design/datalog-dafsa-dhall-schema.md) — the
+  `dlp` typed database-project workflow (Dhall schema, typed CSV/JSON loaders, rule
+  typechecking).
 
 ## Building from Source
 
