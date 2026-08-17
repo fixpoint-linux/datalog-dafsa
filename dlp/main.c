@@ -76,17 +76,17 @@ int main(int argc, char **argv) {
     if (strcmp(cmd, "check") == 0) {
         char errbuf[512];
         int rc = dlp_project_check(dir, errbuf, sizeof errbuf);
-        if (rc == 1 && errbuf[0])
+        if (rc != 0 && errbuf[0])
             fprintf(stderr, "dlp: %s\n", errbuf);
-        return rc;
+        return rc != 0 ? 1 : 0;
     }
 
     if (strcmp(cmd, "build") == 0) {
         char errbuf[512];
         int rc = dlp_project_build(dir, errbuf, sizeof errbuf);
-        if (rc == 1 && errbuf[0])
+        if (rc != 0 && errbuf[0])
             fprintf(stderr, "dlp: %s\n", errbuf);
-        return rc;
+        return rc != 0 ? 1 : 0;
     }
 
     if (strcmp(cmd, "query") == 0) {
@@ -98,9 +98,9 @@ int main(int argc, char **argv) {
         }
         char errbuf[512];
         int rc = dlp_project_query(dir, goal, errbuf, sizeof errbuf);
-        if (rc == 1 && errbuf[0])
+        if (rc != 0 && errbuf[0])
             fprintf(stderr, "dlp: %s\n", errbuf);
-        return rc;
+        return rc != 0 ? 1 : 0;
     }
 
     fprintf(stderr, "dlp: unknown command '%s'\n\n", cmd);

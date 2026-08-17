@@ -193,8 +193,8 @@ int dlp_csv_load(dl_db *db, const dl_schema *s, const char *rel,
         uint32_t cols[DL_SCHEMA_MAX_ARITY];
         for (int i = 0; i < nf; i++) {
             int j = colmap[i];                       /* schema column index */
-            char *cell = trim_ws(fields[i]);
             if (r->cols[j] == DLT_NATURAL) {
+                char *cell = trim_ws(fields[i]);     /* Natural trims ws */
                 /* ^[0-9]+$ and <= 4294967295 */
                 const char *p = cell;
                 if (!*p) { free(line); fclose(f);
@@ -217,7 +217,9 @@ int dlp_csv_load(dl_db *db, const dl_schema *s, const char *rel,
                 }
                 cols[j] = (uint32_t)v;
             } else {
-                /* DLT_TEXT: verbatim (minus a single quote pair), interned. */
+                /* DLT_TEXT: verbatim (minus a single quote pair), interned.
+                 * Do NOT trim whitespace — Text cells are taken as-is. */
+                char *cell = fields[i];
                 unquote(cell);
                 if (db) cols[j] = dl_intern_str(db, cell);
                 else cols[j] = 0;

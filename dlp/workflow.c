@@ -182,10 +182,13 @@ static int check_data_dir(const dl_schema *schema, const char *data_dir, const c
 /* Build the concatenated rules source by reading every rules file (*.datalog)
  * in sorted order and joining them with a newline.  Returns malloc'd buffer or
  * NULL on error (a missing rules dir with zero files yields an empty string). */
-static char *concat_rules(const char *rules_dir, const char *rules_prefix) {
+static char *concat_rules(const char *rules_dir, const char *rules_prefix,
+                          int *has_rules) {
     int nfiles = 0;
     char **files = list_dir(rules_dir, ".datalog", &nfiles);
     if (nfiles < 0) return NULL;
+    if (has_rules) *has_rules = (nfiles > 0);
+    if (nfiles == 0) { free(files); return NULL; }
     size_t total = 1;
     for (int i = 0; i < nfiles; i++) total += strlen(files[i]) + 2048;
     char *buf = malloc(total);
@@ -230,10 +233,8 @@ static int do_check(const char *dir, dl_schema *schema, char *errbuf, size_t err
     if (project_paths(dir, sp, sizeof sp, dp, sizeof dp, rp, sizeof rp, bp, sizeof bp, errbuf, errcap) != 0)
         return -1;
 
-    if (dlp_schema_load(schema, sp, errbuf, errcap) != 0) {
-        fprintf(stderr, "dlp: %s\n", errbuf);
-        return -1;
-    }
+    if (dlp_schema_load(schema, sp, errbuf, errcap) != 0)
+        return -1;  /* main prints the diagnostic; do not fprintf here (double-print) */
 
     int errs = 0;
     /* rules dir may be absent (no rules) — treat as no files. */
@@ -316,14 +317,20 @@ int dlp_project_build(const char *dir, char *errbuf, size_t errcap) {
     }
 
     /* Concatenate + load rules (re-typechecks against attached schema — passes
-       since the per-file check already passed). */
-    char *rules_src = concat_rules(rp, rp);
-    if (!rules_src) { dl_close(db); return seterr(errbuf, errcap, "cannot read rules"); }
-    int loadrc = dl_load_rules(db, rules_src);
-    free(rules_src);
-    if (loadrc != 0) { dl_close(db); return seterr(errbuf, errcap, "rule load/compile failed"); }
-
-    if (dl_compile(db) != 0) { dl_close(db); return seterr(errbuf, errcap, "compile failed"); }
+       since the per-file check already passed).  An EDB-only project (no rule
+       files under the rules dir) skips rule load/compile entirely. */
+    int has_rules = 0;
+    char *rules_src = concat_rules(rp, rp, &has_rules);
+    if (!rules_src && has_rules) {
+        dl_close(db);
+        return seterr(errbuf, errcap, "cannot read rules");
+    }
+    if (rules_src) {
+        int loadrc = dl_load_rules(db, rules_src);
+        free(rules_src);
+        if (loadrc != 0) { dl_close(db); return seterr(errbuf, errcap, "rule load/compile failed"); }
+        if (dl_compile(db) != 0) { dl_close(db); return seterr(errbuf, errcap, "compile failed"); }
+    }
     if (dl_publish_snapshot(db) != 0) { dl_close(db); return seterr(errbuf, errcap, "publish failed"); }
     dl_close(db);
     return 0;
@@ -470,12 +477,15 @@ int dlp_project_query(const char *dir, const char *goal_str, char *errbuf, size_
         free(files);
     }
 
-    char *rules_src = concat_rules(rp, rp);
-    if (!rules_src) { dl_close(db); return seterr(errbuf, errcap, "cannot read rules"); }
-    int loadrc = dl_load_rules(db, rules_src);
-    free(rules_src);
-    if (loadrc != 0) { dl_close(db); return seterr(errbuf, errcap, "rule load/compile failed"); }
-    if (dl_compile(db) != 0) { dl_close(db); return seterr(errbuf, errcap, "compile failed"); }
+    int has_rules = 0;
+    char *rules_src = concat_rules(rp, rp, &has_rules);
+    if (!rules_src && has_rules) { dl_close(db); return seterr(errbuf, errcap, "cannot read rules"); }
+    if (rules_src) {
+        int loadrc = dl_load_rules(db, rules_src);
+        free(rules_src);
+        if (loadrc != 0) { dl_close(db); return seterr(errbuf, errcap, "rule load/compile failed"); }
+        if (dl_compile(db) != 0) { dl_close(db); return seterr(errbuf, errcap, "compile failed"); }
+    }
     if (dl_publish_snapshot(db) != 0) { dl_close(db); return seterr(errbuf, errcap, "publish failed"); }
 
     /* Parse the goal. */
