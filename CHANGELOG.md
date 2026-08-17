@@ -5,6 +5,24 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **v2 DAFSA order-statistics — pull-iterator wired into the VM (lazy `OP_RANGE`)**:
+  `OP_RANGE`'s generator (the `range(X,Rel,Lo,Hi)` leading-column builtin) is
+  now a **lazy resumable generator** driven by the #5 pull-based sorted
+  iterator instead of the eager `rel_range_each` rank/select materialization,
+  so early consumer backtracking stops enumeration.  An owned `dl_iter*` lives
+  in `vm_frame`, opened on first entry via the new LIVE-only
+  `dl_iter_open_live(relation*)` constructor (which borrows `rel->d` and never
+  routes to the snapshot view — `vm_execute` runs with `snap_version>0` on a
+  re-publish and must read the live relation, else a stale mmap snapshot
+  silently mis-evaluates), advanced per backtrack re-entry
+  (skip-`<lo`/stop-`≥hi`/dedup-consecutive-col0, rebind X), and closed on
+  pop/cleanup (no double-free).  `vm_range_yields` is a new test observable
+  proving short-circuiting.  FILTER case (X bound) unchanged; recursive-SCC
+  rejection + IVM/DRed/agg/magic/topdown exclusion gates intact.  Tests:
+  test_m15_vmiter.c (7/7) — oracle (byte-identical vs an independent
+  `dl_prefix` full-scan + col0-filter + distinct + sort), edge cases, dedup,
+  filter, laziness (early-stop after 10 of N=100000), snapshot-LIVE re-publish
+  `{5,7}`, gates.
 - **v2 DAFSA order-statistics — automatic perm-index selection**: a compile-time
   cost gate (`emit_nonleading_join`, src/compiler.c) that wires up the
   previously-dead `OP_HASH_JOIN` as a slot-free fallback for non-leading joins.

@@ -165,7 +165,7 @@ In rough priority order. ~~struck-through~~ items are implemented (commit noted)
    `range(X, Rel, Lo, Hi)` reserved builtin (a `member(X,L)` analog for
    relations) lowered to an `OP_RANGE` opcode: generator (bind X to distinct
    leading-column values in `[Lo,Hi)`) or filter.  **The generator is now a
-   LAZY resumable generator driven by the #5 pull-iterator** (commit `9d4f2c6`,
+   LAZY resumable generator driven by the #5 pull-iterator** (commit `2f78be3`,
    2026-08-17): an owned `dl_iter*` in `vm_frame`, opened first entry via the
    LIVE-only `dl_iter_open_live` (never the snapshot-aware open — `vm_execute`
    runs with `snap_version>0` on re-publish and must read the live `rel->d`),
