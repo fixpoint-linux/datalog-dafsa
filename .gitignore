@@ -7,6 +7,13 @@ build-tmp/
 # binaries
 /dl
 /dl-lsp
+/dlp/dlp
+/dlp_schema_check
+
+# cosmocc/APE build artifacts
+.ape-*
+*.aarch64.elf
+*.com.dbg
 /tests/test_m0
 /tests/test_m1
 /tests/test_m2

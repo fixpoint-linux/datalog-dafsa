@@ -50,7 +50,7 @@ ALL_OBJS = $(VENDOR_OBJS) $(LIB_OBJS)
 
 # ─── Targets ─────────────────────────────────────────────────────────────
 
-.PHONY: all clean test bench test-m1 test-m2 wasm lsp test-lsp
+.PHONY: all clean test bench test-m1 test-m2 wasm lsp test-lsp dlp dlp_schema_check dlp-check
 
 all: build-tmp libdatalog.so dl
 
@@ -297,6 +297,57 @@ test-m16: tests/test_m16_travel dl build-tmp
 	@echo "=== Running M16 time-travel (as-of) snapshot tests ==="
 	LD_LIBRARY_PATH=. ./tests/test_m16_travel
 
+# ─── dlp (dl-project tool) — OPT-IN, links the engine + dhall-c ──────────
+# A NEW top-level tool that scaffolds a project and loads/walks a schema.dhall
+# into a typed dl_schema.  Built with cosmocc (the dhall-c interpreter is not
+# gcc-clean for this link) and is NOT part of the default `make`/`make test`
+# (which stay gcc-only and never touch dhall-c).  Usage:
+#   make dlp            # uses $(CURDIR)/../dhall-c by default
+#   make dlp DHALLC=/path/to/dhall-c
+#   make dlp-check      # build + run the schema-check harness
+
+# dhall-c core sources (link directly, in dhall-c's own order; exclude its
+# entry-point/extra TUs: main/wasm/bench/lsp and json.c which only LSP links).
+DHALLC ?= $(CURDIR)/../dhall-c
+CORE_SRCS = $(DHALLC)/src/arena.c $(DHALLC)/src/lexer.c \
+            $(DHALLC)/src/parser.c $(DHALLC)/src/ast.c \
+            $(DHALLC)/src/normalize.c $(DHALLC)/src/typecheck.c \
+            $(DHALLC)/src/builtins.c $(DHALLC)/src/serialize.c \
+            $(DHALLC)/src/import.c $(DHALLC)/src/bignum.c \
+            $(DHALLC)/src/sha256.c $(DHALLC)/src/ssrf.c $(DHALLC)/src/http.c
+
+# Engine sources for dlp: the LIB_OBJS source set + vendored dafsa*.c,
+# EXCLUDING the TUs that carry their own entry points (dl_cli.c main,
+# lsp.c main, playground-wasm.c wasm entry).  We compile from source again
+# with cosmocc (the gcc-built .o files are not cosmo-safe to reuse).
+DLP_ENGINE_SRCS = src/intern.c src/termstore.c src/relation.c \
+                  src/vrelation.c src/tupleset.c src/parser.c src/compiler.c \
+                  src/vm.c src/snapshot.c src/regexwalk.c src/permindex.c \
+                  src/util.c src/dl.c src/iter.c src/magic.c src/topdown.c \
+                  src/analyze.c src/schema.c src/typecheck.c \
+                  vendor/dafsa.c vendor/dafsa_state.c vendor/dafsa_core.c \
+                  vendor/dafsa_persist.c vendor/dafsa_view.c \
+                  vendor/dafsa_crc32.c vendor/dafsa_wal.c vendor/dafsa_build.c \
+                  vendor/dafsa_rank.c vendor/dafsa_view_rank.c
+
+DLP_SRCS = dlp/main.c dlp/schema_load.c dlp/init.c
+
+# Use := (not ?=) so the environment's CC=cc does not override cosmocc.
+COSMOCC := cosmocc
+DLP_CFLAGS = -std=c11 -O2 -g -Wall -Wextra -I$(DHALLC)/src -Ivendor -Isrc
+
+dlp: $(DLP_SRCS) $(DLP_ENGINE_SRCS) $(CORE_SRCS) dlp/dlp.h
+	$(COSMOCC) $(DLP_CFLAGS) -o dlp/dlp $(DLP_SRCS) $(DLP_ENGINE_SRCS) $(CORE_SRCS)
+
+# Verification harness: assert the worked-example schema.dhall walks to the
+# expected dl_schema.  Links the same sources as `dlp`.
+dlp_schema_check: dlp/schema_check.c dlp/schema_load.c $(DLP_ENGINE_SRCS) $(CORE_SRCS) dlp/dlp.h
+	$(COSMOCC) $(DLP_CFLAGS) -o $@ dlp/schema_check.c dlp/schema_load.c $(DLP_ENGINE_SRCS) $(CORE_SRCS)
+
+dlp-check: dlp dlp_schema_check
+	./dlp_schema_check
+	@rm -rf /tmp/dlp-check-proj && ./dlp/dlp init /tmp/dlp-check-proj && ./dlp/dlp schema /tmp/dlp-check-proj
+
 # ─── WebAssembly playground ─────────────────────────────────────────────
 # Builds the in-browser language playground (docs/playground.js + .wasm)
 # from src/playground-wasm.c + the full engine core, then runs the headless
@@ -313,7 +364,9 @@ wasm:
 
 clean:
 	rm -f vendor/*.o src/*.o
-	rm -f libdatalog.so dl dl-lsp
+	rm -f libdatalog.so dl dl-lsp dlp/dlp dlp_schema_check
+	rm -f dlp/dlp.aarch64.elf dlp/dlp.com.dbg \
+	      dlp_schema_check.aarch64.elf dlp_schema_check.com.dbg
 	rm -f tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4 \
 	      tests/test_m4_review tests/test_m5 tests/test_m5_review tests/test_m6 \
 	      tests/test_m6_review tests/test_bulk \
