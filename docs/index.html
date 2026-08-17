@@ -19,6 +19,7 @@
       <a href="architecture.html">Architecture</a>
       <a href="order-statistics.html">Order Stats</a>
       <a href="time-travel.html">Time Travel</a>
+      <a href="typed-projects.html">Typed Projects</a>
       <a class="nav-cta" href="playground.html">Playground</a>
     </nav>
   </div>
@@ -70,6 +71,19 @@
         retention bounds disk growth.
       </p>
       <p><a href="time-travel.html">Time-travel &amp; as-of queries &rarr;</a></p>
+    </div>
+    <div class="headline-card">
+      <h3>Typed projects — schema, validated data, and typechecked rules</h3>
+      <p>
+        The <code>dlp</code> tool defines the database schema in Dhall
+        (<code>schema.dhall</code>), validates and coerces CSV/JSON data against
+        it, and <strong>typechecks every rule</strong> before compilation. A
+        variable can&rsquo;t silently be <code>Natural</code> in one atom and
+        <code>Text</code> in another — mixed-type rules are rejected with
+        <code>file:line:col</code> diagnostics. Closed-world and typed, so type
+        errors surface early instead of mis-evaluating.
+      </p>
+      <p><a href="typed-projects.html">The typed project workflow &rarr;</a></p>
     </div>
   </div>
 
@@ -174,6 +188,7 @@ Snapshot published.</code></pre>
     <li><a href="architecture.html">Architecture</a> — storage thesis, lifecycle, join &amp; evaluation strategies.</li>
     <li><a href="order-statistics.html">Order Statistics</a> — rank / select / range / count and the sorted iterator.</li>
     <li><a href="time-travel.html">Time Travel</a> — versioned snapshots and as-of queries.</li>
+    <li><a href="typed-projects.html">Typed Projects</a> — schema.dhall + validated data + typechecked rules.</li>
   </ul>
 </main>
 

@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Typed Projects (dlp) — datalog-dafsa</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site">
+  <div class="wrap">
+    <a class="brand" href="index.html">datalog-dafsa</a>
+    <nav>
+      <a href="index.html">Overview</a>
+      <a href="language.html">Language</a>
+      <a href="cli.html">CLI</a>
+      <a href="api.html">C API</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="order-statistics.html">Order Stats</a>
+      <a href="time-travel.html">Time Travel</a>
+      <a href="typed-projects.html">Typed Projects</a>
+      <a href="playground.html">Playground</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+  <h1>Typed Projects (<code>dlp</code>)</h1>
+  <p>
+    <code>dlp</code> (&ldquo;dl-project&rdquo;) is a <strong>typed, project-based
+    workflow</strong> layered on top of the engine. Instead of loading untyped
+    facts and rules directly, you define a database <em>schema</em> in Dhall,
+    load data validated against it, and write Datalog rules whose relations are
+    <strong>typechecked against the schema before they compile</strong>. This
+    turns silent type errors into clear, early diagnostics.
+  </p>
+  <div class="note">
+    <code>dlp</code> is a separate binary from the low-level <code>dl</code> CLI.
+    It links the engine together with the <a href="https://github.com/jmars/dhall-c">dhall-c</a>
+    interpreter in-process, so the schema is typechecked and normalized without
+    any on-disk intermediate. The gcc core build is untouched — <code>dlp</code>
+    is opt-in via <code>make dlp DHALLC=&lt;path-to-dhall-c&gt;</code>.
+  </div>
+
+  <h2 id="why">Why typed schemas?</h2>
+  <p>
+    Every engine value is a <code>u32</code> — either a raw integer or an interned
+    symbol id. Without column types, an int column and a symbol column are
+    indistinguishable, and a rule can silently mix them (a real correctness trap).
+    The typed workflow closes that gap:
+  </p>
+  <ul>
+    <li><strong>Closed world</strong> — every relation is declared in
+      <code>schema.dhall</code>; using an undeclared relation is an error that
+      points at the schema.</li>
+    <li><strong>Per-column types</strong> — <code>Natural</code> (raw u32) vs
+      <code>Text</code> (interned symbol), checked on both data and rules.</li>
+    <li><strong>Rule typechecking</strong> — every rule is checked for
+      <em>occurrence consistency</em> (a variable can&rsquo;t be Natural in one
+      atom and Text in another), with <code>file:line:col</code> diagnostics.</li>
+    <li><strong>Typed data loading</strong> — CSV/JSON rows are validated and
+      coerced per column before they enter the store.</li>
+  </ul>
+  <p>
+    For example, the rule <code>tc(A, W) :- weight(A, W).</code> is rejected:
+    <code>W</code> is <code>Natural</code> in <code>weight.w</code> but
+    <code>Text</code> in <code>tc.dst</code> — a bug the untyped engine would
+    silently mis-evaluate.
+  </p>
+
+  <h2 id="layout">Project layout</h2>
+  <p>A database project is a directory with a few conventional subdirectories:</p>
+  <pre class="code"><code>mydb/
+  schema.dhall      # the typed schema (the contract)
+  data/             # EDB CSV/JSON inputs, file stem = relation name
+  rules/            # .datalog rule files (concatenated, sorted)
+  .build/           # dlp-owned: build snapshot, schema.json echo</code></pre>
+
+  <h2 id="schema">The schema DSL</h2>
+  <p>
+    The schema is <strong>Dhall-as-data</strong>: self-contained <code>let</code>s
+    with a final <code>: Schema</code> annotation. Each relation declares its
+    name, arity, and per-column type. The type universe is minimal today —
+    <code>Natural</code> (raw u32) and <code>Text</code> (interned symbol) — and
+    designed to grow. The column-type union uses an <em>empty-record payload</em>
+    to tag the type:
+  </p>
+  <pre class="code"><code>let ColumnType = &lt; Natural : {=} | Text : {=} &gt;
+let Column = { name : Text, type : ColumnType }
+let Relation = { name : Text, columns : List Column }
+let Schema = { relations : List Relation }
+in { relations =
+     [ { name = "node", columns = [ { name = "id", type = &lt; Text = {=} &gt; } ] } ]
+   } : Schema</code></pre>
+  <p>
+    Arity is the length of <code>columns</code> (1&ndash;8, enforced by the tool).
+    Relations that appear as rule <em>heads</em> are IDB (derived); loading data
+    into them is an error.
+  </p>
+
+  <h2 id="commands">Commands</h2>
+  <table>
+    <tr><th>Command</th><th>Does</th></tr>
+    <tr><td><code>dlp init [dir]</code></td><td>Scaffold a project directory with an example schema.</td></tr>
+    <tr><td><code>dlp schema [dir]</code></td><td>Dhall-typecheck + normalize <code>schema.dhall</code> and print the typed relations.</td></tr>
+    <tr><td><code>dlp check [dir]</code></td><td>Validate schema + typecheck rules + dry-run data. <strong>No writes</strong> — the CI command.</td></tr>
+    <tr><td><code>dlp build [dir]</code></td><td>Check, then build a snapshot under <code>.build/</code> (declare EDB, load data, compile, publish).</td></tr>
+    <tr><td><code>dlp query [dir] 'goal'</code></td><td>Build in-process and evaluate a goal, e.g. <code>'tc(alice, X)'</code>.</td></tr>
+  </table>
+  <p>
+    Data files are matched to schema columns <strong>by name</strong> (any order):
+    CSV headers map to columns; JSON is an array of objects. CSV is text-typed
+    (<code>Text</code> takes any cell verbatim; <code>Natural</code> requires
+    <code>^[0-9]+$</code> &le; 4294967295). JSON is strict (number &rarr;
+    <code>Natural</code>, string &rarr; <code>Text</code>).
+  </p>
+
+  <h2 id="errors">Catching the bug</h2>
+  <p>
+    A mixed-type rule fails <code>dlp check</code> and <code>dlp build</code> with
+    a precise diagnostic (here <code>&lt;input&gt;</code> is the rule file):
+  </p>
+  <pre class="code"><code>$ dlp check .
+rules/reach.datalog: &lt;input&gt;:1:19: variable W is Natural here (weight) but Text at &lt;input&gt;:1:6 (tc)</code></pre>
+  <p>
+    Data validation reports the exact row and column, e.g.
+    <code>weight.csv:3:2: column 'w' expects Natural, got "heavy"</code>.
+  </p>
+
+  <h2 id="build">Building dlp</h2>
+  <p>
+    <code>dlp</code> is an opt-in cosmocc build (the default gcc <code>make</code> /
+    <code>make test</code> never touch it or dhall-c). With dhall-c as a sibling
+    repo:
+  </p>
+  <pre class="code"><code>make dlp DHALLC=../dhall-c        # builds dlp/dlp
+make dlp-golden                   # end-to-end golden test (check/build/query)</code></pre>
+
+</main>
+
+</body>
+</html>
