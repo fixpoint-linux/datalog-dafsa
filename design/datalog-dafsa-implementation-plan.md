@@ -1,6 +1,6 @@
 # Implementation Plan: DAFSA-Backed Deductive Database (Datalog VM)
 
-**Status:** M0-M9 + v2 IVM complete (2026-08-15), extended through 2026-08-17. 306+ tests green. M8 added magic-sets/QSQ top-down; M9 added arithmetic/comparison and string builtins; v2 IVM (Slices 0-5) shipped; v2 also added bushy plans, variable arity (variadic relations), and nested terms/lists. Trace/JIT REJECTED (see §10.8 of architecture). **Deferred (future):** time-travel, pointwise/stratified negation over recursive predicates, and the IVM/DRed fallback-gap follow-ups below.
+**Status:** M0-M9 + v2 IVM complete (2026-08-15), extended through 2026-08-17. 300+ tests green. M8 added magic-sets/QSQ top-down; M9 added arithmetic/comparison and string builtins; v2 IVM (Slices 0-5) shipped; v2 also added bushy plans, variable arity (variadic relations), nested terms/lists, and time-travel / as-of snapshot queries. Trace/JIT REJECTED (see §10.8 of architecture). **Deferred (future):** pointwise/stratified negation over recursive predicates, and the IVM/DRed fallback-gap follow-ups below.
 **Goal:** Turn the architecture into a concrete, executable build plan with file layout, per-milestone tasks, and verification for each step.
 **Repos involved:** this project (new, e.g. `~/projects/datalog-dafsa/`), consuming the proven jing-meta DAFSA C engine (`indexer/dafsa/dafsa.c` + `dafsa_core.c` + `dafsa_persist.c` + `dafsa_view.c` + `dafsa_wal.c` + `dafsa.h`).
 
@@ -192,8 +192,8 @@ Tasks:
 ---
 
 ### M8+ — v2 (partially scoped)
-- Magic-sets (SHIPPED, M8), arithmetic/string builtins (SHIPPED, M9), IVM (SHIPPED, v2 Slices 0-5), bushy plans (SHIPPED), variable arity / variadic relations (SHIPPED), nested terms/lists (SHIPPED).
-- **Deferred (future):** time-travel, pointwise/stratified negation over recursive predicates, and the IVM/DRed fallback-gap follow-ups (see below).
+- Magic-sets (SHIPPED, M8), arithmetic/string builtins (SHIPPED, M9), IVM (SHIPPED, v2 Slices 0-5), bushy plans (SHIPPED), variable arity / variadic relations (SHIPPED), nested terms/lists (SHIPPED), time-travel / as-of snapshot queries (SHIPPED — `dl_snapshot_versions` / `dl_query_version` / `dl_query_bound_version` / `dl_set_snapshot_retain`).
+- **Deferred (future):** pointwise/stratified negation over recursive predicates, and the IVM/DRed fallback-gap follow-ups (see below).
 - Trace/JIT compilation: REJECTED (2026-08-15) — the interpreter is not the bottleneck; the fixpoint is dominated by C tuple/DAFSA ops a JIT'd body would still call into. See architecture §10.8.
 
 ### IVM / DRed fallback-gap follow-ups (parked / future)

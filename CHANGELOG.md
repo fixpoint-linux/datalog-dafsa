@@ -5,6 +5,23 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **v2 — time-travel / as-of snapshot queries**: query any PAST published
+  snapshot version, not just the current one. Old version dirs already persist
+  (publish never prunes); this adds `dl_snapshot_versions` (enumerate ascending
+  version dirs, two-call idiom, excludes CURRENT + `.tmp` + stray files),
+  `dl_query_version` / `dl_query_bound_version` (read from disk with an explicit
+  version via a stack-local view cache — never `db->vcache`, which keys by
+  rel_name only and would silently return a different version's view), and
+  `dl_set_snapshot_retain` (opt-in prune-to-N, default keep-all). As-of reads
+  do NOT mutate `db->snap_version`, so CURRENT/live routing is untouched.
+  Nonexistent version or unknown rel → `-1` (loud, never empty). Retention
+  runs at the end of `dl_publish_snapshot` under the single-writer lock,
+  rm_rf'ing the oldest version dirs, never CURRENT, best-effort/idempotent
+  (unlink-while-mmap keeps live iterators valid). As-of rank/select/range/count
+  deferred (scan-only v1). Tests: test_m16_travel.c (8/8) — as-of==CURRENT
+  byte-identical (query order v2→v1→v2 exposes the cache bug), immutability,
+  enumeration + cap + NULL sizing, loud -1, empty-db, bound prefix,
+  prune-to-N then restore, variadic.
 - **v2 DAFSA order-statistics — pull-iterator wired into the VM (lazy `OP_RANGE`)**:
   `OP_RANGE`'s generator (the `range(X,Rel,Lo,Hi)` leading-column builtin) is
   now a **lazy resumable generator** driven by the #5 pull-based sorted
