@@ -7,59 +7,35 @@
 <link rel="stylesheet" href="style.css">
 <link rel="stylesheet" href="vendor/codemirror.css">
 <style>
-  /* LSP live-diagnostics styling (CodeMirror squiggle + tooltip + list). */
-  .CodeMirror { border: 1px solid #d0d7de; height: 420px; font-size: 14px; }
-  .CodeMirror, .CodeMirror-scroll { background: #f6f8fa; color: #1f2328; }
-  .CodeMirror-gutters { background: #eaeef2; border-right: 1px solid #d0d7de; }
-  .CodeMirror-linenumber { color: #8b949e; }
-  .CodeMirror-cursor { border-left: 2px solid #0969da; }
-  .CodeMirror-selected { background: #d0e2ff; }
-  .cm-comment { color: #6e7781; font-style: italic; }
-  .cm-string { color: #0a3069; }
-  .cm-number { color: #0550ae; }
-  .cm-keyword { color: #cf222e; font-weight: 600; }
-  .cm-variable-2 { color: #8250df; }
-  .cm-atom { color: #0550ae; }
-  .cm-operator { color: #57606a; }
-  .cm-bracket { color: #57606a; }
-  .cm-def { color: #116329; font-weight: 600; }
-  .cm-dl-squiggle { text-decoration: underline wavy #f85149; text-decoration-skip-ink: none; }
+  /* LSP live-diagnostics styling (CodeMirror squiggle + tooltip + list).
+     Editor syntax colors use the Tokyo Night palette. */
+  .CodeMirror { border: 1px solid #414868; height: 440px; font-size: 14px; }
+  .CodeMirror, .CodeMirror-scroll { background: #1a1b26; color: #c0caf5; }
+  .CodeMirror-gutters { background: #16161e; border-right: 1px solid #292e42; }
+  .CodeMirror-linenumber { color: #3b4261; }
+  .CodeMirror-cursor { border-left: 2px solid #c0caf5; }
+  .CodeMirror-selected { background: #33467c; }
+  .cm-comment { color: #565f89; font-style: italic; }
+  .cm-string { color: #9ece6a; }
+  .cm-number { color: #ff9e64; }
+  .cm-keyword { color: #bb9af7; font-weight: 600; }
+  .cm-variable-2 { color: #7dcfff; }
+  .cm-atom { color: #7aa2f7; }
+  .cm-operator { color: #89ddff; }
+  .cm-bracket { color: #c0caf5; }
+  .cm-def { color: #73daca; font-weight: 600; }
+  .cm-dl-squiggle { text-decoration: underline wavy #f7768e; text-decoration-skip-ink: none; }
   #diagnostics { margin: 12px 0; font-size: 14px; }
-  #diagnostics .dl-diag { color: #b62324; padding: 2px 0; font-family: monospace; }
-  #diagnostics .dl-ok { color: #1a7f37; }
+  #diagnostics .dl-diag { color: #f7768e; padding: 2px 0; font-family: monospace; }
+  #diagnostics .dl-ok { color: #9ece6a; }
   #tooltip {
-    position: absolute; z-index: 10; background: #fff8e1; border: 1px solid #e0c36a;
-    color: #5d4037; padding: 4px 8px; font-size: 13px; font-family: monospace;
+    position: absolute; z-index: 10; background: #1f2335; border: 1px solid #7aa2f7;
+    color: #c0caf5; padding: 4px 8px; font-size: 13px; font-family: monospace;
     max-width: 420px; white-space: pre-wrap; pointer-events: none; border-radius: 3px;
-    box-shadow: 0 2px 6px rgba(0,0,0,0.15);
+    box-shadow: 0 2px 8px rgba(0,0,0,0.5);
   }
   #editor-wrap { position: relative; }
-  #output { background: #0d1117; color: #e6edf3; border: 1px solid #30363d; }
-  @media (prefers-color-scheme: dark) {
-    .CodeMirror, .CodeMirror-scroll { background: #0d1117; color: #e6edf3; }
-    .CodeMirror { border-color: #30363d; }
-    .CodeMirror-gutters { background: #161b22; border-right-color: #30363d; }
-    .CodeMirror-linenumber { color: #8b949e; }
-    .CodeMirror-cursor { border-left-color: #58a6ff; }
-    .CodeMirror-selected { background: #264f78; }
-    .cm-comment { color: #8b949e; }
-    .cm-string { color: #a5d6ff; }
-    .cm-number { color: #79c0ff; }
-    .cm-keyword { color: #ff7b72; }
-    .cm-variable-2 { color: #d2a8ff; }
-    .cm-atom { color: #79c0ff; }
-    .cm-operator { color: #e6edf3; }
-    .cm-bracket { color: #e6edf3; }
-    .cm-def { color: #7ee787; }
-    .cm-dl-squiggle { text-decoration-color: #ff7b72; }
-    #diagnostics .dl-diag { color: #ff7b72; }
-    #diagnostics .dl-ok { color: #3fb950; }
-    #tooltip {
-      background: #2d333b; border: 1px solid #57606a; color: #e6edf3;
-      box-shadow: 0 2px 8px rgba(0,0,0,0.5);
-    }
-    #output { border-color: #30363d; }
-  }
+  #output { background: #16161e; color: #c0caf5; border: 1px solid #414868; }
 </style>
 </head>
 <body>
