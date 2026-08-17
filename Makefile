@@ -324,13 +324,13 @@ DLP_ENGINE_SRCS = src/intern.c src/termstore.c src/relation.c \
                   src/vrelation.c src/tupleset.c src/parser.c src/compiler.c \
                   src/vm.c src/snapshot.c src/regexwalk.c src/permindex.c \
                   src/util.c src/dl.c src/iter.c src/magic.c src/topdown.c \
-                  src/analyze.c src/schema.c src/typecheck.c \
+                  src/analyze.c src/schema.c src/typecheck.c src/json.c \
                   vendor/dafsa.c vendor/dafsa_state.c vendor/dafsa_core.c \
                   vendor/dafsa_persist.c vendor/dafsa_view.c \
                   vendor/dafsa_crc32.c vendor/dafsa_wal.c vendor/dafsa_build.c \
                   vendor/dafsa_rank.c vendor/dafsa_view_rank.c
 
-DLP_SRCS = dlp/main.c dlp/schema_load.c dlp/init.c dlp/csv_load.c dlp/workflow.c
+DLP_SRCS = dlp/main.c dlp/schema_load.c dlp/init.c dlp/csv_load.c dlp/json_load.c dlp/workflow.c
 
 # Use := (not ?=) so the environment's CC=cc does not override cosmocc.
 COSMOCC := cosmocc

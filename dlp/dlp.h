@@ -42,6 +42,18 @@ int dlp_project_init(const char *dir, char *errbuf, size_t errcap);
 int dlp_csv_load(dl_db *db, const dl_schema *s, const char *rel,
                  const char *path, char *errbuf, size_t errcap);
 
+/* Typed JSON loader (S6).  Loads `path` (a JSON array of objects, file stem =
+ * relation) into relation `rel` of schema `s` with STRICT typing: a JSON
+ * number maps to a Natural (must be integer-valued within [0,4294967295]) and
+ * a JSON string maps to a Text; any other value type is an error.  Object
+ * keys must exactly match the schema column names (unknown/missing keys are
+ * errors listing both sets).  When db == NULL this is a DRY-RUN (validation
+ * only, used by `dlp check`); when db != NULL validated facts are added via
+ * dl_add_fact.  Returns the number of facts loaded (or validated) on success,
+ * -1 on failure with the first human-readable diagnostic in errbuf. */
+int dlp_json_load(dl_db *db, const dl_schema *s, const char *rel,
+                  const char *path, char *errbuf, size_t errcap);
+
 /* S5 workflow commands.  `dir` is a project directory (schema.dhall + data/ +
  * rules/).  Each returns 0 on success, -1 on failure with a diagnostic in
  * errbuf.  check does not write anything; build and query write under dir/.build. */

@@ -109,4 +109,69 @@ if ! grep -q 'Natural' "$WORK/bug-build.err"; then
 fi
 ok "build (bug) rejected (stderr has 'Natural')"
 
+# --- JSON good project (S6): identical worked example, data as data/*.json ---
+# Same schema + rules; node/edge/weight come from JSON arrays-of-objects with
+# strict typing (JSON number -> Natural, JSON string -> Text).  The query must
+# be identical to the CSV variant.
+NODE_J='[{"id":"alice"},{"id":"bob"},{"id":"carol"},{"id":"dave"}]'
+EDGE_J='[{"src":"alice","dst":"bob"},{"src":"bob","dst":"carol"},{"src":"alice","dst":"dave"},{"src":"dave","dst":"carol"}]'
+WEIGHT_J='[{"src":"alice","w":3},{"src":"bob","w":10},{"src":"dave","w":2}]'
+
+J="$WORK/jgood"
+write "$J/schema.dhall" "$SCHEMA"
+write "$J/data/node.json"   "$NODE_J"
+write "$J/data/edge.json"   "$EDGE_J"
+write "$J/data/weight.json" "$WEIGHT_J"
+write "$J/rules/reach.datalog" "$GOOD_RULES"
+
+"$DLP" check "$J" ; ok "check (JSON good)"
+"$DLP" build "$J" ; ok "build (JSON good)"
+
+JOUT="$("$DLP" query "$J" 'tc(alice,X)')"
+if [ "$(printf '%s' "$JOUT" | sort)" != "$(printf '%s' "$EXPECTED")" ]; then
+    fail "JSON query tc(alice,X) = $(printf '%s' "$JOUT" | sort); expected: $EXPECTED"
+fi
+ok "JSON query 'tc(alice,X)' == bob/carol/dave (sorted)"
+
+# --- JSON negative typing (S6) ---
+# A JSON string in a Natural column must be rejected (check + build).
+B1="$WORK/jbad-natural"
+write "$B1/schema.dhall" "$SCHEMA"
+write "$B1/data/node.json"   "$NODE_J"
+write "$B1/data/edge.json"   "$EDGE_J"
+write "$B1/data/weight.json" '[{"src":"alice","w":"3"}]'
+write "$B1/rules/reach.datalog" "$GOOD_RULES"
+
+if "$DLP" check "$B1" 2>"$WORK/bad-natural-check.err"; then
+    fail "check (string-in-Natural) unexpectedly succeeded"
+fi
+if ! grep -q 'Natural' "$WORK/bad-natural-check.err"; then
+    fail "check (string-in-Natural) stderr lacks 'Natural': $(cat "$WORK/bad-natural-check.err")"
+fi
+ok "check (string in Natural JSON column) rejected (stderr has 'Natural')"
+
+if "$DLP" build "$B1" 2>"$WORK/bad-natural-build.err"; then
+    fail "build (string-in-Natural) unexpectedly succeeded"
+fi
+if ! grep -q 'Natural' "$WORK/bad-natural-build.err"; then
+    fail "build (string-in-Natural) stderr lacks 'Natural': $(cat "$WORK/bad-natural-build.err")"
+fi
+ok "build (string in Natural JSON column) rejected (stderr has 'Natural')"
+
+# A JSON number in a Text column must be rejected.
+B2="$WORK/jbad-text"
+write "$B2/schema.dhall" "$SCHEMA"
+write "$B2/data/node.json"   '[{"id":42}]'
+write "$B2/data/edge.json"   "$EDGE_J"
+write "$B2/data/weight.json" "$WEIGHT_J"
+write "$B2/rules/reach.datalog" "$GOOD_RULES"
+
+if "$DLP" check "$B2" 2>"$WORK/bad-text.err"; then
+    fail "check (number-in-Text) unexpectedly succeeded"
+fi
+if ! grep -q 'Text' "$WORK/bad-text.err"; then
+    fail "check (number-in-Text) stderr lacks 'Text': $(cat "$WORK/bad-text.err")"
+fi
+ok "check (number in Text JSON column) rejected (stderr has 'Text')"
+
 echo "ALL GOLDEN TESTS PASSED"

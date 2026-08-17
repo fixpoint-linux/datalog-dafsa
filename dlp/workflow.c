@@ -93,6 +93,70 @@ fail:
     return NULL;
 }
 
+/* List the data files in `dir` (both ".csv" and ".json"), sorted
+ * alphabetically across both extensions.  Returns a malloc'd array of
+ * malloc'd basenames, `*count` set.  Returns NULL on error. */
+static char **list_data_dir(const char *dir, int *count) {
+    int nc = 0, nj = 0;
+    char **csv = list_dir(dir, ".csv", &nc);
+    char **json = list_dir(dir, ".json", &nj);
+    if ((nc < 0 && !csv) || (nj < 0 && !json)) {
+        if (csv) { for (int i = 0; i < nc; i++) free(csv[i]); free(csv); }
+        if (json) { for (int i = 0; i < nj; i++) free(json[i]); free(json); }
+        *count = -1;
+        return NULL;
+    }
+    if (!csv) { nc = 0; }
+    if (!json) { nj = 0; }
+    if (nc < 0) nc = 0;         /* appease alloc-size range analysis */
+    if (nj < 0) nj = 0;
+    size_t ncap = (size_t)nc + (size_t)nj;
+    if (ncap == 0) ncap = 1;
+    char **out = malloc(ncap * sizeof *out);
+    if (!out) {
+        for (int i = 0; i < nc; i++) free(csv[i]);
+        for (int i = 0; i < nj; i++) free(json[i]);
+        free(csv); free(json);
+        *count = -1;
+        return NULL;
+    }
+    int n = 0;
+    for (int i = 0; i < nc; i++) out[n++] = csv[i];
+    for (int i = 0; i < nj; i++) out[n++] = json[i];
+    free(csv); free(json);
+    /* qsort basenames. */
+    int cmp2(const void *a, const void *b) {
+        return strcmp(*(char *const *)a, *(char *const *)b);
+    }
+    qsort(out, (size_t)n, sizeof *out, cmp2);
+    *count = n;
+    return out;
+}
+
+/* Load (db != NULL) or dry-run validate (db == NULL) one data file, choosing
+ * the CSV or JSON typed loader by the file extension.  `path` is the full
+ * path to the file.  Returns the fact count or -1 with errbuf set. */
+static long load_data_file(dl_db *db, const dl_schema *schema,
+                           const char *data_prefix, const char *fname,
+                           const char *path, char *errbuf, size_t errcap) {
+    (void)data_prefix;          /* the full `path` is supplied by the caller */
+    /* relation name == file stem (strip ".csv"/".json") */
+    char rel[256];
+    size_t n = strlen(fname);
+    if (has_suffix(fname, ".json")) {
+        if (n >= 5) n -= 5;
+        if (n >= sizeof rel) n = sizeof rel - 1;
+        memcpy(rel, fname, n);
+        rel[n] = '\0';
+        return dlp_json_load(db, schema, rel, path, errbuf, errcap);
+    }
+    if (n >= 4) n -= 4;             /* strip ".csv" */
+    if (n >= sizeof rel) n = sizeof rel - 1;
+    memcpy(rel, fname, n);
+    rel[n] = '\0';
+    return dlp_csv_load(db, schema, rel, path, errbuf, errcap);
+}
+
 /* ─── EDB/IDB inference + rule typechecking (D1) ───────────────────────── */
 /* Parse each rules file (*.datalog) in sorted order, mark every rule-head
  * relation is_idb=1 on the public dl_schema, and typecheck the rules directly
@@ -150,27 +214,20 @@ static int typecheck_rules_dir(dl_schema *schema, const char *rules_dir, const c
     return errs;
 }
 
-/* Dry-run validate every data file (*.csv) (no writes).  Prints errors to
- * stderr and returns the number of failing files. */
+/* Dry-run validate every data file (*.csv and *.json) (no writes).  Prints
+ * errors to stderr and returns the number of failing files. */
 static int check_data_dir(const dl_schema *schema, const char *data_dir, const char *data_prefix) {
     int nfiles = 0, errs = 0;
-    char **files = list_dir(data_dir, ".csv", &nfiles);
+    char **files = list_data_dir(data_dir, &nfiles);
     if (nfiles < 0) return -1;
     for (int f = 0; f < nfiles; f++) {
-        /* relation name == CSV stem */
-        char rel[256];
-        size_t n = strlen(files[f]);
-        if (n >= 4) n -= 4;             /* strip ".csv" */
-        if (n >= sizeof rel) n = sizeof rel - 1;
-        memcpy(rel, files[f], n);
-        rel[n] = '\0';
         char path[1024];
         if (snprintf(path, sizeof path, "%s/%s", data_prefix, files[f]) >= (int)sizeof path) { errs++; continue; }
         char errbuf[512];
         errbuf[0] = '\0';
-        long cnt = dlp_csv_load(NULL, schema, rel, path, errbuf, sizeof errbuf);
+        long cnt = load_data_file(NULL, schema, data_prefix, files[f], path, errbuf, sizeof errbuf);
         if (cnt < 0) {
-            fprintf(stderr, "%s\n", errbuf[0] ? errbuf : "csv load failed");
+            fprintf(stderr, "%s\n", errbuf[0] ? errbuf : "data load failed");
             errs++;
         }
     }
@@ -289,25 +346,19 @@ int dlp_project_build(const char *dir, char *errbuf, size_t errcap) {
         }
     }
 
-    /* Load CSVs (typed). */
+    /* Load data files (typed; CSV + JSON). */
     struct stat st;
     if (stat(dp, &st) == 0) {
         int nfiles = 0;
-        char **files = list_dir(dp, ".csv", &nfiles);
+        char **files = list_data_dir(dp, &nfiles);
         if (nfiles < 0) { dl_close(db); return seterr(errbuf, errcap, "cannot read data dir '%s'", dp); }
         for (int f = 0; f < nfiles; f++) {
-            char rel[256];
-            size_t n = strlen(files[f]);
-            if (n >= 4) n -= 4;
-            if (n >= sizeof rel) n = sizeof rel - 1;
-            memcpy(rel, files[f], n);
-            rel[n] = '\0';
             char path[1024];
             if (snprintf(path, sizeof path, "%s/%s", dp, files[f]) >= (int)sizeof path) { dl_close(db); return seterr(errbuf, errcap, "data path too long"); }
             char e[512];
             e[0] = '\0';
-            if (dlp_csv_load(db, &schema, rel, path, e, sizeof e) < 0) {
-                fprintf(stderr, "%s\n", e[0] ? e : "csv load failed");
+            if (load_data_file(db, &schema, dp, files[f], path, e, sizeof e) < 0) {
+                fprintf(stderr, "%s\n", e[0] ? e : "data load failed");
                 dl_close(db);
                 return 1;
             }
@@ -456,20 +507,14 @@ int dlp_project_query(const char *dir, const char *goal_str, char *errbuf, size_
     struct stat st;
     if (stat(dp, &st) == 0) {
         int nfiles = 0;
-        char **files = list_dir(dp, ".csv", &nfiles);
+        char **files = list_data_dir(dp, &nfiles);
         if (nfiles < 0) { dl_close(db); return seterr(errbuf, errcap, "cannot read data dir '%s'", dp); }
         for (int f = 0; f < nfiles; f++) {
-            char rel[256];
-            size_t n = strlen(files[f]);
-            if (n >= 4) n -= 4;
-            if (n >= sizeof rel) n = sizeof rel - 1;
-            memcpy(rel, files[f], n);
-            rel[n] = '\0';
             char path[1024];
             if (snprintf(path, sizeof path, "%s/%s", dp, files[f]) >= (int)sizeof path) { dl_close(db); return seterr(errbuf, errcap, "data path too long"); }
             char e[512]; e[0] = '\0';
-            if (dlp_csv_load(db, &schema, rel, path, e, sizeof e) < 0) {
-                fprintf(stderr, "%s\n", e[0] ? e : "csv load failed");
+            if (load_data_file(db, &schema, dp, files[f], path, e, sizeof e) < 0) {
+                fprintf(stderr, "%s\n", e[0] ? e : "data load failed");
                 dl_close(db); return 1;
             }
         }
