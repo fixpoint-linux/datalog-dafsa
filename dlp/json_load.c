@@ -140,13 +140,14 @@ int dlp_json_load(dl_db *db, const dl_schema *s, const char *rel,
             for (int j = 0; j < r->arity; j++)
                 if (strcmp(key, dlp_schema_colname(s, rel, j)) == 0) { idx = j; break; }
             if (idx < 0) {
+                int ngot = el->as.obj.n < DL_SCHEMA_MAX_ARITY ? el->as.obj.n : DL_SCHEMA_MAX_ARITY;
                 const char *got[DL_SCHEMA_MAX_ARITY];
-                for (int m = 0; m < el->as.obj.n; m++) got[m] = el->as.obj.keys[m];
+                for (int m = 0; m < ngot; m++) got[m] = el->as.obj.keys[m];
                 char exp[256], gots[256];
                 const char *expn[DL_SCHEMA_MAX_ARITY];
                 for (int m = 0; m < r->arity; m++) expn[m] = dlp_schema_colname(s, rel, m);
                 join_names(exp, sizeof exp, expn, r->arity);
-                join_names(gots, sizeof gots, got, el->as.obj.n);
+                join_names(gots, sizeof gots, got, ngot);
                 seterr(errbuf, errcap,
                        "%s: element %d: unknown column '%s'; expects %s, got %s",
                        path, e, key, exp, gots);
@@ -156,13 +157,14 @@ int dlp_json_load(dl_db *db, const dl_schema *s, const char *rel,
         }
         for (int j = 0; j < r->arity; j++) {
             if (!used[j]) {
+                int ngot = el->as.obj.n < DL_SCHEMA_MAX_ARITY ? el->as.obj.n : DL_SCHEMA_MAX_ARITY;
                 const char *got[DL_SCHEMA_MAX_ARITY];
-                for (int m = 0; m < el->as.obj.n; m++) got[m] = el->as.obj.keys[m];
+                for (int m = 0; m < ngot; m++) got[m] = el->as.obj.keys[m];
                 char exp[256], gots[256];
                 const char *expn[DL_SCHEMA_MAX_ARITY];
                 for (int m = 0; m < r->arity; m++) expn[m] = dlp_schema_colname(s, rel, m);
                 join_names(exp, sizeof exp, expn, r->arity);
-                join_names(gots, sizeof gots, got, el->as.obj.n);
+                join_names(gots, sizeof gots, got, ngot);
                 seterr(errbuf, errcap,
                        "%s: element %d: missing column '%s'; expects %s, got %s",
                        path, e, dlp_schema_colname(s, rel, j), exp, gots);
