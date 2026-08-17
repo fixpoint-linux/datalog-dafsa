@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>datalog-dafsa — a DAFSA-backed Datalog engine in C</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site">
+  <div class="wrap">
+    <a class="brand" href="index.html">datalog-dafsa</a>
+    <nav>
+      <a href="index.html">Overview</a>
+      <a href="language.html">Language</a>
+      <a href="cli.html">CLI</a>
+      <a href="api.html">C API</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="order-statistics.html">Order Stats</a>
+      <a href="time-travel.html">Time Travel</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+  <h1>datalog-dafsa</h1>
+  <p>
+    A DAFSA-backed Datalog engine written in C. You load facts into an on-disk
+    minimal-acyclic-DAFSA fact store, compile Datalog rules to a small VM,
+    materialize derived relations, and serve reads from an mmap&rsquo;d snapshot.
+  </p>
+  <p>
+    The storage thesis is simple: every fact is a <em>fixed-width big-endian
+    key</em>, so the DAFSA&rsquo;s two strongest primitives — exact-key lookup and
+    prefix enumeration — are exactly the two most common join access patterns.
+  </p>
+
+  <h2>Quickstart</h2>
+  <pre class="code"><code>make                 # build libdatalog.so, dl CLI, test binaries
+make test            # run the full test suite
+make bench           # run the demonstration benchmark</code></pre>
+
+  <p>
+    The <code>dl</code> CLI loads facts and answers queries. The database
+    directory defaults to <code>dl-test-db</code> and can be overridden with
+    <code>-d &lt;dir&gt;</code>.
+  </p>
+
+  <pre class="code"><code>$ cat edges.csv
+1,2
+1,3
+2,3
+2,4
+3,5
+
+# Load a headerless CSV (arity 1-8) into a relation.
+$ ./dl -d /tmp/db load edges.csv --rel edge
+Loaded 5 facts into edge
+
+# Exact lookup.
+$ ./dl -d /tmp/db lookup edge 1 2
+found
+
+# Prefix enumeration (bind leading columns).
+$ ./dl -d /tmp/db prefix edge 2
+2 3
+2 4
+
+# Run a Datalog rule (compile + publish + query in one step):
+# transitive closure of edge.
+$ ./dl -d /tmp/db query 'tc(X,Y) :- edge(X,Y). tc(X,Y) :- edge(X,Z), tc(Z,Y).' tc
+1 2
+1 3
+1 4
+1 5
+2 3
+2 4
+2 5
+3 5
+
+# Publish a snapshot for read-only serving.
+$ ./dl -d /tmp/db publish
+Snapshot published.</code></pre>
+
+  <p>
+    CSV values that parse as integers are stored raw as u32; anything else is
+    interned to a symbol id. Other commands include <code>bound</code>,
+    <code>pattern</code> (regex), and <code>qmagic</code> (magic-sets).
+    See <a href="cli.html">the CLI reference</a>.
+  </p>
+
+  <h2>Feature summary</h2>
+  <table class="features">
+    <thead>
+      <tr><th>Area</th><th>Capabilities</th><th>Details</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>DAFSA storage</td>
+        <td>Fixed-width u32BE key encoding; one DAFSA + WAL per relation; symbol interner; WAL + compaction</td>
+        <td><a href="architecture.html">Architecture</a></td>
+      </tr>
+      <tr>
+        <td>Datalog syntax</td>
+        <td>Facts, rules, recursion, negation, aggregates (count/sum/min/max), equality, comparisons, arithmetic, strings, lists, range, regex</td>
+        <td><a href="language.html">Language Reference</a></td>
+      </tr>
+      <tr>
+        <td>Evaluation strategies</td>
+        <td>Semi-naive fixpoint, stratified negation, bushy joins, permutation-index selection + hash-join, magic-sets / QSQ top-down, incremental view maintenance</td>
+        <td><a href="architecture.html#strategies">Architecture &sect; strategies</a></td>
+      </tr>
+      <tr>
+        <td>Order statistics</td>
+        <td>rank / select / range_count / count, bound + perm variants, pull-iterator + merge-join, lazy range generator</td>
+        <td><a href="order-statistics.html">Order Statistics</a></td>
+      </tr>
+      <tr>
+        <td>Time-travel</td>
+        <td>Versioned snapshots, as-of queries, opt-in retention</td>
+        <td><a href="time-travel.html">Time Travel</a></td>
+      </tr>
+      <tr>
+        <td>Durability</td>
+        <td>Per-relation WAL + fsync, single-writer lock, atomic snapshot publish, mmap read path</td>
+        <td><a href="architecture.html#durability">Architecture &sect; durability</a></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Reference pages</h2>
+  <ul>
+    <li><a href="language.html">Language Reference</a> — the complete rule language.</li>
+    <li><a href="cli.html">CLI Reference</a> — the 8 <code>dl</code> subcommands.</li>
+    <li><a href="api.html">C API Reference</a> — the full <code>dl.h</code> surface.</li>
+    <li><a href="architecture.html">Architecture</a> — storage thesis, lifecycle, join &amp; evaluation strategies.</li>
+    <li><a href="order-statistics.html">Order Statistics</a> — rank / select / range / count and the sorted iterator.</li>
+    <li><a href="time-travel.html">Time Travel</a> — versioned snapshots and as-of queries.</li>
+  </ul>
+</main>
+
+<footer class="site-foot">
+  <div class="wrap">
+    Datalog engine source lives in the <code>datalog-dafsa</code> repository; the
+    public C API is <code>src/dl.h</code>. No JavaScript is used on this site.
+  </div>
+</footer>
+
+</body>
+</html>

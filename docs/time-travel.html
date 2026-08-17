@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Time Travel — datalog-dafsa</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site">
+  <div class="wrap">
+    <a class="brand" href="index.html">datalog-dafsa</a>
+    <nav>
+      <a href="index.html">Overview</a>
+      <a href="language.html">Language</a>
+      <a href="cli.html">CLI</a>
+      <a href="api.html">C API</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="order-statistics.html">Order Stats</a>
+      <a href="time-travel.html">Time Travel</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+  <h1>Time Travel</h1>
+  <p>
+    Every call to <code>dl_publish_snapshot</code> writes a versioned snapshot
+    directory (<code>snapshots/&lt;N&gt;/</code>) and flips the
+    <code>CURRENT</code> pointer. Old snapshot versions persist on disk, which
+    makes <em>as-of</em> queries possible: read any past snapshot as if it were
+    current, without touching the live routing. Time-travel is available through
+    the C API only — there is no Datalog syntax and no CLI command.
+  </p>
+
+  <h2 id="versions">Versioned snapshots</h2>
+  <p>
+    Each successful publish produces a monotonically increasing version number
+    starting at 1. Enumerate the available versions ascending with
+    <code>dl_snapshot_versions</code>, using the two-call idiom:
+  </p>
+  <pre class="code"><code>long total = dl_snapshot_versions(db, NULL, 0);   /* size */
+uint32_t *vers = malloc((size_t)total * sizeof(*vers));
+dl_snapshot_versions(db, vers, (size_t)total);    /* fill */
+free(vers);</code></pre>
+  <p>
+    It returns the <em>total</em> number of versions even when the output buffer
+    is smaller (filling at most <code>cap</code> entries), returns 0 when no
+    snapshot has been published, and -1 on a NULL <code>db</code>.
+  </p>
+
+  <h2 id="asof">As-of queries</h2>
+  <p>
+    Query a relation as of a specific published version with
+    <code>dl_query_version</code>, or bind leading columns with
+    <code>dl_query_bound_version</code>:
+  </p>
+  <pre class="code"><code>long n = dl_query_version(db, version, "edge", cb, user);
+long m = dl_query_bound_version(db, version, "edge", leading, k, cb, user);</code></pre>
+  <p>
+    Semantics and guarantees:
+  </p>
+  <ul>
+    <li>As-of reads use an explicit version and read that version&rsquo;s manifest
+      + mmap view from disk; <code>db-&gt;snap_version</code> is never mutated, so
+      live/current routing is untouched.</li>
+    <li>As-of views are <strong>immutable</strong>: add/delete operations after a
+      publish never change an earlier version&rsquo;s view. The live
+      <code>dl_query</code> stays on the current version until the next publish.</li>
+    <li>A nonexistent version (including 0), a NULL goal/relation absent from
+      that version, or a NULL callback is a <strong>loud</strong> -1 — never a
+      silently-empty result.</li>
+    <li>Variadic relations are supported (arity-mixed tuples are returned).</li>
+  </ul>
+
+  <h2 id="retain">Retention</h2>
+  <p>
+    By default every version is kept forever. To bound disk usage, opt in to
+    prune-to-N with <code>dl_set_snapshot_retain</code>: after each successful
+    publish, the oldest versions beyond the most-recent <code>n</code> are
+    pruned. <code>n == 0</code> (the default) restores keep-all.
+  </p>
+  <pre class="code"><code>dl_set_snapshot_retain(db, 5);   /* keep the 5 most-recent versions */
+dl_set_snapshot_retain(db, 0);   /* back to keep-all */</code></pre>
+  <p>
+    A pruned version is gone — querying it returns -1 (loud), matching the
+    nonexistent-version contract.
+  </p>
+
+  <h2 id="model">Concurrency model</h2>
+  <p>
+    This fits the engine&rsquo;s single-writer / multiple-reader model. Readers
+    hold mmap views and keep reading valid data even after a retention prune
+    unlinks the underlying snapshot directory. A reader holding an mmap of
+    <code>snapshots/&lt;V&gt;/&lt;rel&gt;.dafsa</code> keeps reading valid data
+    after the pruner removes the directory — the unlink does not disturb the
+    open mapping.
+  </p>
+
+</main>
+
+<footer class="site-foot">
+  <div class="wrap">
+    Back to <a href="index.html">overview</a>. See also
+    <a href="api.html">C API</a>, <a href="architecture.html">Architecture</a>.
+  </div>
+</footer>
+
+</body>
+</html>

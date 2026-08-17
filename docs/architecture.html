@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Architecture — datalog-dafsa</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site">
+  <div class="wrap">
+    <a class="brand" href="index.html">datalog-dafsa</a>
+    <nav>
+      <a href="index.html">Overview</a>
+      <a href="language.html">Language</a>
+      <a href="cli.html">CLI</a>
+      <a href="api.html">C API</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="order-statistics.html">Order Stats</a>
+      <a href="time-travel.html">Time Travel</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+  <h1>Architecture</h1>
+  <p>
+    This page explains the storage thesis and the join / evaluation strategies.
+    It is a qualitative description; see <code>tests/bench.c</code> for the
+    demonstration benchmark harness rather than this site for numbers.
+  </p>
+
+  <h2 id="storage">The storage thesis: fixed-width big-endian keys</h2>
+  <p>
+    The linchpin of the engine is that every fact of arity <code>a</code> is
+    encoded as one fixed-width key of <code>4*a</code> bytes — each column a u32
+    in big-endian byte order, laid out in column order with no inter-column
+    separator, plus a trailing <code>\0</code> guard.
+  </p>
+  <p>
+    Because the columns sit at known byte offsets, &ldquo;bind the first
+    <code>k</code> columns to constants and enumerate the rest&rdquo; becomes
+    exactly a <em>byte-prefix</em> lookup on the relation&rsquo;s DAFSA. The
+    DAFSA&rsquo;s two strongest primitives — exact-key lookup and prefix
+    enumeration — are precisely the two most common join access patterns.
+  </p>
+
+  <h2 id="per-relation">One DAFSA per relation</h2>
+  <p>
+    Each relation <code>R</code> of arity <code>a_R</code> has its own DAFSA,
+    plus its own write-ahead log. Per-relation DAFSAs preserve prefix-enum
+    selectivity, isolate compaction, and keep schema / arity / permutation-index
+    metadata clean.
+  </p>
+  <p>
+    A separate <strong>symbol DAFSA</strong> maps interned strings to u32 symbol
+    ids — a forward <code>str&rarr;sym</code> DAFSA plus a reverse
+    <code>sym&rarr;str</code> array.
+  </p>
+
+  <h2 id="lifecycle">Lifecycle: load &rarr; compile &rarr; publish &rarr; serve</h2>
+  <ol>
+    <li><strong>Load</strong> facts into a database directory
+      (<code>dl_load_facts</code> bulk CSV, or incremental
+      <code>dl_add_fact</code> / <code>dl_delete_fact</code>).</li>
+    <li><strong>Declare</strong> relations and <strong>compile</strong> rules
+      (<code>dl_load_rules</code> + <code>dl_compile</code>), running the
+      semi-naive fixpoint VM to materialize derived relations.</li>
+    <li><strong>Publish</strong> a versioned snapshot atomically
+      (<code>dl_publish_snapshot</code>: save the interner + all relations, flip
+      the <code>CURRENT</code> pointer).</li>
+    <li><strong>Serve</strong> reads from mmap&rsquo;d read-only views
+      (<code>dl_query</code> / <code>dl_query_bound</code> /
+      <code>dl_pattern</code>) instead of running the VM.</li>
+  </ol>
+  <p>This is a single-writer / multiple-reader model: one writer, readers on mmap.</p>
+
+  <h2 id="durability">Durability</h2>
+  <p>
+    <code>dl_add_fact</code> / <code>dl_delete_fact</code> append to a per-relation
+    WAL and fsync before committing in memory. A <code>fcntl</code> single-writer
+    lock guards the database. The interner is saved durably, and it is ordered
+    <em>before</em> WAL records so crash recovery can decode symbol ids. WAL
+    compaction triggers at 25% of the relation size.
+  </p>
+
+  <h2 id="strategies">Join &amp; evaluation strategies</h2>
+
+  <h3>Prefix enumeration = index-nested-loop join</h3>
+  <p>
+    The VM implements joins as index-nested-loop: for each tuple, bind the shared
+    leading columns to constants and prefix-enumerate the next relation (via
+    <code>relation.c</code>&rsquo;s prefix walker, which DFS-traverses the DAFSA
+    from the prefix state). Non-leading-column joins are handled by per-relation
+    <strong>permutation indices</strong> — a permuted DAFSA for every
+    column-prefix the compiler sees used as a join key — plus a hash-join
+    fallback for the rest. <code>min</code>/<code>max</code> aggregates fall out
+    of the big-endian encoding (extreme prefix = extreme key).
+  </p>
+
+  <h3>Semi-naive fixpoint + stratification</h3>
+  <p>
+    Recursive rules are evaluated with a semi-naive fixpoint (only the delta is
+    propagated each round). A stratification pass assigns strata and rejects
+    unstratifiable programs (negation through recursion, or a strict cycle
+    through <code>range</code>). Derived relations in a recursive SCC are
+    materialized before any same-stratum dependent reads them.
+  </p>
+
+  <h3>Bushy joins</h3>
+  <p>
+    Negation-free rules optionally take a binary-tree (bushy) join plan when a
+    natural 2-partition with a low cut width exists (compiled-time toggle,
+    default on). Otherwise a greedy left-deep join reorders the body atoms by
+    ascending estimated cardinality.
+  </p>
+
+  <h3>Permutation-index selection</h3>
+  <p>
+    For a non-leading-column join, the compiler picks between a permuted DAFSA
+    (<code>OP_LOOKUP_PERM</code>) and a slot-free hash join
+    (<code>OP_HASH_JOIN</code>) using a cardinality cost gate. A recursive body
+    atom is always served by a permutation index (never a hash join, which would
+    read a stale DAFSA), and a hash-join fallback is used when no index is worth
+    building. See <a href="order-statistics.html#perm">Order Statistics</a>.
+  </p>
+
+  <h3>Magic-sets / QSQ top-down</h3>
+  <p>
+    The <code>dl_query_magic</code> family re-evaluates a <em>scoped</em>
+    fixpoint seeded by the bound goal arguments, materializing only the reachable
+    IDB slice — the result is byte-identical to a bound query over the fully
+    materialized relation. The top-down / QSQ path evaluates the same adorned +
+    magic program but schedules it demand-driven (an SLG worklist over subqueries)
+    instead of as a forward fixpoint. Both are opt-in per-query paths and are
+    available through the C API only.
+  </p>
+
+  <h3>Incremental view maintenance (IVM)</h3>
+  <p>
+    After rules are compiled and a snapshot is published, subsequent fact
+    insertions (and deletions) are maintained incrementally where eligible
+    (delta propagation, DRed for deletions, aggregate maintenance, bulk) instead
+    of re-running the full fixpoint. Programs using list builtins or variadics
+    are excluded from the incremental paths and always evaluate via the full
+    fixpoint — never silently mis-evaluated.
+  </p>
+
+  <h3>Pull-iterator + merge-join</h3>
+  <p>
+    A resumable pull-based sorted iterator (<code>dl_iter_*</code>) exposes each
+    relation in ascending key order, and <code>dl_merge_join</code> equi-joins
+    two sorted iterators on a shared leading prefix, streaming pairs in sorted
+    order. See <a href="order-statistics.html#iter">Order Statistics</a>.
+  </p>
+
+  <h3>Lazy <code>OP_RANGE</code></h3>
+  <p>
+    The <code>range(X, Rel, Lo, Hi)</code> generator is a <em>lazy</em> resumable
+    generator over the pull-iterator (not an eager materialization): it skips to
+    the lower bound, deduplicates consecutive leading-column values, stops at the
+    upper bound, and can be short-circuited by an early-stopping consumer. It
+    reads the live relation (never a stale snapshot view). See
+    <a href="order-statistics.html#range">Order Statistics</a>.
+  </p>
+
+  <h2 id="performance">Performance</h2>
+  <p>
+    The engine is built around the DAFSA&rsquo;s exact-lookup and prefix-walk
+    primitives, giving index-nested-loop joins whose cost tracks the size of the
+    <em>bound</em> prefix rather than a full scan, and order statistics
+    (rank / select / range / count) that run in time logarithmic in the number of
+    distinct tuples via the DAFSA&rsquo;s subtree arrays. The exact-characterizing
+    benchmark is <code>tests/bench.c</code> (<code>make bench</code>); this site
+    deliberately does not quote specific numbers.
+  </p>
+
+</main>
+
+<footer class="site-foot">
+  <div class="wrap">
+    Back to <a href="index.html">overview</a>. See also
+    <a href="order-statistics.html">Order Statistics</a>,
+    <a href="time-travel.html">Time Travel</a>.
+  </div>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Language Reference — datalog-dafsa</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site">
+  <div class="wrap">
+    <a class="brand" href="index.html">datalog-dafsa</a>
+    <nav>
+      <a href="index.html">Overview</a>
+      <a href="language.html">Language</a>
+      <a href="cli.html">CLI</a>
+      <a href="api.html">C API</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="order-statistics.html">Order Stats</a>
+      <a href="time-travel.html">Time Travel</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+  <h1>Language Reference</h1>
+  <p>
+    This is the complete reference for the rule language. Every example is a
+    real construct that the parser and compiler accept (several are drawn
+    directly from the passing test suite). Rules are passed to the engine as
+    source text via <code>dl_load_rules</code>, the CLI <code>query</code> /
+    <code>qmagic</code> commands, or a <code>.dl</code> file.
+  </p>
+
+  <h2 id="comments">Comments</h2>
+  <p>Line comments start with <code>#</code> and run to the end of the line.</p>
+  <pre class="code"><code># this is a comment
+tc(X, Y) :- edge(X, Y).        # transitive closure base case
+tc(X, Y) :- edge(X, Z), tc(Z, Y).</code></pre>
+
+  <h2 id="facts">Facts</h2>
+  <p>
+    A fact is a ground predicate with constants only — a predicate followed by
+    a parenthesised argument list, terminated by a full stop. There is no
+    <code>:-</code>.
+  </p>
+  <pre class="code"><code>edge(1, 2).
+edge(2, 3).
+person("alice").
+</code></pre>
+
+  <h2 id="rules">Rules</h2>
+  <p>
+    A rule is <code>head :- body1, body2, ..., bodyN.</code> The body atoms are
+    conjoined with commas; the head is a single atom. Rules may reference
+    existing relations (arity must match) or declare a new derived relation.
+  </p>
+  <pre class="code"><code>path(X, Y) :- edge(X, Y).
+tc(X, Y) :- edge(X, Y).
+tc(X, Y) :- edge(X, Z), tc(Z, Y).
+</code></pre>
+  <p>
+    Multiple rules with the <em>same head predicate</em> form a union: the
+    engine materialises each rule and unions the results, deduplicating. There
+    is no <code>;</code> disjunction operator — same-head rules are the way to
+    express a disjunction.
+  </p>
+  <pre class="code"><code>p(X) :- edge(X, Y).
+p(Y) :- edge(X, Y).   # p = union of the two rules' results, deduplicated
+</code></pre>
+
+  <h2 id="vars">Variables, constants, integers and strings</h2>
+  <ul>
+    <li><strong>Variables</strong> start with an uppercase letter <code>A-Z</code>
+      or underscore <code>_</code>, then any alphanumeric or underscore.</li>
+    <li><strong>Symbol constants</strong> are bare lowercase identifiers —
+      <code>foo</code>, <code>red</code>. They are interned to a symbol id.</li>
+    <li><strong>String constants</strong> are <em>double-quoted</em>:
+      <code>"alice"</code>. These are interned symbol values, used anywhere a
+      constant appears.</li>
+    <li><strong>Integer constants</strong> are decimal literals
+      <code>0 1 2 ...</code>. Raw integer literals are limited to &lt; 2^31
+      (2147483648 is rejected) so they can never collide with list handles.
+      <code>2147483647</code> is legal.</li>
+  </ul>
+  <pre class="code"><code>q("alice").          # double-quoted string constant
+q(foo).              # bare lowercase symbol constant
+q(42).               # integer literal (raw u32)</code></pre>
+  <p>
+    Note the asymmetry: <code>"foo"</code> (double quotes) is a string constant;
+    <code>'...'</code> (single quotes) is a <em>regex pattern</em> and is only
+    valid after <code>~</code> (see <a href="#regex">Regex</a>). A bare lowercase
+    identifier is itself a symbol constant.
+  </p>
+
+  <h2 id="recursion">Recursion</h2>
+  <p>
+    Recursive rules are evaluated with a semi-naive fixpoint. A predicate is
+    recursive if it appears in its own body, directly or through a cycle.
+  </p>
+  <pre class="code"><code>tc(X, Y) :- edge(X, Y).
+tc(X, Y) :- edge(X, Z), tc(Z, Y).     # recursive: tc in its own body
+</code></pre>
+  <p>
+    Aggregates are <em>not</em> allowed in recursive rules (a compile error).
+  </p>
+
+  <h2 id="negation">Negation</h2>
+  <p>
+    A negated body atom is prefixed with <code>!</code>. Negation is
+    <em>stratified</em>: a variable in a negated atom must be bound by a positive
+    body atom first, and negation through recursion is rejected at compile time.
+  </p>
+  <pre class="code"><code>path(X, Y) :- edge(X, Y), !blocked(X, Y).
+reachable(X) :- edge(X, Y), !blocked(X).</code></pre>
+  <p>
+    Un-stratifiable programs (a strict dependency cycle through negation) are a
+    loud compile error.
+  </p>
+
+  <h2 id="equality">Equality</h2>
+  <p>
+    Body equality is written <code>X = Y</code> (both sides variables). It acts
+    as a filter when both sides are bound, and binds an unbound variable from
+    its bound counterpart otherwise.
+  </p>
+  <pre class="code"><code>q(X, Y) :- edge(X, Y), X = Y.        # keep rows where X == Y
+q(Y)    :- edge(X, Y), X = Y.        # bind Y from an already-bound X
+</code></pre>
+
+  <h2 id="comparisons">Comparisons</h2>
+  <p>
+    Ordering comparisons <code>&lt;</code> <code>&lt;=</code> <code>&gt;</code>
+    <code>&gt;=</code> accept a variable or an integer constant on either side.
+    Inequality <code>!=</code> additionally accepts a symbol constant on the
+    right (it interns the symbol and compares symbol ids). A symbol constant is
+    <em>not</em> allowed in an ordering comparison.
+  </p>
+  <pre class="code"><code>lt(X, Y) :- pair(X, Y), X &lt; Y.
+le(X, Y) :- pair(X, Y), X &lt;= Y.
+gt(X, Y) :- pair(X, Y), X &gt; Y.
+ge(X, Y) :- pair(X, Y), X &gt;= Y.
+ne(X, Y) :- pair(X, Y), X != Y.
+r(X)     :- val(X), X != foo.        # != accepts a symbol-constant RHS
+</code></pre>
+  <p>
+    An ungrounded comparison operand (a variable not bound by any positive body
+    atom) is a loud compile error.
+  </p>
+
+  <h2 id="arithmetic">Arithmetic</h2>
+  <p>
+    Arithmetic is written <code>X = &lt;expr&gt;</code> in the body, producing
+    the value <code>X</code>. Operators are <code>+ - * / %</code>; <code>* / %</code>
+    bind tighter than <code>+ -</code>, all left-associative, with parentheses
+    allowed. Operands are variables and integer constants (a symbol constant is
+    rejected — symbols have no numeric value). Arithmetic wraps at u32
+    (<code>0 - 1 == 0xFFFFFFFF</code>), and division/modulo by a literal
+    <code>0</code> is a compile error (a variable divisor of 0 simply yields no
+    tuple).
+  </p>
+  <pre class="code"><code>r1(X) :- pair(A, B, C), X = A + B * C.      # precedence: A + (B*C)
+r2(X) :- pair(A, B, C), X = (A + B) * C.    # parentheses
+add(X, Y, S) :- pair(X, Y), S = X + Y.
+inc(X)       :- pair(A, B, C), X = A + 1.   # integer constant operand
+</code></pre>
+  <p>
+    Arithmetic in a recursive rule works (bounded by the fixpoint), and the
+    result variable must not be bound before the arithmetic is evaluated.
+  </p>
+
+  <h2 id="aggregates">Aggregates</h2>
+  <p>
+    Aggregates appear <em>in the body</em>, binding a result variable:
+    <code>N = count()</code>, <code>S = sum(Y)</code>, <code>M = min(Y)</code>,
+    <code>M = max(Y)</code>. The result variable is referenced in the head, and
+    every <em>other</em> head variable is the implicit group-by key.
+  </p>
+  <pre class="code"><code># group by X: number of outgoing edges per node
+cnt(X, N) :- edge(X, Y), N = count().
+
+# group by X: total of Y per X
+total(X, S) :- edge(X, Y), S = sum(Y).
+
+# min / max of Y per X
+minv(X, M) :- edge(X, Y), M = min(Y).
+maxv(X, M) :- edge(X, Y), M = max(Y).
+
+# no group-by vars -> a single global count
+cnt(N) :- edge(X, Y), N = count().</code></pre>
+  <p>Constraints on aggregates:</p>
+  <ul>
+    <li><code>count()</code> takes no arguments; <code>sum/min/max</code> take
+      exactly one variable argument.</li>
+    <li>Only one aggregate is allowed per rule.</li>
+    <li>Aggregates are not allowed inside negation, in recursive rules, or in
+      rules whose head contains a constant.</li>
+    <li>Aggregates over a variadic relation are rejected.</li>
+  </ul>
+
+  <h2 id="strings">String builtins</h2>
+  <p>
+    String values are interned symbols. Two kinds of builtin exist:
+  </p>
+  <ul>
+    <li><strong>Producers</strong> (bind a result variable):
+      <code>C = concat(A, B)</code>, <code>N = length(S)</code>,
+      <code>L = lower(S)</code>, <code>U = upper(S)</code>.</li>
+    <li><strong>Filters</strong> (test a string):
+      <code>prefix(S, P)</code>, <code>suffix(S, P)</code>,
+      <code>contains(S, P)</code>.</li>
+  </ul>
+  <pre class="code"><code>cat(A, B, C) :- pair(A, B), C = concat(A, B).
+lens(A, N)   :- str(A),    N = length(A).       # byte length
+lc(X)        :- s(Y),      X = lower(Y).        # ASCII case folding
+uc(X)        :- s(Y),      X = upper(Y).
+pref(X)      :- str(X),    prefix(X, "he").
+suf(X)       :- str(X),    suffix(X, "o").
+cont(X)      :- str(X),    contains(X, "ll").</code></pre>
+  <p>
+    <code>lower</code> and <code>upper</code> are implemented (ASCII A&ndash;Z
+    folding). <code>length</code> is the byte length (UTF-8 bytes, not
+    codepoints), and it also accepts a constant list literal (list length).
+    String operands must be variables or double-quoted string constants — a raw
+    integer operand is rejected. A producer result longer than 4096 bytes
+    backtracks (no tuple).
+  </p>
+
+  <h2 id="lists">Lists</h2>
+  <p>
+    Lists are first-class values, interned in a term store (equal lists share
+    one handle). List literals are written <code>[e1, e2, ...]</code>;
+    <code>[]</code> is the empty list.
+  </p>
+  <ul>
+    <li><strong>Producers</strong>: <code>L = cons(H, T)</code>,
+      <code>H = car(L)</code>, <code>T = cdr(L)</code>,
+      <code>L = append(A, B)</code>.</li>
+    <li><strong>Filter / generator</strong>: <code>member(X, L)</code> — tests X
+      when X is bound, enumerates L&rsquo;s elements when X is unbound.</li>
+    <li><strong>Patterns</strong>: <code>[X | Xs]</code> destructures a list into
+      head and tail; it can appear as a relational argument (e.g.
+      <code>p([H | T])</code>) or as a list-assignment form
+      <code>[H | T] = L</code>.</li>
+  </ul>
+  <pre class="code"><code>r(X, H, T, A) :- p(X), L = cons(X, [7, 8]), H = car(L),
+                 T = cdr(L), A = append(L, [9]).
+q(H, T)       :- p([H | T]).                 # pattern in a relational arg
+r(X)          :- p([7, X]).                  # constant element + var
+r(X)          :- p(L), member(X, L).         # generator
+s(X)          :- num(X), p(L), member(X, L). # filter
+empty_tail(A, B) :- [A, B] = [1, 2].         # assignment form, empty tail
+tail_pat(H, T)   :- [H | T] = [1, 2, 3].     # assignment form, tail
+from_var(H, T)   :- p(L), [H | T] = L.       # assignment from a var
+</code></pre>
+  <p>
+    A list pattern is not allowed in a rule head or fact (use <code>cons</code>
+    to build), or in a negated atom (patterns cannot bind variables under
+    negation). The tail after <code>|</code> must be a variable.
+  </p>
+
+  <h2 id="range">Range</h2>
+  <p>
+    <code>range(X, Rel, Lo, Hi)</code> is a reserved builtin that scans the
+    <em>distinct leading-column values</em> of the relation <code>Rel</code>
+    in the half-open interval <code>[Lo, Hi)</code>:
+  </p>
+  <ul>
+    <li><code>X</code> is the variable, <strong>first</strong>.</li>
+    <li><code>Rel</code> is the relation <em>name</em> (an identifier, not a
+      variable).</li>
+    <li><code>Lo</code> and <code>Hi</code> are the half-open bounds (variable or
+      integer constant).</li>
+  </ul>
+  <p>
+    When <code>X</code> is unbound, <code>range</code> acts as a generator
+    yielding each distinct <code>col0</code> value of <code>Rel</code> in
+    <code>[Lo, Hi)</code>, in lex order. When <code>X</code> is bound it acts as
+    a filter. The range is over the leading column only.
+  </p>
+  <pre class="code"><code>q(X) :- range(X, r, 10, 20).          # X in {col0 of r in [10, 20)}
+p(X) :- r(X), range(X, r, 10, 20).    # filter form
+q(X, Lo, Hi) :- bounds(Lo, Hi), range(X, r, Lo, Hi).   # var bounds
+</code></pre>
+  <p>
+    <code>Rel</code> must be a known, non-variadic relation of arity &ge; 1.
+    Range over a recursive relation, an unknown relation, a negated range, or
+    an ungrounded bound variable is a loud compile error.
+  </p>
+
+  <h2 id="regex">Regex patterns</h2>
+  <p>
+    A body atom may carry a regex pattern written as a <em>single-quoted</em>
+    string after a tilde: <code>pred(...) ~ 'pattern'</code>. The pattern is
+    compiled to a DFA and matched against the full key. In the CLI, use
+    <code>pattern</code> for standalone regex queries.
+  </p>
+  <pre class="code"><code>q(X, Y) :- edge(X, Y) ~ '(a|b).*'.</code></pre>
+  <p>
+    A negated pattern atom is not supported (compile error). In rules, patterns
+    are compiled at load time; a bad regex is a loud error.
+  </p>
+
+  <h2 id="variadic">Variadic relations</h2>
+  <p>
+    A relation may be declared <em>variadic</em>, accepting facts of any arity
+    1&ndash;8. Storage is per-arity fixed-width; rule atoms resolve to the
+    variant matching their syntactic argument count. A variadic head must be
+    declared before <code>dl_load_rules</code>. Aggregates over a variadic
+    relation, recursive variadic heads, and magic/top-down queries over programs
+    containing variadics are rejected at compile time (they always evaluate via
+    the full fixpoint).
+  </p>
+  <pre class="code"><code>/* C API: */
+dl_declare_relation_variadic(db, "v");</code></pre>
+
+  <h2 id="reserved">Reserved names</h2>
+  <p>
+    The builtin names are reserved — a rule head cannot use them (rejected with
+    a clear diagnostic): <code>member</code>, <code>car</code>,
+    <code>cons</code>, <code>cdr</code>, <code>append</code>,
+    <code>concat</code>, <code>length</code>, <code>lower</code>,
+    <code>upper</code>, <code>prefix</code>, <code>suffix</code>,
+    <code>contains</code>, <code>range</code>.
+  </p>
+
+  <h2 id="errors">Compile-error semantics</h2>
+  <p>
+    The engine never silently mis-evaluates. Unsupported or malformed programs
+    are rejected with a diagnostic at <em>compile time</em> and
+    <code>dl_load_rules</code> / <code>dl_compile</code> return -1. Rejected
+    cases include:
+  </p>
+  <ul>
+    <li>unstratifiable negation or an unstratifiable strict cycle through range;</li>
+    <li>unsafe negation (a variable not bound by a positive atom);</li>
+    <li>ungrounded comparison, arithmetic, string, list, member, or range
+      operands;</li>
+    <li>division/modulo by a literal <code>0</code>;</li>
+    <li>aggregates in recursive rules, two aggregates, negated aggregates,
+      constants in an aggregate head;</li>
+    <li>list patterns in heads/facts or negated atoms; a reserved name as a head;</li>
+    <li>range over a recursive / unknown / variadic relation;</li>
+    <li>integer literals &ge; 2^31; a symbol constant in an ordering comparison
+      or arithmetic;</li>
+    <li>a rule with no positive body atom (unless a lone
+      <code>member</code>/<code>range</code>/list-assignment drives it).</li>
+  </ul>
+
+</main>
+
+<footer class="site-foot">
+  <div class="wrap">
+    Back to <a href="index.html">overview</a>. See also
+    <a href="cli.html">CLI</a>, <a href="api.html">C API</a>,
+    <a href="architecture.html">Architecture</a>.
+  </div>
+</footer>
+
+</body>
+</html>

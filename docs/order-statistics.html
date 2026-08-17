@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Order Statistics — datalog-dafsa</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site">
+  <div class="wrap">
+    <a class="brand" href="index.html">datalog-dafsa</a>
+    <nav>
+      <a href="index.html">Overview</a>
+      <a href="language.html">Language</a>
+      <a href="cli.html">CLI</a>
+      <a href="api.html">C API</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="order-statistics.html">Order Stats</a>
+      <a href="time-travel.html">Time Travel</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+  <h1>Order Statistics</h1>
+  <p>
+    Because every fact is stored as a fixed-width u32 <em>big-endian</em> key,
+    the numeric order of keys is exactly their lexicographic order. That single
+    fact makes positional queries — rank, select, range count, and an ordered
+    enumeration — natural and cheap over a DAFSA&rsquo;s sorted structure.
+    Order statistics are available through the C API only; there is no Datalog
+    syntax and no CLI command for them.
+  </p>
+
+  <h2 id="core">rank / select / range_count / count</h2>
+  <p>The core four functions operate on the <em>leading</em> column order (the natural key order):</p>
+  <pre class="code"><code>uint64_t dl_rank(db, "r", cols, arity);          /* # tuples strictly &lt; cols */
+int      dl_select(db, "r", k, cols_out, arity); /* k-th tuple (0-indexed, lex) */
+uint64_t dl_range_count(db, "r", lo, hi, arity); /* # tuples in [lo, hi) */
+uint64_t dl_count(db, "r");                      /* O(1) distinct-tuple count */</code></pre>
+  <ul>
+    <li><code>dl_rank</code> counts distinct tuples strictly lexicographically
+      smaller than <code>cols</code>. An absent key ranks at its insertion
+      position (between neighbours, below the minimum, or at the count).</li>
+    <li><code>dl_select</code> writes the k-th tuple (0-indexed, lex order);
+      returns -1 if k is out of range.</li>
+    <li><code>dl_range_count</code> returns <code>rank(hi) &minus; rank(lo)</code>
+      for the half-open range <code>[lo, hi)</code>.</li>
+    <li><code>dl_count</code> is an O(1) distinct-tuple count backed by a
+      memoized subtree array.</li>
+  </ul>
+  <p>
+    When a snapshot has been published (<code>db-&gt;snap_version &gt; 0</code>),
+    these read the mmap snapshot view, so they reflect the <em>published</em>
+    state even if the live in-memory relation has since been mutated; otherwise
+    they read the in-memory relation.
+  </p>
+
+  <h2 id="bound">Bound variants</h2>
+  <p>
+    The <code>_bound</code> family restricts to tuples whose first <code>k</code>
+    columns equal a <code>leading</code> bound, then applies rank / select /
+    range_count to the suffix (the remaining <code>arity-k</code> columns). The
+    <code>cols</code>/<code>lo</code>/<code>hi</code> are full arity-length
+    tuples whose first <code>k</code> entries must equal <code>leading</code>.
+    <code>k==0</code> means no bound (degenerates to the base family).
+  </p>
+  <pre class="code"><code>uint64_t dl_rank_bound(db, "r", leading, k, cols, arity);
+int      dl_select_bound(db, "r", leading, k, idx, cols_out, arity);
+uint64_t dl_range_count_bound(db, "r", leading, k, lo, hi, arity);</code></pre>
+
+  <h2 id="perm">Permuted order statistics</h2>
+  <p>
+    The <code>_perm</code> family evaluates order statistics over a
+    <em>permuted</em> view — an order-by on a <em>non-leading</em> column. A
+    permutation index is declared with <code>dl_db_declare_perm</code> (an
+    exported helper in the internal <code>permindex.h</code>, not part of the
+    public <code>dl.h</code> surface); then
+    <code>perm[j]</code> is the original column that appears at permuted position
+    <code>j</code>. For example <code>perm = {1, 0}</code> over an arity-2
+    relation orders tuples by column 1, then column 0 as the tiebreaker.
+  </p>
+  <p>
+    <code>cols</code>/<code>lo</code>/<code>hi</code> are full tuples in the
+    <em>original</em> column order. Rank and range-count forward-map the input to
+    permuted order before ranking; select inverse-maps its permuted-order result
+    back to original order, so a select&rarr;rank round-trip over the same perm is
+    the identity. The permuted relation is built on demand and rebuilt if dirty —
+    a stale index is never silently used.
+  </p>
+  <pre class="code"><code>uint64_t dl_rank_perm(db, rel, perm_id, cols, arity);
+int      dl_select_perm(db, rel, perm_id, k, cols_out, arity);
+uint64_t dl_range_count_perm(db, rel, perm_id, lo, hi, arity);
+int      dl_db_perm_count(db);   /* number of declared perm indices */</code></pre>
+  <p>
+    The compiler also <em>selects</em> permutation indices automatically for
+    non-leading-column joins (<a href="architecture.html#strategies">see
+    Architecture</a>).
+  </p>
+
+  <h2 id="iter">Pull-iterator + merge-join</h2>
+  <p>
+    <code>dl_iter_*</code> is a resumable pull-based cursor over a relation in
+    ascending key order. It reads from the mmap snapshot view when a snapshot is
+    current, else the in-memory relation. Because a DAFSA is a minimal acyclic
+    DFA with per-state transitions sorted by symbol, pre-order DFS == byte/lex ==
+    u32BE numeric order; from a bound state every final state sits at the same
+    fixed depth, so emit-then-backtrack yields exactly one tuple per
+    <code>dl_iter_next</code>.
+  </p>
+  <pre class="code"><code>dl_iter *it = dl_iter_open(db, "r", leading, k);   /* k==0: all tuples */
+uint32_t row[MAXA];
+while (dl_iter_next(it, row) == 1) { /* consume ascending tuple */ }
+dl_iter_close(it);</code></pre>
+  <p>
+    <code>dl_merge_join</code> equi-joins two sorted iterators on their first
+    <code>jcols</code> columns, streaming matching pairs in sorted order with
+    cross-product semantics (duplicates preserved). Both iterators are left
+    exhausted on return; a non-zero callback return stops the join early.
+  </p>
+  <pre class="code"><code>long n = dl_merge_join(left, right, jcols, join_cb, user);</code></pre>
+
+  <h2 id="range">Lazy <code>OP_RANGE</code></h2>
+  <p>
+    The Datalog <code>range(X, Rel, Lo, Hi)</code> builtin (see the
+    <a href="language.html#range">Language Reference</a>) is backed by a
+    <em>lazy</em> resumable generator over the pull-iterator. It:
+  </p>
+  <ul>
+    <li>opens a k=0 cursor and <strong>skips</strong> leading-column values below
+      the lower bound;</li>
+    <li><strong>deduplicates</strong> consecutive equal leading-column values
+      (yielding distinct col0 values, not every tuple);</li>
+    <li><strong>stops</strong> at the upper bound;</li>
+    <li>can be <strong>short-circuited</strong> by an early-stopping consumer.</li>
+  </ul>
+  <p>
+    It reads the live relation (never a stale snapshot view), and range over a
+    recursive relation is rejected at compile time.
+  </p>
+
+</main>
+
+<footer class="site-foot">
+  <div class="wrap">
+    Back to <a href="index.html">overview</a>. See also
+    <a href="api.html">C API</a>, <a href="architecture.html">Architecture</a>.
+  </div>
+</footer>
+
+</body>
+</html>

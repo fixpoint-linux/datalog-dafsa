@@ -102,6 +102,14 @@ Public C API in [`src/dl.h`](src/dl.h). All value arrays are u32 (raw ints or sy
 
 Total: 306 test cases across 17 test binaries + a CLI smoke test.
 
+## Documentation site
+
+A static, dependency-free documentation site lives in [`docs/`](docs/): an
+overview with quickstart, the full Language Reference, the CLI and C API
+references, architecture notes, and feature pages for order-statistics and
+time-travel. It is served by GitHub Pages directly from `docs/` on `main` —
+see [`docs/README.md`](docs/README.md) for how to enable Pages.
+
 ## Design Docs
 
 - [`design/datalog-dafsa-architecture.md`](design/datalog-dafsa-architecture.md) — the

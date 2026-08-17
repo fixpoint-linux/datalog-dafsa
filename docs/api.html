@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>C API Reference — datalog-dafsa</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site">
+  <div class="wrap">
+    <a class="brand" href="index.html">datalog-dafsa</a>
+    <nav>
+      <a href="index.html">Overview</a>
+      <a href="language.html">Language</a>
+      <a href="cli.html">CLI</a>
+      <a href="api.html">C API</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="order-statistics.html">Order Stats</a>
+      <a href="time-travel.html">Time Travel</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+  <h1>C API Reference</h1>
+  <p>
+    The public C API is declared in <code>src/dl.h</code>. All value arrays are
+    u32 (raw integers or interned symbol ids). The handle type is the opaque
+    <code>dl_db</code>. This page documents the complete surface, grouped by
+    area. See also <a href="order-statistics.html">Order Statistics</a> and
+    <a href="time-travel.html">Time Travel</a> for the larger feature groups.
+  </p>
+
+  <h2 id="lifecycle">Lifecycle</h2>
+  <table class="api">
+    <tbody>
+      <tr><td><code>dl_db *dl_open(const char *dir)</code></td><td>Open or create a database directory. Returns NULL on error.</td></tr>
+      <tr><td><code>void dl_close(dl_db *db)</code></td><td>Close the database, flushing and saving state.</td></tr>
+      <tr><td><code>dl_db *dl_open2(const char *dir, int *err_out)</code></td><td>Open with explicit error reporting. On failure sets <code>*err_out</code> (see <code>DL_E_LOCKED</code>) and returns NULL.</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="schema">Schema</h2>
+  <table class="api">
+    <tbody>
+      <tr><td><code>int dl_declare_relation(dl_db *db, const char *name, uint8_t arity)</code></td><td>Declare a fixed-arity relation (1&ndash;8). Idempotent; arity 0 declares a variadic relation.</td></tr>
+      <tr><td><code>int dl_declare_relation_variadic(dl_db *db, const char *name)</code></td><td>Declare a variadic relation: facts of any arity 1&ndash;8 are accepted, stored per-arity.</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="facts">Facts</h2>
+  <table class="api">
+    <tbody>
+      <tr><td><code>int dl_load_facts(dl_db *db, const char *rel, const char *csv_path)</code></td><td>Load ground facts from a headerless CSV (quoted strings interned; bare integers raw u32). Returns facts loaded, or -1.</td></tr>
+      <tr><td><code>int dl_add_fact(dl_db *db, const char *rel, const uint32_t *cols, uint8_t arity)</code></td><td>Add a single fact (durable WAL + fsync). Returns 1 added / 0 duplicate / -1 error.</td></tr>
+      <tr><td><code>int dl_delete_fact(dl_db *db, const char *rel, const uint32_t *cols, uint8_t arity)</code></td><td>Delete a single fact. Returns 1 deleted / 0 absent / -1 error.</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="query">Queries</h2>
+  <table class="api">
+    <tbody>
+      <tr><td><code>int dl_lookup(dl_db *db, const char *rel, const uint32_t *cols, uint8_t arity)</code></td><td>Exact lookup. Returns 1 if present, else 0.</td></tr>
+      <tr><td><code>typedef int (*dl_tuple_cb)(const uint32_t *cols, uint8_t arity, void *user)</code></td><td>Tuple enumeration callback; return non-zero to stop early.</td></tr>
+      <tr><td><code>long dl_prefix(dl_db *db, const char *rel, const uint32_t *leading, uint8_t k, dl_tuple_cb cb, void *user)</code></td><td>Bind the first k columns and enumerate matching tuples. Returns count, or -1.</td></tr>
+      <tr><td><code>long dl_query(dl_db *db, const char *goal_rel, dl_tuple_cb cb, void *user)</code></td><td>Stream the goal relation&rsquo;s tuples. Reads mmap snapshot if published, else runs the VM. Returns tuple count, or -1.</td></tr>
+      <tr><td><code>long dl_query_bound(dl_db *db, const char *goal_rel, const uint32_t *leading, uint8_t k, dl_tuple_cb cb, void *user)</code></td><td>Prefix-bind k columns of the goal and enumerate.</td></tr>
+      <tr><td><code>long dl_pattern(dl_db *db, const char *rel, const struct regex_dfa *dfa, dl_tuple_cb cb, void *user)</code></td><td>Enumerate tuples whose full key matches a compiled regex DFA.</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="iter">Iterator + merge-join</h2>
+  <p>
+    A resumable pull-based cursor over the tuples of a relation in ascending key
+    order (u32BE key encoding &rArr; numeric order == lex order). Reads from the
+    mmap snapshot view when a snapshot is current, else the in-memory relation.
+  </p>
+  <table class="api">
+    <tbody>
+      <tr><td><code>dl_iter *dl_iter_open(dl_db *db, const char *rel, const uint32_t *leading, uint8_t k)</code></td><td>Open a cursor bound to the first k leading columns (k==0: all). Returns NULL on error; an absent prefix yields a valid empty iterator.</td></tr>
+      <tr><td><code>int dl_iter_seek(dl_iter *it, const uint32_t *leading, uint8_t k)</code></td><td>Re-bind the cursor to a new leading prefix. Returns 0 / -1.</td></tr>
+      <tr><td><code>int dl_iter_next(dl_iter *it, uint32_t *cols_out)</code></td><td>Fetch the next tuple ascending. Returns 1 / 0 at end / -1 error.</td></tr>
+      <tr><td><code>uint8_t dl_iter_arity(const dl_iter *it)</code></td><td>The relation&rsquo;s arity (0 for a NULL/error cursor).</td></tr>
+      <tr><td><code>void dl_iter_close(dl_iter *it)</code></td><td>Close the cursor (NULL-safe).</td></tr>
+      <tr><td><code>typedef int (*dl_join_cb)(const uint32_t *l, uint8_t la, const uint32_t *r, uint8_t ra, void *user)</code></td><td>Merge-join pair callback.</td></tr>
+      <tr><td><code>long dl_merge_join(dl_iter *l, dl_iter *r, uint8_t jcols, dl_join_cb cb, void *user)</code></td><td>Equi-join two sorted iterators on their first jcols columns, streaming pairs in sorted order (cross-product semantics, duplicates preserved). Both iterators left exhausted. Returns pairs emitted, or -1.</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="order-stats">Order statistics</h2>
+  <table class="api">
+    <tbody>
+      <tr><td><code>uint64_t dl_rank(dl_db *db, const char *rel, const uint32_t *cols, uint8_t arity)</code></td><td>Number of distinct tuples strictly lexicographically smaller than <code>cols</code>. <code>UINT64_MAX</code> on error.</td></tr>
+      <tr><td><code>int dl_select(dl_db *db, const char *rel, uint64_t k, uint32_t *cols_out, uint8_t arity)</code></td><td>The k-th tuple (0-indexed, lex order). Returns 0 / -1.</td></tr>
+      <tr><td><code>uint64_t dl_range_count(dl_db *db, const char *rel, const uint32_t *lo, const uint32_t *hi, uint8_t arity)</code></td><td>Number of distinct tuples in the half-open range [lo, hi) = rank(hi) &minus; rank(lo).</td></tr>
+      <tr><td><code>uint64_t dl_count(dl_db *db, const char *rel)</code></td><td>O(1) distinct-tuple count (memoized subtree array).</td></tr>
+      <tr><td><code>uint64_t dl_rank_bound(db, rel, leading, k, cols, arity)</code></td><td>Rank restricted to tuples whose first k columns equal <code>leading</code>.</td></tr>
+      <tr><td><code>int dl_select_bound(db, rel, leading, k, idx, cols_out, arity)</code></td><td>Select within a leading-prefix bound.</td></tr>
+      <tr><td><code>uint64_t dl_range_count_bound(db, rel, leading, k, lo, hi, arity)</code></td><td>Range count within a leading-prefix bound.</td></tr>
+      <tr><td><code>uint64_t dl_rank_perm(db, rel, perm_id, cols, arity)</code></td><td>Rank over a permuted view (order-by on a non-leading column).</td></tr>
+      <tr><td><code>int dl_select_perm(db, rel, perm_id, k, cols_out, arity)</code></td><td>Select over a permuted view (inverse-maps the result back to original column order).</td></tr>
+      <tr><td><code>uint64_t dl_range_count_perm(db, rel, perm_id, lo, hi, arity)</code></td><td>Range count over a permuted view.</td></tr>
+      <tr><td><code>int dl_db_perm_count(const dl_db *db)</code></td><td>Number of permutation indices currently declared.</td></tr>
+    </tbody>
+  </table>
+  <p>
+    Details and examples are on the <a href="order-statistics.html">Order
+    Statistics</a> page.
+  </p>
+
+  <h2 id="rules">Rules</h2>
+  <table class="api">
+    <tbody>
+      <tr><td><code>int dl_load_rules(dl_db *db, const char *dl_source)</code></td><td>Parse and compile Datalog rules from a source string. Returns 0 / -1. Rules may reference existing relations or declare new derived relations.</td></tr>
+      <tr><td><code>int dl_compile(dl_db *db)</code></td><td>Compile all loaded rules into bytecode and run them (semi-naive fixpoint), materializing derived relations. Returns 0 / -1.</td></tr>
+      <tr><td><code>long dl_query_magic(db, goal_rel, leading, k, cb, user)</code></td><td>Magic-sets bound query (leading/k). Re-evaluates a scoped fixpoint; result is byte-identical to <code>dl_query_bound</code>. Returns count, or -1.</td></tr>
+      <tr><td><code>long dl_query_magic_adorn(db, goal_rel, adorn, vals, nvals, cb, user)</code></td><td>Magic-sets with an arbitrary adornment string of <code>b</code>/<code>f</code> chars.</td></tr>
+      <tr><td><code>long dl_query_topdown(db, goal_rel, leading, k, cb, user)</code></td><td>Top-down / QSQ: the same adorned magic program, scheduled demand-driven (SLG worklist) instead of forward semi-naive. C-API only — no CLI command.</td></tr>
+      <tr><td><code>long dl_query_topdown_adorn(db, goal_rel, adorn, vals, nvals, cb, user)</code></td><td>Top-down / QSQ with an arbitrary adornment.</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="snapshot">Snapshot</h2>
+  <table class="api">
+    <tbody>
+      <tr><td><code>int dl_publish_snapshot(dl_db *db)</code></td><td>Atomically save the interner + all relations to a versioned snapshot directory and flip the CURRENT pointer. After publish, <code>dl_query</code> reads from mmap.</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="time-travel">Time-travel / as-of</h2>
+  <table class="api">
+    <tbody>
+      <tr><td><code>long dl_snapshot_versions(const dl_db *db, uint32_t *out, size_t cap)</code></td><td>Enumerate every published snapshot version ascending. Returns the total (two-call idiom).</td></tr>
+      <tr><td><code>long dl_query_version(dl_db *db, uint32_t version, const char *goal_rel, dl_tuple_cb cb, void *user)</code></td><td>As-of query: stream tuples as of snapshot <code>version</code>, bypassing live routing. Nonexistent version / absent relation is a loud -1, never a silent empty result.</td></tr>
+      <tr><td><code>long dl_query_bound_version(dl_db *db, uint32_t version, const char *goal_rel, const uint32_t *leading, uint8_t k, dl_tuple_cb cb, void *user)</code></td><td>As-of prefix query.</td></tr>
+      <tr><td><code>int dl_set_snapshot_retain(dl_db *db, unsigned n)</code></td><td>Opt-in retention: keep at most n most-recent versions, pruning older ones after each publish. n==0 (default) keeps every version.</td></tr>
+    </tbody>
+  </table>
+  <p>Details and examples are on the <a href="time-travel.html">Time Travel</a> page.</p>
+
+  <h2 id="hooks">Fault-injection hooks (test-only)</h2>
+  <table class="api">
+    <tbody>
+      <tr><td><code>void dl_set_fault_hook(dl_db *db, int (*hook)(dl_fpoint fp, void *user), void *user)</code></td><td>Install a fault-injection hook called at each fpoint during publish (<code>DL_FPOINT_AFTER_REL_SAVE</code>, <code>DL_FPOINT_AFTER_RENAME</code>); non-zero aborts the publish.</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="interner">Interner</h2>
+  <table class="api">
+    <tbody>
+      <tr><td><code>uint32_t dl_intern_str(dl_db *db, const char *str)</code></td><td>Intern a string, return its sym_id (1-based). Returns 0 on OOM.</td></tr>
+      <tr><td><code>const char *dl_intern_str_of(dl_db *db, uint32_t sym_id)</code></td><td>Look up a sym_id &rarr; string. Returns NULL if out of range.</td></tr>
+    </tbody>
+  </table>
+
+</main>
+
+<footer class="site-foot">
+  <div class="wrap">
+    Back to <a href="index.html">overview</a>. See also
+    <a href="language.html">Language</a>, <a href="architecture.html">Architecture</a>.
+  </div>
+</footer>
+
+</body>
+</html>

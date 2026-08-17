@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CLI Reference — datalog-dafsa</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site">
+  <div class="wrap">
+    <a class="brand" href="index.html">datalog-dafsa</a>
+    <nav>
+      <a href="index.html">Overview</a>
+      <a href="language.html">Language</a>
+      <a href="cli.html">CLI</a>
+      <a href="api.html">C API</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="order-statistics.html">Order Stats</a>
+      <a href="time-travel.html">Time Travel</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+  <h1>CLI Reference</h1>
+  <p>
+    The <code>dl</code> binary is the command-line front end. There are exactly
+    8 subcommands. The database directory defaults to <code>dl-test-db</code>
+    and can be set with <code>-d &lt;dir&gt;</code>. Command values that parse
+    as bare integers are stored raw as u32; anything else is interned to a
+    string symbol id.
+  </p>
+  <pre class="code"><code>dl [-d &lt;dir&gt;] load    &lt;csv&gt; --rel &lt;name&gt;
+dl [-d &lt;dir&gt;] lookup  &lt;rel&gt; &lt;val&gt; [&lt;val&gt; ...]
+dl [-d &lt;dir&gt;] prefix  &lt;rel&gt; [&lt;val&gt; ...]
+dl [-d &lt;dir&gt;] query   '&lt;rule&gt;' | &lt;file.dl&gt; &lt;goal-rel&gt;
+dl [-d &lt;dir&gt;] qmagic  '&lt;rule&gt;' | &lt;file.dl&gt; &lt;goal-rel&gt; [-a &lt;adorn&gt;] &lt;val&gt; [&lt;val&gt; ...]
+dl [-d &lt;dir&gt;] publish
+dl [-d &lt;dir&gt;] bound   &lt;rel&gt; &lt;val&gt; [&lt;val&gt; ...]
+dl [-d &lt;dir&gt;] pattern &lt;rel&gt; '&lt;regex&gt;'</code></pre>
+
+  <h2 id="load">load</h2>
+  <p>Load facts from a headerless CSV file into a relation (arity 1&ndash;8).</p>
+  <pre class="code"><code>$ ./dl -d /tmp/db load edges.csv --rel edge
+Loaded 5 facts into edge</code></pre>
+  <p>
+    The relation&rsquo;s arity is inferred from the first non-empty CSV row.
+    Values: quoted strings are interned; bare integers are stored raw as u32.
+  </p>
+
+  <h2 id="lookup">lookup</h2>
+  <p>Exact lookup of a fact by its full column values. Prints <code>found</code> or <code>not found</code>.</p>
+  <pre class="code"><code>$ ./dl -d /tmp/db lookup edge 1 2
+found
+
+$ ./dl -d /tmp/db lookup edge 9 9
+not found</code></pre>
+
+  <h2 id="prefix">prefix</h2>
+  <p>Bind the leading columns to the given values and enumerate every matching complete tuple.</p>
+  <pre class="code"><code># all tuples
+$ ./dl -d /tmp/db prefix edge
+1 2
+1 3
+2 3
+2 4
+3 5
+
+# tuples with leading column == 2
+$ ./dl -d /tmp/db prefix edge 2
+2 3
+2 4</code></pre>
+  <p>With no bound values, this lists the whole relation.</p>
+
+  <h2 id="query">query</h2>
+  <p>
+    Parse, compile, and run a Datalog rule in one step, then stream the goal
+    relation&rsquo;s tuples. The rule source may be a quoted inline string or a
+    <code>.dl</code> file path; the goal is the relation to print.
+  </p>
+  <pre class="code"><code>$ ./dl -d /tmp/db query \
+    'tc(X,Y) :- edge(X,Y). tc(X,Y) :- edge(X,Z), tc(Z,Y).' tc
+1 2
+1 3
+1 4
+1 5
+2 3
+2 4
+2 5
+3 5</code></pre>
+  <p>
+    Internally this loads the rules, publishes a snapshot (running the VM if the
+    fixpoint is dirty), then queries the goal relation.
+  </p>
+
+  <h2 id="qmagic">qmagic</h2>
+  <p>
+    Magic-sets bound query: evaluates a <em>scoped</em> fixpoint seeded by the
+    bound values, materialising only the reachable IDB slice. The result is
+    byte-for-byte identical to <code>dl_query_bound</code> over the fully
+    materialized goal.
+  </p>
+  <pre class="code"><code># leading-prefix form: bind the first k args
+$ ./dl -d /tmp/db qmagic \
+    'tc(X,Y) :- edge(X,Y). tc(X,Y) :- edge(X,Z), tc(Z,Y).' tc 1
+
+# arbitrary-adornment form: -a &lt;adorn&gt; binds named positions
+$ ./dl -d /tmp/db qmagic \
+    'tc(X,Y) :- edge(X,Y). tc(X,Y) :- edge(X,Z), tc(Z,Y).' tc -a "bf" 1</code></pre>
+  <p>
+    The optional <code>-a &lt;adorn&gt;</code> is a string of exactly
+    <code>goal-arity</code> characters, each <code>b</code> (bound) or
+    <code>f</code> (free); <code>vals</code> are packed left-to-right in the
+    order of the <code>b</code> positions. Programs using negation, aggregates,
+    or cross-predicate mutual recursion are rejected with a diagnostic.
+  </p>
+
+  <h2 id="publish">publish</h2>
+  <p>Atomically publish a versioned snapshot of the database.</p>
+  <pre class="code"><code>$ ./dl -d /tmp/db publish
+Snapshot published.</code></pre>
+  <p>After publishing, <code>query</code> reads from mmap instead of running the VM.</p>
+
+  <h2 id="bound">bound</h2>
+  <p>Bound query (snapshot path): bind leading columns and enumerate via the snapshot view.</p>
+  <pre class="code"><code>$ ./dl -d /tmp/db bound edge 1
+1 2
+1 3</code></pre>
+
+  <h2 id="pattern">pattern</h2>
+  <p>Enumerate all tuples whose full key matches a regex.</p>
+  <pre class="code"><code>$ ./dl -d /tmp/db pattern edge '(a|b).*'</code></pre>
+  <p>A bad pattern is a loud error.</p>
+
+  <h2 id="scope">What is <em>not</em> in the CLI</h2>
+  <p>
+    The top-down / QSQ path (<code>dl_query_topdown</code> /
+    <code>dl_query_topdown_adorn</code>) is available only through the C API —
+    there is <strong>no</strong> <code>topdown</code> CLI subcommand. Likewise,
+    order-statistics (rank / select / range / count) and time-travel (as-of
+    queries) are C-API only; they have no CLI command.
+  </p>
+
+</main>
+
+<footer class="site-foot">
+  <div class="wrap">
+    Back to <a href="index.html">overview</a>. See also
+    <a href="language.html">Language</a>, <a href="api.html">C API</a>.
+  </div>
+</footer>
+
+</body>
+</html>
