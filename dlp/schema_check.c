@@ -17,25 +17,25 @@
 
 static const char *WORKED =
     "-- worked-example schema (S4)\n"
-    "let ColumnType = < Natural : Bool | Text : Bool >\n"
+    "let ColumnType = < Natural : {=} | Text : {=} >\n"
     "in let Column = { name : Text, type : ColumnType }\n"
     "in let Relation = { name : Text, columns : List Column }\n"
     "in let Schema = { relations : List Relation }\n"
     "in { relations =\n"
     "     [ { name = \"node\",\n"
-    "         columns = [ { name = \"id\", type = < Text = True > } ] },\n"
+    "         columns = [ { name = \"id\", type = < Text = {=} > } ] },\n"
     "       { name = \"edge\",\n"
-    "         columns = [ { name = \"src\", type = < Text = True > },\n"
-    "                     { name = \"dst\", type = < Text = True > } ] },\n"
+    "         columns = [ { name = \"src\", type = < Text = {=} > },\n"
+    "                     { name = \"dst\", type = < Text = {=} > } ] },\n"
     "       { name = \"weight\",\n"
-    "         columns = [ { name = \"src\", type = < Text = True > },\n"
-    "                     { name = \"w\", type = < Natural = True > } ] },\n"
+    "         columns = [ { name = \"src\", type = < Text = {=} > },\n"
+    "                     { name = \"w\", type = < Natural = {=} > } ] },\n"
     "       { name = \"light_edge\",\n"
-    "         columns = [ { name = \"src\", type = < Text = True > },\n"
-    "                     { name = \"dst\", type = < Text = True > } ] },\n"
+    "         columns = [ { name = \"src\", type = < Text = {=} > },\n"
+    "                     { name = \"dst\", type = < Text = {=} > } ] },\n"
     "       { name = \"tc\",\n"
-    "         columns = [ { name = \"src\", type = < Text = True > },\n"
-    "                     { name = \"dst\", type = < Text = True > } ] } ] } : Schema\n";
+    "         columns = [ { name = \"src\", type = < Text = {=} > },\n"
+    "                     { name = \"dst\", type = < Text = {=} > } ] } ] } : Schema\n";
 
 static int failures = 0;
 static int runs = 0;

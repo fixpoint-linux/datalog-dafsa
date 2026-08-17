@@ -86,16 +86,16 @@ mydb/
   .build/           # dlp-owned: build snapshot, schema.json echo
 ```
 
-**Schema DSL (Bool-payload union).** The schema is Dhall-as-data — self-contained
+**Schema DSL (empty-record-payload union).** The schema is Dhall-as-data — self-contained
 `let`s with a `: Schema` annotation. `Natural` = raw u32, `Text` = interned symbol:
 
 ```dhall
-let ColumnType = < Natural : Bool | Text : Bool >
+let ColumnType = < Natural : {=} | Text : {=} >
 let Column = { name : Text, type : ColumnType }
 let Relation = { name : Text, columns : List Column }
 let Schema = { relations : List Relation }
 in { relations =
-     [ { name = "node", columns = [ { name = "id", type = < Text = True > } ] } ]
+     [ { name = "node", columns = [ { name = "id", type = < Text = {=} > } ] } ]
    } : Schema
 ```
 

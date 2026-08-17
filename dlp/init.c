@@ -1,15 +1,15 @@
 /* init.c — scaffold a new dlp project directory.
  *
  * `dlp init [dir]` creates dir/ (default ".") containing:
- *   schema.dhall   — worked-example typed schema (Bool-payload union DSL)
+ *   schema.dhall   — worked-example typed schema (empty-record-payload union DSL)
  *   data/          — EDB CSV/JSON inputs (S5)
  *   rules/         — .datalog rule files (S5)
  *   .build/        — scratch/build artifacts
  *
- * The template schema.dhall uses the S0-verified DSL: nested `let` (one `in`
- * per binding — dhall-c has no multi-let), a Bool-payload union type
- * `let ColumnType = < Natural : Bool | Text : Bool >`, union values
- * `< Text = True >` / `< Natural = True >`, and the final body annotated
+ * The template schema.dhall uses nested `let` (one `in` per binding — dhall-c
+ * has no multi-let), an empty-record-payload union type
+ * `let ColumnType = < Natural : {=} | Text : {=} >`, union values
+ * `< Text = {=} >` / `< Natural = {=} >`, and the final body annotated
  * `: Schema`.  The worked example declares node[Text], edge[Text,Text],
  * weight[Text,Natural], light_edge[Text,Text], tc[Text,Text].
  */
@@ -23,26 +23,26 @@
 
 #define TEMPLATE_SCHEMA \
     "-- dlp project schema (S4 worked example)\n" \
-    "-- Bool-payload union DSL: < Natural = True > | < Text = True >\n" \
-    "let ColumnType = < Natural : Bool | Text : Bool >\n" \
+    "-- empty-record-payload union DSL: < Natural = {=} > | < Text = {=} >\n" \
+    "let ColumnType = < Natural : {=} | Text : {=} >\n" \
     "in let Column = { name : Text, type : ColumnType }\n" \
     "in let Relation = { name : Text, columns : List Column }\n" \
     "in let Schema = { relations : List Relation }\n" \
     "in { relations =\n" \
     "     [ { name = \"node\",\n" \
-    "         columns = [ { name = \"id\", type = < Text = True > } ] },\n" \
+    "         columns = [ { name = \"id\", type = < Text = {=} > } ] },\n" \
     "       { name = \"edge\",\n" \
-    "         columns = [ { name = \"src\", type = < Text = True > },\n" \
-    "                     { name = \"dst\", type = < Text = True > } ] },\n" \
+    "         columns = [ { name = \"src\", type = < Text = {=} > },\n" \
+    "                     { name = \"dst\", type = < Text = {=} > } ] },\n" \
     "       { name = \"weight\",\n" \
-    "         columns = [ { name = \"src\", type = < Text = True > },\n" \
-    "                     { name = \"w\", type = < Natural = True > } ] },\n" \
+    "         columns = [ { name = \"src\", type = < Text = {=} > },\n" \
+    "                     { name = \"w\", type = < Natural = {=} > } ] },\n" \
     "       { name = \"light_edge\",\n" \
-    "         columns = [ { name = \"src\", type = < Text = True > },\n" \
-    "                     { name = \"dst\", type = < Text = True > } ] },\n" \
+    "         columns = [ { name = \"src\", type = < Text = {=} > },\n" \
+    "                     { name = \"dst\", type = < Text = {=} > } ] },\n" \
     "       { name = \"tc\",\n" \
-    "         columns = [ { name = \"src\", type = < Text = True > },\n" \
-    "                     { name = \"dst\", type = < Text = True > } ] } ] } : Schema\n"
+    "         columns = [ { name = \"src\", type = < Text = {=} > },\n" \
+    "                     { name = \"dst\", type = < Text = {=} > } ] } ] } : Schema\n"
 
 static int mkdir_if_missing(const char *dir) {
     struct stat st;

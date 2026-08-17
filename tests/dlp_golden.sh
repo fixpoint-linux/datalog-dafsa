@@ -15,26 +15,26 @@ write() { # write <path> <content>  (path is absolute; $WORK already applied by 
   printf '%s' "$2" > "$1"
 }
 
-SCHEMA='-- golden schema (Bool-payload DSL)
-let ColumnType = < Natural : Bool | Text : Bool >
+SCHEMA='-- golden schema (empty-record-payload DSL)
+let ColumnType = < Natural : {=} | Text : {=} >
 in let Column = { name : Text, type : ColumnType }
 in let Relation = { name : Text, columns : List Column }
 in let Schema = { relations : List Relation }
 in { relations =
      [ { name = "node",
-         columns = [ { name = "id", type = < Text = True > } ] },
+         columns = [ { name = "id", type = < Text = {=} > } ] },
        { name = "edge",
-         columns = [ { name = "src", type = < Text = True > },
-                     { name = "dst", type = < Text = True > } ] },
+         columns = [ { name = "src", type = < Text = {=} > },
+                     { name = "dst", type = < Text = {=} > } ] },
        { name = "weight",
-         columns = [ { name = "src", type = < Text = True > },
-                     { name = "w", type = < Natural = True > } ] },
+         columns = [ { name = "src", type = < Text = {=} > },
+                     { name = "w", type = < Natural = {=} > } ] },
        { name = "light_edge",
-         columns = [ { name = "src", type = < Text = True > },
-                     { name = "dst", type = < Text = True > } ] },
+         columns = [ { name = "src", type = < Text = {=} > },
+                     { name = "dst", type = < Text = {=} > } ] },
        { name = "tc",
-         columns = [ { name = "src", type = < Text = True > },
-                     { name = "dst", type = < Text = True > } ] } ] } : Schema
+         columns = [ { name = "src", type = < Text = {=} > },
+                     { name = "dst", type = < Text = {=} > } ] } ] } : Schema
 '
 
 NODE='id

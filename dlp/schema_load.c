@@ -5,7 +5,7 @@
    still applies full runtime type-guarding.  The dnsd term-walker helpers
    (rec_get/text_flat/nat_u64/list_elems) are copied verbatim from the proven
    compendium/src/config.c and adapted for the schema shape:
-   { relations = [ { name = "...", columns = [ { name = "...", type = <Text = True> }, ... ] }, ... ] } */#include "dhall.h"
+   { relations = [ { name = "...", columns = [ { name = "...", type = <Text = {=}> }, ... ] }, ... ] } */#include "dhall.h"
 #include "dlp.h"
 
 #include <ctype.h>
@@ -70,7 +70,7 @@ static int list_elems(Term *t, Term **elems, int cap) {
     return n;
 }
 
-/* Read a column's payload-union literal (< Text = True > / < Natural = True >)
+/* Read a column's payload-union literal (< Text = {=} > / < Natural = {=} >)
    and map its selected alternative to a dl_coltype. */
 static bool walk_coltype(dl_coltype *out, Term *t) {
     if (t->tag != TmUnionLit) { walk_error("column type must be a union literal"); return false; }

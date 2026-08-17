@@ -14,12 +14,15 @@ are untouched, and `dlp` is opt-in (`make dlp DHALLC=<path-to-dhall-c>`, verifie
 `typecheck.c` — those live only in the `dlp` target, so the core stays gcc-clean and
 portable.
 
-**One documented deviation from this design note:** the DSL uses the **`Bool`-payload
-union value syntax** — `let ColumnType = < Natural : Bool | Text : Bool >` with union
-values written `< Text = True >` — rather than the `{=}` payload sketched below. This
-was the S0 spike finding: dhall-c's typechecker rejects `{=}` as a union-alternative
-type payload, so the mechanical `Bool`-payload fallback (identical DSL structure)
-was adopted instead.
+**One documented deviation from this design note (now RESOLVED):** the DSL shipped
+with the **`Bool`-payload union value syntax** — `let ColumnType = < Natural : Bool | Text : Bool >`
+with union values `< Text = True >` — rather than the `{=}` payload sketched below.
+That was the S0 spike finding: dhall-c's typechecker rejected `{=}` as a union-alternative
+type payload, so the mechanical `Bool`-payload fallback (identical DSL structure) was
+adopted. dhall-c was since fixed (`bae0e08`: the type-position predicate now accepts the
+empty record type `{}`), so the `dlp` schema DSL was switched back to the intended
+**`{=}` payload**: `let ColumnType = < Natural : {=} | Text : {=} >` with union values
+`< Text = {=} >`.
 
 ## TL;DR
 
@@ -304,8 +307,9 @@ Touched existing files (each minimal):
 Stage order (each independently landable + green; status as of 2026-08-17):
 
 - **[done] S0** — spikes: dhall-c `{=}` **rejected** by typechecker → adopted the
-  `Bool`-payload fallback (`< Text = True >`); dnsd patches (partial-union +
-  type-alias resolution) landed; datalog-dafsa builds under cosmocc.
+  `Bool`-payload fallback (`< Text = True >`) at the time; dhall-c was later fixed
+  (`bae0e08`) and the DSL switched back to the `{=}` payload; dnsd patches
+  (partial-union + type-alias resolution) landed; datalog-dafsa builds under cosmocc.
 - **[done] S1** — parser positions (`line`/`col`) + tests.
 - **[done] S2** — `schema.h/.c` + `dl_attach_schema` no-op hook + `test_schema`.
 - **[done] S3** — `typecheck.c` + fixtures (positive: worked example; negative: int/text
@@ -339,6 +343,7 @@ Stage order (each independently landable + green; status as of 2026-08-17):
 ## Open decisions (deferred to implementation)
 
 - dhall-c referenced by **path** vs **vendored** (built by path via `DHALLC=..` today).
-- Whether `{=}` parses in dhall-c — **resolved at S0**: it does **not** typecheck;
-  the `Bool`-payload fallback (`< Text = True >`) shipped. See "What landed".
+- Whether `{=}` parses in dhall-c — **resolved at S0**: it did not typecheck, so the
+  `Bool`-payload fallback (`< Text = True >`) shipped. dhall-c was later fixed
+  (`bae0e08`) and the DSL was switched back to the `{=}` payload. See "What landed".
 - `toml` loading is a natural S7+ add once JSON lands (not in v1).
