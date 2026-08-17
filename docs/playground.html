@@ -8,22 +8,24 @@
 <link rel="stylesheet" href="vendor/codemirror.css">
 <style>
   /* LSP live-diagnostics styling (CodeMirror squiggle + tooltip + list).
-     Editor syntax colors use the Tokyo Night palette. */
+     Editor syntax colors use the Tokyo Night palette. Token rules are scoped
+     under .cm-s-tokyonight (the editor's theme) so they carry the SAME
+     two-class specificity as CodeMirror's default theme and actually apply. */
   .CodeMirror { border: 1px solid #414868; height: 440px; font-size: 14px; }
   .CodeMirror, .CodeMirror-scroll { background: #1a1b26; color: #c0caf5; }
   .CodeMirror-gutters { background: #16161e; border-right: 1px solid #292e42; }
   .CodeMirror-linenumber { color: #3b4261; }
   .CodeMirror-cursor { border-left: 2px solid #c0caf5; }
   .CodeMirror-selected { background: #33467c; }
-  .cm-comment { color: #565f89; font-style: italic; }
-  .cm-string { color: #9ece6a; }
-  .cm-number { color: #ff9e64; }
-  .cm-keyword { color: #bb9af7; font-weight: 600; }
-  .cm-variable-2 { color: #7dcfff; }
-  .cm-atom { color: #7aa2f7; }
-  .cm-operator { color: #89ddff; }
-  .cm-bracket { color: #c0caf5; }
-  .cm-def { color: #73daca; font-weight: 600; }
+  .cm-s-tokyonight .cm-comment { color: #565f89; font-style: italic; }
+  .cm-s-tokyonight .cm-string { color: #9ece6a; }
+  .cm-s-tokyonight .cm-number { color: #ff9e64; }
+  .cm-s-tokyonight .cm-keyword { color: #bb9af7; font-weight: 600; }
+  .cm-s-tokyonight .cm-variable-2 { color: #7dcfff; }
+  .cm-s-tokyonight .cm-atom { color: #7aa2f7; }
+  .cm-s-tokyonight .cm-operator { color: #89ddff; }
+  .cm-s-tokyonight .cm-bracket { color: #c0caf5; }
+  .cm-s-tokyonight .cm-def { color: #73daca; font-weight: 600; }
   .cm-dl-squiggle { text-decoration: underline wavy #f7768e; text-decoration-skip-ink: none; }
   #diagnostics { margin: 12px 0; font-size: 14px; }
   #diagnostics .dl-diag { color: #f7768e; padding: 2px 0; font-family: monospace; }

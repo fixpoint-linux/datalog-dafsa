@@ -277,6 +277,7 @@
   } else {
     editor = CodeMirror.fromTextArea(progEl, {
       mode: 'datalog',
+      theme: 'tokyonight',
       lineNumbers: true,
       lineWrapping: true,
       indentUnit: 2
