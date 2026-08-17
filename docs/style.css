@@ -198,6 +198,69 @@ table.api td:first-child { white-space: nowrap; }
     margin: 1em 0;
 }
 
+/* ─── Playground ─────────────────────────────────────────────────────── */
+
+#program {
+    width: 100%;
+    font-family: "SFMono-Regular", ui-monospace, Menlo, Consolas,
+                 "Liberation Mono", monospace;
+    font-size: 0.9em;
+    line-height: 1.45;
+    background: #f6f8fa;
+    border: 1px solid #e2e4e8;
+    border-radius: 6px;
+    padding: 12px 14px;
+    color: #1f2328;
+    margin: 0.5em 0;
+    resize: vertical;
+    tab-size: 4;
+}
+
+.playground-controls {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin: 0.6em 0 1.2em;
+}
+
+.playground-controls label {
+    font-weight: 600;
+    font-size: 0.95em;
+}
+
+.playground-controls input[type="text"] {
+    font-family: "SFMono-Regular", ui-monospace, Menlo, Consolas,
+                 "Liberation Mono", monospace;
+    font-size: 0.95em;
+    padding: 6px 10px;
+    border: 1px solid #d0d7de;
+    border-radius: 6px;
+    background: #ffffff;
+    color: #1f2328;
+}
+
+.playground-controls button {
+    font-size: 0.95em;
+    font-weight: 600;
+    padding: 7px 18px;
+    border: none;
+    border-radius: 6px;
+    background: #0969da;
+    color: #ffffff;
+    cursor: pointer;
+}
+
+.playground-controls button:hover {
+    background: #0550ae;
+}
+
+#output {
+    min-height: 4em;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
 /* ─── Footer ────────────────────────────────────────────────────────── */
 
 footer.site-foot {
@@ -224,6 +287,16 @@ footer.site-foot {
     pre.code {
         background: #161b22;
         border-color: #30363d;
+    }
+    #program {
+        background: #161b22;
+        border-color: #30363d;
+        color: #e6edf3;
+    }
+    .playground-controls input[type="text"] {
+        background: #0d1117;
+        border-color: #30363d;
+        color: #e6edf3;
     }
     table.features th,
     table.features td {

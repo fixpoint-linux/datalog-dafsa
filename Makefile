@@ -47,7 +47,7 @@ ALL_OBJS = $(VENDOR_OBJS) $(LIB_OBJS)
 
 # ─── Targets ─────────────────────────────────────────────────────────────
 
-.PHONY: all clean test bench test-m1 test-m2
+.PHONY: all clean test bench test-m1 test-m2 wasm
 
 all: build-tmp libdatalog.so dl
 
@@ -264,6 +264,17 @@ test-m2: tests/test_m2 dl build-tmp
 test-m16: tests/test_m16_travel dl build-tmp
 	@echo "=== Running M16 time-travel (as-of) snapshot tests ==="
 	LD_LIBRARY_PATH=. ./tests/test_m16_travel
+
+# ─── WebAssembly playground ─────────────────────────────────────────────
+# Builds the in-browser language playground (docs/playground.js + .wasm)
+# from src/playground-wasm.c + the full engine core, then runs the headless
+# node smoke test against the freshly-built bundle.  Requires emscripten +
+# node on the HOST (see scripts/build-wasm.sh); the emitted artifacts are
+# committed to docs/ so the Pages site needs no build step.
+
+wasm:
+	./scripts/build-wasm.sh
+	@node tests/wasm-smoke.js
 
 # ─── Clean ───────────────────────────────────────────────────────────────
 

@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Playground — datalog-dafsa</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site">
+  <div class="wrap">
+    <a class="brand" href="index.html">datalog-dafsa</a>
+    <nav>
+      <a href="index.html">Overview</a>
+      <a href="language.html">Language</a>
+      <a href="cli.html">CLI</a>
+      <a href="api.html">C API</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="order-statistics.html">Order Stats</a>
+      <a href="time-travel.html">Time Travel</a>
+      <a href="playground.html">Playground</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+  <h1>Playground</h1>
+  <p>
+    Type Datalog facts and rules below and hit <strong>Run</strong>. The program
+    is evaluated <em>entirely in your browser</em> by the real C engine,
+    compiled to WebAssembly — no server, no filesystem. The goal relation&rsquo;s
+    tuples are streamed back as plain text.
+  </p>
+
+  <p id="status" class="note"></p>
+
+  <textarea id="program" rows="16" spellcheck="false"
+            aria-label="Datalog program"></textarea>
+
+  <div class="playground-controls">
+    <label for="goal">Goal relation</label>
+    <input id="goal" type="text" value="path" aria-label="Goal relation name">
+    <button id="runBtn" type="button">Run</button>
+  </div>
+
+  <h2>Output</h2>
+  <pre id="output" class="code">(no results)</pre>
+
+  <h2>Supported subset</h2>
+  <p>
+    The in-browser engine supports the <em>in-memory</em> feature set of the
+    language:
+  </p>
+  <ul>
+    <li><strong>Facts</strong> — bare lowercase symbols, double-quoted strings,
+        integers, and <em>flat</em> list literals (elements are single values;
+        nested lists aren&rsquo;t yet accepted in a fact).</li>
+    <li><strong>Rules</strong> — including recursion (semi-naive fixpoint),
+        stratified negation (<code>!q(X)</code>), and conjunctions.</li>
+    <li><strong>Aggregates</strong> — <code>count()</code>, <code>sum()</code>,
+        <code>min()</code>, <code>max()</code>.</li>
+    <li><strong>Equality &amp; comparisons</strong> — <code>=</code>,
+        <code>&lt;</code> <code>&lt;=</code> <code>&gt;</code>
+        <code>&gt;=</code> <code>!=</code>.</li>
+    <li><strong>Arithmetic</strong> — <code>+</code> <code>-</code>
+        <code>*</code> <code>/</code> <code>%</code>.</li>
+    <li><strong>Strings</strong> — <code>concat</code>, <code>length</code>,
+        <code>lower</code>, <code>upper</code>, <code>prefix</code>,
+        <code>suffix</code>, <code>contains</code>.</li>
+    <li><strong>Lists</strong> — <code>cons</code>, <code>car</code>,
+        <code>cdr</code>, <code>append</code>, <code>member</code>,
+        <code>[X|Xs]</code> patterns.</li>
+    <li><strong>Range predicate</strong> — <code>range(X, Rel, Lo, Hi)</code>.</li>
+    <li><strong>Regex pattern walks</strong> — the <code>~ '...'</code> form.</li>
+  </ul>
+  <p class="warn">
+    Not supported in the browser: <code>publish</code>/snapshot, time-travel
+    (as-of) queries, variadic relations, and the WAL / incremental-maintenance
+    API — all of which require the disk-backed engine.
+  </p>
+  <p class="note">
+    Rendering caveat: the engine uses the CLI&rsquo;s value heuristic, so a raw
+    integer result (including one inside a list literal) that happens to equal a
+    small symbol id can display as that symbol instead of the number. This is the
+    documented B6 int-vs-symbol collision — a display heuristic, not a bug.
+    Examples above use integer data to stay unambiguous.
+  </p>
+
+  <p>
+    The WebAssembly bundle is rebuilt from the C source with
+    <code>make wasm</code>; see <a href="README.md">docs/README</a> for details.
+  </p>
+</main>
+
+<footer class="site-foot">
+  <div class="wrap">
+    The playground runs <code>src/playground-wasm.c</code> — a thin entry
+    point over the same engine core as the CLI — compiled to WebAssembly.
+  </div>
+</footer>
+
+<script src="playground.js"></script>
+<script src="playground-ui.js"></script>
+
+</body>
+</html>
