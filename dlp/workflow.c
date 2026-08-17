@@ -196,10 +196,11 @@ static int typecheck_rules_dir(dl_schema *schema, const char *rules_dir, const c
                     schema->rels[k].is_idb = 1;
         }
 
-        /* Typecheck this file's rules against the schema. */
+        /* Typecheck this file's rules against the schema.  srcname = the real
+         * rules-file path so diagnostics show the actual file, not <input>. */
         char errbuf[512];
         errbuf[0] = '\0';
-        if (dl_typecheck_rules(schema, rules, n_rules, errbuf, sizeof errbuf) != 0) {
+        if (dl_typecheck_rules(schema, rules, n_rules, path, errbuf, sizeof errbuf) != 0) {
             /* Per-file parse => <input>:line:col is file-relative (D4). */
             fprintf(stderr, "rules/%s: %s\n", files[f], errbuf[0] ? errbuf : "typecheck failed");
             errs++;

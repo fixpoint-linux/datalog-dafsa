@@ -88,7 +88,7 @@ static int check_prog(const dl_schema *s, const char *src, const char *want_msg)
     if (!rules) { FAIL("parse_rules failed"); parse_free(p); return 999; }
 
     errbuf[0] = '\0';
-    rc = dl_typecheck_rules(s, (void *)rules, n, errbuf, sizeof(errbuf));
+    rc = dl_typecheck_rules(s, (void *)rules, n, NULL, errbuf, sizeof(errbuf));
 
     if (want_msg) {
         if (rc != -1) { printf("  (rc=%d) ", rc); }
@@ -324,11 +324,35 @@ static void test_list_builtins(void)
     TEST("reject: TOK_LIST literal in list builtin");
     if (check_prog(&s, "out_list(R) :- cons(R, x, [a,b]).\n", "list literal") == -1)
         PASS(); else FAIL("list literal in cons not rejected");
+}
 
-    TEST("reject: range still not typed");
-    if (check_prog(&s, "out_nat(A) :- str1(X), range(A, str1, X, Y).\n",
-                   "range") == -1)
-        PASS(); else FAIL("range unexpectedly typed");
+/* range(X, Rel, Lo, Hi): X/Lo/Hi Natural, Rel a relation NAME (no value type).
+ * Uses build_schema's `edge` (Natural,Natural) as the ranged relation. */
+static void test_range(void)
+{
+    dl_schema s;
+    build_schema(&s);
+
+    TEST("accept: range(X, edge, 0, 100) with X Natural");
+    if (check_prog(&s, "bar(X,Y) :- edge(X,Y), range(A, edge, 0, 100).\n",
+                   NULL) == 0)
+        PASS(); else FAIL("range acceptance rejected");
+
+    TEST("accept: range bound operands are vars already typed Natural");
+    if (check_prog(&s, "bar(X,Y) :- edge(X,Y), edge(Lo,A), range(B, edge, Lo, 100).\n",
+                   NULL) == 0)
+        PASS(); else FAIL("range with var bound rejected");
+
+    /* Lo bound to a Text column conflicts with Natural bound. */
+    TEST("reject: range bound var typed Text conflicts");
+    if (check_prog(&s, "total(A) :- label(Lo), range(A, edge, Lo, 100).\n",
+                   "but Text") == -1)
+        PASS(); else FAIL("range Text bound not rejected");
+
+    TEST("reject: range relation must be a name");
+    if (check_prog(&s, "bar(X,Y) :- edge(X,Y), range(A, X, 0, 100).\n",
+                   "range relation must be a name") == -1)
+        PASS(); else FAIL("range with non-name relation not rejected");
 }
 
 static void test_optional_enum(void)
@@ -411,19 +435,81 @@ static void test_inequality(void)
         FAIL("Text ordering < not rejected");
 }
 
-static void test_list_assignment_v1(void)
+static void test_list_assignment(void)
 {
     dl_schema s;
-    build_schema(&s);
+    build_param_schema(&s);
 
-    /* List assignment `[X|Xs] = L` must be rejected EXPLICITLY, not silently
-     * mishandled (pattern vars skipped / misleading 'untyped variable L'). */
-    TEST("reject: list assignment not yet typed");
-    if (check_prog(&s, "bar(X,Y) :- edge(X,Y), [H|T] = L.\n",
-                   "list assignment") == -1)
+    /* List assignment `[X|Xs] = L`: X binds elem (List<Text> -> Text), Xs
+     * binds List<Text>.  taglist is a List<Text> column. */
+    TEST("accept: [X|Xs] = L from a List column (X elem, Xs List<elem>)");
+    if (check_prog(&s, "out_text(X) :- taglist(L), [X|Xs] = L.\n", NULL) == 0)
+        PASS(); else FAIL("[X|Xs] = L not accepted");
+
+    TEST("accept: [X] = L single-element car pattern (X elem)");
+    if (check_prog(&s, "out_text(X) :- taglist(L), [X] = L.\n", NULL) == 0)
+        PASS(); else FAIL("[X] = L not accepted");
+
+    TEST("reject: untyped list-assignment RHS (cannot infer elem type)");
+    if (check_prog(&s, "out_text(X) :- [X|Xs] = L.\n",
+                   "cannot infer list element type") == -1)
+        PASS(); else FAIL("untyped list-assignment RHS not rejected");
+
+    TEST("reject: list-assignment RHS is a non-List column");
+    if (check_prog(&s, "out_text(X) :- str1(L), [X|Xs] = L.\n",
+                   "not a List") == -1)
+        PASS(); else FAIL("non-List list-assignment RHS not rejected");
+}
+
+/* The `srcname` parameter flows into diagnostics: a real path appears (not
+ * <input>), and NULL keeps the literal <input>. */
+static void test_srcname(void)
+{
+    dl_schema s;
+    parser *p;
+    int n = 0;
+    rule **rules;
+    char errbuf[512];
+
+    build_param_schema(&s);
+
+    p = parse_create("out_text(X) :- str1(L), [X|Xs] = L.\n");
+    rules = parse_rules(p, &n);
+    if (!rules) { FAIL("parse_rules failed"); parse_free(p); return; }
+
+    TEST("srcname path appears in diagnostic");
+    errbuf[0] = '\0';
+    if (dl_typecheck_rules(&s, (void *)rules, n, "rules/reach.datalog",
+                           errbuf, sizeof errbuf) != -1) {
+        FAIL("expected reject");
+    } else if (strstr(errbuf, "rules/reach.datalog") == NULL) {
+        printf("  (errbuf='%s') ", errbuf);
+        FAIL("real srcname not present in diagnostic");
+    } else if (strstr(errbuf, "<input>") != NULL) {
+        printf("  (errbuf='%s') ", errbuf);
+        FAIL("stale <input> still present with a real srcname");
+    } else {
         PASS();
-    else
-        FAIL("list assignment not rejected");
+    }
+
+    TEST("srcname NULL keeps <input>");
+    errbuf[0] = '\0';
+    if (dl_typecheck_rules(&s, (void *)rules, n, NULL,
+                           errbuf, sizeof errbuf) != -1) {
+        FAIL("expected reject");
+    } else if (strstr(errbuf, "<input>") == NULL) {
+        printf("  (errbuf='%s') ", errbuf);
+        FAIL("NULL srcname did not fall back to <input>");
+    } else {
+        PASS();
+    }
+
+    {
+        int i;
+        for (i = 0; i < n; i++) rule_free(rules[i]);
+        free(rules);
+    }
+    parse_free(p);
 }
 
 static void test_untyped_var(void)
@@ -546,12 +632,14 @@ int main(void)
     test_arity_mismatch();
     test_reserved_builtin_head();
     test_inequality();
-    test_list_assignment_v1();
+    test_list_assignment();
     test_untyped_var();
     test_scalar_ordering();
     test_scalar_minmax();
     test_list_builtins();
+    test_range();
     test_optional_enum();
+    test_srcname();
 
     printf("\n%d tests, %d failed\n", tests_run, tests_failed);
     return tests_failed ? 1 : 0;

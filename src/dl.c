@@ -2114,7 +2114,7 @@ int dl_load_rules(dl_db *db, const char *dl_source)
      * here — the `dlp` tool layer surfaces it to the user.) */
     if (db->schema != NULL) {
         char errbuf[256];
-        if (dl_typecheck_rules(db->schema, (void *)rules, n_rules,
+        if (dl_typecheck_rules(db->schema, (void *)rules, n_rules, NULL,
                                errbuf, sizeof errbuf) != 0) {
             int i;
             for (i = 0; i < n_rules; i++) rule_free(rules[i]);

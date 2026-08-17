@@ -102,10 +102,13 @@ const dl_reldef *dl_schema_find(const dl_schema *s, const char *name);
  * `rules` is the parser's rule** (opaque here to keep this header free of
  * parser.h).  Returns 0 if the rules typecheck against `schema`, -1 on
  * failure with a human-readable diagnostic written into errbuf (errcap bytes).
+ * `srcname` names the source file in diagnostics (NULL => the literal
+ * `<input>`); the dlp tool passes the real rules-file path so errors show the
+ * actual file.
  *
  * Implemented in src/typecheck.c (S3). */
 int dl_typecheck_rules(const dl_schema *schema, void *rules, int n_rules,
-                       char *errbuf, size_t errcap);
+                       const char *srcname, char *errbuf, size_t errcap);
 
 #ifdef __cplusplus
 }

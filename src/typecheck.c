@@ -9,12 +9,14 @@
  *
  * Atom dispatch mirrors compiler.c's name-based recognition (the builtin
  * predicate-name sets are COPIED here — the compiler's helpers are static, so
- * this module must not depend on compiler internals).  List/range builtins are
- * rejected in v1 ("not yet typed").  Stratification is the compiler's job, so a
- * negated atom is typed exactly like its positive form.
+ * this module must not depend on compiler internals).  List builtins and the
+ * `range` builtin are typed here too (v2).  Stratification is the compiler's
+ * job, so a negated atom is typed exactly like its positive form.
  *
  * Because dl_typecheck_rules is called by dl_load_rules which knows no source
- * filename, the "file" component of every diagnostic is the literal `<input>`.
+ * filename, the default "file" component of every diagnostic is the literal
+ * `<input>` — the dlp tool overrides it with the real rules-file path via the
+ * `srcname` parameter.
  */
 
 #include "typecheck.h"
@@ -24,6 +26,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Source name used in diagnostics.  dl_typecheck_rules sets it from its
+ * `srcname` parameter (NULL => `<input>`). */
+static const char *g_srcname = "<input>";
 
 /* ─── Copy of the builtin predicate-name classification (from compiler.c,
  *    which keeps these static — do NOT depend on compiler internals) ───── */
@@ -96,6 +102,11 @@ typedef struct {
 /* Recursive helper for arithmetic expr trees (defined below type_arith). */
 static int type_expr(vtab *t, const expr *e, int line, int col,
                      const char *site, char *errbuf, size_t errcap);
+
+/* Defined below (v2 list builtins).  type_list_assignment (above) uses it to
+ * resolve the RHS of `[X|Xs] = L` to a List colspec. */
+static int resolve_list_operand(vtab *t, const token *tok, const char *pred,
+                                dl_colspec *lt, char *errbuf, size_t errcap);
 
 static void vtab_free(vtab *t)
 {
@@ -211,7 +222,8 @@ static int constrain_var(vtab *t, const char *name, dl_colspec want,
 {
     varent *e = vtab_get(t, name);
     if (!e) {
-        set_err(errbuf, errcap, "<input>: out of memory in typechecker\n");
+        set_err(errbuf, errcap, "%s: out of memory in typechecker\n",
+                g_srcname);
         return -1;
     }
     if (e->type.tag == 0) {
@@ -226,10 +238,10 @@ static int constrain_var(vtab *t, const char *name, dl_colspec want,
         type_name(&want, wbuf, sizeof wbuf);
         type_name(&e->type, hbuf, sizeof hbuf);
         set_err(errbuf, errcap,
-                "<input>:%d:%d: variable %s is %s here (%s) but %s at "
-                "<input>:%d:%d (%s)\n",
-                line, col, name, wbuf, site,
-                hbuf, e->line, e->col,
+                "%s:%d:%d: variable %s is %s here (%s) but %s at "
+                "%s:%d:%d (%s)\n",
+                g_srcname, line, col, name, wbuf, site,
+                hbuf, g_srcname, e->line, e->col,
                 e->site ? e->site : "");
         return -1;
     }
@@ -257,8 +269,8 @@ static int constrain_arg(vtab *t, const token *a, dl_colspec want,
             char wbuf[64];
             type_name(&want, wbuf, sizeof wbuf);
             set_err(errbuf, errcap,
-                    "<input>:%d:%d: int constant %u in a %s column (%s)\n",
-                    a->line, a->col, a->ival, wbuf, site);
+                    "%s:%d:%d: int constant %u in a %s column (%s)\n",
+                    g_srcname, a->line, a->col, a->ival, wbuf, site);
             return -1;
         }
         return 0;
@@ -268,16 +280,16 @@ static int constrain_arg(vtab *t, const token *a, dl_colspec want,
             char wbuf[64];
             type_name(&want, wbuf, sizeof wbuf);
             set_err(errbuf, errcap,
-                    "<input>:%d:%d: constant '%s' is Text but a %s column "
-                    "(%s) requires Natural\n", a->line, a->col, a->text,
+                    "%s:%d:%d: constant '%s' is Text but a %s column "
+                    "(%s) requires Natural\n", g_srcname, a->line, a->col, a->text,
                     wbuf, site);
             return -1;
         }
         return 0;
     case TOK_LIST:
         set_err(errbuf, errcap,
-                "<input>:%d:%d: lists are not yet in the typed universe\n",
-                a->line, a->col);
+                "%s:%d:%d: lists are not yet in the typed universe\n",
+                g_srcname, a->line, a->col);
         return -1;
     default:
         return 0;
@@ -297,22 +309,22 @@ static int type_relational(vtab *t, const dl_schema *schema, const atom *a,
 
     if (is_head && is_reserved_builtin_name(a->pred)) {
         set_err(errbuf, errcap,
-                "<input>:%d:%d: '%s' is a reserved builtin predicate name and "
-                "cannot be used as a rule head\n", a->line, a->col, a->pred);
+                "%s:%d:%d: '%s' is a reserved builtin predicate name and "
+                "cannot be used as a rule head\n", g_srcname, a->line, a->col, a->pred);
         return -1;
     }
 
     rd = dl_schema_find(schema, a->pred);
     if (!rd) {
         set_err(errbuf, errcap,
-                "<input>:%d:%d: relation '%s' is not declared in schema.dhall\n",
-                a->line, a->col, a->pred);
+                "%s:%d:%d: relation '%s' is not declared in schema.dhall\n",
+                g_srcname, a->line, a->col, a->pred);
         return -1;
     }
     if (a->nargs != rd->arity) {
         set_err(errbuf, errcap,
-                "<input>:%d:%d: relation '%s' has arity %d but the rule uses "
-                "%d argument(s)\n", a->line, a->col, a->pred, rd->arity,
+                "%s:%d:%d: relation '%s' has arity %d but the rule uses "
+                "%d argument(s)\n", g_srcname, a->line, a->col, a->pred, rd->arity,
                 a->nargs);
         return -1;
     }
@@ -350,6 +362,42 @@ static dl_colspec token_inherent_type(const token *a)
     }
 }
 
+/* List assignment `[X|Xs] = L` (the parser builds an '=' atom with nargs==2,
+ * args[0] a TOK_LIST pattern, args[1] the RHS list value).  Resolve the RHS
+ * to a List<elem> (reusing resolve_list_operand, defined below type_equality),
+ * then bind the pattern per emit_pattern semantics (compiler.c): each head
+ * element var (children[i]) := elem, the tail var (tail) := List<elem>.
+ * Constant head elements (TOK_INT/TOK_IDENT) have no var to constrain — skip.
+ * `[X] = L` (single head child, no tail) still binds X := elem (car pattern). */
+static int type_list_assignment(vtab *t, const atom *a, char *errbuf, size_t errcap)
+{
+    const token *pat = a->nargs > 0 ? a->args[0] : NULL;
+    const token *rhs = a->nargs > 1 ? a->args[1] : NULL;
+    dl_colspec lt;
+    int i;
+
+    if (!resolve_list_operand(t, rhs, a->pred, &lt, errbuf, errcap)) return -1;
+    dl_colspec ec = scalar(lt.elem);
+    dl_colspec lr = list_of(lt.elem);
+
+    if (pat) {
+        for (i = 0; i < pat->nchildren; i++) {
+            const token *el = pat->children[i];
+            if (el && el->kind == TOK_VAR) {
+                if (constrain_var(t, el->text, ec, el->line, el->col,
+                                  a->pred, errbuf, errcap) != 0)
+                    return -1;
+            }
+        }
+        if (pat->tail && pat->tail->kind == TOK_VAR) {
+            if (constrain_var(t, pat->tail->text, lr, pat->tail->line,
+                              pat->tail->col, a->pred, errbuf, errcap) != 0)
+                return -1;
+        }
+    }
+    return 0;
+}
+
 /* `X = Y` plain equality: both sides must have the same type.  Variables take
  * their already-typed value (or stay untyped); a constant contributes its
  * inherent type (int -> Natural, symbol/string -> Text). */
@@ -360,15 +408,10 @@ static int type_equality(vtab *t, const atom *a, char *errbuf, size_t errcap)
     dl_colspec lt = scalar(0), rt = scalar(0);
 
     /* List assignment `[X|Xs] = L` (parser builds an equality atom whose
-     * args[0] is a TOK_LIST pattern).  v1 does not type lists, so reject it
-     * EXPLICITLY (consistent with the list/range builtin rejection) rather
-     * than silently registering only the RHS and skipping the pattern vars. */
-    if (l && l->kind == TOK_LIST) {
-        set_err(errbuf, errcap,
-                "<input>:%d:%d: list assignment is not yet in the typed "
-                "universe\n", l->line, l->col);
-        return -1;
-    }
+     * args[0] is a TOK_LIST pattern): type the RHS as a List and bind the
+     * pattern vars (head elements := elem, tail := List<elem>). */
+    if (l && l->kind == TOK_LIST)
+        return type_list_assignment(t, a, errbuf, errcap);
 
     if (l && l->kind == TOK_VAR) {
         varent *le = vtab_find(t, l->text);
@@ -392,8 +435,8 @@ static int type_equality(vtab *t, const atom *a, char *errbuf, size_t errcap)
             return constrain_var(t, l->text, rt, l->line, l->col, a->pred,
                                  errbuf, errcap);
         /* both constants of different types */
-        set_err(errbuf, errcap, "<input>:%d:%d: mismatched types in equality\n",
-                a->line, a->col);
+        set_err(errbuf, errcap, "%s:%d:%d: mismatched types in equality\n",
+                g_srcname, a->line, a->col);
         return -1;
     }
     /* One side typed, the other an untyped variable: propagate the type. */
@@ -434,9 +477,9 @@ static int type_aggregate(vtab *t, const atom *a, char *errbuf, size_t errcap)
             dl_colspec ot = e ? e->type : scalar(0);
             if (ot.tag == 0) {
                 set_err(errbuf, errcap,
-                        "<input>:%d:%d: %s operand is not yet typed "
+                        "%s:%d:%d: %s operand is not yet typed "
                         "(min/max needs a Natural/Timestamp/Date column)\n",
-                        a->args[0]->line, a->args[0]->col, op);
+                        g_srcname, a->args[0]->line, a->args[0]->col, op);
                 return -1;
             }
             if (ot.tag != DLT_NATURAL && ot.tag != DLT_TIMESTAMP &&
@@ -444,9 +487,9 @@ static int type_aggregate(vtab *t, const atom *a, char *errbuf, size_t errcap)
                 char obuf[64];
                 type_name(&ot, obuf, sizeof obuf);
                 set_err(errbuf, errcap,
-                        "<input>:%d:%d: %s over a %s column is not supported "
+                        "%s:%d:%d: %s over a %s column is not supported "
                         "(min/max needs Natural/Timestamp/Date)\n",
-                        a->args[0]->line, a->args[0]->col, op, obuf);
+                        g_srcname, a->args[0]->line, a->args[0]->col, op, obuf);
                 return -1;
             }
             return constrain_var(t, a->pred, ot, a->line, a->col, op,
@@ -529,15 +572,15 @@ static int resolve_list_operand(vtab *t, const token *tok, const char *pred,
                                 dl_colspec *lt, char *errbuf, size_t errcap)
 {
     if (!tok) {
-        set_err(errbuf, errcap, "<input>: '%s' is missing its list operand\n",
-                pred);
+        set_err(errbuf, errcap, "%s: '%s' is missing its list operand\n",
+                g_srcname, pred);
         return 0;
     }
     if (tok->kind == TOK_LIST) {
         set_err(errbuf, errcap,
-                "<input>:%d:%d: list literal in '%s' is not supported in v1 "
+                "%s:%d:%d: list literal in '%s' is not supported in v1 "
                 "(lists are not yet typed as literals)\n",
-                tok->line, tok->col, pred);
+                g_srcname, tok->line, tok->col, pred);
         return 0;
     }
     if (tok->kind == TOK_VAR) {
@@ -545,28 +588,28 @@ static int resolve_list_operand(vtab *t, const token *tok, const char *pred,
         if (e && e->type.tag == DLT_LIST) { *lt = e->type; return 1; }
         if (e && e->type.tag == 0) {
             set_err(errbuf, errcap,
-                    "<input>:%d:%d: cannot infer list element type in '%s' "
+                    "%s:%d:%d: cannot infer list element type in '%s' "
                     "(list operand '%s' is untyped)\n",
-                    tok->line, tok->col, pred, tok->text);
+                    g_srcname, tok->line, tok->col, pred, tok->text);
             return 0;
         }
         if (e) {
             char wbuf[64];
             type_name(&e->type, wbuf, sizeof wbuf);
             set_err(errbuf, errcap,
-                    "<input>:%d:%d: '%s' in '%s' is %s, not a List\n",
-                    tok->line, tok->col, tok->text, pred, wbuf);
+                    "%s:%d:%d: '%s' in '%s' is %s, not a List\n",
+                    g_srcname, tok->line, tok->col, tok->text, pred, wbuf);
             return 0;
         }
         set_err(errbuf, errcap,
-                "<input>:%d:%d: cannot infer list element type in '%s' "
+                "%s:%d:%d: cannot infer list element type in '%s' "
                 "(list operand '%s' is untyped)\n",
-                tok->line, tok->col, pred, tok->text);
+                g_srcname, tok->line, tok->col, pred, tok->text);
         return 0;
     }
     set_err(errbuf, errcap,
-            "<input>:%d:%d: '%s' requires a List operand, got a constant\n",
-            tok->line, tok->col, pred);
+            "%s:%d:%d: '%s' requires a List operand, got a constant\n",
+            g_srcname, tok->line, tok->col, pred);
     return 0;
 }
 
@@ -652,6 +695,44 @@ static int type_list_builtin(vtab *t, const atom *a, char *errbuf, size_t errcap
                                  errbuf, errcap);
         return 0;
     }
+    return 0;
+}
+
+/* `range(X, Rel, Lo, Hi)` (compiler.c range_builtin_valid): args[0] is the
+ * member variable X := Natural, args[1] is the relation NAME (TOK_IDENT — a
+ * name, NOT a value: it is resolved by the compiler against declared
+ * relations, so it carries no column type), args[2]/args[3] are the half-open
+ * bounds (TOK_VAR|TOK_INT) := Natural. */
+static int type_range(vtab *t, const atom *a, char *errbuf, size_t errcap)
+{
+    const token *x  = a->nargs > 0 ? a->args[0] : NULL;
+    const token *rl = a->nargs > 1 ? a->args[1] : NULL;
+    const token *lo = a->nargs > 2 ? a->args[2] : NULL;
+    const token *hi = a->nargs > 3 ? a->args[3] : NULL;
+
+    if (a->nargs != 4) {
+        set_err(errbuf, errcap,
+                "%s:%d:%d: 'range' expects 4 arguments "
+                "(range(X, Rel, Lo, Hi))\n", g_srcname, a->line, a->col);
+        return -1;
+    }
+    /* Rel is a relation NAME (TOK_IDENT), not a value operand. */
+    if (!rl || rl->kind != TOK_IDENT) {
+        set_err(errbuf, errcap,
+                "%s:%d:%d: range relation must be a name (got a value or "
+                "variable)\n", g_srcname,
+                rl ? rl->line : a->line, rl ? rl->col : a->col);
+        return -1;
+    }
+    if (x && x->kind == TOK_VAR) {
+        if (constrain_var(t, x->text, scalar(DLT_NATURAL), x->line, x->col,
+                          "range", errbuf, errcap) != 0)
+            return -1;
+    }
+    if (constrain_arg(t, lo, scalar(DLT_NATURAL), "range", errbuf, errcap) != 0)
+        return -1;
+    if (constrain_arg(t, hi, scalar(DLT_NATURAL), "range", errbuf, errcap) != 0)
+        return -1;
     return 0;
 }
 
@@ -744,16 +825,12 @@ static int type_body_atom(vtab *t, const dl_schema *schema, const atom *a,
     if (is_str_filter_pred(a->pred))
         return type_str_filter(t, a, errbuf, errcap);
 
-    /* v2 list builtins: real typing.  range stays a v1 reject (it is
-       Natural-only and trivially typeable later). */
+    /* v2 list builtins: real typing. */
     if (is_list_builtin_pred(a->pred))
         return type_list_builtin(t, a, errbuf, errcap);
-    if (is_range_builtin_pred(a->pred)) {
-        set_err(errbuf, errcap,
-                "<input>:%d:%d: 'range' is a range builtin and is not yet "
-                "typed in v1\n", a->line, a->col);
-        return -1;
-    }
+    /* range(X, Rel, Lo, Hi): real typing (X/Lo/Hi Natural, Rel a name). */
+    if (is_range_builtin_pred(a->pred))
+        return type_range(t, a, errbuf, errcap);
 
     /* otherwise: relational atom (negation types as its positive form) */
     return type_relational(t, schema, a, 0, errbuf, errcap);
@@ -788,8 +865,8 @@ static int type_rule(const dl_schema *schema, const rule *r,
     for (i = 0; i < t.n; i++) {
         if (t.v[i].type.tag == 0) {
             set_err(errbuf, errcap,
-                    "<input>: untyped variable %s in rule '%s' "
-                    "(no column constrains it)\n", t.v[i].name,
+                    "%s: untyped variable %s in rule '%s' "
+                    "(no column constrains it)\n", g_srcname, t.v[i].name,
                     r->head ? r->head->pred : "");
             vtab_free(&t);
             return -1;
@@ -801,10 +878,12 @@ static int type_rule(const dl_schema *schema, const rule *r,
 }
 
 int dl_typecheck_rules(const dl_schema *schema, void *rules, int n_rules,
-                       char *errbuf, size_t errcap)
+                       const char *srcname, char *errbuf, size_t errcap)
 {
     rule **rr = (rule **)rules;
     int i;
+
+    g_srcname = srcname ? srcname : "<input>";
 
     if (!schema || !rr || n_rules <= 0)
         return 0; /* nothing to check */
