@@ -189,7 +189,9 @@ In rough priority order. ~~struck-through~~ items are implemented (commit noted)
    `dl_merge_join` is an O(n+m+out) equi-join on the first J columns
    (one-token lookahead + right-run buffering, duplicate-preserving, sorted,
    drains both iterators).  Snapshot path owns an mmap `dafsa_view`; live path
-   borrows `rel->d`.  Not yet wired into the VM (no OP code / order-by).
+   borrows `rel->d`.  **Wired into the VM** (commit `2f78be3`) as the lazy
+   resumable driver behind `OP_RANGE`; a dedicated VM merge-join/order-by
+   opcode is not yet added (future).
 6. ~~**Automatic perm-index selection**~~ — **implemented** (commit `b553f2c`).
    A compile-time cost gate in `emit_nonleading_join` (src/compiler.c) wires up
    the previously-dead `OP_HASH_JOIN` as a **slot-free fallback**: a perm is
@@ -217,7 +219,27 @@ In rough priority order. ~~struck-through~~ items are implemented (commit noted)
    including duplicate-add / absent-delete / bad-arg). A precision improvement
    would track only real structural changes; deferred because a DAFSA merge
    restructures the DAG wholesale (incremental maintenance is infeasible in the
-   general case).
+   general case).  **Parked (future):** low value for the read-heavy +
+   batch-write workload — subtree counts build lazily and once, so a coarse
+   rebuild between mutation batches is amortized and nearly invisible. Revisit
+   only if OLTP-style point-updates interleaved with rank/select ever appear.
+
+## Parked / future follow-ups (only if a use case appears)
+
+These are **not** planned work — recorded so a future session can pick them up
+without re-deriving why they were set aside.
+
+- **Snapshot `dl_*_bound` / `dl_*_perm`** (order-statistics over a published
+  snapshot for a prefixed or permuted relation). Plain snapshot rank/select is
+  covered (#4); the bound/perm variants need (a) a stable snapshot
+  `perm_id`→name mapping across reopen and (b) a view `_from` variant. Niche —
+  build only if a read path needs rank/select on a permuted/prefixed relation
+  from a snapshot.
+- **VM merge-join / order-by opcode** over the #5 iterator (currently the
+  iterator only drives `OP_RANGE`). Cheap to add once a concrete rule shape
+  justifies it.
+- **Tier 3 / B-tree companion** (see struck #7) — a real complementary sorted
+  structure beside the DAFSA if genuine OLTP point-seek is ever required.
 
 ## References
 

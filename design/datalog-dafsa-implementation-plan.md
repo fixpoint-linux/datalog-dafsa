@@ -1,6 +1,6 @@
 # Implementation Plan: DAFSA-Backed Deductive Database (Datalog VM)
 
-**Status:** M0-M9 + v2 IVM complete (2026-08-15). 306 tests green (18 suites + CLI smoke). M8 added magic-sets; M9 added arithmetic/comparison and string builtins; v2 IVM (Slices 0-5: deletion-correctness, insert/recursive/DRed-deletion/aggregate/bulk incremental view maintenance) shipped. Trace/JIT REJECTED (see §10.8 of architecture). Remaining deferred: bushy plans, time-travel, variable arity, top-down/QSQ magic.
+**Status:** M0-M9 + v2 IVM complete (2026-08-15), extended through 2026-08-17. 306+ tests green. M8 added magic-sets/QSQ top-down; M9 added arithmetic/comparison and string builtins; v2 IVM (Slices 0-5) shipped; v2 also added bushy plans, variable arity (variadic relations), and nested terms/lists. Trace/JIT REJECTED (see §10.8 of architecture). **Deferred (future):** time-travel, pointwise/stratified negation over recursive predicates, and the IVM/DRed fallback-gap follow-ups below.
 **Goal:** Turn the architecture into a concrete, executable build plan with file layout, per-milestone tasks, and verification for each step.
 **Repos involved:** this project (new, e.g. `~/projects/datalog-dafsa/`), consuming the proven jing-meta DAFSA C engine (`indexer/dafsa/dafsa.c` + `dafsa_core.c` + `dafsa_persist.c` + `dafsa_view.c` + `dafsa_wal.c` + `dafsa.h`).
 
@@ -192,9 +192,31 @@ Tasks:
 ---
 
 ### M8+ — v2 (partially scoped)
-- Magic-sets (SHIPPED, M8), arithmetic/string builtins (SHIPPED, M9), IVM (SHIPPED, v2 Slices 0-5).
-- Still deferred: bushy plans, time-travel, variable arity, negation/aggregates interaction, top-down/QSQ magic.
+- Magic-sets (SHIPPED, M8), arithmetic/string builtins (SHIPPED, M9), IVM (SHIPPED, v2 Slices 0-5), bushy plans (SHIPPED), variable arity / variadic relations (SHIPPED), nested terms/lists (SHIPPED).
+- **Deferred (future):** time-travel, pointwise/stratified negation over recursive predicates, and the IVM/DRed fallback-gap follow-ups (see below).
 - Trace/JIT compilation: REJECTED (2026-08-15) — the interpreter is not the bottleneck; the fixpoint is dominated by C tuple/DAFSA ops a JIT'd body would still call into. See architecture §10.8.
+
+### IVM / DRed fallback-gap follow-ups (parked / future)
+
+The incremental machinery (Slices 0-5) ships a full-re-eval fallback for every
+program outside the incremental classes. Narrowing those gaps is **not** planned
+work — the engine's read-heavy + batch-write workload makes most of them
+low-value. Recorded so a future session can revisit without re-deriving:
+
+- **Recursion + deletion via DRed-over-recursion** — the only gap with real
+  marginal value; also the hardest (advisor-scoped-out in IVM Slice 3) and low
+  payoff for the stated workload. If ever pursued, plan it as an advisor slice.
+- **Aggregate shapes under delete** beyond count/sum/min/max (shared head,
+  repeated-variable anchor, derived anchor, etc.) — currently fall back.
+- **Negation on the insert path** (IVM excludes `OP_NEG_CHECK`; DRed allows
+  stratified negation only for delete) — the un-enumerable retraction case.
+- **`OP_WALK` / `OP_LOOKUP_PERM` / `OP_HASH_JOIN` override support** — these are
+  the fast-path ops the compiler picks precisely; making them delta-override-able
+  is real work for little gain.
+- **Bushy `OP_MAT_*` delta override** — subtree buffers are built fresh per exec;
+  a delta cannot thread through.
+- **`range` / list / variadic IVM eligibility** — excluded by design (they defeat
+  the single-arity delta model); do not re-enable.
 
 ---
 
