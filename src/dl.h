@@ -454,6 +454,29 @@ uint32_t    dl_intern_str(dl_db *db, const char *str);
 /* Look up a sym_id → string.  Returns NULL if id is out of range. */
 const char *dl_intern_str_of(dl_db *db, uint32_t sym_id);
 
+/* ─── List term-store access (v2 lists, public wrappers) ─────────────────── */
+/* A List column VALUE is a hash-consed list handle in the reserved high range
+ * [TERM_BASE, ...) (TERM_BASE = the empty list NIL).  These thin wrappers
+ * forward to the db's term store so dlp loaders/printers can build and walk
+ * list values through the PUBLIC API (matching dl_intern_str).  Each returns
+ * 0 (or 0/NULL) on a NULL db / absent term store / invalid operand. */
+
+/* Intern the cons cell (head, tail); tail MUST be a list.  Returns the
+ * canonical handle, or 0 on error/OOM. */
+uint32_t dl_term_cons(dl_db *db, uint32_t head, uint32_t tail);
+
+/* append(a, b): list a followed by list b.  Returns the canonical handle, or
+ * 0 on error/OOM or a non-list operand.  append(NIL, b) == b. */
+uint32_t dl_term_append(dl_db *db, uint32_t a, uint32_t b);
+
+/* 1 if v is a list handle in this store (EXACT index-range test). */
+int      dl_term_is_list(const dl_db *db, uint32_t v);
+
+/* head / tail of a cons cell.  Precondition: h is a list handle and h != NIL;
+ * returns 0 otherwise. */
+uint32_t dl_term_car(const dl_db *db, uint32_t h);
+uint32_t dl_term_cdr(const dl_db *db, uint32_t h);
+
 #ifdef __cplusplus
 }
 #endif

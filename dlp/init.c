@@ -9,10 +9,10 @@
  * The template schema.dhall uses nested `let` (one `in` per binding — dhall-c
  * has no multi-let), an empty-record-payload union type
  * `let ColumnType = < ... >` covering the 5 flat scalars plus List/Optional/Enum
- * (List/Optional/Enum wired in Stage B), union values like `< Text = {=} >`,
- * and the final body annotated `: Schema`.  The worked example declares
- * node[Text], edge[Text,Text], weight[Text,Natural], light_edge[Text,Text],
- * tc[Text,Text], and metrics[Bool,Char,Date,Timestamp,Signed].
+ * (parameterized; payload record < List = { elem = < Text = {=} > } >), and the
+ * final body annotated `: Schema`.  Two relations stay within the schema's
+ * arity-8 cap: `node` exercises the 6 scalar types (Text + 5 flat scalars) and
+ * `catalog` exercises the 3 parameterized types (List/Optional/Enum).
  */
 #include "dlp.h"
 
@@ -23,8 +23,9 @@
 #include <sys/stat.h>
 
 #define TEMPLATE_SCHEMA \
-    "-- dlp project schema (S4 worked example)\n" \
+    "-- dlp project schema (worked example)\n" \
     "-- empty-record-payload union DSL: < Natural = {=} > | < Text = {=} > | ...\n" \
+    "-- List/Optional/Enum carry a payload record: < List = { elem = < Text = {=} > } >\n" \
     "let Elem = < Natural : {=} | Text : {=} | Bool : {=} | Char : {=} | Date : {=} | Timestamp : {=} | Signed : {=} >\n" \
     "in let ColumnType = < Natural : {=} | Text : {=} | Bool : {=} | Char : {=} | Date : {=} | Timestamp : {=} | Signed : {=} | List : { elem : Elem } | Optional : { elem : Elem } | Enum : { values : List Text } >\n" \
     "in let Column = { name : Text, type : ColumnType }\n" \
@@ -32,25 +33,16 @@
     "in let Schema = { relations : List Relation }\n" \
     "in { relations =\n" \
     "     [ { name = \"node\",\n" \
-    "         columns = [ { name = \"id\", type = < Text = {=} > } ] },\n" \
-    "       { name = \"edge\",\n" \
-    "         columns = [ { name = \"src\", type = < Text = {=} > },\n" \
-    "                     { name = \"dst\", type = < Text = {=} > } ] },\n" \
-    "       { name = \"weight\",\n" \
-    "         columns = [ { name = \"src\", type = < Text = {=} > },\n" \
-    "                     { name = \"w\", type = < Natural = {=} > } ] },\n" \
-    "       { name = \"light_edge\",\n" \
-    "         columns = [ { name = \"src\", type = < Text = {=} > },\n" \
-    "                     { name = \"dst\", type = < Text = {=} > } ] },\n" \
-    "       { name = \"tc\",\n" \
-    "         columns = [ { name = \"src\", type = < Text = {=} > },\n" \
-    "                     { name = \"dst\", type = < Text = {=} > } ] },\n" \
-    "       { name = \"metrics\",\n" \
-    "         columns = [ { name = \"active\", type = < Bool = {=} > },\n" \
-    "                     { name = \"initial\", type = < Char = {=} > },\n" \
+    "         columns = [ { name = \"id\", type = < Text = {=} > },\n" \
+    "                     { name = \"active\", type = < Bool = {=} > },\n" \
     "                     { name = \"born\", type = < Date = {=} > },\n" \
     "                     { name = \"seen\", type = < Timestamp = {=} > },\n" \
-    "                     { name = \"delta\", type = < Signed = {=} > } ] } ] } : Schema\n"
+    "                     { name = \"initial\", type = < Char = {=} > },\n" \
+    "                     { name = \"delta\", type = < Signed = {=} > } ] },\n" \
+    "       { name = \"catalog\",\n" \
+    "         columns = [ { name = \"tags\", type = < List = { elem = < Text = {=} > } > },\n" \
+    "                     { name = \"nick\", type = < Optional = { elem = < Text = {=} > } > },\n" \
+    "                     { name = \"color\", type = < Enum = { values = [ \"red\", \"green\", \"blue\" ] } > } ] } ] } : Schema\n"
 
 static int mkdir_if_missing(const char *dir) {
     struct stat st;

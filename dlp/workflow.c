@@ -15,6 +15,7 @@
  */
 #include "dlp.h"
 #include "dl.h"
+#include "termstore.h"
 #include "parser.h"
 #include "typecheck.h"
 #include "coerce.h"
@@ -458,6 +459,41 @@ typedef struct {
     const goal   *g;
 } print_ctx;
 
+/* Print ONE scalar value (a flat colspec + raw u32) to stdout.  Used by
+ * print_row for flat scalars and recursively by List/Optional elements. */
+static void print_scalar(const print_ctx *ctx, const dl_colspec *c, uint32_t v) {
+    char buf[16];
+    switch (c->tag) {
+    case DLT_NATURAL:
+    case DLT_TIMESTAMP:
+        printf("%u", v);                 /* raw u32 (epoch) */
+        break;
+    case DLT_TEXT:
+    case DLT_ENUM: {                     /* interned symbol */
+        const char *s = dl_intern_str_of(ctx->db, v);
+        printf("%s", s ? s : "");
+        break;
+    }
+    case DLT_BOOL:
+        printf("%s", v ? "true" : "false");
+        break;
+    case DLT_CHAR: {
+        int n = utf8_encode_cp(v, buf);
+        printf("%.*s", n, buf);
+        break;
+    }
+    case DLT_DATE:
+        print_date(v, buf, sizeof buf);
+        printf("%s", buf);
+        break;
+    case DLT_SIGNED:
+        printf("%d", (int)dezigzag(v));
+        break;
+    default:
+        break;
+    }
+}
+
 static int print_row(const uint32_t *cols, uint8_t arity, void *user) {
     print_ctx *ctx = (print_ctx *)user;
     (void)arity;
@@ -472,34 +508,44 @@ static int print_row(const uint32_t *cols, uint8_t arity, void *user) {
         if (ctx->g->bound[i]) continue;
         if (!first) printf(" ");
         first = 0;
-        char buf[16];
         switch (ctx->r->cols[i].tag) {
         case DLT_NATURAL:
         case DLT_TIMESTAMP:
-            printf("%u", cols[i]);                 /* raw u32 (epoch) */
-            break;
         case DLT_TEXT:
-        case DLT_ENUM: {                           /* interned symbol */
-            const char *s = dl_intern_str_of(ctx->db, cols[i]);
-            printf("%s", s ? s : "");
-            break;
-        }
+        case DLT_ENUM:
         case DLT_BOOL:
-            printf("%s", cols[i] ? "true" : "false");
+        case DLT_CHAR:
+        case DLT_DATE:
+        case DLT_SIGNED:
+            print_scalar(ctx, &ctx->r->cols[i], cols[i]);
             break;
-        case DLT_CHAR: {
-            int n = utf8_encode_cp(cols[i], buf);
-            printf("%.*s", n, buf);
+        case DLT_LIST: {
+            /* '[' e1, e2, ... ']' walking the cons chain. */
+            dl_colspec ec;
+            memset(&ec, 0, sizeof ec);
+            ec.tag = ctx->r->cols[i].elem;
+            printf("[");
+            int fe = 1;
+            uint32_t node = cols[i];
+            while (node != TERM_NIL && dl_term_is_list(ctx->db, node)) {
+                if (!fe) printf(", ");
+                fe = 0;
+                print_scalar(ctx, &ec, dl_term_car(ctx->db, node));
+                node = dl_term_cdr(ctx->db, node);
+            }
+            printf("]");
             break;
         }
-        case DLT_DATE:
-            print_date(cols[i], buf, sizeof buf);
-            printf("%s", buf);
+        case DLT_OPTIONAL: {
+            /* None -> 'null'; Some(elem) -> elem. */
+            if (cols[i] == DLP_OPT_NONE) { printf("null"); break; }
+            dl_colspec ec;
+            memset(&ec, 0, sizeof ec);
+            ec.tag = ctx->r->cols[i].elem;
+            print_scalar(ctx, &ec, cols[i]);
             break;
-        case DLT_SIGNED:
-            printf("%d", (int)dezigzag(cols[i]));
-            break;
-        default: /* List/Optional: not printable until Stage B */
+        }
+        default:
             break;
         }
         col++;

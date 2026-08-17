@@ -1622,6 +1622,38 @@ const char *dl_intern_str_of(dl_db *db, uint32_t sym_id)
     return intern_str_of(db->ir, sym_id);
 }
 
+/* ─── List term-store access (v2 lists, public wrappers) ─────────────────── */
+
+uint32_t dl_term_cons(dl_db *db, uint32_t head, uint32_t tail)
+{
+    if (!db || !db->terms) return 0;
+    return term_cons(db->terms, head, tail);
+}
+
+uint32_t dl_term_append(dl_db *db, uint32_t a, uint32_t b)
+{
+    if (!db || !db->terms) return 0;
+    return term_append(db->terms, a, b);
+}
+
+int dl_term_is_list(const dl_db *db, uint32_t v)
+{
+    if (!db || !db->terms) return 0;
+    return term_is_list(db->terms, v);
+}
+
+uint32_t dl_term_car(const dl_db *db, uint32_t h)
+{
+    if (!db || !db->terms) return 0;
+    return term_car(db->terms, h);
+}
+
+uint32_t dl_term_cdr(const dl_db *db, uint32_t h)
+{
+    if (!db || !db->terms) return 0;
+    return term_cdr(db->terms, h);
+}
+
 /* ─── Query primitives ────────────────────────────────────────────────── */
 
 int dl_lookup(dl_db *db, const char *rel_name,

@@ -24,6 +24,7 @@
  */
 #include "dlp.h"
 #include "dl.h"
+#include "termstore.h"
 #include "coerce.h"
 
 #include <ctype.h>
@@ -90,6 +91,71 @@ static void join_names(char *buf, size_t cap, const char *const *names, int n) {
     }
     if (off + 1 < cap) { buf[off] = ']'; buf[off + 1] = '\0'; }
 }
+
+/* Parse a Natural (decimal digits only, <= u32 max) from `cell`.  0 on success
+ * else -1. */
+static int parse_nat(const char *cell, uint32_t *out) {
+    const char *p = cell;
+    if (!*p) return -1;
+    unsigned long v = 0;
+    for (; *p; p++) {
+        if (*p < '0' || *p > '9') return -1;
+        v = v * 10 + (unsigned long)(*p - '0');
+        if (v > 4294967295UL) return -1;
+    }
+    *out = (uint32_t)v;
+    return 0;
+}
+
+/* Coerce ONE List/Optional ELEMENT cell string against `elem` (a flat scalar
+ * type).  Needs db only for DLT_TEXT interning; when db==NULL (dry-run) a Text
+ * element stores 0.  0 on success else -1. */
+static int coerce_elem_cell(dl_db *db, dl_coltype elem, char *cell, uint32_t *out) {
+    switch (elem) {
+    case DLT_NATURAL:
+    case DLT_TIMESTAMP:
+        return parse_nat(cell, out);
+    case DLT_TEXT:
+        if (db) *out = dl_intern_str(db, cell);
+        else *out = 0;
+        return 0;
+    case DLT_BOOL:
+        return parse_bool(cell, out);
+    case DLT_CHAR:
+        return parse_char(cell, strlen(cell), out);
+    case DLT_DATE:
+        return parse_date(cell, out);
+    case DLT_SIGNED:
+        return parse_signed(cell, out);
+    default:
+        return -1;
+    }
+}
+
+/* Split a list-inner string "a,b,c" (already un-bracketed) into elements,
+ * honoring a single surrounding '...' quote pair around an element (so a Text
+ * element with an embedded comma survives).  Elements are pointers into `s`
+ * (NUL-terminated in place).  Returns the TOTAL element count (may exceed
+ * `cap`; callers detect overflow and reject). */
+static int list_split(char *s, char **out, int cap) {
+    int n = 0;
+    char *p = s;
+    while (*p) {
+        char *start = p;
+        int quoted = 0;
+        if (*p == '\'') { quoted = 1; start++; p++; }
+        while (*p) {
+            if (*p == '\'') { *p = '\0'; p++; break; }
+            if (*p == ',' && !quoted) break;
+            p++;
+        }
+        if (*p == ',') { *p = '\0'; p++; }
+        if (n < cap) out[n] = start;
+        n++;
+    }
+    return n;
+}
+
 
 int dlp_csv_load(dl_db *db, const dl_schema *s, const char *rel,
                  const char *path, char *errbuf, size_t errcap) {
@@ -265,6 +331,81 @@ int dlp_csv_load(dl_db *db, const dl_schema *s, const char *rel,
                                   "%s:%d:%d: column '%s' expects Signed, got \"%s\"",
                                   path, lineno, i + 1,
                                   dlp_schema_colname(s, rel, j), cell); }
+                break;
+            }
+            case DLT_LIST: {
+                /* A List<elem> cell is a bracketed, QUOTED field "[e1,e2,...]".
+                   csv_split keeps a quoted field (with embedded commas) as ONE
+                   field and strips the surrounding quote pair, leaving "[...]".
+                   Strip the brackets and sub-split on ',' honoring a '...'
+                   element quote, then build the cons chain TAIL-FIRST. */
+                char *cell = fields[i];
+                unquote(cell);
+                size_t ln = strlen(cell);
+                if (ln < 2 || cell[0] != '[' || cell[ln - 1] != ']') {
+                    free(line); fclose(f);
+                    return seterr(errbuf, errcap,
+                                  "%s:%d:%d: column '%s' expects List \"[...]\", got \"%s\"",
+                                  path, lineno, i + 1,
+                                  dlp_schema_colname(s, rel, j), cell);
+                }
+                cell[ln - 1] = '\0';
+                cell++;                             /* skip '[' */
+                char *elems[DLP_LIST_MAX_ELEMS];
+                int ne = list_split(cell, elems, DLP_LIST_MAX_ELEMS);
+                if (ne > DLP_LIST_MAX_ELEMS) {
+                    free(line); fclose(f);
+                    return seterr(errbuf, errcap,
+                                  "%s:%d:%d: column '%s' List has too many elements (cap %d)",
+                                  path, lineno, i + 1,
+                                  dlp_schema_colname(s, rel, j), DLP_LIST_MAX_ELEMS);
+                }
+                uint32_t acc = TERM_NIL;
+                for (int e = ne - 1; e >= 0; e--) {
+                    char *ecell = trim_ws(elems[e]);
+                    uint32_t ev;
+                    if (coerce_elem_cell(db, r->cols[j].elem, ecell, &ev) != 0) {
+                        free(line); fclose(f);
+                        return seterr(errbuf, errcap,
+                                      "%s:%d:%d: column '%s' List element %d is not coercible to its element type",
+                                      path, lineno, i + 1,
+                                      dlp_schema_colname(s, rel, j), e);
+                    }
+                    acc = dl_term_cons(db, ev, acc);
+                }
+                cols[j] = acc;
+                break;
+            }
+            case DLT_OPTIONAL: {
+                /* Optional<elem>: empty cell -> None; else coerce elem. */
+                char *cell = trim_ws(fields[i]);
+                if (!*cell) { cols[j] = DLP_OPT_NONE; break; }
+                if (coerce_elem_cell(db, r->cols[j].elem, cell, &cols[j]) != 0) {
+                    free(line); fclose(f);
+                    return seterr(errbuf, errcap,
+                                  "%s:%d:%d: column '%s' Optional element is not coercible to its element type",
+                                  path, lineno, i + 1,
+                                  dlp_schema_colname(s, rel, j));
+                }
+                break;
+            }
+            case DLT_ENUM: {
+                /* Enum: cell must be one of evalues (case-sensitive), then
+                   interned (same as Text). */
+                char *cell = trim_ws(fields[i]);
+                unquote(cell);
+                int ok = 0;
+                for (int k = 0; k < r->cols[j].n_evalues; k++)
+                    if (strcmp(cell, r->cols[j].evalues[k]) == 0) { ok = 1; break; }
+                if (!ok) { free(line); fclose(f);
+                    return seterr(errbuf, errcap,
+                                  "%s:%d:%d: column '%s' expects an Enum value from {%s}, got \"%s\"",
+                                  path, lineno, i + 1,
+                                  dlp_schema_colname(s, rel, j),
+                                  r->cols[j].n_evalues > 0 ? r->cols[j].evalues[0] : "",
+                                  cell); }
+                if (db) cols[j] = dl_intern_str(db, cell);
+                else cols[j] = 0;
                 break;
             }
             default: { free(line); fclose(f);

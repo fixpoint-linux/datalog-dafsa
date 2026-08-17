@@ -38,8 +38,8 @@ static void walk_error(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt); vsnprintf(walk_err, sizeof walk_err, fmt, ap); va_end(ap);
 }
 
-/* Human-readable column-type name (Stage A: flat scalars; List/Optional/Enum
- * render bare names until Stage B). */
+/* Human-readable column-type name (List/Optional render one level of elem;
+ * Enum renders bare). */
 void dlp_coltype_name(const dl_colspec *c, char *out, size_t cap) {
     if (!c) { snprintf(out, cap, "?"); return; }
     switch (c->tag) {
@@ -50,8 +50,16 @@ void dlp_coltype_name(const dl_colspec *c, char *out, size_t cap) {
     case DLT_DATE:      snprintf(out, cap, "Date");      return;
     case DLT_TIMESTAMP: snprintf(out, cap, "Timestamp"); return;
     case DLT_SIGNED:    snprintf(out, cap, "Signed");    return;
-    case DLT_LIST:      snprintf(out, cap, "List");      return;
-    case DLT_OPTIONAL:  snprintf(out, cap, "Optional");  return;
+    case DLT_LIST:
+    case DLT_OPTIONAL: {
+        dl_colspec ec;
+        memset(&ec, 0, sizeof ec);
+        ec.tag = c->elem;
+        char en[32];
+        dlp_coltype_name(&ec, en, sizeof en);
+        snprintf(out, cap, "%s<%s>", c->tag == DLT_LIST ? "List" : "Optional", en);
+        return;
+    }
     case DLT_ENUM:      snprintf(out, cap, "Enum");      return;
     default:            snprintf(out, cap, "?");         return;
     }
@@ -89,27 +97,63 @@ static int list_elems(Term *t, Term **elems, int cap) {
     return n;
 }
 
-/* Read a column's payload-union literal (< Text = {=} > / < Natural = {=} >)
+/* Read a column's payload-union literal (< Text = {=} > / < Natural = {=} >
+   / < List = { elem = < Text = {=} > } > / < Enum = { values = [...] } >)
    and map its selected alternative to a dl_colspec.  The 5 flat scalars map
-   to their DLT_* tag (payload {=} ignored); List/Optional/Enum are deferred to
-   Stage B ('unknown column type'). */
+   to their DLT_* tag (payload {=} ignored).  List/Optional read the payload
+   record's 'elem' (which must resolve to a FLAT scalar — nested parameterized
+   element types are rejected in v1); Enum reads 'values' into evalues[]. */
 static bool walk_coltype(dl_colspec *out, Term *t) {
     if (t->tag != TmUnionLit) { walk_error("column type must be a union literal"); return false; }
     const char *label = NULL;
+    Term *value = NULL;
     for (int i = 0; i < t->as.uni.n; i++)
-        if (t->as.uni.fs[i].value) { label = t->as.uni.fs[i].label; break; }
+        if (t->as.uni.fs[i].value) { label = t->as.uni.fs[i].label; value = t->as.uni.fs[i].value; break; }
     if (!label) { walk_error("column type union has no selected alternative"); return false; }
-    dl_coltype tag = 0;
-    if      (!strcmp(label, "Natural"))   tag = DLT_NATURAL;
-    else if (!strcmp(label, "Text"))      tag = DLT_TEXT;
-    else if (!strcmp(label, "Bool"))      tag = DLT_BOOL;
-    else if (!strcmp(label, "Char"))      tag = DLT_CHAR;
-    else if (!strcmp(label, "Date"))      tag = DLT_DATE;
-    else if (!strcmp(label, "Timestamp")) tag = DLT_TIMESTAMP;
-    else if (!strcmp(label, "Signed"))    tag = DLT_SIGNED;
+
+    dl_colspec c;
+    memset(&c, 0, sizeof c);
+
+    if      (!strcmp(label, "Natural"))   c.tag = DLT_NATURAL;
+    else if (!strcmp(label, "Text"))      c.tag = DLT_TEXT;
+    else if (!strcmp(label, "Bool"))      c.tag = DLT_BOOL;
+    else if (!strcmp(label, "Char"))      c.tag = DLT_CHAR;
+    else if (!strcmp(label, "Date"))      c.tag = DLT_DATE;
+    else if (!strcmp(label, "Timestamp")) c.tag = DLT_TIMESTAMP;
+    else if (!strcmp(label, "Signed"))    c.tag = DLT_SIGNED;
+    else if (!strcmp(label, "List") || !strcmp(label, "Optional")) {
+        /* The selected alternative's fs[i].value is the payload RECORD
+           literal; read its 'elem' field and recurse. */
+        Term *elem = rec_get(value, "elem");
+        if (!elem) { walk_error("column type '%s' is missing its 'elem' field", label); return false; }
+        dl_colspec ec;
+        if (!walk_coltype(&ec, elem)) return false;
+        if (ec.tag == DLT_LIST || ec.tag == DLT_OPTIONAL || ec.tag == DLT_ENUM) {
+            walk_error("nested parameterized element type not supported (v1)");
+            return false;
+        }
+        c.tag = !strcmp(label, "List") ? DLT_LIST : DLT_OPTIONAL;
+        c.elem = ec.tag;
+    }
+    else if (!strcmp(label, "Enum")) {
+        Term *vals = rec_get(value, "values");
+        if (!vals) { walk_error("column type 'Enum' is missing its 'values' field"); return false; }
+        static Term *elems[DL_ENUM_MAX_VALUES + 1];
+        int n = list_elems(vals, elems, DL_ENUM_MAX_VALUES + 1);
+        if (n < 0) return false;
+        if (n == 0) { walk_error("Enum must have at least one value"); return false; }
+        if (n > DL_ENUM_MAX_VALUES) {
+            walk_error("Enum has more than %d values", DL_ENUM_MAX_VALUES);
+            return false;
+        }
+        c.tag = DLT_ENUM;
+        c.n_evalues = (uint8_t)n;
+        for (int k = 0; k < n; k++)
+            if (!text_flat(elems[k], c.evalues[k], DL_ENUM_VALUE_MAX)) return false;
+    }
     else { walk_error("unknown column type '%s'", label); return false; }
-    memset(out, 0, sizeof *out);
-    out->tag = tag;
+
+    *out = c;
     return true;
 }
 

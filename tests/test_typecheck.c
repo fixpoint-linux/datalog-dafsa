@@ -241,16 +241,130 @@ static void test_reserved_builtin_head(void)
         FAIL("reserved builtin head not rejected");
 }
 
-static void test_list_builtin_v1(void)
+/* ─── Stage B: List/Optional/Enum column type rules ───────────────────── */
+
+/* Schema with List/Optional/Enum columns + scalar-typed output columns. */
+static void build_param_schema(dl_schema *s)
+{
+    memset(s, 0, sizeof(*s));
+    {
+        dl_colspec c[] = { {.tag=DLT_LIST, .elem=DLT_TEXT} };   /* List<Text> */
+        assert(dl_schema_add(s, "taglist", 1, c, 0) == 0);
+    }
+    {
+        dl_colspec c[] = { {.tag=DLT_TEXT} };
+        assert(dl_schema_add(s, "str1", 1, c, 0) == 0);
+    }
+    {
+        dl_colspec c[] = { {.tag=DLT_LIST, .elem=DLT_TEXT} };
+        assert(dl_schema_add(s, "out_list", 1, c, 0) == 0);
+    }
+    {
+        dl_colspec c[] = { {.tag=DLT_TEXT} };
+        assert(dl_schema_add(s, "out_text", 1, c, 0) == 0);
+    }
+    {
+        dl_colspec c[] = { {.tag=DLT_NATURAL} };
+        assert(dl_schema_add(s, "out_nat", 1, c, 0) == 0);
+    }
+    {
+        dl_colspec c[] = { {.tag=DLT_OPTIONAL, .elem=DLT_TEXT} };
+        assert(dl_schema_add(s, "maybe", 1, c, 0) == 0);
+    }
+    {
+        dl_colspec c[] = { {.tag=DLT_OPTIONAL, .elem=DLT_TEXT} };
+        assert(dl_schema_add(s, "out_opt", 1, c, 0) == 0);
+    }
+    {
+        dl_colspec c[] = { {.tag=DLT_ENUM, .n_evalues=3,
+                            .evalues={{"red"},{"green"},{"blue"}}} };
+        assert(dl_schema_add(s, "color", 1, c, 0) == 0);
+    }
+    {
+        dl_colspec c[] = { {.tag=DLT_ENUM, .n_evalues=3,
+                            .evalues={{"red"},{"green"},{"blue"}}} };
+        assert(dl_schema_add(s, "color_out", 1, c, 0) == 0);
+    }
+}
+
+static void test_list_builtins(void)
 {
     dl_schema s;
-    build_schema(&s);
+    build_param_schema(&s);
 
-    TEST("reject: list builtin not yet typed (member)");
-    if (check_prog(&s, "bar(X,Y) :- edge(X,Y), member(X, L).\n", "not yet") == -1)
-        PASS();
-    else
-        FAIL("member not rejected as untyped");
+    TEST("accept: member(X,L) L typed List<Text> -> X Text");
+    if (check_prog(&s, "out_text(X) :- taglist(L), member(X, L).\n", NULL) == 0)
+        PASS(); else FAIL("member over typed List rejected");
+
+    TEST("accept: car(R,L) L List<Text> -> R Text");
+    if (check_prog(&s, "out_text(R) :- taglist(L), car(R, L).\n", NULL) == 0)
+        PASS(); else FAIL("car over List rejected");
+
+    TEST("accept: cdr(R,L) L List<Text> -> R List<Text>");
+    if (check_prog(&s, "out_list(R) :- taglist(L), cdr(R, L).\n", NULL) == 0)
+        PASS(); else FAIL("cdr over List rejected");
+
+    TEST("accept: cons(R,H,T) T List<Text> -> H Text, R List<Text>");
+    if (check_prog(&s, "out_list(R) :- taglist(T), cons(R, H, T).\n", NULL) == 0)
+        PASS(); else FAIL("cons over List rejected");
+
+    TEST("accept: append(R,A,B) A List<Text> -> B,R List<Text>");
+    if (check_prog(&s, "out_list(R) :- taglist(A), append(R, A, B).\n", NULL) == 0)
+        PASS(); else FAIL("append over List rejected");
+
+    TEST("reject: member with untyped list operand (cannot infer)");
+    if (check_prog(&s, "out_text(X) :- member(X, L).\n", "cannot infer") == -1)
+        PASS(); else FAIL("member untyped not rejected");
+
+    TEST("reject: member elem type conflict (X Natural vs List<Text> elem)");
+    if (check_prog(&s, "out_nat(X) :- taglist(L), member(X, L).\n",
+                   "but Natural") == -1)
+        PASS(); else FAIL("member elem conflict not rejected");
+
+    TEST("reject: TOK_LIST literal in list builtin");
+    if (check_prog(&s, "out_list(R) :- cons(R, x, [a,b]).\n", "list literal") == -1)
+        PASS(); else FAIL("list literal in cons not rejected");
+
+    TEST("reject: range still not typed");
+    if (check_prog(&s, "out_nat(A) :- str1(X), range(A, str1, X, Y).\n",
+                   "range") == -1)
+        PASS(); else FAIL("range unexpectedly typed");
+}
+
+static void test_optional_enum(void)
+{
+    dl_schema s;
+    build_param_schema(&s);
+
+    /* Optional<Text> in =/relational (equality/print type). */
+    TEST("accept: Optional<Text> column round-trips through a var");
+    if (check_prog(&s, "out_opt(X) :- maybe(X).\n", NULL) == 0)
+        PASS(); else FAIL("Optional relational rejected");
+
+    TEST("accept: Optional<Text> = Optional<Text>");
+    if (check_prog(&s, "out_opt(X) :- maybe(Y), X = Y.\n", NULL) == 0)
+        PASS(); else FAIL("Optional equality rejected");
+
+    TEST("reject: Optional not orderable (<)");
+    if (check_prog(&s, "out_nat(A) :- maybe(X), maybe(Y), X < Y.\n", NULL) == -1)
+        PASS(); else FAIL("Optional ordering not rejected");
+
+    /* Enum in =/relational. */
+    TEST("accept: Enum column round-trips through a var");
+    if (check_prog(&s, "color_out(X) :- color(X).\n", NULL) == 0)
+        PASS(); else FAIL("Enum relational rejected");
+
+    TEST("accept: Enum = Enum");
+    if (check_prog(&s, "color_out(X) :- color(Y), X = Y.\n", NULL) == 0)
+        PASS(); else FAIL("Enum equality rejected");
+
+    TEST("reject: Enum not orderable (<)");
+    if (check_prog(&s, "out_nat(A) :- color(X), color(Y), X < Y.\n", NULL) == -1)
+        PASS(); else FAIL("Enum ordering not rejected");
+
+    TEST("accept: List = List (structural equality via handle)");
+    if (check_prog(&s, "out_list(X) :- taglist(Y), X = Y.\n", NULL) == 0)
+        PASS(); else FAIL("List equality rejected");
 }
 
 static void test_inequality(void)
@@ -431,12 +545,13 @@ int main(void)
     test_int_const_in_text_col();
     test_arity_mismatch();
     test_reserved_builtin_head();
-    test_list_builtin_v1();
     test_inequality();
     test_list_assignment_v1();
     test_untyped_var();
     test_scalar_ordering();
     test_scalar_minmax();
+    test_list_builtins();
+    test_optional_enum();
 
     printf("\n%d tests, %d failed\n", tests_run, tests_failed);
     return tests_failed ? 1 : 0;

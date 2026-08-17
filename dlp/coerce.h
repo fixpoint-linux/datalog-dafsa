@@ -22,6 +22,13 @@
 #include <stdio.h>
 #include <string.h>
 
+/* Optional<elem> None sentinel: a raw u32 0xFFFFFFFF (the same sentinel as the
+ * VM's UNBOUND).  Some(elem) is the element's raw u32 encoding. */
+#define DLP_OPT_NONE 0xFFFFFFFFu
+
+/* Max elements in a List column value (CSV cell / JSON array; v1 fixed cap). */
+#define DLP_LIST_MAX_ELEMS 64
+
 /* True when `s` equals `lit` case-insensitively (ASCII). */
 static inline int str_ieq(const char *s, const char *lit)
 {

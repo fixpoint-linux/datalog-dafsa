@@ -31,6 +31,7 @@
  */
 #include "dlp.h"
 #include "dl.h"
+#include "termstore.h"
 #include "json.h"
 #include "coerce.h"
 
@@ -45,6 +46,52 @@ static int seterr(char *errbuf, size_t errcap, const char *fmt, ...) {
     vsnprintf(errbuf, errcap, fmt, ap);
     va_end(ap);
     return -1;
+}
+
+/* Coerce ONE List/Optional ELEMENT Json value against `elem` (a flat scalar
+ * type).  Needs db only for DLT_TEXT interning (dry-run: 0).  0 on success,
+ * -1 on a type/coercion mismatch. */
+static int coerce_elem_json(dl_db *db, dl_coltype elem, Json *v, uint32_t *out) {
+    switch (elem) {
+    case DLT_NATURAL:
+    case DLT_TIMESTAMP: {
+        if (!v || v->type != J_NUM) return -1;
+        double d = v->as.num;
+        if (!(d >= 0.0) || d > 4294967295.0 || d != (double)(unsigned long)d) return -1;
+        *out = (uint32_t)(unsigned long)d;
+        return 0;
+    }
+    case DLT_TEXT: {
+        const char *str = json_str(v);
+        if (!str) return -1;
+        if (db) *out = dl_intern_str(db, str);
+        else *out = 0;
+        return 0;
+    }
+    case DLT_BOOL:
+        if (!v || v->type != J_BOOL) return -1;
+        *out = v->as.b ? 1u : 0u;
+        return 0;
+    case DLT_CHAR: {
+        const char *str = json_str(v);
+        if (!str) return -1;
+        return parse_char(str, strlen(str), out);
+    }
+    case DLT_DATE: {
+        const char *str = json_str(v);
+        if (!str) return -1;
+        return parse_date(str, out);
+    }
+    case DLT_SIGNED: {
+        if (!v || v->type != J_NUM) return -1;
+        double d = v->as.num;
+        if (d != (double)(long long)d || d < -2147483648.0 || d > 2147483647.0) return -1;
+        *out = zigzag((int32_t)(long long)d);
+        return 0;
+    }
+    default:
+        return -1;
+    }
 }
 
 /* Append "[a, b, c]" of `names` (n of them) to a buffer. */
@@ -273,6 +320,71 @@ int dlp_json_load(dl_db *db, const dl_schema *s, const char *rel,
                 }
                 int32_t sv = (int32_t)(long long)d;
                 cols[j] = zigzag(sv);
+                break;
+            }
+            case DLT_LIST: {
+                /* List<elem>: a JSON array; build the cons chain TAIL-FIRST. */
+                if (!v || v->type != J_ARR) {
+                    seterr(errbuf, errcap,
+                           "%s: element %d: column '%s' expects List (JSON array), got %s",
+                           path, e, cname, type_name(v));
+                    goto done;
+                }
+                int ne = v->as.arr.n;
+                if (ne > DLP_LIST_MAX_ELEMS) {
+                    seterr(errbuf, errcap,
+                           "%s: element %d: column '%s' List has too many elements (cap %d)",
+                           path, e, cname, DLP_LIST_MAX_ELEMS);
+                    goto done;
+                }
+                uint32_t acc = TERM_NIL;
+                for (int ei = ne - 1; ei >= 0; ei--) {
+                    uint32_t ev;
+                    if (coerce_elem_json(db, r->cols[j].elem, v->as.arr.items[ei], &ev) != 0) {
+                        seterr(errbuf, errcap,
+                               "%s: element %d: column '%s' List element %d is not coercible to its element type",
+                               path, e, cname, ei);
+                        goto done;
+                    }
+                    acc = dl_term_cons(db, ev, acc);
+                }
+                cols[j] = acc;
+                break;
+            }
+            case DLT_OPTIONAL: {
+                /* Optional<elem>: JSON null -> None; else coerce elem.  A
+                   MISSING key is already an error (enforced above). */
+                if (v && v->type == J_NULL) { cols[j] = DLP_OPT_NONE; break; }
+                if (coerce_elem_json(db, r->cols[j].elem, v, &cols[j]) != 0) {
+                    seterr(errbuf, errcap,
+                           "%s: element %d: column '%s' Optional element is not coercible to its element type",
+                           path, e, cname);
+                    goto done;
+                }
+                break;
+            }
+            case DLT_ENUM: {
+                /* Enum: a JSON string that must be one of evalues, interned. */
+                const char *estr = json_str(v);
+                if (!estr) {
+                    seterr(errbuf, errcap,
+                           "%s: element %d: column '%s' expects Enum (string), got %s",
+                           path, e, cname, type_name(v));
+                    goto done;
+                }
+                int ok = 0;
+                for (int k = 0; k < r->cols[j].n_evalues; k++)
+                    if (strcmp(estr, r->cols[j].evalues[k]) == 0) { ok = 1; break; }
+                if (!ok) {
+                    seterr(errbuf, errcap,
+                           "%s: element %d: column '%s' expects an Enum value from {%s}, got \"%s\"",
+                           path, e, cname,
+                           r->cols[j].n_evalues > 0 ? r->cols[j].evalues[0] : "",
+                           estr);
+                    goto done;
+                }
+                if (db) cols[j] = dl_intern_str(db, estr);
+                else cols[j] = 0;
                 break;
             }
             default: {

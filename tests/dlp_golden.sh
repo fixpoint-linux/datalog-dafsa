@@ -15,8 +15,9 @@ write() { # write <path> <content>  (path is absolute; $WORK already applied by 
   printf '%s' "$2" > "$1"
 }
 
-SCHEMA='-- golden schema (empty-record-payload DSL)
-let ColumnType = < Natural : {=} | Text : {=} >
+SCHEMA='-- golden schema (empty-record-payload DSL, expanded for Stage B)
+let Elem = < Natural : {=} | Text : {=} | Bool : {=} | Char : {=} | Date : {=} | Timestamp : {=} | Signed : {=} >
+in let ColumnType = < Natural : {=} | Text : {=} | Bool : {=} | Char : {=} | Date : {=} | Timestamp : {=} | Signed : {=} | List : { elem : Elem } | Optional : { elem : Elem } | Enum : { values : List Text } >
 in let Column = { name : Text, type : ColumnType }
 in let Relation = { name : Text, columns : List Column }
 in let Schema = { relations : List Relation }
@@ -34,7 +35,14 @@ in { relations =
                      { name = "dst", type = < Text = {=} > } ] },
        { name = "tc",
          columns = [ { name = "src", type = < Text = {=} > },
-                     { name = "dst", type = < Text = {=} > } ] } ] } : Schema
+                     { name = "dst", type = < Text = {=} > } ] },
+       { name = "catalog",
+         columns = [ { name = "tags", type = < List = { elem = < Text = {=} > } > },
+                     { name = "nick", type = < Optional = { elem = < Text = {=} > } > },
+                     { name = "color", type = < Enum = { values = [ "red", "green", "blue" ] } > } ] },
+       { name = "membertag", columns = [ { name = "x", type = < Text = {=} > } ] },
+       { name = "cartag",    columns = [ { name = "x", type = < Text = {=} > } ] },
+       { name = "constag",   columns = [ { name = "r", type = < List = { elem = < Text = {=} > } > } ] } ] } : Schema
 '
 
 NODE='id
@@ -57,9 +65,23 @@ bob,10
 dave,2
 '
 
+# List<Text> cells are bracketed + QUOTED; Optional empty cell -> None; the
+# third row tests a quoted-field-with-embedded-comma kept as ONE field AND a
+# single-quoted Text element protecting its comma.
+CATALOG='tags,nick,color
+"[alice,bob,carol]",alice,red
+"[x]",,green
+"['"'"'a,b'"'"',c]",bob,blue
+'
+
 GOOD_RULES='tc(A,B):-edge(A,B).
 tc(A,C):-edge(A,B),tc(B,C).
 light_edge(A,B):-edge(A,B),weight(A,W),W<10.
+'
+# List builtin rules (Stage B typecheck): member/car/cons over catalog.tags.
+LIST_RULES='membertag(X):-catalog(T,N,C),member(X,T).
+cartag(X):-catalog(T,N,C),car(X,T).
+constag(R):-catalog(T,N,C),cons(R,newtag,T).
 '
 
 BUG_RULES='tc(A,W):-weight(A,W).
@@ -71,7 +93,9 @@ write "$P/schema.dhall" "$SCHEMA"
 write "$P/data/node.csv"   "$NODE"
 write "$P/data/edge.csv"   "$EDGE"
 write "$P/data/weight.csv" "$WEIGHT"
+write "$P/data/catalog.csv" "$CATALOG"
 write "$P/rules/reach.datalog" "$GOOD_RULES"
+write "$P/rules/lists.datalog" "$LIST_RULES"
 
 "$DLP" check "$P" ; ok "check (good)"
 "$DLP" build "$P" ; ok "build (good)"
@@ -84,6 +108,44 @@ if [ "$(printf '%s' "$OUT" | sort)" != "$(printf '%s' "$EXPECTED")" ]; then
     fail "query tc(alice,X) = $(printf '%s' "$OUT" | sort); expected: $EXPECTED"
 fi
 ok "query 'tc(alice,X)' == bob/carol/dave (sorted)"
+
+# List<Text> column from a CSV bracketed+quoted cell, Optional Some(nick=alice),
+# and a Text list element containing a comma round-trip through the printer.
+OUT="$(printf '%s' "$("$DLP" query "$P" 'catalog(X,Y,red)')" | sort)"
+EXPECTED='[alice, bob, carol] alice'
+if [ "$OUT" != "$EXPECTED" ]; then
+    fail "query catalog(X,Y,red) = [$OUT]; expected: $EXPECTED"
+fi
+ok "List/Optional round-trip from CSV (catalog(X,Y,red))"
+
+# member/car/cons list-builtin rules typechecked and evaluate.  catalog's 3
+# List cells contribute {alice,bob,carol} U {x} U {"a,b",c}.
+OUT="$(printf '%s' "$("$DLP" query "$P" 'membertag(X)')" | sort)"
+EXPECTED='a,b
+alice
+bob
+c
+carol
+x'
+if [ "$OUT" != "$EXPECTED" ]; then
+    fail "query membertag(X) = [$OUT]; expected: $EXPECTED"
+fi
+ok "member over List<Text> typechecks + evaluates"
+
+# --- Enum out-of-set rejected by check + build (CSV) ---
+E1="$WORK/badenum"
+write "$E1/schema.dhall" "$SCHEMA"
+write "$E1/data/catalog.csv" 'tags,nick,color
+"[a]",alice,purple
+'
+write "$E1/rules/reach.datalog" "$GOOD_RULES"
+if "$DLP" check "$E1" 2>"$WORK/badenum-check.err"; then
+    fail "check (Enum out-of-set) unexpectedly succeeded"
+fi
+if ! grep -q 'Enum' "$WORK/badenum-check.err"; then
+    fail "check (Enum out-of-set) stderr lacks 'Enum': $(cat "$WORK/badenum-check.err")"
+fi
+ok "check (Enum out-of-set) rejected (stderr has 'Enum')"
 
 # --- bug project ---
 Q="$WORK/bug"
@@ -116,22 +178,44 @@ ok "build (bug) rejected (stderr has 'Natural')"
 NODE_J='[{"id":"alice"},{"id":"bob"},{"id":"carol"},{"id":"dave"}]'
 EDGE_J='[{"src":"alice","dst":"bob"},{"src":"bob","dst":"carol"},{"src":"alice","dst":"dave"},{"src":"dave","dst":"carol"}]'
 WEIGHT_J='[{"src":"alice","w":3},{"src":"bob","w":10},{"src":"dave","w":2}]'
+# List<Text> = JSON array; Optional null -> None; Enum valid.
+CATALOG_J='[{"tags":["a","b"],"nick":null,"color":"red"},{"tags":[],"nick":"zoe","color":"green"}]'
 
 J="$WORK/jgood"
 write "$J/schema.dhall" "$SCHEMA"
 write "$J/data/node.json"   "$NODE_J"
 write "$J/data/edge.json"   "$EDGE_J"
 write "$J/data/weight.json" "$WEIGHT_J"
+write "$J/data/catalog.json" "$CATALOG_J"
 write "$J/rules/reach.datalog" "$GOOD_RULES"
+write "$J/rules/lists.datalog" "$LIST_RULES"
 
 "$DLP" check "$J" ; ok "check (JSON good)"
 "$DLP" build "$J" ; ok "build (JSON good)"
 
-JOUT="$("$DLP" query "$J" 'tc(alice,X)')"
-if [ "$(printf '%s' "$JOUT" | sort)" != "$(printf '%s' "$EXPECTED")" ]; then
-    fail "JSON query tc(alice,X) = $(printf '%s' "$JOUT" | sort); expected: $EXPECTED"
+JOUT="$(printf '%s' "$("$DLP" query "$J" 'tc(alice,X)')" | sort)"
+if [ "$JOUT" != 'bob
+carol
+dave' ]; then
+    fail "JSON query tc(alice,X) = $JOUT; expected bob/carol/dave"
 fi
 ok "JSON query 'tc(alice,X)' == bob/carol/dave (sorted)"
+
+# List from a JSON array + Optional null (None) round-trip: bound color=green
+# gives the empty list [] and Some(nick=zoe).
+JOUT="$(printf '%s' "$("$DLP" query "$J" 'catalog(X,Y,green)')" | sort)"
+if [ "$JOUT" != '[] zoe' ]; then
+    fail "JSON query catalog(X,Y,green) = [$JOUT]; expected '[] zoe'"
+fi
+ok "List from JSON array + Optional null (catalog(X,Y,green))"
+
+# Optional empty CSV cell -> None: catalog CSV row 2 has empty nick.  Query
+# bound color=green over the CSV project (P) must show None (null) for nick.
+P_OUT="$(printf '%s' "$("$DLP" query "$P" 'catalog(X,Y,green)')" | sort)"
+if [ "$P_OUT" != '[x] null' ]; then
+    fail "CSV query catalog(X,Y,green) = [$P_OUT]; expected '[x] null'"
+fi
+ok "Optional empty CSV cell -> None (catalog(X,Y,green) over CSV)"
 
 # --- JSON negative typing (S6) ---
 # A JSON string in a Natural column must be rejected (check + build).

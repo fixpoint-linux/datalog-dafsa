@@ -154,8 +154,17 @@ static dl_colspec scalar(dl_coltype tag)
     return c;
 }
 
-/* Full human-readable type name (Stage A: flat scalars; List/Optional/Enum
- * render bare names until Stage B adds their parameter rendering). */
+/* A List colspec wrapping a flat element type (v1 elements are flat scalars). */
+static dl_colspec list_of(dl_coltype elem)
+{
+    dl_colspec c;
+    memset(&c, 0, sizeof c);
+    c.tag = DLT_LIST;
+    c.elem = elem;
+    return c;
+}
+
+/* Full human-readable type name (flat scalars + List<elem>/Optional<elem>/Enum). */
 static void type_name(const dl_colspec *c, char *out, size_t cap)
 {
     if (!c) { snprintf(out, cap, "?"); return; }
@@ -167,8 +176,16 @@ static void type_name(const dl_colspec *c, char *out, size_t cap)
     case DLT_DATE:      snprintf(out, cap, "Date");      return;
     case DLT_TIMESTAMP: snprintf(out, cap, "Timestamp"); return;
     case DLT_SIGNED:    snprintf(out, cap, "Signed");    return;
-    case DLT_LIST:      snprintf(out, cap, "List");      return;
-    case DLT_OPTIONAL:  snprintf(out, cap, "Optional");  return;
+    case DLT_LIST:
+    case DLT_OPTIONAL: {
+        /* elem is a flat scalar (v1) — its name is short, so a small buffer
+           is enough and the combined "<...>" always fits the caller's cap. */
+        dl_colspec ec = scalar(c->elem);
+        char en[16];
+        type_name(&ec, en, sizeof en);
+        snprintf(out, cap, "%s<%s>", c->tag == DLT_LIST ? "List" : "Optional", en);
+        return;
+    }
     case DLT_ENUM:      snprintf(out, cap, "Enum");      return;
     default:            snprintf(out, cap, "?");         return;
     }
@@ -496,6 +513,148 @@ static int type_str_filter(vtab *t, const atom *a, char *errbuf, size_t errcap)
     return 0;
 }
 
+/* ─── v2 list builtins (member/car/cdr/cons/append) ─────────────────────── */
+
+/* Resolve the LIST OPERAND of a list builtin to its List colspec.
+ *
+ *   - a TOK_LIST literal          -> v1 reject (lists as literals not typed);
+ *   - a variable typed as a List  -> write its List colspec into *lt, return 1;
+ *   - an UNTYPED variable         -> 'cannot infer list element type' (v1
+ *                                    left-to-right boundary — a two-pass /
+ *                                    unification typechecker removes this);
+ *   - a variable typed non-List   -> type-conflict diagnostic;
+ *   - any other token             -> 'requires a List operand'.
+ * Returns 1 on success, 0 on failure (message written to errbuf). */
+static int resolve_list_operand(vtab *t, const token *tok, const char *pred,
+                                dl_colspec *lt, char *errbuf, size_t errcap)
+{
+    if (!tok) {
+        set_err(errbuf, errcap, "<input>: '%s' is missing its list operand\n",
+                pred);
+        return 0;
+    }
+    if (tok->kind == TOK_LIST) {
+        set_err(errbuf, errcap,
+                "<input>:%d:%d: list literal in '%s' is not supported in v1 "
+                "(lists are not yet typed as literals)\n",
+                tok->line, tok->col, pred);
+        return 0;
+    }
+    if (tok->kind == TOK_VAR) {
+        varent *e = vtab_find(t, tok->text);
+        if (e && e->type.tag == DLT_LIST) { *lt = e->type; return 1; }
+        if (e && e->type.tag == 0) {
+            set_err(errbuf, errcap,
+                    "<input>:%d:%d: cannot infer list element type in '%s' "
+                    "(list operand '%s' is untyped)\n",
+                    tok->line, tok->col, pred, tok->text);
+            return 0;
+        }
+        if (e) {
+            char wbuf[64];
+            type_name(&e->type, wbuf, sizeof wbuf);
+            set_err(errbuf, errcap,
+                    "<input>:%d:%d: '%s' in '%s' is %s, not a List\n",
+                    tok->line, tok->col, tok->text, pred, wbuf);
+            return 0;
+        }
+        set_err(errbuf, errcap,
+                "<input>:%d:%d: cannot infer list element type in '%s' "
+                "(list operand '%s' is untyped)\n",
+                tok->line, tok->col, pred, tok->text);
+        return 0;
+    }
+    set_err(errbuf, errcap,
+            "<input>:%d:%d: '%s' requires a List operand, got a constant\n",
+            tok->line, tok->col, pred);
+    return 0;
+}
+
+/* Type one v2 list builtin.  Arg order matches the compiler's
+ * list_builtin_valid: car/cdr have 2 args (Result, List); cons/append have 3
+ * (Result, Head/A, Tail/B); member is a filter (X, List).  args[0] is always
+ * a result/member variable.
+ *
+ *   member(X,L):  L typed List<elem> -> X := elem.
+ *   car(R,L):     L List<elem>       -> R := elem.
+ *   cdr(R,L):     L List<elem>       -> R := List<elem>.
+ *   cons(R,H,T):  T List<elem>       -> H := elem, R := List<elem>.
+ *   append(R,A,B):A List<elem>       -> B := List<elem>, R := List<elem>.
+ */
+static int type_list_builtin(vtab *t, const atom *a, char *errbuf, size_t errcap)
+{
+    const char *p = a->pred;
+    dl_colspec lt;
+
+    if (strcmp(p, "member") == 0) {
+        const token *mx = a->nargs > 0 ? a->args[0] : NULL;
+        const token *ml = a->nargs > 1 ? a->args[1] : NULL;
+        if (!resolve_list_operand(t, ml, p, &lt, errbuf, errcap)) return -1;
+        dl_colspec ec = scalar(lt.elem);
+        if (mx && mx->kind == TOK_VAR)
+            return constrain_var(t, mx->text, ec, mx->line, mx->col, p,
+                                 errbuf, errcap);
+        return 0;
+    }
+
+    if (strcmp(p, "car") == 0) {
+        const token *res = a->nargs > 0 ? a->args[0] : NULL;
+        const token *ll  = a->nargs > 1 ? a->args[1] : NULL;
+        if (!resolve_list_operand(t, ll, p, &lt, errbuf, errcap)) return -1;
+        dl_colspec ec = scalar(lt.elem);
+        if (res && res->kind == TOK_VAR)
+            return constrain_var(t, res->text, ec, res->line, res->col, p,
+                                 errbuf, errcap);
+        return 0;
+    }
+
+    if (strcmp(p, "cdr") == 0) {
+        const token *res = a->nargs > 0 ? a->args[0] : NULL;
+        const token *ll  = a->nargs > 1 ? a->args[1] : NULL;
+        if (!resolve_list_operand(t, ll, p, &lt, errbuf, errcap)) return -1;
+        dl_colspec lr = list_of(lt.elem);
+        if (res && res->kind == TOK_VAR)
+            return constrain_var(t, res->text, lr, res->line, res->col, p,
+                                 errbuf, errcap);
+        return 0;
+    }
+
+    if (strcmp(p, "cons") == 0) {
+        const token *res = a->nargs > 0 ? a->args[0] : NULL;
+        const token *hh  = a->nargs > 1 ? a->args[1] : NULL;
+        const token *tt  = a->nargs > 2 ? a->args[2] : NULL;
+        if (!resolve_list_operand(t, tt, p, &lt, errbuf, errcap)) return -1;
+        dl_colspec ec = scalar(lt.elem);
+        dl_colspec lr = list_of(lt.elem);
+        if (hh && hh->kind == TOK_VAR)
+            if (constrain_var(t, hh->text, ec, hh->line, hh->col, p,
+                              errbuf, errcap) != 0)
+                return -1;
+        if (res && res->kind == TOK_VAR)
+            return constrain_var(t, res->text, lr, res->line, res->col, p,
+                                 errbuf, errcap);
+        return 0;
+    }
+
+    /* append */
+    {
+        const token *res = a->nargs > 0 ? a->args[0] : NULL;
+        const token *aa  = a->nargs > 1 ? a->args[1] : NULL;
+        const token *bb  = a->nargs > 2 ? a->args[2] : NULL;
+        if (!resolve_list_operand(t, aa, p, &lt, errbuf, errcap)) return -1;
+        dl_colspec lr = list_of(lt.elem);
+        if (bb && bb->kind == TOK_VAR)
+            if (constrain_var(t, bb->text, lr, bb->line, bb->col, p,
+                              errbuf, errcap) != 0)
+                return -1;
+        if (res && res->kind == TOK_VAR)
+            return constrain_var(t, res->text, lr, res->line, res->col, p,
+                                 errbuf, errcap);
+        return 0;
+    }
+    return 0;
+}
+
 int type_expr(vtab *t, const expr *e, int line, int col, const char *site,
               char *errbuf, size_t errcap)
 {
@@ -585,11 +744,14 @@ static int type_body_atom(vtab *t, const dl_schema *schema, const atom *a,
     if (is_str_filter_pred(a->pred))
         return type_str_filter(t, a, errbuf, errcap);
 
-    /* list + range builtins: v1 reject (not yet typed) */
-    if (is_list_builtin_pred(a->pred) || is_range_builtin_pred(a->pred)) {
+    /* v2 list builtins: real typing.  range stays a v1 reject (it is
+       Natural-only and trivially typeable later). */
+    if (is_list_builtin_pred(a->pred))
+        return type_list_builtin(t, a, errbuf, errcap);
+    if (is_range_builtin_pred(a->pred)) {
         set_err(errbuf, errcap,
-                "<input>:%d:%d: '%s' is a list/range builtin and is not yet "
-                "typed in v1\n", a->line, a->col, a->pred);
+                "<input>:%d:%d: 'range' is a range builtin and is not yet "
+                "typed in v1\n", a->line, a->col);
         return -1;
     }
 
