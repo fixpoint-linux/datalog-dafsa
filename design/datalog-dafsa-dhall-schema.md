@@ -255,24 +255,29 @@ is OK (interned as text "123" — CSV is untyped).
 
 ## Extensibility (minimal universe, no redesign)
 
-Three growth axes:
+**Status: implemented (2026-08-17).** Both growth axes landed. The type universe is
+now: flat scalars `Natural`, `Text`, `Bool`, `Char`, `Date` (yyyymmdd), `Timestamp`
+(epoch), `Signed` (i32 zigzag) — all raw u32 — plus the parameterized `List` /
+`Optional` (of a flat element type) and `Enum` (fixed value set). `dl_reldef.cols[]`
+upgraded from `dl_coltype` to a `{tag, param}` `dl_colspec` struct; the schema union
+was widened (backward-compatible — schema files only construct values, never
+case-analyze). The encoding contract stays: one switch in the coercion path.
 
-1. **New flat scalar fitting u32** (`Timestamp`=epoch, `Date`=yyyymmdd, `Char`,
-   `Signed` via zigzag): add a `DLT_*` enum value + schema union alternative
-   `< Timestamp : {=} >` (union *widening* is safe here — schema files only
-   construct values, never case-analyze) + one coercion case + let it into
-   comparisons (total u32 order).
-2. **Parameterized types** (`List`/`Optional`/`Enum`): the union payload earns its
-   keep — `< List : { elem : < Natural : {=} | Text : {=} > } >`,
-   `< Enum : { values : List Text } >`. Internally `dl_reldef.cols[]` upgrades from
-   `dl_coltype` to a small `{tag, param}` struct — a contained refactor of new code
-   only (`schema.h` + typecheck switch are the only consumers). The typechecker
-   grows real unification only when a polymorphic builtin arrives (e.g. a
-   lexicographic Text compare op); until then v1's no-polymorphism simplification
-   holds.
-3. **Per-column constraints** (min/max, regex) ride the same payload.
+Design notes that drove it:
 
-The encoding contract stays: one switch in the coercion path, one row in docs.
+1. **Flat scalars fitting u32** (`Timestamp`=epoch, `Date`=yyyymmdd, `Char`, `Bool`,
+   `Signed` via zigzag): each is a `DLT_*` enum value + a schema union alternative
+   `< Timestamp : {=} >` + one coercion case. Signed is deliberately **not** in the
+   ordering-comparison/min/max rules: zigzag's u32 order is not numeric order (the
+   VM would silently mis-order); it is an equality/print type.
+2. **Parameterized types** (`List`/`Optional`/`Enum`): the union payload earned its
+   keep — `< List : { elem : Elem } >`, `< Optional : { elem : Elem } >`,
+   `< Enum : { values : List Text } >`. The typechecker's list builtins
+   (member/car/cdr/cons/append) now type with the element type; v1 keeps a
+   left-to-right element-type inference boundary (an untyped list operand is
+   'cannot infer list element type') and rejects `range` + TOK_LIST literals.
+3. **Per-column constraints** (min/max, regex) ride the same payload — still future
+   work.
 
 ## Build / toolchain
 

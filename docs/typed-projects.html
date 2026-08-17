@@ -54,8 +54,9 @@
     <li><strong>Closed world</strong> — every relation is declared in
       <code>schema.dhall</code>; using an undeclared relation is an error that
       points at the schema.</li>
-    <li><strong>Per-column types</strong> — <code>Natural</code> (raw u32) vs
-      <code>Text</code> (interned symbol), checked on both data and rules.</li>
+    <li><strong>Per-column types</strong> — eight built-in types spanning flat
+      scalars (Natural, Text, Bool, Char, Date, Timestamp, Signed) and
+      parameterized (List, Optional, Enum), checked on both data and rules.</li>
     <li><strong>Rule typechecking</strong> — every rule is checked for
       <em>occurrence consistency</em> (a variable can&rsquo;t be Natural in one
       atom and Text in another), with <code>file:line:col</code> diagnostics.</li>
@@ -81,18 +82,41 @@
   <p>
     The schema is <strong>Dhall-as-data</strong>: self-contained <code>let</code>s
     with a final <code>: Schema</code> annotation. Each relation declares its
-    name, arity, and per-column type. The type universe is minimal today —
-    <code>Natural</code> (raw u32) and <code>Text</code> (interned symbol) — and
-    designed to grow. The column-type union uses an <em>empty-record payload</em>
-    to tag the type:
+    name, arity, and per-column type. The column-type union spans <strong>flat
+    scalars</strong> (all raw u32: <code>Natural</code>, <code>Text</code> /
+    interned symbol, <code>Bool</code>, <code>Char</code>, <code>Date</code>
+    =yyyymmdd, <code>Timestamp</code> =epoch seconds, <code>Signed</code> =i32
+    zigzag) and <strong>parameterized</strong> types (<code>List</code> /
+    <code>Optional</code> of a flat element type, and <code>Enum</code> with a
+    fixed value set). The column-type union uses an <em>empty-record payload</em>
+    to tag a flat type, and a payload record to carry a parameterized type&rsquo;s
+    element type / value set:
   </p>
-  <pre class="code"><code>let ColumnType = &lt; Natural : {=} | Text : {=} &gt;
+  <pre class="code"><code>let Elem = &lt; Natural : {=} | Text : {=} | Bool : {=} | Char : {=} |
+             Date : {=} | Timestamp : {=} | Signed : {=} &gt;
+let ColumnType = &lt; Natural : {=} | Text : {=} | Bool : {=} | Char : {=} |
+                   Date : {=} | Timestamp : {=} | Signed : {=} |
+                   List : { elem : Elem } | Optional : { elem : Elem } |
+                   Enum : { values : List Text } &gt;
 let Column = { name : Text, type : ColumnType }
 let Relation = { name : Text, columns : List Column }
 let Schema = { relations : List Relation }
 in { relations =
-     [ { name = "node", columns = [ { name = "id", type = &lt; Text = {=} &gt; } ] } ]
+     [ { name = "node", columns = [ { name = "id", type = &lt; Text = {=} &gt; },
+                                    { name = "tags", type = &lt; List = { elem = &lt; Text = {=} &gt; } &gt; },
+                                    { name = "nick", type = &lt; Optional = { elem = &lt; Text = {=} &gt; } &gt; },
+                                    { name = "color", type = &lt; Enum = { values = [ "red", "green" ] } &gt; } ] } ]
    } : Schema</code></pre>
+  <p>
+    Coercion is per-type on load: <code>Text</code>/<code>Enum</code> interned,
+    <code>Natural</code> <code>^[0-9]+$</code> &le; 4294967295, <code>Bool</code>
+    <code>true/false/0/1</code> (CSV) or a JSON boolean, <code>Char</code> one
+    Unicode codepoint, <code>Date</code> <code>yyyy-mm-dd</code>,
+    <code>Timestamp</code> unix-seconds integer, <code>Signed</code> signed i32,
+    <code>List</code> a JSON array or a bracketed quoted CSV cell
+    <code>[a,b,c]</code>, <code>Optional</code> JSON <code>null</code> or an empty
+    CSV cell.
+  </p>
   <p>
     Arity is the length of <code>columns</code> (1&ndash;8, enforced by the tool).
     Relations that appear as rule <em>heads</em> are IDB (derived); loading data

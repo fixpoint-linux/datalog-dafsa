@@ -87,15 +87,26 @@ mydb/
 ```
 
 **Schema DSL (empty-record-payload union).** The schema is Dhall-as-data — self-contained
-`let`s with a `: Schema` annotation. `Natural` = raw u32, `Text` = interned symbol:
+`let`s with a `: Schema` annotation. The column-type universe spans **flat scalars**
+(raw u32: `Natural`, `Text`/interned symbol, `Bool`, `Char`, `Date`=yyyymmdd,
+`Timestamp`=epoch seconds, `Signed`=i32 zigzag) and **parameterized** types
+(`List`/`Optional` of a flat element type, and `Enum` with a fixed value set):
 
 ```dhall
-let ColumnType = < Natural : {=} | Text : {=} >
+let Elem = < Natural : {=} | Text : {=} | Bool : {=} | Char : {=} |
+             Date : {=} | Timestamp : {=} | Signed : {=} >
+let ColumnType = < Natural : {=} | Text : {=} | Bool : {=} | Char : {=} |
+                   Date : {=} | Timestamp : {=} | Signed : {=} |
+                   List : { elem : Elem } | Optional : { elem : Elem } |
+                   Enum : { values : List Text } >
 let Column = { name : Text, type : ColumnType }
 let Relation = { name : Text, columns : List Column }
 let Schema = { relations : List Relation }
 in { relations =
-     [ { name = "node", columns = [ { name = "id", type = < Text = {=} > } ] } ]
+     [ { name = "node", columns = [ { name = "id", type = < Text = {=} > },
+                                    { name = "tags", type = < List = { elem = < Text = {=} > } > },
+                                    { name = "nick", type = < Optional = { elem = < Text = {=} > } > },
+                                    { name = "color", type = < Enum = { values = [ "red", "green" ] } > } ] } ]
    } : Schema
 ```
 
@@ -109,10 +120,13 @@ in { relations =
   publish a snapshot into `.build/`.
 - `dlp query [dir] 'goal'` — build then evaluate a goal and print the rows.
 
-**Data validation.** CSV headers are matched to columns **by name** in any order:
-`Text` accepts any cell verbatim, `Natural` must be `^[0-9]+$` ≤ `4294967295`. JSON
-is strict: array of objects, keys = column names, JSON number → `Natural`, JSON
-string → `Text`; any other value type is an error.
+**Data validation.** CSV headers are matched to columns **by name** in any order;
+JSON is strict (array of objects, keys = column names). Coercion is per-type:
+`Text`/`Enum` verbatim or interned, `Natural` = `^[0-9]+$` ≤ `4294967295`,
+`Bool` = `true/false/0/1` (CSV) or JSON boolean, `Char` = one Unicode codepoint,
+`Date` = `yyyy-mm-dd`, `Timestamp` = unix-seconds integer, `Signed` = signed i32,
+`List` = JSON array or a bracketed quoted CSV cell `[a,b,c]`, `Optional` = JSON
+`null` or empty CSV cell. Mismatched data is rejected with `path:line:col`.
 
 **Closed world.** Rules are closed-world: relations appearing as rule heads are
 IDB, so loading data into a rule-defined relation is an error, and undeclared
