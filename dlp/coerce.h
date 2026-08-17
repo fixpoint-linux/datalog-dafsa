@@ -18,9 +18,12 @@
 #ifndef DLP_COERCE_H
 #define DLP_COERCE_H
 
+#include "regexwalk.h"
+
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include "schema.h"
 
 /* Optional<elem> None sentinel: a raw u32 0xFFFFFFFF (the same sentinel as the
  * VM's UNBOUND).  Some(elem) is the element's raw u32 encoding. */
@@ -185,6 +188,46 @@ static inline int parse_signed(const char *s, uint32_t *out)
 static inline int32_t dezigzag(uint32_t z)
 {
     return (int32_t)((z >> 1) ^ (uint32_t)-(int32_t)(z & 1));
+}
+
+/* Enforce a column's min/max on a coerced raw u32.  Returns 1 in-range,
+ * 0 out-of-range.  Natural/Timestamp/Date/Char compare (int64_t)raw;
+ * Signed compares (int64_t)dezigzag(raw); everything else is unconstrained. */
+static inline int check_minmax(const dl_colspec *c, uint32_t raw)
+{
+    int64_t v;
+    if (!c) return 1;
+    switch (c->tag) {
+    case DLT_NATURAL:
+    case DLT_TIMESTAMP:
+    case DLT_DATE:
+    case DLT_CHAR:
+        v = (int64_t)raw;
+        break;
+    case DLT_SIGNED:
+        v = (int64_t)dezigzag(raw);
+        break;
+    default:
+        return 1;
+    }
+    if (c->has_min && v < c->min) return 0;
+    if (c->has_max && v > c->max) return 0;
+    return 1;
+}
+
+/* Full-key match of NUL-terminated s against a compiled regex DFA (implicit
+ * ^...$ anchored).  Walk from state 0; trans[s*256+byte] == 0xFFFFFFFF is the
+ * dead state; accept at the end. */
+static inline int regex_dfa_full_match(const regex_dfa *dfa, const char *s)
+{
+    uint32_t st = 0;
+    const unsigned char *p;
+    if (!dfa || !s || dfa->n_states == 0) return 0;
+    for (p = (const unsigned char *)s; *p; p++) {
+        st = dfa->trans[(size_t)st * 256 + *p];
+        if (st == 0xFFFFFFFFu) return 0; /* DFA_DEAD */
+    }
+    return dfa->accept[st] != 0;
 }
 
 /* UTF-8-encode one codepoint into buf (must hold >= 4 bytes); returns bytes

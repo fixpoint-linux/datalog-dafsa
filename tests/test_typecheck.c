@@ -260,6 +260,10 @@ static void build_param_schema(dl_schema *s)
         assert(dl_schema_add(s, "out_list", 1, c, 0) == 0);
     }
     {
+        dl_colspec c[] = { {.tag=DLT_LIST, .elem=DLT_NATURAL} };
+        assert(dl_schema_add(s, "natlist", 1, c, 0) == 0);
+    }
+    {
         dl_colspec c[] = { {.tag=DLT_TEXT} };
         assert(dl_schema_add(s, "out_text", 1, c, 0) == 0);
     }
@@ -321,9 +325,94 @@ static void test_list_builtins(void)
                    "but Natural") == -1)
         PASS(); else FAIL("member elem conflict not rejected");
 
-    TEST("reject: TOK_LIST literal in list builtin");
-    if (check_prog(&s, "out_list(R) :- cons(R, x, [a,b]).\n", "list literal") == -1)
-        PASS(); else FAIL("list literal in cons not rejected");
+    TEST("accept: TOK_LIST literal as cons tail (flip of old negative)");
+    if (check_prog(&s, "out_list(R) :- cons(R, x, [a,b]).\n", NULL) == 0)
+        PASS(); else FAIL("cons list-literal tail not accepted");
+}
+
+/* TOK_LIST literals: element typing + element inference (finish-dlp Item 1). */
+static void test_list_literals(void)
+{
+    dl_schema s;
+    build_param_schema(&s);
+
+    /* member over an all-constant literal infers List<Text> -> X Text. */
+    TEST("accept: member(X,[a,b]) infers Text elem");
+    if (check_prog(&s, "out_text(X) :- member(X,[a,b]).\n", NULL) == 0)
+        PASS(); else FAIL("member list-literal inference rejected");
+
+    /* car/cdr over an all-constant literal. */
+    TEST("accept: car(R,[a,b]) R Text");
+    if (check_prog(&s, "out_text(R) :- car(R,[a,b]).\n", NULL) == 0)
+        PASS(); else FAIL("car list-literal inference rejected");
+
+    TEST("accept: cdr(R,[a,b]) R List<Text>");
+    if (check_prog(&s, "out_list(R) :- cdr(R,[a,b]).\n", NULL) == 0)
+        PASS(); else FAIL("cdr list-literal inference rejected");
+
+    /* append with an all-constant second list literal typed against elem. */
+    TEST("accept: append(R,T,[b,c]) T List<Text>, [b,c] List<Text>");
+    if (check_prog(&s, "out_list(R) :- taglist(T), append(R,T,[b,c]).\n", NULL) == 0)
+        PASS(); else FAIL("append list-literal B rejected");
+
+    /* cons head as a flat constant checked against the tail's inferred elem. */
+    TEST("accept: cons(R,x,[a,b]) head constant matches Text elem");
+    if (check_prog(&s, "out_list(R) :- cons(R,x,[a,b]).\n", NULL) == 0)
+        PASS(); else FAIL("cons constant head rejected");
+
+    /* Relational-arg pattern: [X] in a List<Text> column binds X := Text. */
+    TEST("accept: taglist([X]) pattern binds X Text");
+    if (check_prog(&s, "out_text(X) :- taglist([X]).\n", NULL) == 0)
+        PASS(); else FAIL("taglist([X]) pattern rejected");
+
+    /* List literal as a fact/head in a List column. */
+    TEST("accept: taglist([a,b]) list literal in List column");
+    if (check_prog(&s, "taglist([a,b]).\n", NULL) == 0)
+        PASS(); else FAIL("list literal fact rejected");
+
+    /* natlist is List<Natural>: an all-int literal is allowed there. */
+    TEST("accept: natlist([1,2]) list literal in List<Natural> column");
+    if (check_prog(&s, "natlist([1,2]).\n", NULL) == 0)
+        PASS(); else FAIL("natlist int literal rejected");
+
+    /* NEGATIVE: empty literal cannot infer an element type in a builtin. */
+    TEST("reject: member(X,[]) cannot infer empty list");
+    if (check_prog(&s, "out_text(X) :- member(X,[]).\n", "cannot infer") == -1)
+        PASS(); else FAIL("member empty literal not rejected");
+
+    TEST("reject: car(R,[]) cannot infer empty list");
+    if (check_prog(&s, "out_list(R) :- car(R,[]).\n", "cannot infer") == -1)
+        PASS(); else FAIL("car empty literal not rejected");
+
+    /* NEGATIVE: mixed element types in one literal. */
+    TEST("reject: member(X,[a,1]) mixed element types");
+    if (check_prog(&s, "out_text(X) :- member(X,[a,1]).\n", "mixed") == -1)
+        PASS(); else FAIL("mixed-element literal not rejected");
+
+    /* NEGATIVE: list literal in a non-List column. */
+    TEST("reject: out_nat([1,2]) list literal in a Natural column");
+    if (check_prog(&s, "out_nat([1,2]).\n", "list literal in a Natural") == -1)
+        PASS(); else FAIL("list literal in Natural column not rejected");
+
+    /* NEGATIVE: nested list literal element rejected. */
+    TEST("reject: member(X,[[a],[b]]) nested list literal");
+    if (check_prog(&s, "out_text(X) :- member(X,[[a],[b]]).\n", "nested") == -1)
+        PASS(); else FAIL("nested list literal not rejected");
+
+    /* NEGATIVE: list pattern as a builtin operand rejected. */
+    TEST("reject: member(X,[a|Xs]) pattern not allowed as operand");
+    if (check_prog(&s, "out_text(X) :- member(X,[a|Xs]).\n", "pattern") == -1)
+        PASS(); else FAIL("list pattern operand not rejected");
+
+    /* NEGATIVE: literal element type conflicts with column elem (Text elem in
+     * a List<Natural> column). */
+    TEST("reject: int element in a List<Text> column");
+    if (check_prog(&s, "taglist([a,1]).\n", "int element in a List<Text>") == -1)
+        PASS(); else FAIL("int element in List<Text> column not rejected");
+
+    TEST("reject: symbol element in a List<Natural> column");
+    if (check_prog(&s, "natlist([1,a]).\n", "list literal 'a' element in a List<Natural>") == -1)
+        PASS(); else FAIL("symbol element in List<Natural> column not rejected");
 }
 
 /* range(X, Rel, Lo, Hi): X/Lo/Hi Natural, Rel a relation NAME (no value type).
@@ -637,6 +726,7 @@ int main(void)
     test_scalar_ordering();
     test_scalar_minmax();
     test_list_builtins();
+    test_list_literals();
     test_range();
     test_optional_enum();
     test_srcname();

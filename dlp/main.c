@@ -52,6 +52,17 @@ static int cmd_schema(const char *dir) {
             char tn[64];
             dlp_coltype_name(&r->cols[j], tn, sizeof tn);
             printf("%s%s", j ? "," : "", tn);
+            /* Compact constraint suffix (finish-dlp Item 2): Natural[1..150],
+             * Signed[-10..+10], Text~regex.  dlp_coltype_name stays bare. */
+            const dl_colspec *c = &r->cols[j];
+            if (c->has_min && c->has_max)
+                printf("[%lld..%lld]", (long long)c->min, (long long)c->max);
+            else if (c->has_min)
+                printf("[%lld..]", (long long)c->min);
+            else if (c->has_max)
+                printf("[..%lld]", (long long)c->max);
+            if (c->has_regex)
+                printf("~%s", c->regex);
         }
         printf("\n");
     }

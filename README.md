@@ -86,29 +86,45 @@ mydb/
   .build/           # dlp-owned: build snapshot, schema.json echo
 ```
 
-**Schema DSL (empty-record-payload union).** The schema is Dhall-as-data — self-contained
+**Schema DSL (Optional-payload union).** The schema is Dhall-as-data — self-contained
 `let`s with a `: Schema` annotation. The column-type universe spans **flat scalars**
 (raw u32: `Natural`, `Text`/interned symbol, `Bool`, `Char`, `Date`=yyyymmdd,
 `Timestamp`=epoch seconds, `Signed`=i32 zigzag) and **parameterized** types
-(`List`/`Optional` of a flat element type, and `Enum` with a fixed value set):
+(`List`/`Optional` of a flat element type, and `Enum` with a fixed value set).
+Flat scalars carry an **Optional constraint payload** — `min`/`max` for
+Natural/Char/Date/Timestamp/Signed and a `regex` for Text — enforced at data
+load (`dlp check`/`build`); `None` (or `{=}` for Bool and List/Optional
+elements) means unconstrained:
 
 ```dhall
 let Elem = < Natural : {=} | Text : {=} | Bool : {=} | Char : {=} |
              Date : {=} | Timestamp : {=} | Signed : {=} >
-let ColumnType = < Natural : {=} | Text : {=} | Bool : {=} | Char : {=} |
-                   Date : {=} | Timestamp : {=} | Signed : {=} |
+let NC = { min = None Natural, max = None Natural }   -- unconstrained Natural
+let TC = { regex = None Text }                         -- unconstrained Text
+let SC = { min = None Integer, max = None Integer }    -- unconstrained Signed
+let ColumnType = < Natural : { min : Optional Natural, max : Optional Natural } |
+                   Text : { regex : Optional Text } | Bool : {=} |
+                   Char : { min : Optional Natural, max : Optional Natural } |
+                   Date : { min : Optional Natural, max : Optional Natural } |
+                   Timestamp : { min : Optional Natural, max : Optional Natural } |
+                   Signed : { min : Optional Integer, max : Optional Integer } |
                    List : { elem : Elem } | Optional : { elem : Elem } |
                    Enum : { values : List Text } >
 let Column = { name : Text, type : ColumnType }
 let Relation = { name : Text, columns : List Column }
 let Schema = { relations : List Relation }
 in { relations =
-     [ { name = "node", columns = [ { name = "id", type = < Text = {=} > },
+     [ { name = "node", columns = [ { name = "id", type = < Text = TC > },
+                                    { name = "score", type = < Natural = { min = Some 0, max = Some 150 } > },
                                     { name = "tags", type = < List = { elem = < Text = {=} > } > },
                                     { name = "nick", type = < Optional = { elem = < Text = {=} > } > },
                                     { name = "color", type = < Enum = { values = [ "red", "green" ] } > } ] } ]
    } : Schema
 ```
+
+Notes: `Signed` bounds are `Integer` literals and REQUIRE an explicit sign —
+`Some -10` / `Some +10` (bare `10` is `Natural`). Text `regex` uses full-key
+matching (implicit `^...$` — do not write `^`/`$` anchors).
 
 **Commands** (the new `dlp` binary; the low-level `dl` CLI is unchanged):
 

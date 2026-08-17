@@ -24,21 +24,29 @@
 
 #define TEMPLATE_SCHEMA \
     "-- dlp project schema (worked example)\n" \
-    "-- empty-record-payload union DSL: < Natural = {=} > | < Text = {=} > | ...\n" \
+    "-- Optional-payload union DSL: scalars carry Optional constraint payloads\n" \
+    "--   < Natural = { min = None Natural, max = None Natural } > etc.\n" \
     "-- List/Optional/Enum carry a payload record: < List = { elem = < Text = {=} > } >\n" \
+    "-- Constrain a scalar: < Natural = { min = Some 0, max = Some 150 } >\n" \
+    "--                     < Signed = { min = Some -10, max = Some +10 } >  (explicit sign)\n" \
+    "--                     < Text = { regex = Some \"[A-Z]+\" } >  (full-key match; no ^...$ anchors)\n" \
+    "-- Helper bindings cut the verbosity of unconstrained scalars.\n" \
     "let Elem = < Natural : {=} | Text : {=} | Bool : {=} | Char : {=} | Date : {=} | Timestamp : {=} | Signed : {=} >\n" \
-    "in let ColumnType = < Natural : {=} | Text : {=} | Bool : {=} | Char : {=} | Date : {=} | Timestamp : {=} | Signed : {=} | List : { elem : Elem } | Optional : { elem : Elem } | Enum : { values : List Text } >\n" \
+    "in let NC = { min = None Natural, max = None Natural }\n" \
+    "in let TC = { regex = None Text }\n" \
+    "in let SC = { min = None Integer, max = None Integer }\n" \
+    "in let ColumnType = < Natural : { min : Optional Natural, max : Optional Natural } | Text : { regex : Optional Text } | Bool : {=} | Char : { min : Optional Natural, max : Optional Natural } | Date : { min : Optional Natural, max : Optional Natural } | Timestamp : { min : Optional Natural, max : Optional Natural } | Signed : { min : Optional Integer, max : Optional Integer } | List : { elem : Elem } | Optional : { elem : Elem } | Enum : { values : List Text } >\n" \
     "in let Column = { name : Text, type : ColumnType }\n" \
     "in let Relation = { name : Text, columns : List Column }\n" \
     "in let Schema = { relations : List Relation }\n" \
     "in { relations =\n" \
     "     [ { name = \"node\",\n" \
-    "         columns = [ { name = \"id\", type = < Text = {=} > },\n" \
+    "         columns = [ { name = \"id\", type = < Text = TC > },\n" \
     "                     { name = \"active\", type = < Bool = {=} > },\n" \
-    "                     { name = \"born\", type = < Date = {=} > },\n" \
-    "                     { name = \"seen\", type = < Timestamp = {=} > },\n" \
-    "                     { name = \"initial\", type = < Char = {=} > },\n" \
-    "                     { name = \"delta\", type = < Signed = {=} > } ] },\n" \
+    "                     { name = \"born\", type = < Date = NC > },\n" \
+    "                     { name = \"seen\", type = < Timestamp = NC > },\n" \
+    "                     { name = \"initial\", type = < Char = NC > },\n" \
+    "                     { name = \"delta\", type = < Signed = SC > } ] },\n" \
     "       { name = \"catalog\",\n" \
     "         columns = [ { name = \"tags\", type = < List = { elem = < Text = {=} > } > },\n" \
     "                     { name = \"nick\", type = < Optional = { elem = < Text = {=} > } > },\n" \

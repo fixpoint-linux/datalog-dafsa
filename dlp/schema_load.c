@@ -97,6 +97,85 @@ static int list_elems(Term *t, Term **elems, int cap) {
     return n;
 }
 
+/* ─── Constraint-payload readers (finish-dlp Item 2) ───────────────────── */
+
+/* Read Some n / None _ for a Natural bound (must fit u32). */
+static bool read_opt_nat(Term *t, uint32_t *out, bool *present) {
+    if (!t) { walk_error("constraint field missing"); return false; }
+    if (t->tag == TmNone) { *present = false; return true; }
+    if (t->tag == TmSome && t->as.some.val && t->as.some.val->tag == TmConst) {
+        Const c = t->as.some.val->as.c;
+        uint64_t v;
+        bool ok = true;
+        if (c.kind != C_NAT) { walk_error("Natural bound expected"); return false; }
+        v = c.bnat ? bignat_to_u64(c.bnat, &ok) : c.nat;
+        if (!ok || v > 4294967295ULL) { walk_error("Natural bound out of u32 range"); return false; }
+        *out = (uint32_t)v;
+        *present = true;
+        return true;
+    }
+    walk_error("Natural bound expected");
+    return false;
+}
+
+/* Read Some n / None _ for an Integer bound (must fit i32). */
+static bool read_opt_int(Term *t, int32_t *out, bool *present) {
+    if (!t) { walk_error("constraint field missing"); return false; }
+    if (t->tag == TmNone) { *present = false; return true; }
+    if (t->tag == TmSome && t->as.some.val && t->as.some.val->tag == TmConst) {
+        Const c = t->as.some.val->as.c;
+        if (c.kind != C_INT) { walk_error("Integer bound expected"); return false; }
+        if (c.big || c.i64 < INT32_MIN || c.i64 > INT32_MAX) {
+            walk_error("Integer bound out of i32 range");
+            return false;
+        }
+        *out = (int32_t)c.i64;
+        *present = true;
+        return true;
+    }
+    walk_error("Integer bound expected");
+    return false;
+}
+
+/* Read Some s / None _ for a Text bound (regex). */
+static bool read_opt_text(Term *t, char *out, size_t cap, bool *present) {
+    if (!t) { walk_error("constraint field missing"); return false; }
+    if (t->tag == TmNone) { *present = false; return true; }
+    if (t->tag == TmSome && t->as.some.val) {
+        *present = true;
+        return text_flat(t->as.some.val, out, cap);
+    }
+    walk_error("Text bound expected");
+    return false;
+}
+
+/* Read min/max bounds from a scalar payload record into `c`.  Natural/Char/
+ * Date/Timestamp bounds are Natural (u32); Signed bounds are Integer (i32). */
+static bool read_minmax_bounds(dl_colspec *c, Term *value, bool is_signed) {
+    Term *mn = rec_get(value, "min");
+    Term *mx = rec_get(value, "max");
+    if (is_signed) {
+        int32_t lo = 0, hi = 0;
+        bool hlo = false, hhi = false;
+        if (!read_opt_int(mn, &lo, &hlo)) return false;
+        if (!read_opt_int(mx, &hi, &hhi)) return false;
+        if (hlo) { c->has_min = 1; c->min = (int64_t)lo; }
+        if (hhi) { c->has_max = 1; c->max = (int64_t)hi; }
+    } else {
+        uint32_t lo = 0, hi = 0;
+        bool hlo = false, hhi = false;
+        if (!read_opt_nat(mn, &lo, &hlo)) return false;
+        if (!read_opt_nat(mx, &hi, &hhi)) return false;
+        if (hlo) { c->has_min = 1; c->min = (int64_t)lo; }
+        if (hhi) { c->has_max = 1; c->max = (int64_t)hi; }
+    }
+    if (c->has_min && c->has_max && c->min > c->max) {
+        walk_error("min > max");
+        return false;
+    }
+    return true;
+}
+
 /* Read a column's payload-union literal (< Text = {=} > / < Natural = {=} >
    / < List = { elem = < Text = {=} > } > / < Enum = { values = [...] } >)
    and map its selected alternative to a dl_colspec.  The 5 flat scalars map
@@ -152,6 +231,31 @@ static bool walk_coltype(dl_colspec *out, Term *t) {
             if (!text_flat(elems[k], c.evalues[k], DL_ENUM_VALUE_MAX)) return false;
     }
     else { walk_error("unknown column type '%s'", label); return false; }
+
+    /* Per-column value constraints from the scalar payload record.  These are
+     * DATA-LOAD metadata (min/max/regex); they do NOT affect structural type
+     * equality (dl_colspec_eq ignores them).  Natural/Char/Date/Timestamp and
+     * Signed carry min/max; Text carries an optional regex; Bool has none.
+     * A payload with NO constraint fields (e.g. the `{=}` used as a List/
+     * Optional element payload) leaves all flags clear — unconstrained. */
+    if (c.tag == DLT_NATURAL || c.tag == DLT_CHAR || c.tag == DLT_DATE ||
+        c.tag == DLT_TIMESTAMP) {
+        if (rec_get(value, "min") || rec_get(value, "max")) {
+            if (!read_minmax_bounds(&c, value, false)) return false;
+        }
+    } else if (c.tag == DLT_SIGNED) {
+        if (rec_get(value, "min") || rec_get(value, "max")) {
+            if (!read_minmax_bounds(&c, value, true)) return false;
+        }
+    } else if (c.tag == DLT_TEXT) {
+        Term *rx = rec_get(value, "regex");
+        if (rx) {
+            bool present = false;
+            if (!read_opt_text(rx, c.regex,
+                               sizeof c.regex, &present)) return false;
+            c.has_regex = present ? 1 : 0;
+        }
+    }
 
     *out = c;
     return true;

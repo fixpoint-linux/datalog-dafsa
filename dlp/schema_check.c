@@ -16,24 +16,32 @@
 #include <string.h>
 
 static const char *WORKED =
-    "-- expanded worked-example schema (artifact-1)\n"
+    "-- expanded worked-example schema (finish-dlp artifact-3 DSL)\n"
+    "-- scalars carry Optional constraint payloads; NC/TC/SC cut verbosity\n"
     "let Elem = < Natural : {=} | Text : {=} | Bool : {=} | Char : {=} | Date : {=} | Timestamp : {=} | Signed : {=} >\n"
-    "in let ColumnType = < Natural : {=} | Text : {=} | Bool : {=} | Char : {=} | Date : {=} | Timestamp : {=} | Signed : {=} | List : { elem : Elem } | Optional : { elem : Elem } | Enum : { values : List Text } >\n"
+    "in let NC = { min = None Natural, max = None Natural }\n"
+    "in let TC = { regex = None Text }\n"
+    "in let SC = { min = None Integer, max = None Integer }\n"
+    "in let ColumnType = < Natural : { min : Optional Natural, max : Optional Natural } | Text : { regex : Optional Text } | Bool : {=} | Char : { min : Optional Natural, max : Optional Natural } | Date : { min : Optional Natural, max : Optional Natural } | Timestamp : { min : Optional Natural, max : Optional Natural } | Signed : { min : Optional Integer, max : Optional Integer } | List : { elem : Elem } | Optional : { elem : Elem } | Enum : { values : List Text } >\n"
     "in let Column = { name : Text, type : ColumnType }\n"
     "in let Relation = { name : Text, columns : List Column }\n"
     "in let Schema = { relations : List Relation }\n"
     "in { relations =\n"
     "     [ { name = \"node\",\n"
-    "         columns = [ { name = \"id\", type = < Text = {=} > },\n"
+    "         columns = [ { name = \"id\", type = < Text = TC > },\n"
     "                     { name = \"active\", type = < Bool = {=} > },\n"
-    "                     { name = \"born\", type = < Date = {=} > },\n"
-    "                     { name = \"seen\", type = < Timestamp = {=} > },\n"
-    "                     { name = \"initial\", type = < Char = {=} > },\n"
-    "                     { name = \"delta\", type = < Signed = {=} > } ] },\n"
+    "                     { name = \"born\", type = < Date = NC > },\n"
+    "                     { name = \"seen\", type = < Timestamp = NC > },\n"
+    "                     { name = \"initial\", type = < Char = NC > },\n"
+    "                     { name = \"delta\", type = < Signed = SC > } ] },\n"
     "       { name = \"catalog\",\n"
     "         columns = [ { name = \"tags\", type = < List = { elem = < Text = {=} > } > },\n"
     "                     { name = \"nick\", type = < Optional = { elem = < Text = {=} > } > },\n"
-    "                     { name = \"color\", type = < Enum = { values = [ \"red\", \"green\", \"blue\" ] } > } ] } ] } : Schema\n";
+    "                     { name = \"color\", type = < Enum = { values = [ \"red\", \"green\", \"blue\" ] } > } ] },\n"
+    "       { name = \"constrained\",\n"
+    "         columns = [ { name = \"score\", type = < Natural = { min = Some 0, max = Some 150 } > },\n"
+    "                     { name = \"temp\", type = < Signed = { min = Some -10, max = Some +10 } > },\n"
+    "                     { name = \"code\", type = < Text = { regex = Some \"^[A-Z][a-z]+$\" } > } ] } ] } : Schema\n";
 
 static int failures = 0;
 static int runs = 0;
@@ -68,7 +76,7 @@ int main(void) {
     expect(rc == 0, "dlp_schema_load returns 0");
     if (rc != 0) { printf("  errbuf: %s\n", errbuf); return 1; }
 
-    expect(s.n_rels == 2, "n_rels == 2");
+    expect(s.n_rels == 3, "n_rels == 3");
 
     const dl_reldef *node = find(&s, "node");
     expect(node != NULL, "node present");
@@ -105,6 +113,35 @@ int main(void) {
                    strcmp(cat->cols[2].evalues[2], "blue") == 0,
                    "catalog[2] Enum values {red,green,blue}");
         }
+    }
+
+    /* `constrained` exercises per-column constraints (finish-dlp Item 2). */
+    const dl_reldef *con = find(&s, "constrained");
+    expect(con != NULL, "constrained present");
+    if (con) {
+        expect(con->arity == 3, "constrained arity == 3");
+        expect(con->cols[0].tag == DLT_NATURAL &&
+               con->cols[0].has_min == 1 && con->cols[0].has_max == 1 &&
+               con->cols[0].min == 0 && con->cols[0].max == 150,
+               "constrained[0] Natural[0..150]");
+        expect(con->cols[1].tag == DLT_SIGNED &&
+               con->cols[1].has_min == 1 && con->cols[1].has_max == 1 &&
+               con->cols[1].min == -10 && con->cols[1].max == 10,
+               "constrained[1] Signed[-10..+10]");
+        expect(con->cols[2].tag == DLT_TEXT && con->cols[2].has_regex == 1 &&
+               strcmp(con->cols[2].regex, "^[A-Z][a-z]+$") == 0,
+               "constrained[2] Text~^[A-Z][a-z]+$");
+    }
+
+    /* dl_colspec_eq must IGNORE constraints: two same-type columns with
+       different ranges are structurally equal (occurrence-consistency). */
+    {
+        dl_colspec a, b;
+        memset(&a, 0, sizeof a); a.tag = DLT_NATURAL;
+        a.has_min = 1; a.min = 1; a.has_max = 1; a.max = 10;
+        memset(&b, 0, sizeof b); b.tag = DLT_NATURAL;
+        b.has_min = 1; b.min = 100; b.has_max = 1; b.max = 200;
+        expect(dl_colspec_eq(a, b), "dl_colspec_eq ignores min/max constraints");
     }
 
     /* Render the coltype names (dlp schema output path) — must show the

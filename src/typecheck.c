@@ -108,6 +108,12 @@ static int type_expr(vtab *t, const expr *e, int line, int col,
 static int resolve_list_operand(vtab *t, const token *tok, const char *pred,
                                 dl_colspec *lt, char *errbuf, size_t errcap);
 
+/* TOK_LIST literal typing helpers (defined after token_inherent_type). */
+static int type_list_literal_known(vtab *t, const token *lit, dl_coltype elem,
+                                   const char *site, char *errbuf, size_t errcap);
+static int infer_list_literal_elem(const token *lit, dl_coltype *elem,
+                                   char *errbuf, size_t errcap);
+
 static void vtab_free(vtab *t)
 {
     int i;
@@ -287,10 +293,15 @@ static int constrain_arg(vtab *t, const token *a, dl_colspec want,
         }
         return 0;
     case TOK_LIST:
-        set_err(errbuf, errcap,
-                "%s:%d:%d: lists are not yet in the typed universe\n",
-                g_srcname, a->line, a->col);
-        return -1;
+        if (want.tag != DLT_LIST) {
+            char wbuf[64];
+            type_name(&want, wbuf, sizeof wbuf);
+            set_err(errbuf, errcap,
+                    "%s:%d:%d: list literal in a %s column (%s)\n",
+                    g_srcname, a->line, a->col, wbuf, site);
+            return -1;
+        }
+        return type_list_literal_known(t, a, want.elem, site, errbuf, errcap);
     default:
         return 0;
     }
@@ -360,6 +371,128 @@ static dl_colspec token_inherent_type(const token *a)
     case TOK_STRING:   return scalar(DLT_TEXT);
     default:           return scalar(0); /* TOK_VAR / TOK_LIST / punctuation */
     }
+}
+
+/* ─── TOK_LIST literal typing (finish-dlp Item 1) ───────────────────────── */
+
+/* Inherent flat element type of a constant list element, or 0. */
+static dl_coltype elem_of_const(const token *a)
+{
+    if (!a) return 0;
+    if (a->kind == TOK_INT) return DLT_NATURAL;
+    if (a->kind == TOK_IDENT || a->kind == TOK_STRING) return DLT_TEXT;
+    return 0;
+}
+
+/* Check one list-literal element against flat scalar elem.  var binds elem;
+ * constant must int->Natural / ident|string->Text; nested list rejected. */
+static int constrain_list_elem(vtab *t, const token *e, dl_coltype elem,
+                               const char *site, char *errbuf, size_t errcap)
+{
+    char wbuf[32];
+    if (!e) return 0;
+    if (e->kind == TOK_VAR)
+        return constrain_var(t, e->text, scalar(elem), e->line, e->col,
+                             site, errbuf, errcap);
+    if (e->kind == TOK_INT) {
+        if (elem != DLT_NATURAL) {
+            dl_colspec wc = scalar(elem);
+            type_name(&wc, wbuf, sizeof wbuf);
+            set_err(errbuf, errcap,
+                    "%s:%d:%d: list literal int element in a List<%s> (%s)\n",
+                    g_srcname, e->line, e->col, wbuf, site);
+            return -1;
+        }
+        return 0;
+    }
+    if (e->kind == TOK_IDENT || e->kind == TOK_STRING) {
+        if (elem != DLT_TEXT) {
+            dl_colspec wc = scalar(elem);
+            type_name(&wc, wbuf, sizeof wbuf);
+            set_err(errbuf, errcap,
+                    "%s:%d:%d: list literal '%s' element in a List<%s> (%s)\n",
+                    g_srcname, e->line, e->col, e->text, wbuf, site);
+            return -1;
+        }
+        return 0;
+    }
+    if (e->kind == TOK_LIST) {
+        set_err(errbuf, errcap,
+                "%s:%d:%d: nested list literal element is not supported "
+                "(flat element type only) (%s)\n",
+                g_srcname, e->line, e->col, site);
+        return -1;
+    }
+    return 0;
+}
+
+/* Type a TOK_LIST against a KNOWN flat element type. */
+static int type_list_literal_known(vtab *t, const token *lit, dl_coltype elem,
+                                   const char *site, char *errbuf, size_t errcap)
+{
+    int i;
+    if (!lit || lit->kind != TOK_LIST) return 0;
+    for (i = 0; i < lit->nchildren; i++)
+        if (constrain_list_elem(t, lit->children[i], elem, site, errbuf, errcap) != 0)
+            return -1;
+    if (lit->tail && lit->tail->kind == TOK_VAR)
+        if (constrain_var(t, lit->tail->text, list_of(elem), lit->tail->line,
+                          lit->tail->col, site, errbuf, errcap) != 0)
+            return -1;
+    return 0;
+}
+
+/* Infer element type of an all-constant list literal (list-builtin operand). */
+static int infer_list_literal_elem(const token *lit, dl_coltype *elem,
+                                   char *errbuf, size_t errcap)
+{
+    int i;
+    dl_coltype got = 0;
+    if (!lit || lit->kind != TOK_LIST) return -1;
+    if (lit->tail) {
+        set_err(errbuf, errcap,
+                "%s:%d:%d: list pattern is not allowed as a list-builtin operand\n",
+                g_srcname, lit->line, lit->col);
+        return -1;
+    }
+    for (i = 0; i < lit->nchildren; i++) {
+        const token *e = lit->children[i];
+        dl_coltype ec;
+        if (e->kind == TOK_VAR) {
+            set_err(errbuf, errcap,
+                    "%s:%d:%d: list literal with a variable element is not "
+                    "allowed as a list-builtin operand (it is a pattern)\n",
+                    g_srcname, e->line, e->col);
+            return -1;
+        }
+        if (e->kind == TOK_LIST) {
+            set_err(errbuf, errcap,
+                    "%s:%d:%d: nested list literal element is not supported\n",
+                    g_srcname, e->line, e->col);
+            return -1;
+        }
+        ec = elem_of_const(e);
+        if (ec == 0) continue;
+        if (got == 0) got = ec;
+        else if (got != ec) {
+            set_err(errbuf, errcap,
+                    "%s:%d:%d: list literal has mixed element types "
+                    "(%s and %s)\n",
+                    g_srcname, lit->line, lit->col,
+                    got == DLT_NATURAL ? "Natural" : "Text",
+                    ec == DLT_NATURAL ? "Natural" : "Text");
+            return -1;
+        }
+    }
+    if (got == 0) {
+        set_err(errbuf, errcap,
+                "%s:%d:%d: cannot infer list element type from an empty list "
+                "literal [] (bind it via another operand or a column)\n",
+                g_srcname, lit->line, lit->col);
+        return -1;
+    }
+    *elem = got;
+    return 0;
 }
 
 /* List assignment `[X|Xs] = L` (the parser builds an '=' atom with nargs==2,
@@ -577,11 +710,10 @@ static int resolve_list_operand(vtab *t, const token *tok, const char *pred,
         return 0;
     }
     if (tok->kind == TOK_LIST) {
-        set_err(errbuf, errcap,
-                "%s:%d:%d: list literal in '%s' is not supported in v1 "
-                "(lists are not yet typed as literals)\n",
-                g_srcname, tok->line, tok->col, pred);
-        return 0;
+        dl_coltype elem;
+        if (infer_list_literal_elem(tok, &elem, errbuf, errcap) != 0) return 0;
+        *lt = list_of(elem);
+        return 1;
     }
     if (tok->kind == TOK_VAR) {
         varent *e = vtab_find(t, tok->text);
@@ -669,10 +801,20 @@ static int type_list_builtin(vtab *t, const atom *a, char *errbuf, size_t errcap
         if (!resolve_list_operand(t, tt, p, &lt, errbuf, errcap)) return -1;
         dl_colspec ec = scalar(lt.elem);
         dl_colspec lr = list_of(lt.elem);
-        if (hh && hh->kind == TOK_VAR)
-            if (constrain_var(t, hh->text, ec, hh->line, hh->col, p,
-                              errbuf, errcap) != 0)
+        if (hh) {
+            if (hh->kind == TOK_VAR) {
+                if (constrain_var(t, hh->text, ec, hh->line, hh->col, p,
+                                  errbuf, errcap) != 0)
+                    return -1;
+            } else if (hh->kind == TOK_LIST) {
+                set_err(errbuf, errcap,
+                        "%s:%d:%d: cons head must be a flat scalar, got a "
+                        "list literal\n", g_srcname, hh->line, hh->col);
                 return -1;
+            } else if (constrain_list_elem(t, hh, lt.elem, p, errbuf, errcap) != 0) {
+                return -1;
+            }
+        }
         if (res && res->kind == TOK_VAR)
             return constrain_var(t, res->text, lr, res->line, res->col, p,
                                  errbuf, errcap);
@@ -686,10 +828,21 @@ static int type_list_builtin(vtab *t, const atom *a, char *errbuf, size_t errcap
         const token *bb  = a->nargs > 2 ? a->args[2] : NULL;
         if (!resolve_list_operand(t, aa, p, &lt, errbuf, errcap)) return -1;
         dl_colspec lr = list_of(lt.elem);
-        if (bb && bb->kind == TOK_VAR)
-            if (constrain_var(t, bb->text, lr, bb->line, bb->col, p,
-                              errbuf, errcap) != 0)
+        if (bb) {
+            if (bb->kind == TOK_VAR) {
+                if (constrain_var(t, bb->text, lr, bb->line, bb->col, p,
+                                  errbuf, errcap) != 0)
+                    return -1;
+            } else if (bb->kind == TOK_LIST) {
+                if (type_list_literal_known(t, bb, lt.elem, p, errbuf, errcap) != 0)
+                    return -1;
+            } else {
+                set_err(errbuf, errcap,
+                        "%s:%d:%d: append's second operand must be a List, "
+                        "got a constant\n", g_srcname, bb->line, bb->col);
                 return -1;
+            }
+        }
         if (res && res->kind == TOK_VAR)
             return constrain_var(t, res->text, lr, res->line, res->col, p,
                                  errbuf, errcap);

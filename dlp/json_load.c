@@ -48,6 +48,12 @@ static int seterr(char *errbuf, size_t errcap, const char *fmt, ...) {
     return -1;
 }
 
+/* Free every compiled regex DFA in rdfs[0..n-1] (NULL-safe, idempotent). */
+static void free_rdfs(regex_dfa **rdfs, int n) {
+    for (int j = 0; j < n; j++)
+        if (rdfs[j]) { regex_dfa_free(rdfs[j]); rdfs[j] = NULL; }
+}
+
 /* Coerce ONE List/Optional ELEMENT Json value against `elem` (a flat scalar
  * type).  Needs db only for DLT_TEXT interning (dry-run: 0).  0 on success,
  * -1 on a type/coercion mismatch. */
@@ -155,10 +161,32 @@ int dlp_json_load(dl_db *db, const dl_schema *s, const char *rel,
     if (!src)
         return seterr(errbuf, errcap, "cannot open '%s'", path);
 
+    /* Compile each regex-constrained Text column's regex ONCE (regex_compile
+     * allocates ~49 MiB/DFA — never per-element).  rdfs[j] is non-NULL iff
+     * column j has a regex; freed on every return path via free_rdfs. */
+    regex_dfa *rdfs[DL_SCHEMA_MAX_ARITY];
+    memset(rdfs, 0, sizeof rdfs);
+    for (int j = 0; j < r->arity; j++) {
+        if (r->cols[j].tag == DLT_TEXT && r->cols[j].has_regex) {
+            rdfs[j] = regex_compile(r->cols[j].regex);
+            if (!rdfs[j] || rdfs[j]->errmsg || rdfs[j]->n_states == 0) {
+                const char *em = rdfs[j] ? rdfs[j]->errmsg : "compile failed";
+                free_rdfs(rdfs, r->arity);
+                free(src);
+                return seterr(errbuf, errcap,
+                              "%s: bad regex '%s' on column '%s': %s",
+                              path, r->cols[j].regex,
+                              dlp_schema_colname(s, rel, j), em ? em : "");
+            }
+        }
+    }
+
     Json *root = json_parse(src, len);
     free(src);
-    if (!root)
+    if (!root) {
+        free_rdfs(rdfs, r->arity);
         return seterr(errbuf, errcap, "%s: malformed JSON", path);
+    }
 
     int rc = -1;
     int fact_count = 0;
@@ -253,6 +281,13 @@ int dlp_json_load(dl_db *db, const dl_schema *s, const char *rel,
                     seterr(errbuf, errcap,
                            "%s: element %d: column '%s' expects Text, got %s",
                            path, e, cname, type_name(v));
+                    goto done;
+                }
+                if (rdfs[j] && !regex_dfa_full_match(rdfs[j], str)) {
+                    seterr(errbuf, errcap,
+                           "%s: element %d: column '%s' value \"%s\" does not "
+                           "match regex '%s'",
+                           path, e, cname, str, r->cols[j].regex);
                     goto done;
                 }
                 if (db) cols[j] = dl_intern_str(db, str);
@@ -396,6 +431,26 @@ int dlp_json_load(dl_db *db, const dl_schema *s, const char *rel,
             }
         }
 
+        /* Enforce per-column min/max value constraints (finish-dlp Item 2). */
+        for (int j = 0; j < r->arity; j++) {
+            if (!check_minmax(&r->cols[j], cols[j])) {
+                char rb[64];
+                const dl_colspec *cc = &r->cols[j];
+                if (cc->has_min && cc->has_max)
+                    snprintf(rb, sizeof rb, "[%lld..%lld]", (long long)cc->min, (long long)cc->max);
+                else if (cc->has_min)
+                    snprintf(rb, sizeof rb, "[%lld..]", (long long)cc->min);
+                else if (cc->has_max)
+                    snprintf(rb, sizeof rb, "[..%lld]", (long long)cc->max);
+                else
+                    rb[0] = '\0';
+                seterr(errbuf, errcap,
+                       "%s: element %d: column '%s' value out of range (allowed %s)",
+                       path, e, dlp_schema_colname(s, rel, j), rb);
+                goto done;
+            }
+        }
+
         if (db) {
             if (dl_add_fact(db, rel, cols, r->arity) < 0) {
                 seterr(errbuf, errcap, "%s: element %d: dl_add_fact failed", path, e);
@@ -406,6 +461,7 @@ int dlp_json_load(dl_db *db, const dl_schema *s, const char *rel,
     }
     rc = fact_count;
 done:
+    free_rdfs(rdfs, r->arity);
     json_free(root);
     return rc;
 }

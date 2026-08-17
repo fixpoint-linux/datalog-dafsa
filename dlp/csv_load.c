@@ -79,6 +79,12 @@ static int seterr(char *errbuf, size_t errcap, const char *fmt, ...) {
     return -1;
 }
 
+/* Free every compiled regex DFA in rdfs[0..n-1] (NULL-safe, idempotent). */
+static void free_rdfs(regex_dfa **rdfs, int n) {
+    for (int j = 0; j < n; j++)
+        if (rdfs[j]) { regex_dfa_free(rdfs[j]); rdfs[j] = NULL; }
+}
+
 /* Append "[a, b, c]" of `names` (n of them) to a buffer. */
 static void join_names(char *buf, size_t cap, const char *const *names, int n) {
     size_t off = 0;
@@ -177,9 +183,28 @@ int dlp_csv_load(dl_db *db, const dl_schema *s, const char *rel,
     int lineno = 0;             /* 1-based CSV row; header row == 1 */
     int fact_count = 0;
 
+    /* Compile each regex-constrained Text column's regex ONCE (regex_compile
+     * allocates ~49 MiB/DFA — never per-cell).  rdfs[j] is non-NULL iff
+     * column j has a regex; freed on every return path via free_rdfs. */
+    regex_dfa *rdfs[DL_SCHEMA_MAX_ARITY];
+    memset(rdfs, 0, sizeof rdfs);
+    for (int j = 0; j < r->arity; j++) {
+        if (r->cols[j].tag == DLT_TEXT && r->cols[j].has_regex) {
+            rdfs[j] = regex_compile(r->cols[j].regex);
+            if (!rdfs[j] || rdfs[j]->errmsg || rdfs[j]->n_states == 0) {
+                const char *em = rdfs[j] ? rdfs[j]->errmsg : "compile failed";
+                free_rdfs(rdfs, r->arity); free(line); fclose(f);
+                return seterr(errbuf, errcap,
+                              "%s: bad regex '%s' on column '%s': %s",
+                              path, r->cols[j].regex,
+                              dlp_schema_colname(s, rel, j), em ? em : "");
+            }
+        }
+    }
+
     /* Header line. */
     if ((len = getline(&line, &cap, f)) <= 0) {
-        free(line); fclose(f);
+        free_rdfs(rdfs, r->arity); free(line); fclose(f);
         return seterr(errbuf, errcap, "%s: empty file (no header row)", path);
     }
     lineno = 1;
@@ -209,13 +234,13 @@ int dlp_csv_load(dl_db *db, const dl_schema *s, const char *rel,
             for (int k = 0; k < r->arity; k++) expn[k] = dlp_schema_colname(s, rel, k);
             join_names(exp, sizeof exp, expn, r->arity);
             join_names(gots, sizeof gots, got, nhdr);
-            free(line); fclose(f);
+            free_rdfs(rdfs, r->arity); free(line); fclose(f);
             return seterr(errbuf, errcap,
                           "%s:1: header error: relation '%s' has unknown column '%s'; expects %s, got %s",
                           path, rel, name, exp, gots);
         }
         if (used[idx]) {
-            free(line); fclose(f);
+            free_rdfs(rdfs, r->arity); free(line); fclose(f);
             return seterr(errbuf, errcap,
                           "%s:1: header error: relation '%s' has duplicate column '%s'",
                           path, rel, name);
@@ -234,7 +259,7 @@ int dlp_csv_load(dl_db *db, const dl_schema *s, const char *rel,
             for (int k = 0; k < r->arity; k++) expn[k] = dlp_schema_colname(s, rel, k);
             join_names(exp, sizeof exp, expn, r->arity);
             join_names(gots, sizeof gots, got, nhdr);
-            free(line); fclose(f);
+            free_rdfs(rdfs, r->arity); free(line); fclose(f);
             return seterr(errbuf, errcap,
                           "%s:1: header error: relation '%s' is missing column '%s'; expects %s, got %s",
                           path, rel, dlp_schema_colname(s, rel, j), exp, gots);
@@ -252,7 +277,7 @@ int dlp_csv_load(dl_db *db, const dl_schema *s, const char *rel,
         char *fields[DL_SCHEMA_MAX_ARITY];
         int nf = csv_split(line, fields, DL_SCHEMA_MAX_ARITY);
         if (nf != r->arity) {
-            free(line); fclose(f);
+            free_rdfs(rdfs, r->arity); free(line); fclose(f);
             return seterr(errbuf, errcap, "%s:%d: expected %d columns, got %d",
                           path, lineno, (int)r->arity, nf);
         }
@@ -267,19 +292,19 @@ int dlp_csv_load(dl_db *db, const dl_schema *s, const char *rel,
                  * is a Natural-valued epoch in the same raw-u32 encoding. */
                 char *cell = trim_ws(fields[i]);
                 const char *p = cell;
-                if (!*p) { free(line); fclose(f);
+                if (!*p) { free_rdfs(rdfs, r->arity); free(line); fclose(f);
                     return seterr(errbuf, errcap,
                                   "%s:%d:%d: column '%s' expects Natural, got \"\"",
                                   path, lineno, i + 1, dlp_schema_colname(s, rel, j)); }
                 unsigned long v = 0;
                 for (; *p; p++) {
-                    if (*p < '0' || *p > '9') { free(line); fclose(f);
+                    if (*p < '0' || *p > '9') { free_rdfs(rdfs, r->arity); free(line); fclose(f);
                         return seterr(errbuf, errcap,
                                       "%s:%d:%d: column '%s' expects Natural, got \"%s\"",
                                       path, lineno, i + 1,
                                       dlp_schema_colname(s, rel, j), cell); }
                     v = v * 10 + (unsigned long)(*p - '0');
-                    if (v > 4294967295UL) { free(line); fclose(f);
+                    if (v > 4294967295UL) { free_rdfs(rdfs, r->arity); free(line); fclose(f);
                         return seterr(errbuf, errcap,
                                       "%s:%d:%d: column '%s' expects Natural, got \"%s\"",
                                       path, lineno, i + 1,
@@ -290,16 +315,26 @@ int dlp_csv_load(dl_db *db, const dl_schema *s, const char *rel,
             }
             case DLT_TEXT: {
                 /* DLT_TEXT: verbatim (minus a single quote pair), interned.
-                 * Do NOT trim whitespace — Text cells are taken as-is. */
+                 * Do NOT trim whitespace — Text cells are taken as-is.  If the
+                 * column has a regex constraint, the raw string must match. */
                 char *cell = fields[i];
                 unquote(cell);
+                if (rdfs[j] && !regex_dfa_full_match(rdfs[j], cell)) {
+                    free_rdfs(rdfs, r->arity); free(line); fclose(f);
+                    return seterr(errbuf, errcap,
+                                  "%s:%d:%d: column '%s' value \"%s\" does not "
+                                  "match regex '%s'",
+                                  path, lineno, i + 1,
+                                  dlp_schema_colname(s, rel, j), cell,
+                                  r->cols[j].regex);
+                }
                 if (db) cols[j] = dl_intern_str(db, cell);
                 else cols[j] = 0;
                 break;
             }
             case DLT_BOOL: {
                 char *cell = trim_ws(fields[i]);
-                if (parse_bool(cell, &cols[j]) != 0) { free(line); fclose(f);
+                if (parse_bool(cell, &cols[j]) != 0) { free_rdfs(rdfs, r->arity); free(line); fclose(f);
                     return seterr(errbuf, errcap,
                                   "%s:%d:%d: column '%s' expects Bool, got \"%s\"",
                                   path, lineno, i + 1,
@@ -308,7 +343,7 @@ int dlp_csv_load(dl_db *db, const dl_schema *s, const char *rel,
             }
             case DLT_CHAR: {
                 char *cell = trim_ws(fields[i]);
-                if (parse_char(cell, strlen(cell), &cols[j]) != 0) { free(line); fclose(f);
+                if (parse_char(cell, strlen(cell), &cols[j]) != 0) { free_rdfs(rdfs, r->arity); free(line); fclose(f);
                     return seterr(errbuf, errcap,
                                   "%s:%d:%d: column '%s' expects Char (one UTF-8 scalar), got \"%s\"",
                                   path, lineno, i + 1,
@@ -317,7 +352,7 @@ int dlp_csv_load(dl_db *db, const dl_schema *s, const char *rel,
             }
             case DLT_DATE: {
                 char *cell = trim_ws(fields[i]);
-                if (parse_date(cell, &cols[j]) != 0) { free(line); fclose(f);
+                if (parse_date(cell, &cols[j]) != 0) { free_rdfs(rdfs, r->arity); free(line); fclose(f);
                     return seterr(errbuf, errcap,
                                   "%s:%d:%d: column '%s' expects Date (yyyy-mm-dd), got \"%s\"",
                                   path, lineno, i + 1,
@@ -326,7 +361,7 @@ int dlp_csv_load(dl_db *db, const dl_schema *s, const char *rel,
             }
             case DLT_SIGNED: {
                 char *cell = trim_ws(fields[i]);
-                if (parse_signed(cell, &cols[j]) != 0) { free(line); fclose(f);
+                if (parse_signed(cell, &cols[j]) != 0) { free_rdfs(rdfs, r->arity); free(line); fclose(f);
                     return seterr(errbuf, errcap,
                                   "%s:%d:%d: column '%s' expects Signed, got \"%s\"",
                                   path, lineno, i + 1,
@@ -343,7 +378,7 @@ int dlp_csv_load(dl_db *db, const dl_schema *s, const char *rel,
                 unquote(cell);
                 size_t ln = strlen(cell);
                 if (ln < 2 || cell[0] != '[' || cell[ln - 1] != ']') {
-                    free(line); fclose(f);
+                    free_rdfs(rdfs, r->arity); free(line); fclose(f);
                     return seterr(errbuf, errcap,
                                   "%s:%d:%d: column '%s' expects List \"[...]\", got \"%s\"",
                                   path, lineno, i + 1,
@@ -354,7 +389,7 @@ int dlp_csv_load(dl_db *db, const dl_schema *s, const char *rel,
                 char *elems[DLP_LIST_MAX_ELEMS];
                 int ne = list_split(cell, elems, DLP_LIST_MAX_ELEMS);
                 if (ne > DLP_LIST_MAX_ELEMS) {
-                    free(line); fclose(f);
+                    free_rdfs(rdfs, r->arity); free(line); fclose(f);
                     return seterr(errbuf, errcap,
                                   "%s:%d:%d: column '%s' List has too many elements (cap %d)",
                                   path, lineno, i + 1,
@@ -365,7 +400,7 @@ int dlp_csv_load(dl_db *db, const dl_schema *s, const char *rel,
                     char *ecell = trim_ws(elems[e]);
                     uint32_t ev;
                     if (coerce_elem_cell(db, r->cols[j].elem, ecell, &ev) != 0) {
-                        free(line); fclose(f);
+                        free_rdfs(rdfs, r->arity); free(line); fclose(f);
                         return seterr(errbuf, errcap,
                                       "%s:%d:%d: column '%s' List element %d is not coercible to its element type",
                                       path, lineno, i + 1,
@@ -381,7 +416,7 @@ int dlp_csv_load(dl_db *db, const dl_schema *s, const char *rel,
                 char *cell = trim_ws(fields[i]);
                 if (!*cell) { cols[j] = DLP_OPT_NONE; break; }
                 if (coerce_elem_cell(db, r->cols[j].elem, cell, &cols[j]) != 0) {
-                    free(line); fclose(f);
+                    free_rdfs(rdfs, r->arity); free(line); fclose(f);
                     return seterr(errbuf, errcap,
                                   "%s:%d:%d: column '%s' Optional element is not coercible to its element type",
                                   path, lineno, i + 1,
@@ -397,7 +432,7 @@ int dlp_csv_load(dl_db *db, const dl_schema *s, const char *rel,
                 int ok = 0;
                 for (int k = 0; k < r->cols[j].n_evalues; k++)
                     if (strcmp(cell, r->cols[j].evalues[k]) == 0) { ok = 1; break; }
-                if (!ok) { free(line); fclose(f);
+                if (!ok) { free_rdfs(rdfs, r->arity); free(line); fclose(f);
                     return seterr(errbuf, errcap,
                                   "%s:%d:%d: column '%s' expects an Enum value from {%s}, got \"%s\"",
                                   path, lineno, i + 1,
@@ -408,22 +443,43 @@ int dlp_csv_load(dl_db *db, const dl_schema *s, const char *rel,
                 else cols[j] = 0;
                 break;
             }
-            default: { free(line); fclose(f);
+            default: { free_rdfs(rdfs, r->arity); free(line); fclose(f);
                 return seterr(errbuf, errcap,
                               "%s:%d:%d: column '%s' has an unsupported type for CSV loading",
                               path, lineno, i + 1, dlp_schema_colname(s, rel, j)); }
             }
         }
 
+        /* Enforce per-column min/max value constraints (finish-dlp Item 2). */
+        for (int j = 0; j < r->arity; j++) {
+            if (!check_minmax(&r->cols[j], cols[j])) {
+                char rb[64];
+                const dl_colspec *cc = &r->cols[j];
+                if (cc->has_min && cc->has_max)
+                    snprintf(rb, sizeof rb, "[%lld..%lld]", (long long)cc->min, (long long)cc->max);
+                else if (cc->has_min)
+                    snprintf(rb, sizeof rb, "[%lld..]", (long long)cc->min);
+                else if (cc->has_max)
+                    snprintf(rb, sizeof rb, "[..%lld]", (long long)cc->max);
+                else
+                    rb[0] = '\0';
+                free_rdfs(rdfs, r->arity); free(line); fclose(f);
+                return seterr(errbuf, errcap,
+                              "%s:%d: column '%s' value out of range (allowed %s)",
+                              path, lineno, dlp_schema_colname(s, rel, j), rb);
+            }
+        }
+
         if (db) {
             if (dl_add_fact(db, rel, cols, r->arity) < 0) {
-                free(line); fclose(f);
+                free_rdfs(rdfs, r->arity); free(line); fclose(f);
                 return seterr(errbuf, errcap, "%s:%d: dl_add_fact failed", path, lineno);
             }
         }
         fact_count++;
     }
 
+    free_rdfs(rdfs, r->arity);
     free(line);
     fclose(f);
     return fact_count;

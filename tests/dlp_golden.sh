@@ -15,33 +15,36 @@ write() { # write <path> <content>  (path is absolute; $WORK already applied by 
   printf '%s' "$2" > "$1"
 }
 
-SCHEMA='-- golden schema (empty-record-payload DSL, expanded for Stage B)
+SCHEMA='-- golden schema (Optional-payload DSL, finish-dlp)
 let Elem = < Natural : {=} | Text : {=} | Bool : {=} | Char : {=} | Date : {=} | Timestamp : {=} | Signed : {=} >
-in let ColumnType = < Natural : {=} | Text : {=} | Bool : {=} | Char : {=} | Date : {=} | Timestamp : {=} | Signed : {=} | List : { elem : Elem } | Optional : { elem : Elem } | Enum : { values : List Text } >
+in let NC = { min = None Natural, max = None Natural }
+in let TC = { regex = None Text }
+in let SC = { min = None Integer, max = None Integer }
+in let ColumnType = < Natural : { min : Optional Natural, max : Optional Natural } | Text : { regex : Optional Text } | Bool : {=} | Char : { min : Optional Natural, max : Optional Natural } | Date : { min : Optional Natural, max : Optional Natural } | Timestamp : { min : Optional Natural, max : Optional Natural } | Signed : { min : Optional Integer, max : Optional Integer } | List : { elem : Elem } | Optional : { elem : Elem } | Enum : { values : List Text } >
 in let Column = { name : Text, type : ColumnType }
 in let Relation = { name : Text, columns : List Column }
 in let Schema = { relations : List Relation }
 in { relations =
      [ { name = "node",
-         columns = [ { name = "id", type = < Text = {=} > } ] },
+         columns = [ { name = "id", type = < Text = TC > } ] },
        { name = "edge",
-         columns = [ { name = "src", type = < Text = {=} > },
-                     { name = "dst", type = < Text = {=} > } ] },
+         columns = [ { name = "src", type = < Text = TC > },
+                     { name = "dst", type = < Text = TC > } ] },
        { name = "weight",
-         columns = [ { name = "src", type = < Text = {=} > },
-                     { name = "w", type = < Natural = {=} > } ] },
+         columns = [ { name = "src", type = < Text = TC > },
+                     { name = "w", type = < Natural = NC > } ] },
        { name = "light_edge",
-         columns = [ { name = "src", type = < Text = {=} > },
-                     { name = "dst", type = < Text = {=} > } ] },
+         columns = [ { name = "src", type = < Text = TC > },
+                     { name = "dst", type = < Text = TC > } ] },
        { name = "tc",
-         columns = [ { name = "src", type = < Text = {=} > },
-                     { name = "dst", type = < Text = {=} > } ] },
+         columns = [ { name = "src", type = < Text = TC > },
+                     { name = "dst", type = < Text = TC > } ] },
        { name = "catalog",
          columns = [ { name = "tags", type = < List = { elem = < Text = {=} > } > },
                      { name = "nick", type = < Optional = { elem = < Text = {=} > } > },
                      { name = "color", type = < Enum = { values = [ "red", "green", "blue" ] } > } ] },
-       { name = "membertag", columns = [ { name = "x", type = < Text = {=} > } ] },
-       { name = "cartag",    columns = [ { name = "x", type = < Text = {=} > } ] },
+       { name = "membertag", columns = [ { name = "x", type = < Text = TC > } ] },
+       { name = "cartag",    columns = [ { name = "x", type = < Text = TC > } ] },
        { name = "constag",   columns = [ { name = "r", type = < List = { elem = < Text = {=} > } > } ] } ] } : Schema
 '
 
@@ -257,5 +260,76 @@ if ! grep -q 'Text' "$WORK/bad-text.err"; then
     fail "check (number-in-Text) stderr lacks 'Text': $(cat "$WORK/bad-text.err")"
 fi
 ok "check (number in Text JSON column) rejected (stderr has 'Text')"
+
+# --- per-column constraints (finish-dlp Item 2) ---
+# A Natural[0..150] column + a regex Text column: out-of-range / non-matching
+# rows rejected by check+build; in-range / matching rows pass.
+CSCHEMA='-- constrained schema (finish-dlp Item 2)
+let Elem = < Natural : {=} | Text : {=} | Bool : {=} | Char : {=} | Date : {=} | Timestamp : {=} | Signed : {=} >
+in let NC = { min = None Natural, max = None Natural }
+in let TC = { regex = None Text }
+in let ColumnType = < Natural : { min : Optional Natural, max : Optional Natural } | Text : { regex : Optional Text } | Bool : {=} | Char : { min : Optional Natural, max : Optional Natural } | Date : { min : Optional Natural, max : Optional Natural } | Timestamp : { min : Optional Natural, max : Optional Natural } | Signed : { min : Optional Integer, max : Optional Integer } | List : { elem : Elem } | Optional : { elem : Elem } | Enum : { values : List Text } >
+in let Column = { name : Text, type : ColumnType }
+in let Relation = { name : Text, columns : List Column }
+in let Schema = { relations : List Relation }
+in { relations =
+     [ { name = "score",
+         columns = [ { name = "val", type = < Natural = { min = Some 0, max = Some 150 } > } ] },
+       { name = "code",
+         columns = [ { name = "id", type = < Text = { regex = Some "[A-Z]+[0-9]+" } > } ] },
+       { name = "score_out", columns = [ { name = "val", type = < Natural = NC > } ] },
+       { name = "code_out", columns = [ { name = "id", type = < Text = TC > } ] } ] } : Schema
+'
+SCORE_GOOD='val
+0
+75
+150
+'
+SCORE_BAD='val
+151
+'
+CODE_GOOD='id
+ABC12
+XYZ99
+'
+CODE_BAD='id
+abc
+'
+CONST_RULES='score_out(X):-score(X).
+code_out(C):-code(C).
+'
+CGOOD="$WORK/constgood"
+write "$CGOOD/schema.dhall" "$CSCHEMA"
+write "$CGOOD/data/score.csv" "$SCORE_GOOD"
+write "$CGOOD/data/code.csv"  "$CODE_GOOD"
+write "$CGOOD/rules/r.datalog" "$CONST_RULES"
+"$DLP" check "$CGOOD" ; ok "check (constrained good)"
+"$DLP" build "$CGOOD" ; ok "build (constrained good)"
+
+CBAD1="$WORK/constbad-range"
+write "$CBAD1/schema.dhall" "$CSCHEMA"
+write "$CBAD1/data/score.csv" "$SCORE_BAD"
+write "$CBAD1/data/code.csv"  "$CODE_GOOD"
+write "$CBAD1/rules/r.datalog" "$CONST_RULES"
+if "$DLP" check "$CBAD1" 2>"$WORK/constbad-range.err"; then
+    fail "check (out-of-range Natural) unexpectedly succeeded"
+fi
+if ! grep -q 'out of range' "$WORK/constbad-range.err"; then
+    fail "check (out-of-range Natural) stderr lacks 'out of range': $(cat "$WORK/constbad-range.err")"
+fi
+ok "check (out-of-range Natural[0..150] row) rejected"
+
+CBAD2="$WORK/constbad-regex"
+write "$CBAD2/schema.dhall" "$CSCHEMA"
+write "$CBAD2/data/score.csv" "$SCORE_GOOD"
+write "$CBAD2/data/code.csv"  "$CODE_BAD"
+write "$CBAD2/rules/r.datalog" "$CONST_RULES"
+if "$DLP" check "$CBAD2" 2>"$WORK/constbad-regex.err"; then
+    fail "check (regex non-matching row) unexpectedly succeeded"
+fi
+if ! grep -q 'does not match regex' "$WORK/constbad-regex.err"; then
+    fail "check (regex non-match) stderr lacks 'does not match regex': $(cat "$WORK/constbad-regex.err")"
+fi
+ok "check (regex Text non-matching row) rejected"
 
 echo "ALL GOLDEN TESTS PASSED"

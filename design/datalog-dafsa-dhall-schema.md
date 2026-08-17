@@ -172,29 +172,42 @@ Additive change: `int line, col;` fields on `token` and `atom`, set by the lexer
 
 schema-as-data, self-contained `let`s, `: Schema` body annotation — the exact
 dnsd-proven dhall-c pattern (partial union literals + annotated heterogeneous
-lists). Every union alternative carries a `{=}` payload because dhall-c cannot
-parse bare alternatives.
+lists). Every union alternative carries a payload; flat scalars carry an
+**Optional constraint payload** (`min`/`max`, or a `regex` for Text) that the
+loaders enforce, and `None` means unconstrained:
 
 ```dhall
-let ColumnType = < Natural : {=} | Text : {=} >
+let Elem = < Natural : {=} | Text : {=} | Bool : {=} | Char : {=} | Date : {=} | Timestamp : {=} | Signed : {=} >
+let NC = { min = None Natural, max = None Natural }   -- unconstrained Natural
+let TC = { regex = None Text }                        -- unconstrained Text
+let ColumnType = < Natural : { min : Optional Natural, max : Optional Natural }
+                | Text : { regex : Optional Text } | Bool : {=}
+                | Char : { min : Optional Natural, max : Optional Natural }
+                | Date : { min : Optional Natural, max : Optional Natural }
+                | Timestamp : { min : Optional Natural, max : Optional Natural }
+                | Signed : { min : Optional Integer, max : Optional Integer }
+                | List : { elem : Elem } | Optional : { elem : Elem }
+                | Enum : { values : List Text } >
 let Column = { name : Text, type : ColumnType }
 let Relation = { name : Text, columns : List Column }
 let Schema = { relations : List Relation }
 in { relations =
      [ { name = "node",
-         columns = [ { name = "id", type = < Text : {=} > } ] }
+         columns = [ { name = "id", type = < Text = TC > } ] }
+     , { name = "score",
+         columns = [ { name = "val", type = < Natural = { min = Some 0, max = Some 150 } > } ] }
      , { name = "edge",
-         columns = [ { name = "src", type = < Text : {=} > }
-                   , { name = "dst", type = < Text : {=} > } ] }
+         columns = [ { name = "src", type = < Text = TC > }
+                   , { name = "dst", type = < Text = TC > } ] }
      , { name = "weight",
-         columns = [ { name = "src", type = < Text : {=} > }
-                   , { name = "w",   type = < Natural : {=} > } ] }
+         columns = [ { name = "src", type = < Text = TC > }
+                   , { name = "w",   type = < Natural = NC > } ] }
      , { name = "light_edge",
-         columns = [ { name = "src", type = < Text : {=} > }
-                   , { name = "dst", type = < Text : {=} > } ] }
+         columns = [ { name = "src", type = < Text = TC > }
+                   , { name = "dst", type = < Text = TC > } ] }
      , { name = "tc",
-         columns = [ { name = "src", type = < Text : {=} > }
-                   , { name = "dst", type = < Text : {=} > } ] }
+         columns = [ { name = "src", type = < Text = TC > }
+                   , { name = "dst", type = < Text = TC > } ] }
      ] } : Schema
 ```
 
@@ -203,6 +216,15 @@ in { relations =
 - **Encoding contract** (implicit per tag, declared once): `Natural → raw u32`
   (must fit `0..4294967295`), `Text → dl_intern_str`. Users do not restate encoding
   per column.
+- **Per-column constraints** (implemented, finish-dlp Item 2): Natural/Char/
+  Date/Timestamp and Signed carry `min`/`max` bounds; Text carries a `regex`.
+  They are DATA-LOAD metadata only — the typechecker's occurrence-consistency
+  (`dl_colspec_eq`) deliberately ignores them (a `Natural[1..10]` and a plain
+  `Natural` are the SAME type). The loaders (`dlp check`/`build`) reject rows
+  outside `[min,max]` and Text cells that fail the regex (full-key match,
+  implicit `^...$` — do not write anchors). `Signed` bounds are `Integer`
+  literals and require an explicit sign (`Some -10` / `Some +10`); a bare `10`
+  is `Natural`.
 - **Extensibility hook**: the union payload is reserved for future type
   parameters, e.g. `< Enum : { values : List Text } >`.
 
@@ -273,11 +295,15 @@ Design notes that drove it:
 2. **Parameterized types** (`List`/`Optional`/`Enum`): the union payload earned its
    keep — `< List : { elem : Elem } >`, `< Optional : { elem : Elem } >`,
    `< Enum : { values : List Text } >`. The typechecker's list builtins
-   (member/car/cdr/cons/append) now type with the element type; v1 keeps a
-   left-to-right element-type inference boundary (an untyped list operand is
-   'cannot infer list element type') and rejects `range` + TOK_LIST literals.
-3. **Per-column constraints** (min/max, regex) ride the same payload — still future
-   work.
+   (member/car/cdr/cons/append) now type with the element type; **TOK_LIST
+   literals** (finish-dlp Item 1) type in relational args (against the column's
+   `List<elem>`) and infer their element type as list-builtin operands
+   (`member(X,[a,b])`, `car([a,b])`, `cons(R,x,[a,b])`). v1 keeps a left-to-right
+   element-type inference boundary (an empty `[]` literal is 'cannot infer').
+3. **Per-column constraints** (min/max, regex) ride the same payload — **implemented**
+   (finish-dlp Item 2): Natural/Char/Date/Timestamp/Signed carry `min`/`max`,
+   Text carries a `regex`. Enforced by the loaders (`dlp check`/`build`); the
+   typechecker stays pure (`dl_colspec_eq` ignores constraints).
 
 ## Build / toolchain
 

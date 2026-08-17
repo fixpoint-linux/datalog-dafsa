@@ -30,6 +30,7 @@ extern "C" {
 #define DL_SCHEMA_NAME_MAX  64
 #define DL_ENUM_MAX_VALUES  8
 #define DL_ENUM_VALUE_MAX   32
+#define DL_REGEX_MAX        128
 
 /* Column type tag. Flat scalars are raw u32; parameterized carry a param. */
 typedef enum {
@@ -50,6 +51,13 @@ typedef struct {
     dl_coltype elem;                                    /* LIST/OPTIONAL element (flat scalar only, v1) */
     char       evalues[DL_ENUM_MAX_VALUES][DL_ENUM_VALUE_MAX]; /* ENUM value set (strings, interned at DATA-load) */
     uint8_t    n_evalues;                               /* ENUM cardinality */
+    /* Per-column value constraints (data-load metadata, NOT structural type).
+     * dl_colspec_eq intentionally ignores these: a Natural[1..10] and a plain
+     * Natural are the SAME type for occurrence-consistency. */
+    int        has_min, has_max;                        /* bound present flags */
+    int64_t    min, max;                                /* inclusive [min,max] (Signed via dezigzag) */
+    int        has_regex;                               /* Text column with a regex constraint */
+    char       regex[DL_REGEX_MAX];                     /* NUL-terminated regex (Text only) */
 } dl_colspec;
 
 /* A single relation definition: fixed name, fixed arity (1..8), and the
