@@ -44,7 +44,7 @@ static void test_add_success(void)
     memset(&s, 0, sizeof(s));
 
     {
-        dl_coltype cols[] = { DLT_NATURAL, DLT_TEXT };
+        dl_colspec cols[] = { {.tag=DLT_NATURAL}, {.tag=DLT_TEXT} };
         TEST("dl_schema_add arity-2 name+cols+is_idb");
         if (dl_schema_add(&s, "edge", 2, cols, 0) != 0) {
             FAIL("add edge returned nonzero");
@@ -55,15 +55,15 @@ static void test_add_success(void)
                 if (strcmp(r->name, "edge") != 0) FAIL("name not copied");
                 else if (r->arity != 2) FAIL("arity not stored");
                 else if (r->is_idb != 0) FAIL("is_idb should be 0");
-                else if (r->cols[0] != DLT_NATURAL) FAIL("cols[0] wrong");
-                else if (r->cols[1] != DLT_TEXT) FAIL("cols[1] wrong");
+                else if (r->cols[0].tag != DLT_NATURAL) FAIL("cols[0] wrong");
+                else if (r->cols[1].tag != DLT_TEXT) FAIL("cols[1] wrong");
                 else PASS();
             }
         }
     }
 
     {
-        dl_coltype cols[] = { DLT_TEXT, DLT_TEXT, DLT_TEXT };
+        dl_colspec cols[] = { {.tag=DLT_TEXT}, {.tag=DLT_TEXT}, {.tag=DLT_TEXT} };
         TEST("dl_schema_add arity-3 is_idb=1");
         if (dl_schema_add(&s, "path", 3, cols, 1) != 0) {
             FAIL("add path returned nonzero");
@@ -72,14 +72,14 @@ static void test_add_success(void)
             if (strcmp(r->name, "path") != 0) FAIL("name not copied");
             else if (r->arity != 3) FAIL("arity not stored");
             else if (r->is_idb != 1) FAIL("is_idb should be 1");
-            else if (r->cols[2] != DLT_TEXT) FAIL("cols[2] wrong");
+            else if (r->cols[2].tag != DLT_TEXT) FAIL("cols[2] wrong");
             else PASS();
         }
     }
 
     /* Longer name is truncated + NUL-terminated. */
     {
-        dl_coltype cols[] = { DLT_NATURAL };
+        dl_colspec cols[] = { {.tag=DLT_NATURAL} };
         char longname[128];
         memset(longname, 'x', sizeof(longname) - 1);
         longname[sizeof(longname) - 1] = '\0';
@@ -102,27 +102,27 @@ static void test_add_rejects(void)
     dl_schema s;
     memset(&s, 0, sizeof(s));
     {
-        dl_coltype cols[] = { DLT_NATURAL };
+        dl_colspec cols[] = { {.tag=DLT_NATURAL} };
         if (dl_schema_add(&s, "a", 1, cols, 0) != 0) { FAIL("seed add failed"); return; }
     }
 
     TEST("dup name rejected");
-    { dl_coltype c = DLT_NATURAL; if (dl_schema_add(&s, "a", 1, &c, 0) != 0) PASS(); else FAIL("dup accepted"); }
+    { dl_colspec c = {.tag=DLT_NATURAL}; if (dl_schema_add(&s, "a", 1, &c, 0) != 0) PASS(); else FAIL("dup accepted"); }
 
     TEST("arity 0 rejected");
-    { dl_coltype c = DLT_NATURAL; if (dl_schema_add(&s, "b", 0, &c, 0) != 0) PASS(); else FAIL("arity 0 accepted"); }
+    { dl_colspec c = {.tag=DLT_NATURAL}; if (dl_schema_add(&s, "b", 0, &c, 0) != 0) PASS(); else FAIL("arity 0 accepted"); }
 
     TEST("arity 9 rejected");
-    { dl_coltype c = DLT_NATURAL; if (dl_schema_add(&s, "b", 9, &c, 0) != 0) PASS(); else FAIL("arity 9 accepted"); }
+    { dl_colspec c = {.tag=DLT_NATURAL}; if (dl_schema_add(&s, "b", 9, &c, 0) != 0) PASS(); else FAIL("arity 9 accepted"); }
 
     TEST("NULL name rejected");
-    { dl_coltype c = DLT_NATURAL; if (dl_schema_add(&s, NULL, 1, &c, 0) != 0) PASS(); else FAIL("NULL name accepted"); }
+    { dl_colspec c = {.tag=DLT_NATURAL}; if (dl_schema_add(&s, NULL, 1, &c, 0) != 0) PASS(); else FAIL("NULL name accepted"); }
 
     TEST("NULL cols rejected");
     if (dl_schema_add(&s, "b", 1, NULL, 0) != 0) PASS(); else FAIL("NULL cols accepted");
 
     TEST("NULL schema rejected");
-    { dl_coltype c = DLT_NATURAL; if (dl_schema_add(NULL, "b", 1, &c, 0) != 0) PASS(); else FAIL("NULL schema accepted"); }
+    { dl_colspec c = {.tag=DLT_NATURAL}; if (dl_schema_add(NULL, "b", 1, &c, 0) != 0) PASS(); else FAIL("NULL schema accepted"); }
 }
 
 /* ─── Test 3: find ────────────────────────────────────────────────────── */
@@ -132,14 +132,14 @@ static void test_find(void)
     dl_schema s;
     memset(&s, 0, sizeof(s));
     {
-        dl_coltype cols[] = { DLT_NATURAL, DLT_TEXT };
+        dl_colspec cols[] = { {.tag=DLT_NATURAL}, {.tag=DLT_TEXT} };
         if (dl_schema_add(&s, "edge", 2, cols, 0) != 0) { FAIL("seed add failed"); return; }
     }
 
     TEST("find existing");
     {
         const dl_reldef *r = dl_schema_find(&s, "edge");
-        if (r && r->arity == 2 && r->cols[1] == DLT_TEXT) PASS(); else FAIL("find wrong result");
+        if (r && r->arity == 2 && r->cols[1].tag == DLT_TEXT) PASS(); else FAIL("find wrong result");
     }
 
     TEST("find missing -> NULL");
@@ -159,11 +159,11 @@ static void test_attach_hook(void)
     dl_schema s;
     memset(&s, 0, sizeof(s));
     {
-        dl_coltype cols[] = { DLT_NATURAL, DLT_NATURAL };
+        dl_colspec cols[] = { {.tag=DLT_NATURAL}, {.tag=DLT_NATURAL} };
         if (dl_schema_add(&s, "edge", 2, cols, 0) != 0) { FAIL("schema seed failed"); return; }
     }
     {
-        dl_coltype cols[] = { DLT_NATURAL, DLT_NATURAL };
+        dl_colspec cols[] = { {.tag=DLT_NATURAL}, {.tag=DLT_NATURAL} };
         if (dl_schema_add(&s, "reach", 2, cols, 1) != 0) { FAIL("schema seed failed"); return; }
     }
 

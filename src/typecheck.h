@@ -10,7 +10,7 @@
 #ifndef DL_TYPECHECK_H
 #define DL_TYPECHECK_H
 
-/* dl_typecheck_rules / dl_schema / dl_coltype are declared in schema.h. */
+/* dl_typecheck_rules / dl_schema / dl_colspec are declared in schema.h. */
 #include "schema.h"
 
 #endif /* DL_TYPECHECK_H */

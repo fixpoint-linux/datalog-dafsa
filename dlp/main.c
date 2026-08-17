@@ -48,8 +48,11 @@ static int cmd_schema(const char *dir) {
     for (int i = 0; i < s.n_rels; i++) {
         const dl_reldef *r = &s.rels[i];
         printf("%-12s %-6d ", r->name, (int)r->arity);
-        for (int j = 0; j < r->arity; j++)
-            printf("%s%s", j ? "," : "", r->cols[j] == DLT_NATURAL ? "Natural" : "Text");
+        for (int j = 0; j < r->arity; j++) {
+            char tn[64];
+            dlp_coltype_name(&r->cols[j], tn, sizeof tn);
+            printf("%s%s", j ? "," : "", tn);
+        }
         printf("\n");
     }
     return 0;

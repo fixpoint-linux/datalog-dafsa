@@ -70,32 +70,32 @@ int main(void) {
     const dl_reldef *node = find(&s, "node");
     expect(node != NULL, "node present");
     if (node) {
-        expect(node->arity == 1 && node->cols[0] == DLT_TEXT, "node[Text]");
+        expect(node->arity == 1 && node->cols[0].tag == DLT_TEXT, "node[Text]");
         expect(node->is_idb == 0, "node is EDB (is_idb 0)");
     }
 
     const dl_reldef *edge = find(&s, "edge");
     expect(edge != NULL, "edge present");
     if (edge) {
-        expect(edge->arity == 2 && edge->cols[0] == DLT_TEXT && edge->cols[1] == DLT_TEXT, "edge[Text,Text]");
+        expect(edge->arity == 2 && edge->cols[0].tag == DLT_TEXT && edge->cols[1].tag == DLT_TEXT, "edge[Text,Text]");
     }
 
     const dl_reldef *weight = find(&s, "weight");
     expect(weight != NULL, "weight present");
     if (weight) {
-        expect(weight->arity == 2 && weight->cols[0] == DLT_TEXT && weight->cols[1] == DLT_NATURAL, "weight[Text,Natural]");
+        expect(weight->arity == 2 && weight->cols[0].tag == DLT_TEXT && weight->cols[1].tag == DLT_NATURAL, "weight[Text,Natural]");
     }
 
     const dl_reldef *light_edge = find(&s, "light_edge");
     expect(light_edge != NULL, "light_edge present");
     if (light_edge) {
-        expect(light_edge->arity == 2 && light_edge->cols[0] == DLT_TEXT && light_edge->cols[1] == DLT_TEXT, "light_edge[Text,Text]");
+        expect(light_edge->arity == 2 && light_edge->cols[0].tag == DLT_TEXT && light_edge->cols[1].tag == DLT_TEXT, "light_edge[Text,Text]");
     }
 
     const dl_reldef *tc = find(&s, "tc");
     expect(tc != NULL, "tc present");
     if (tc) {
-        expect(tc->arity == 2 && tc->cols[0] == DLT_TEXT && tc->cols[1] == DLT_TEXT, "tc[Text,Text]");
+        expect(tc->arity == 2 && tc->cols[0].tag == DLT_TEXT && tc->cols[1].tag == DLT_TEXT, "tc[Text,Text]");
     }
 
     printf("\n%d checks, %d failures\n", runs, failures);

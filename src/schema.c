@@ -11,7 +11,7 @@
 #include <string.h>
 
 int dl_schema_add(dl_schema *s, const char *name, uint8_t arity,
-                  const dl_coltype *cols, int is_idb)
+                  const dl_colspec *cols, int is_idb)
 {
     if (!s || !name || !cols)
         return -1;
@@ -34,7 +34,7 @@ int dl_schema_add(dl_schema *s, const char *name, uint8_t arity,
         r->name[sizeof(r->name) - 1] = '\0';
         r->arity = arity;
         r->is_idb = is_idb ? 1 : 0;
-        memcpy(r->cols, cols, arity * sizeof(dl_coltype));
+        memcpy(r->cols, cols, arity * sizeof(dl_colspec));
     }
     s->n_rels++;
     return 0;

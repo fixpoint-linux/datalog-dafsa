@@ -8,10 +8,11 @@
  *
  * The template schema.dhall uses nested `let` (one `in` per binding — dhall-c
  * has no multi-let), an empty-record-payload union type
- * `let ColumnType = < Natural : {=} | Text : {=} >`, union values
- * `< Text = {=} >` / `< Natural = {=} >`, and the final body annotated
- * `: Schema`.  The worked example declares node[Text], edge[Text,Text],
- * weight[Text,Natural], light_edge[Text,Text], tc[Text,Text].
+ * `let ColumnType = < ... >` covering the 5 flat scalars plus List/Optional/Enum
+ * (List/Optional/Enum wired in Stage B), union values like `< Text = {=} >`,
+ * and the final body annotated `: Schema`.  The worked example declares
+ * node[Text], edge[Text,Text], weight[Text,Natural], light_edge[Text,Text],
+ * tc[Text,Text], and metrics[Bool,Char,Date,Timestamp,Signed].
  */
 #include "dlp.h"
 
@@ -23,8 +24,9 @@
 
 #define TEMPLATE_SCHEMA \
     "-- dlp project schema (S4 worked example)\n" \
-    "-- empty-record-payload union DSL: < Natural = {=} > | < Text = {=} >\n" \
-    "let ColumnType = < Natural : {=} | Text : {=} >\n" \
+    "-- empty-record-payload union DSL: < Natural = {=} > | < Text = {=} > | ...\n" \
+    "let Elem = < Natural : {=} | Text : {=} | Bool : {=} | Char : {=} | Date : {=} | Timestamp : {=} | Signed : {=} >\n" \
+    "in let ColumnType = < Natural : {=} | Text : {=} | Bool : {=} | Char : {=} | Date : {=} | Timestamp : {=} | Signed : {=} | List : { elem : Elem } | Optional : { elem : Elem } | Enum : { values : List Text } >\n" \
     "in let Column = { name : Text, type : ColumnType }\n" \
     "in let Relation = { name : Text, columns : List Column }\n" \
     "in let Schema = { relations : List Relation }\n" \
@@ -42,7 +44,13 @@
     "                     { name = \"dst\", type = < Text = {=} > } ] },\n" \
     "       { name = \"tc\",\n" \
     "         columns = [ { name = \"src\", type = < Text = {=} > },\n" \
-    "                     { name = \"dst\", type = < Text = {=} > } ] } ] } : Schema\n"
+    "                     { name = \"dst\", type = < Text = {=} > } ] },\n" \
+    "       { name = \"metrics\",\n" \
+    "         columns = [ { name = \"active\", type = < Bool = {=} > },\n" \
+    "                     { name = \"initial\", type = < Char = {=} > },\n" \
+    "                     { name = \"born\", type = < Date = {=} > },\n" \
+    "                     { name = \"seen\", type = < Timestamp = {=} > },\n" \
+    "                     { name = \"delta\", type = < Signed = {=} > } ] } ] } : Schema\n"
 
 static int mkdir_if_missing(const char *dir) {
     struct stat st;

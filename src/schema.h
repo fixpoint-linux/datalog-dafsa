@@ -18,6 +18,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -27,18 +28,38 @@ extern "C" {
 #define DL_SCHEMA_MAX_RELS  64
 #define DL_SCHEMA_MAX_ARITY 8
 #define DL_SCHEMA_NAME_MAX  64
+#define DL_ENUM_MAX_VALUES  8
+#define DL_ENUM_VALUE_MAX   32
 
-/* Column type of a relation.  DLT_NATURAL -> raw u32; DLT_TEXT -> interned. */
-typedef enum { DLT_NATURAL = 1, DLT_TEXT = 2 } dl_coltype;
+/* Column type tag. Flat scalars are raw u32; parameterized carry a param. */
+typedef enum {
+    DLT_NATURAL   = 1,  /* raw u32 */
+    DLT_TEXT      = 2,  /* interned sym_id */
+    DLT_BOOL      = 3,  /* raw u32 0/1 */
+    DLT_CHAR      = 4,  /* raw u32 Unicode scalar value */
+    DLT_DATE      = 5,  /* raw u32 yyyymmdd */
+    DLT_TIMESTAMP = 6,  /* raw u32 unix (epoch) seconds */
+    DLT_SIGNED    = 7,  /* raw u32 zigzag(i32) */
+    DLT_LIST      = 8,  /* term handle; param.elem = element dl_coltype */
+    DLT_OPTIONAL  = 9,  /* param.elem; None = 0xFFFFFFFF sentinel */
+    DLT_ENUM      = 10, /* param.evalues[0..n_evalues-1]; value = interned sym_id */
+} dl_coltype;
+
+typedef struct {
+    dl_coltype tag;
+    dl_coltype elem;                                    /* LIST/OPTIONAL element (flat scalar only, v1) */
+    char       evalues[DL_ENUM_MAX_VALUES][DL_ENUM_VALUE_MAX]; /* ENUM value set (strings, interned at DATA-load) */
+    uint8_t    n_evalues;                               /* ENUM cardinality */
+} dl_colspec;
 
 /* A single relation definition: fixed name, fixed arity (1..8), and the
  * per-column type for each of the arity columns.  `is_idb` marks derived
  * (rule-head) relations; loading data into an IDB is an error. */
 typedef struct {
-    char        name[DL_SCHEMA_NAME_MAX];
-    uint8_t     arity;
-    uint8_t     is_idb;
-    dl_coltype  cols[DL_SCHEMA_MAX_ARITY];
+    char       name[DL_SCHEMA_NAME_MAX];
+    uint8_t    arity;
+    uint8_t    is_idb;
+    dl_colspec cols[DL_SCHEMA_MAX_ARITY];
 } dl_reldef;
 
 /* A complete schema: an ordered array of relation definitions. */
@@ -47,8 +68,20 @@ typedef struct dl_schema {
     dl_reldef  rels[DL_SCHEMA_MAX_RELS];
 } dl_schema;
 
+/* Structural type equality (tag + elem for LIST/OPTIONAL; tag + value set for
+ * ENUM; tag alone for flat). Use in constrain_var and type_equality. */
+static inline int dl_colspec_eq(dl_colspec a, dl_colspec b) {
+    if (a.tag != b.tag) return 0;
+    if (a.tag == DLT_LIST || a.tag == DLT_OPTIONAL) return a.elem == b.elem;
+    if (a.tag == DLT_ENUM)
+        return a.n_evalues == b.n_evalues &&
+               memcmp(a.evalues, b.evalues,
+                      (size_t)a.n_evalues * DL_ENUM_VALUE_MAX) == 0;
+    return 1;
+}
+
 /* Add a relation definition to the schema.  `cols` must hold at least
- * `arity` dl_coltype values.
+ * `arity` dl_colspec values.
  *
  * Returns 0 on success, -1 on error:
  *   - NULL s / name / cols
@@ -58,7 +91,7 @@ typedef struct dl_schema {
  * The name is copied (strncpy, NUL-terminated); the caller's buffer is not
  * retained. */
 int dl_schema_add(dl_schema *s, const char *name, uint8_t arity,
-                  const dl_coltype *cols, int is_idb);
+                  const dl_colspec *cols, int is_idb);
 
 /* Look up a relation definition by name.  Returns a pointer to the entry in
  * the schema (valid while the schema outlives the call), or NULL if not

@@ -17,6 +17,7 @@
 #include "dl.h"
 #include "parser.h"
 #include "typecheck.h"
+#include "coerce.h"
 
 #include <ctype.h>
 #include <dirent.h>
@@ -471,11 +472,35 @@ static int print_row(const uint32_t *cols, uint8_t arity, void *user) {
         if (ctx->g->bound[i]) continue;
         if (!first) printf(" ");
         first = 0;
-        if (ctx->r->cols[i] == DLT_NATURAL)
-            printf("%u", cols[i]);
-        else {
+        char buf[16];
+        switch (ctx->r->cols[i].tag) {
+        case DLT_NATURAL:
+        case DLT_TIMESTAMP:
+            printf("%u", cols[i]);                 /* raw u32 (epoch) */
+            break;
+        case DLT_TEXT:
+        case DLT_ENUM: {                           /* interned symbol */
             const char *s = dl_intern_str_of(ctx->db, cols[i]);
             printf("%s", s ? s : "");
+            break;
+        }
+        case DLT_BOOL:
+            printf("%s", cols[i] ? "true" : "false");
+            break;
+        case DLT_CHAR: {
+            int n = utf8_encode_cp(cols[i], buf);
+            printf("%.*s", n, buf);
+            break;
+        }
+        case DLT_DATE:
+            print_date(cols[i], buf, sizeof buf);
+            printf("%s", buf);
+            break;
+        case DLT_SIGNED:
+            printf("%d", (int)dezigzag(cols[i]));
+            break;
+        default: /* List/Optional: not printable until Stage B */
+            break;
         }
         col++;
     }

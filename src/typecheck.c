@@ -4,7 +4,7 @@
  * Given a dl_schema and the parser's rule** from dl_load_rules, verify each
  * rule's variables are used with a CONSISTENT type across every occurrence
  * (head + body).  v1 does NO polymorphism/unification: each variable maps to a
- * single dl_coltype for the whole rule; the first conflicting occurrence is
+ * single dl_colspec for the whole rule; the first conflicting occurrence is
  * reported with both sites (file:line:col via the S1 line/col fields).
  *
  * Atom dispatch mirrors compiler.c's name-based recognition (the builtin
@@ -81,7 +81,7 @@ static int is_reserved_builtin_name(const char *name)
 
 typedef struct varent {
     char       *name;      /* owned copy of the variable name */
-    dl_coltype  type;      /* 0 = untyped so far; DLT_NATURAL / DLT_TEXT */
+    dl_colspec  type;      /* tag 0 = untyped so far */
     int         line;      /* first site that typed it (S1 line:col) */
     int         col;
     const char *site;      /* human-readable label of that first site */
@@ -145,16 +145,50 @@ static void set_err(char *errbuf, size_t errcap, const char *fmt, ...)
     va_end(ap);
 }
 
-static const char *type_name(dl_coltype t)
+/* A flat scalar colspec (tag only; elem/evalues left zero). */
+static dl_colspec scalar(dl_coltype tag)
 {
-    return t == DLT_TEXT ? "Text" : "Natural";
+    dl_colspec c;
+    memset(&c, 0, sizeof c);
+    c.tag = tag;
+    return c;
+}
+
+/* Full human-readable type name (Stage A: flat scalars; List/Optional/Enum
+ * render bare names until Stage B adds their parameter rendering). */
+static void type_name(const dl_colspec *c, char *out, size_t cap)
+{
+    if (!c) { snprintf(out, cap, "?"); return; }
+    switch (c->tag) {
+    case DLT_NATURAL:   snprintf(out, cap, "Natural");   return;
+    case DLT_TEXT:      snprintf(out, cap, "Text");      return;
+    case DLT_BOOL:      snprintf(out, cap, "Bool");      return;
+    case DLT_CHAR:      snprintf(out, cap, "Char");      return;
+    case DLT_DATE:      snprintf(out, cap, "Date");      return;
+    case DLT_TIMESTAMP: snprintf(out, cap, "Timestamp"); return;
+    case DLT_SIGNED:    snprintf(out, cap, "Signed");    return;
+    case DLT_LIST:      snprintf(out, cap, "List");      return;
+    case DLT_OPTIONAL:  snprintf(out, cap, "Optional");  return;
+    case DLT_ENUM:      snprintf(out, cap, "Enum");      return;
+    default:            snprintf(out, cap, "?");         return;
+    }
+}
+
+/* Is `t` an ORDERABLE scalar?  Raw u32 order == semantic order for these;
+ * Signed is EXCLUDED (zigzag breaks order) and Text/List/Optional/Enum are
+ * not orderable. */
+static int is_orderable(dl_colspec t)
+{
+    return t.tag == DLT_NATURAL || t.tag == DLT_TIMESTAMP ||
+           t.tag == DLT_DATE    || t.tag == DLT_BOOL     ||
+           t.tag == DLT_CHAR;
 }
 
 /* ─── Constraining ────────────────────────────────────────────────────── */
 
 /* Record that variable `name` must be type `t` at (line,col) of site `site`.
  * Returns 0 on success, -1 on a type conflict (message written to errbuf). */
-static int constrain_var(vtab *t, const char *name, dl_coltype want,
+static int constrain_var(vtab *t, const char *name, dl_colspec want,
                          int line, int col, const char *site,
                          char *errbuf, size_t errcap)
 {
@@ -163,19 +197,22 @@ static int constrain_var(vtab *t, const char *name, dl_coltype want,
         set_err(errbuf, errcap, "<input>: out of memory in typechecker\n");
         return -1;
     }
-    if (e->type == 0) {
+    if (e->type.tag == 0) {
         e->type = want;
         e->line = line;
         e->col  = col;
         e->site = site;
         return 0;
     }
-    if (e->type != want) {
+    if (!dl_colspec_eq(e->type, want)) {
+        char wbuf[64], hbuf[64];
+        type_name(&want, wbuf, sizeof wbuf);
+        type_name(&e->type, hbuf, sizeof hbuf);
         set_err(errbuf, errcap,
                 "<input>:%d:%d: variable %s is %s here (%s) but %s at "
                 "<input>:%d:%d (%s)\n",
-                line, col, name, type_name(want), site,
-                type_name(e->type), e->line, e->col,
+                line, col, name, wbuf, site,
+                hbuf, e->line, e->col,
                 e->site ? e->site : "");
         return -1;
     }
@@ -190,7 +227,7 @@ static int constrain_var(vtab *t, const char *name, dl_coltype want,
  *                Natural number).
  *   TOK_LIST  -> v1 reject: lists are not yet in the typed universe.
  * Returns 0 on success, -1 on conflict (message written to errbuf). */
-static int constrain_arg(vtab *t, const token *a, dl_coltype want,
+static int constrain_arg(vtab *t, const token *a, dl_colspec want,
                          const char *site, char *errbuf, size_t errcap)
 {
     if (!a) return 0;
@@ -199,20 +236,24 @@ static int constrain_arg(vtab *t, const token *a, dl_coltype want,
         return constrain_var(t, a->text, want, a->line, a->col, site,
                              errbuf, errcap);
     case TOK_INT:
-        if (want != DLT_NATURAL) {
+        if (!dl_colspec_eq(want, scalar(DLT_NATURAL))) {
+            char wbuf[64];
+            type_name(&want, wbuf, sizeof wbuf);
             set_err(errbuf, errcap,
                     "<input>:%d:%d: int constant %u in a %s column (%s)\n",
-                    a->line, a->col, a->ival, type_name(want), site);
+                    a->line, a->col, a->ival, wbuf, site);
             return -1;
         }
         return 0;
     case TOK_IDENT:
     case TOK_STRING:
-        if (want != DLT_TEXT) {
+        if (!dl_colspec_eq(want, scalar(DLT_TEXT))) {
+            char wbuf[64];
+            type_name(&want, wbuf, sizeof wbuf);
             set_err(errbuf, errcap,
                     "<input>:%d:%d: constant '%s' is Text but a %s column "
                     "(%s) requires Natural\n", a->line, a->col, a->text,
-                    type_name(want), site);
+                    wbuf, site);
             return -1;
         }
         return 0;
@@ -272,7 +313,7 @@ static int type_arith(vtab *t, const atom *a, char *errbuf, size_t errcap)
     const token *res = a->nargs > 0 ? a->args[0] : NULL;
     /* result var */
     if (res && res->kind == TOK_VAR) {
-        if (constrain_var(t, res->text, DLT_NATURAL, res->line, res->col,
+        if (constrain_var(t, res->text, scalar(DLT_NATURAL), res->line, res->col,
                           a->pred, errbuf, errcap) != 0)
             return -1;
     }
@@ -280,15 +321,15 @@ static int type_arith(vtab *t, const atom *a, char *errbuf, size_t errcap)
     return type_expr(t, a->arith, a->line, a->col, a->pred, errbuf, errcap);
 }
 
-/* Inherent type of a constant token (0 = not a constant / unknown). */
-static dl_coltype token_inherent_type(const token *a)
+/* Inherent type of a constant token (tag 0 = not a constant / unknown). */
+static dl_colspec token_inherent_type(const token *a)
 {
-    if (!a) return 0;
+    if (!a) return scalar(0);
     switch (a->kind) {
-    case TOK_INT:      return DLT_NATURAL;
+    case TOK_INT:      return scalar(DLT_NATURAL);
     case TOK_IDENT:
-    case TOK_STRING:   return DLT_TEXT;
-    default:           return 0; /* TOK_VAR / TOK_LIST / punctuation */
+    case TOK_STRING:   return scalar(DLT_TEXT);
+    default:           return scalar(0); /* TOK_VAR / TOK_LIST / punctuation */
     }
 }
 
@@ -299,7 +340,7 @@ static int type_equality(vtab *t, const atom *a, char *errbuf, size_t errcap)
 {
     const token *l = a->nargs > 0 ? a->args[0] : NULL;
     const token *r = a->nargs > 1 ? a->args[1] : NULL;
-    dl_coltype lt = 0, rt = 0;
+    dl_colspec lt = scalar(0), rt = scalar(0);
 
     /* List assignment `[X|Xs] = L` (parser builds an equality atom whose
      * args[0] is a TOK_LIST pattern).  v1 does not type lists, so reject it
@@ -314,19 +355,19 @@ static int type_equality(vtab *t, const atom *a, char *errbuf, size_t errcap)
 
     if (l && l->kind == TOK_VAR) {
         varent *le = vtab_find(t, l->text);
-        lt = le ? le->type : 0;
+        lt = le ? le->type : scalar(0);
     } else {
         lt = token_inherent_type(l);
     }
     if (r && r->kind == TOK_VAR) {
         varent *re = vtab_find(t, r->text);
-        rt = re ? re->type : 0;
+        rt = re ? re->type : scalar(0);
     } else {
         rt = token_inherent_type(r);
     }
 
     /* Both sides typed and differ: report against the second occurrence. */
-    if (lt != 0 && rt != 0 && lt != rt) {
+    if (lt.tag != 0 && rt.tag != 0 && !dl_colspec_eq(lt, rt)) {
         if (r && r->kind == TOK_VAR)
             return constrain_var(t, r->text, lt, r->line, r->col, a->pred,
                                  errbuf, errcap);
@@ -339,13 +380,13 @@ static int type_equality(vtab *t, const atom *a, char *errbuf, size_t errcap)
         return -1;
     }
     /* One side typed, the other an untyped variable: propagate the type. */
-    if (lt != 0 && rt == 0) {
+    if (lt.tag != 0 && rt.tag == 0) {
         if (r && r->kind == TOK_VAR)
             return constrain_var(t, r->text, lt, r->line, r->col, a->pred,
                                  errbuf, errcap);
         return 0;
     }
-    if (rt != 0 && lt == 0) {
+    if (rt.tag != 0 && lt.tag == 0) {
         if (l && l->kind == TOK_VAR)
             return constrain_var(t, l->text, rt, l->line, l->col, a->pred,
                                  errbuf, errcap);
@@ -353,7 +394,7 @@ static int type_equality(vtab *t, const atom *a, char *errbuf, size_t errcap)
     }
     /* Neither side has a type yet: register both (untyped) so the rule-level
      * untyped-variable check can report them if no other atom types them. */
-    if (lt == 0 && rt == 0) {
+    if (lt.tag == 0 && rt.tag == 0) {
         if (l && l->kind == TOK_VAR) vtab_get(t, l->text);
         if (r && r->kind == TOK_VAR) vtab_get(t, r->text);
     }
@@ -363,20 +404,52 @@ static int type_equality(vtab *t, const atom *a, char *errbuf, size_t errcap)
 /* Aggregate atom: a->pred is the result VAR name, a->agg_op->text is the op.
  *   count      -> result Natural
  *   sum(V)     -> V Natural + result Natural
- *   min(V)/max(V) -> v1 Natural-only + result Natural */
+ *   min(V)/max(V) -> result = operand's ESTABLISHED type; operand must be
+ *                     Natural / Timestamp / Date (orderable, NOT Signed). */
 static int type_aggregate(vtab *t, const atom *a, char *errbuf, size_t errcap)
 {
     const char *op = a->agg_op ? a->agg_op->text : "";
-    /* result var (a->pred) is Natural */
-    if (constrain_var(t, a->pred, DLT_NATURAL, a->line, a->col, op,
+
+    /* min/max: result takes the operand's established type. */
+    if (strcmp(op, "min") == 0 || strcmp(op, "max") == 0) {
+        if (a->nargs > 0 && a->args[0]->kind == TOK_VAR) {
+            varent *e = vtab_find(t, a->args[0]->text);
+            dl_colspec ot = e ? e->type : scalar(0);
+            if (ot.tag == 0) {
+                set_err(errbuf, errcap,
+                        "<input>:%d:%d: %s operand is not yet typed "
+                        "(min/max needs a Natural/Timestamp/Date column)\n",
+                        a->args[0]->line, a->args[0]->col, op);
+                return -1;
+            }
+            if (ot.tag != DLT_NATURAL && ot.tag != DLT_TIMESTAMP &&
+                ot.tag != DLT_DATE) {
+                char obuf[64];
+                type_name(&ot, obuf, sizeof obuf);
+                set_err(errbuf, errcap,
+                        "<input>:%d:%d: %s over a %s column is not supported "
+                        "(min/max needs Natural/Timestamp/Date)\n",
+                        a->args[0]->line, a->args[0]->col, op, obuf);
+                return -1;
+            }
+            return constrain_var(t, a->pred, ot, a->line, a->col, op,
+                                 errbuf, errcap);
+        }
+        /* non-var operand: keep Natural (v1) */
+        return constrain_var(t, a->pred, scalar(DLT_NATURAL), a->line, a->col,
+                             op, errbuf, errcap);
+    }
+
+    /* count / sum: result Natural. */
+    if (constrain_var(t, a->pred, scalar(DLT_NATURAL), a->line, a->col, op,
                       errbuf, errcap) != 0)
         return -1;
     if (strcmp(op, "count") == 0) {
         return 0;
     }
-    /* sum/min/max: the source var is Natural (v1) */
+    /* sum: the source var is Natural. */
     if (a->nargs > 0 && a->args[0]->kind == TOK_VAR) {
-        return constrain_var(t, a->args[0]->text, DLT_NATURAL,
+        return constrain_var(t, a->args[0]->text, scalar(DLT_NATURAL),
                              a->args[0]->line, a->args[0]->col, op,
                              errbuf, errcap);
     }
@@ -393,20 +466,20 @@ static int type_str_producing(vtab *t, const atom *a, char *errbuf, size_t errca
     if (strcmp(p, "length") == 0) {
         /* result Natural, operand Text */
         if (a->nargs > 0 && a->args[0]->kind == TOK_VAR) {
-            if (constrain_var(t, a->args[0]->text, DLT_NATURAL,
+            if (constrain_var(t, a->args[0]->text, scalar(DLT_NATURAL),
                               a->args[0]->line, a->args[0]->col, p,
                               errbuf, errcap) != 0)
                 return -1;
         }
         if (a->nargs > 1) {
-            if (constrain_arg(t, a->args[1], DLT_TEXT, p, errbuf, errcap) != 0)
+            if (constrain_arg(t, a->args[1], scalar(DLT_TEXT), p, errbuf, errcap) != 0)
                 return -1;
         }
         return 0;
     }
     /* concat / lower / upper: all args Text */
     for (j = 0; j < a->nargs; j++) {
-        if (constrain_arg(t, a->args[j], DLT_TEXT, p, errbuf, errcap) != 0)
+        if (constrain_arg(t, a->args[j], scalar(DLT_TEXT), p, errbuf, errcap) != 0)
             return -1;
     }
     return 0;
@@ -417,7 +490,7 @@ static int type_str_filter(vtab *t, const atom *a, char *errbuf, size_t errcap)
 {
     int j;
     for (j = 0; j < a->nargs; j++) {
-        if (constrain_arg(t, a->args[j], DLT_TEXT, a->pred, errbuf, errcap) != 0)
+        if (constrain_arg(t, a->args[j], scalar(DLT_TEXT), a->pred, errbuf, errcap) != 0)
             return -1;
     }
     return 0;
@@ -428,7 +501,7 @@ int type_expr(vtab *t, const expr *e, int line, int col, const char *site,
 {
     if (!e) return 0;
     if (e->kind == EX_VAR) {
-        return constrain_var(t, e->var, DLT_NATURAL, line, col, site,
+        return constrain_var(t, e->var, scalar(DLT_NATURAL), line, col, site,
                              errbuf, errcap);
     }
     if (e->kind == EX_BINOP) {
@@ -450,7 +523,7 @@ static int type_body_atom(vtab *t, const dl_schema *schema, const atom *a,
     if (a->pattern != NULL) {
         int j;
         for (j = 0; j < a->nargs; j++) {
-            if (constrain_arg(t, a->args[j], DLT_TEXT, "~", errbuf, errcap) != 0)
+            if (constrain_arg(t, a->args[j], scalar(DLT_TEXT), "~", errbuf, errcap) != 0)
                 return -1;
         }
         return 0;
@@ -475,12 +548,27 @@ static int type_body_atom(vtab *t, const dl_schema *schema, const atom *a,
         return 0;
     }
 
-    /* ordering comparison {<,<=,>=,>}: both args Natural (v1 rejects Text
-     * operands; raw-cmp ordering on interned Text ids is meaningless). */
+    /* ordering comparison {<,<=,>=,>}: both args must be the SAME orderable
+     * scalar (Natural/Timestamp/Date/Bool/Char — raw u32 order == semantic
+     * order).  Signed is NOT orderable (zigzag breaks order); Text and the
+     * parameterized types are not orderable.  If neither arg has an established
+     * orderable type, default to Natural (v1). */
     if (is_comparison_pred(a->pred)) {
+        dl_colspec lc = a->nargs > 0 ? token_inherent_type(a->args[0]) : scalar(DLT_NATURAL);
+        dl_colspec rc = a->nargs > 1 ? token_inherent_type(a->args[1]) : lc;
+        if (a->nargs > 0 && a->args[0]->kind == TOK_VAR) {
+            varent *le = vtab_find(t, a->args[0]->text);
+            if (le) lc = le->type;
+        }
+        if (a->nargs > 1 && a->args[1]->kind == TOK_VAR) {
+            varent *re = vtab_find(t, a->args[1]->text);
+            if (re) rc = re->type;
+        }
+        /* pick the first established orderable operand type; else Natural */
+        dl_colspec want = is_orderable(lc) ? lc : (is_orderable(rc) ? rc : scalar(DLT_NATURAL));
         int j;
         for (j = 0; j < a->nargs; j++) {
-            if (constrain_arg(t, a->args[j], DLT_NATURAL, a->pred,
+            if (constrain_arg(t, a->args[j], want, a->pred,
                               errbuf, errcap) != 0)
                 return -1;
         }
@@ -536,7 +624,7 @@ static int type_rule(const dl_schema *schema, const rule *r,
     /* untyped-variable check: every var seen in this rule must have a type.
      * A var that never receives a relational/builtin constraint is an error. */
     for (i = 0; i < t.n; i++) {
-        if (t.v[i].type == 0) {
+        if (t.v[i].type.tag == 0) {
             set_err(errbuf, errcap,
                     "<input>: untyped variable %s in rule '%s' "
                     "(no column constrains it)\n", t.v[i].name,

@@ -24,6 +24,7 @@
  */
 #include "dlp.h"
 #include "dl.h"
+#include "coerce.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -193,9 +194,12 @@ int dlp_csv_load(dl_db *db, const dl_schema *s, const char *rel,
         uint32_t cols[DL_SCHEMA_MAX_ARITY];
         for (int i = 0; i < nf; i++) {
             int j = colmap[i];                       /* schema column index */
-            if (r->cols[j] == DLT_NATURAL) {
-                char *cell = trim_ws(fields[i]);     /* Natural trims ws */
-                /* ^[0-9]+$ and <= 4294967295 */
+            switch (r->cols[j].tag) {
+            case DLT_NATURAL:
+            case DLT_TIMESTAMP: {
+                /* Natural / Timestamp: ^[0-9]+$ and <= 4294967295.  Timestamp
+                 * is a Natural-valued epoch in the same raw-u32 encoding. */
+                char *cell = trim_ws(fields[i]);
                 const char *p = cell;
                 if (!*p) { free(line); fclose(f);
                     return seterr(errbuf, errcap,
@@ -216,13 +220,57 @@ int dlp_csv_load(dl_db *db, const dl_schema *s, const char *rel,
                                       dlp_schema_colname(s, rel, j), cell); }
                 }
                 cols[j] = (uint32_t)v;
-            } else {
+                break;
+            }
+            case DLT_TEXT: {
                 /* DLT_TEXT: verbatim (minus a single quote pair), interned.
                  * Do NOT trim whitespace — Text cells are taken as-is. */
                 char *cell = fields[i];
                 unquote(cell);
                 if (db) cols[j] = dl_intern_str(db, cell);
                 else cols[j] = 0;
+                break;
+            }
+            case DLT_BOOL: {
+                char *cell = trim_ws(fields[i]);
+                if (parse_bool(cell, &cols[j]) != 0) { free(line); fclose(f);
+                    return seterr(errbuf, errcap,
+                                  "%s:%d:%d: column '%s' expects Bool, got \"%s\"",
+                                  path, lineno, i + 1,
+                                  dlp_schema_colname(s, rel, j), cell); }
+                break;
+            }
+            case DLT_CHAR: {
+                char *cell = trim_ws(fields[i]);
+                if (parse_char(cell, strlen(cell), &cols[j]) != 0) { free(line); fclose(f);
+                    return seterr(errbuf, errcap,
+                                  "%s:%d:%d: column '%s' expects Char (one UTF-8 scalar), got \"%s\"",
+                                  path, lineno, i + 1,
+                                  dlp_schema_colname(s, rel, j), cell); }
+                break;
+            }
+            case DLT_DATE: {
+                char *cell = trim_ws(fields[i]);
+                if (parse_date(cell, &cols[j]) != 0) { free(line); fclose(f);
+                    return seterr(errbuf, errcap,
+                                  "%s:%d:%d: column '%s' expects Date (yyyy-mm-dd), got \"%s\"",
+                                  path, lineno, i + 1,
+                                  dlp_schema_colname(s, rel, j), cell); }
+                break;
+            }
+            case DLT_SIGNED: {
+                char *cell = trim_ws(fields[i]);
+                if (parse_signed(cell, &cols[j]) != 0) { free(line); fclose(f);
+                    return seterr(errbuf, errcap,
+                                  "%s:%d:%d: column '%s' expects Signed, got \"%s\"",
+                                  path, lineno, i + 1,
+                                  dlp_schema_colname(s, rel, j), cell); }
+                break;
+            }
+            default: { free(line); fclose(f);
+                return seterr(errbuf, errcap,
+                              "%s:%d:%d: column '%s' has an unsupported type for CSV loading",
+                              path, lineno, i + 1, dlp_schema_colname(s, rel, j)); }
             }
         }
 

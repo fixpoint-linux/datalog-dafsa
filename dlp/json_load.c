@@ -32,6 +32,7 @@
 #include "dlp.h"
 #include "dl.h"
 #include "json.h"
+#include "coerce.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -177,7 +178,10 @@ int dlp_json_load(dl_db *db, const dl_schema *s, const char *rel,
         for (int j = 0; j < r->arity; j++) {
             const char *cname = dlp_schema_colname(s, rel, j);
             Json *v = json_obj_get(el, cname);
-            if (r->cols[j] == DLT_NATURAL) {
+            switch (r->cols[j].tag) {
+            case DLT_NATURAL:
+            case DLT_TIMESTAMP: {
+                /* Natural/Timestamp: integer-valued number within u32 (epoch). */
                 if (!v || v->type != J_NUM) {
                     seterr(errbuf, errcap,
                            "%s: element %d: column '%s' expects Natural, got %s",
@@ -194,7 +198,9 @@ int dlp_json_load(dl_db *db, const dl_schema *s, const char *rel,
                     goto done;
                 }
                 cols[j] = (uint32_t)(unsigned long)d;
-            } else {
+                break;
+            }
+            case DLT_TEXT: {
                 const char *str = json_str(v);
                 if (!str) {
                     seterr(errbuf, errcap,
@@ -204,6 +210,77 @@ int dlp_json_load(dl_db *db, const dl_schema *s, const char *rel,
                 }
                 if (db) cols[j] = dl_intern_str(db, str);
                 else cols[j] = 0;
+                break;
+            }
+            case DLT_BOOL: {
+                /* strict: JSON must be a real boolean true/false */
+                if (!v || v->type != J_BOOL) {
+                    seterr(errbuf, errcap,
+                           "%s: element %d: column '%s' expects Bool, got %s",
+                           path, e, cname, type_name(v));
+                    goto done;
+                }
+                cols[j] = v->as.b ? 1u : 0u;
+                break;
+            }
+            case DLT_CHAR: {
+                const char *str = json_str(v);
+                if (!str) {
+                    seterr(errbuf, errcap,
+                           "%s: element %d: column '%s' expects Char (one UTF-8 scalar), got %s",
+                           path, e, cname, type_name(v));
+                    goto done;
+                }
+                if (parse_char(str, strlen(str), &cols[j]) != 0) {
+                    seterr(errbuf, errcap,
+                           "%s: element %d: column '%s' expects Char (one UTF-8 scalar), got string",
+                           path, e, cname);
+                    goto done;
+                }
+                break;
+            }
+            case DLT_DATE: {
+                const char *str = json_str(v);
+                if (!str) {
+                    seterr(errbuf, errcap,
+                           "%s: element %d: column '%s' expects Date (yyyy-mm-dd), got %s",
+                           path, e, cname, type_name(v));
+                    goto done;
+                }
+                if (parse_date(str, &cols[j]) != 0) {
+                    seterr(errbuf, errcap,
+                           "%s: element %d: column '%s' expects Date (yyyy-mm-dd), got string",
+                           path, e, cname);
+                    goto done;
+                }
+                break;
+            }
+            case DLT_SIGNED: {
+                /* JSON integer (may be negative) within i32 -> zigzag */
+                if (!v || v->type != J_NUM) {
+                    seterr(errbuf, errcap,
+                           "%s: element %d: column '%s' expects Signed, got %s",
+                           path, e, cname, type_name(v));
+                    goto done;
+                }
+                double d = v->as.num;
+                if (d != (double)(long long)d ||
+                    d < -2147483648.0 || d > 2147483647.0) {
+                    seterr(errbuf, errcap,
+                           "%s: element %d: column '%s' expects Signed (i32 integer), got number",
+                           path, e, cname);
+                    goto done;
+                }
+                int32_t sv = (int32_t)(long long)d;
+                cols[j] = zigzag(sv);
+                break;
+            }
+            default: {
+                seterr(errbuf, errcap,
+                       "%s: element %d: column '%s' has an unsupported type for JSON loading",
+                       path, e, cname);
+                goto done;
+            }
             }
         }
 

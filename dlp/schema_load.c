@@ -38,6 +38,25 @@ static void walk_error(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt); vsnprintf(walk_err, sizeof walk_err, fmt, ap); va_end(ap);
 }
 
+/* Human-readable column-type name (Stage A: flat scalars; List/Optional/Enum
+ * render bare names until Stage B). */
+void dlp_coltype_name(const dl_colspec *c, char *out, size_t cap) {
+    if (!c) { snprintf(out, cap, "?"); return; }
+    switch (c->tag) {
+    case DLT_NATURAL:   snprintf(out, cap, "Natural");   return;
+    case DLT_TEXT:      snprintf(out, cap, "Text");      return;
+    case DLT_BOOL:      snprintf(out, cap, "Bool");      return;
+    case DLT_CHAR:      snprintf(out, cap, "Char");      return;
+    case DLT_DATE:      snprintf(out, cap, "Date");      return;
+    case DLT_TIMESTAMP: snprintf(out, cap, "Timestamp"); return;
+    case DLT_SIGNED:    snprintf(out, cap, "Signed");    return;
+    case DLT_LIST:      snprintf(out, cap, "List");      return;
+    case DLT_OPTIONAL:  snprintf(out, cap, "Optional");  return;
+    case DLT_ENUM:      snprintf(out, cap, "Enum");      return;
+    default:            snprintf(out, cap, "?");         return;
+    }
+}
+
 /* Look up a record-literal field BY LABEL. normalize() sorts fields
    alphabetically, so index-based access is wrong. */
 static Term *rec_get(Term *t, const char *label) {
@@ -71,16 +90,26 @@ static int list_elems(Term *t, Term **elems, int cap) {
 }
 
 /* Read a column's payload-union literal (< Text = {=} > / < Natural = {=} >)
-   and map its selected alternative to a dl_coltype. */
-static bool walk_coltype(dl_coltype *out, Term *t) {
+   and map its selected alternative to a dl_colspec.  The 5 flat scalars map
+   to their DLT_* tag (payload {=} ignored); List/Optional/Enum are deferred to
+   Stage B ('unknown column type'). */
+static bool walk_coltype(dl_colspec *out, Term *t) {
     if (t->tag != TmUnionLit) { walk_error("column type must be a union literal"); return false; }
     const char *label = NULL;
     for (int i = 0; i < t->as.uni.n; i++)
         if (t->as.uni.fs[i].value) { label = t->as.uni.fs[i].label; break; }
     if (!label) { walk_error("column type union has no selected alternative"); return false; }
-    if      (!strcmp(label, "Natural")) *out = DLT_NATURAL;
-    else if (!strcmp(label, "Text"))    *out = DLT_TEXT;
+    dl_coltype tag = 0;
+    if      (!strcmp(label, "Natural"))   tag = DLT_NATURAL;
+    else if (!strcmp(label, "Text"))      tag = DLT_TEXT;
+    else if (!strcmp(label, "Bool"))      tag = DLT_BOOL;
+    else if (!strcmp(label, "Char"))      tag = DLT_CHAR;
+    else if (!strcmp(label, "Date"))      tag = DLT_DATE;
+    else if (!strcmp(label, "Timestamp")) tag = DLT_TIMESTAMP;
+    else if (!strcmp(label, "Signed"))    tag = DLT_SIGNED;
     else { walk_error("unknown column type '%s'", label); return false; }
+    memset(out, 0, sizeof *out);
+    out->tag = tag;
     return true;
 }
 
@@ -100,7 +129,7 @@ static bool build_schema(dl_schema *s, Term *nf) {
         static Term *celems[DL_SCHEMA_MAX_ARITY];
         int arity = list_elems(columns, celems, DL_SCHEMA_MAX_ARITY);
         if (arity < 0) return false;
-        dl_coltype cols[DL_SCHEMA_MAX_ARITY];
+        dl_colspec cols[DL_SCHEMA_MAX_ARITY];
         for (int j = 0; j < arity; j++) {
             /* Retain the column NAME (S5 header mapping) before the type. */
             static char cname[DL_SCHEMA_NAME_MAX];

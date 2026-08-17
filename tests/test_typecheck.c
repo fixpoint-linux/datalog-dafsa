@@ -44,31 +44,31 @@ static void build_schema(dl_schema *s)
 {
     memset(s, 0, sizeof(*s));
     {
-        dl_coltype c[] = { DLT_NATURAL };
+        dl_colspec c[] = { {.tag=DLT_NATURAL} };
         assert(dl_schema_add(s, "node", 1, c, 0) == 0);
     }
     {
-        dl_coltype c[] = { DLT_NATURAL, DLT_NATURAL };
+        dl_colspec c[] = { {.tag=DLT_NATURAL}, {.tag=DLT_NATURAL} };
         assert(dl_schema_add(s, "edge", 2, c, 0) == 0);
     }
     {
-        dl_coltype c[] = { DLT_NATURAL, DLT_NATURAL };
+        dl_colspec c[] = { {.tag=DLT_NATURAL}, {.tag=DLT_NATURAL} };
         assert(dl_schema_add(s, "weight", 2, c, 0) == 0);
     }
     {
-        dl_coltype c[] = { DLT_NATURAL, DLT_TEXT };
+        dl_colspec c[] = { {.tag=DLT_NATURAL}, {.tag=DLT_TEXT} };
         assert(dl_schema_add(s, "tc", 2, c, 0) == 0);
     }
     {
-        dl_coltype c[] = { DLT_TEXT };
+        dl_colspec c[] = { {.tag=DLT_TEXT} };
         assert(dl_schema_add(s, "label", 1, c, 0) == 0);
     }
     {
-        dl_coltype c[] = { DLT_NATURAL };
+        dl_colspec c[] = { {.tag=DLT_NATURAL} };
         assert(dl_schema_add(s, "total", 1, c, 0) == 0);
     }
     {
-        dl_coltype c[] = { DLT_NATURAL, DLT_NATURAL };
+        dl_colspec c[] = { {.tag=DLT_NATURAL}, {.tag=DLT_NATURAL} };
         assert(dl_schema_add(s, "bar", 2, c, 0) == 0);
     }
 }
@@ -258,19 +258,19 @@ static void test_inequality(void)
     dl_schema s;
     memset(&s, 0, sizeof(s));
     {
-        dl_coltype c[] = { DLT_NATURAL };
+        dl_colspec c[] = { {.tag=DLT_NATURAL} };
         assert(dl_schema_add(&s, "val", 1, c, 0) == 0);
     }
     {
-        dl_coltype c[] = { DLT_TEXT };
+        dl_colspec c[] = { {.tag=DLT_TEXT} };
         assert(dl_schema_add(&s, "lab", 1, c, 0) == 0);
     }
     {
-        dl_coltype c[] = { DLT_TEXT, DLT_TEXT };
+        dl_colspec c[] = { {.tag=DLT_TEXT}, {.tag=DLT_TEXT} };
         assert(dl_schema_add(&s, "tt", 2, c, 0) == 0);
     }
     {
-        dl_coltype c[] = { DLT_NATURAL };
+        dl_colspec c[] = { {.tag=DLT_NATURAL} };
         assert(dl_schema_add(&s, "r", 1, c, 0) == 0);
     }
 
@@ -326,6 +326,100 @@ static void test_untyped_var(void)
         FAIL("untyped variable not rejected");
 }
 
+/* ─── Stage A: flat-scalar column type rules ──────────────────────────── */
+
+/* Schema with one column per new scalar type (all EDB, arity 1). */
+static void build_scalar_schema(dl_schema *s)
+{
+    memset(s, 0, sizeof(*s));
+    {
+        dl_colspec c[] = { {.tag=DLT_DATE} };
+        assert(dl_schema_add(s, "d1", 1, c, 0) == 0);
+    }
+    {
+        dl_colspec c[] = { {.tag=DLT_TIMESTAMP} };
+        assert(dl_schema_add(s, "ts1", 1, c, 0) == 0);
+    }
+    {
+        dl_colspec c[] = { {.tag=DLT_BOOL} };
+        assert(dl_schema_add(s, "b1", 1, c, 0) == 0);
+    }
+    {
+        dl_colspec c[] = { {.tag=DLT_CHAR} };
+        assert(dl_schema_add(s, "ch1", 1, c, 0) == 0);
+    }
+    {
+        dl_colspec c[] = { {.tag=DLT_SIGNED} };
+        assert(dl_schema_add(s, "sg1", 1, c, 0) == 0);
+    }
+    {
+        dl_colspec c[] = { {.tag=DLT_DATE} };  /* Date-typed aggregate result */
+        assert(dl_schema_add(s, "date_out", 1, c, 0) == 0);
+    }
+    {
+        dl_colspec c[] = { {.tag=DLT_NATURAL} };
+        assert(dl_schema_add(s, "nat_out", 1, c, 0) == 0);
+    }
+}
+
+static void test_scalar_ordering(void)
+{
+    dl_schema s;
+    build_scalar_schema(&s);
+
+    /* Ordering comparisons accept the orderable scalars (same type both sides). */
+    TEST("accept: Date < Date");
+    if (check_prog(&s, "nat_out(A) :- d1(X), d1(Y), X < Y.\n", NULL) == 0)
+        PASS(); else FAIL("Date ordering rejected");
+
+    TEST("accept: Timestamp <= Timestamp");
+    if (check_prog(&s, "nat_out(A) :- ts1(X), ts1(Y), X <= Y.\n", NULL) == 0)
+        PASS(); else FAIL("Timestamp ordering rejected");
+
+    TEST("accept: Bool ordering (same type)");
+    if (check_prog(&s, "nat_out(A) :- b1(X), b1(Y), X < Y.\n", NULL) == 0)
+        PASS(); else FAIL("Bool ordering rejected");
+
+    TEST("accept: Char ordering (same type)");
+    if (check_prog(&s, "nat_out(A) :- ch1(X), ch1(Y), X > Y.\n", NULL) == 0)
+        PASS(); else FAIL("Char ordering rejected");
+
+    /* Signed is NOT orderable (zigzag breaks u32 order) -> reject. */
+    TEST("reject: Signed ordering <");
+    if (check_prog(&s, "nat_out(A) :- sg1(X), sg1(Y), X < Y.\n", NULL) == -1)
+        PASS(); else FAIL("Signed ordering not rejected");
+
+    /* Arithmetic is Natural-only: a Signed var in `A = X + 1` must be rejected. */
+    TEST("reject: arithmetic over Signed");
+    if (check_prog(&s, "nat_out(A) :- sg1(X), A = X + 1.\n", NULL) == -1)
+        PASS(); else FAIL("Signed arithmetic not rejected");
+}
+
+static void test_scalar_minmax(void)
+{
+    dl_schema s;
+    build_scalar_schema(&s);
+
+    /* min/max over Date: result takes the operand's (Date) type. */
+    TEST("accept: min over Date (result Date)");
+    if (check_prog(&s, "date_out(M) :- d1(X), M = min(X).\n", NULL) == 0)
+        PASS(); else FAIL("min over Date rejected");
+
+    TEST("accept: max over Date (result Date)");
+    if (check_prog(&s, "date_out(M) :- d1(X), M = max(X).\n", NULL) == 0)
+        PASS(); else FAIL("max over Date rejected");
+
+    /* min/max over Signed must be rejected (not orderable). */
+    TEST("reject: min over Signed");
+    if (check_prog(&s, "nat_out(M) :- sg1(X), M = min(X).\n", NULL) == -1)
+        PASS(); else FAIL("min over Signed not rejected");
+
+    /* min/max over Bool must be rejected (only Natural/Timestamp/Date). */
+    TEST("reject: min over Bool");
+    if (check_prog(&s, "nat_out(M) :- b1(X), M = min(X).\n", NULL) == -1)
+        PASS(); else FAIL("min over Bool not rejected");
+}
+
 int main(void)
 {
     printf("=== Dhall rule typechecker tests ===\n");
@@ -341,6 +435,8 @@ int main(void)
     test_inequality();
     test_list_assignment_v1();
     test_untyped_var();
+    test_scalar_ordering();
+    test_scalar_minmax();
 
     printf("\n%d tests, %d failed\n", tests_run, tests_failed);
     return tests_failed ? 1 : 0;
