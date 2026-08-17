@@ -129,6 +129,11 @@ int db_has_list_builtin(const dl_db *db);
  * topdown queries and always route to the full fixpoint. */
 int db_has_range_builtin(const dl_db *db);
 
+/* LIVE-mode iterator constructor (defined in iter.c) for the VM's OP_RANGE
+ * lazy generator: opens over an already-resolved relation, borrowing rel->d
+ * and NEVER routing to the snapshot view (see iter.c). */
+dl_iter *dl_iter_open_live(relation *rel, const uint32_t *leading, uint8_t k);
+
 /* READ resolution: for a fixed entry, the relation iff arity matches (else
  * NULL); for a variadic entry, variant[arity] WITHOUT materializing it
  * (NULL = absent variant, which callers treat as an EMPTY relation). */

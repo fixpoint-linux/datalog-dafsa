@@ -58,6 +58,10 @@ int vm_agg_runs = 0;
  * fell-back full re-eval would also produce correct views). */
 int vm_propagate_runs = 0;
 
+/* OP_RANGE lazy generator test observable (see vm.h): counts distinct col0
+ * values yielded by range_resume. */
+long vm_range_yields = 0;
+
 static relation *db_rel(dl_db *db, int idx)
 {
     if (idx < 0 || (size_t)idx >= db->nrels) return NULL;
@@ -102,33 +106,6 @@ static void tbuf_free(tuple_buf *tb)
 {
     free(tb->data);
     memset(tb, 0, sizeof(*tb));
-}
-/* OP_RANGE generator callback: push DISTINCT cols[0] values.  rel_range_each
- * enumerates in lex order, so equal col0 values are CONTIGUOUS — dedup = skip
- * any value equal to the last pushed.  Returns non-zero to stop (OOM). */
-struct range_ctx {
-    tuple_buf *tb;
-    uint32_t   last;
-    int        have;
-    int        oom;
-};
-static int range_col0_cb(const uint32_t *cols, uint8_t arity, void *user)
-{
-    struct range_ctx *rc = (struct range_ctx *)user;
-    uint32_t v = cols[0];
-    (void)arity;
-    if (rc->have && v == rc->last) return 0;   /* duplicate col0 */
-    if (rc->tb->count >= rc->tb->cap) {
-        long nc = rc->tb->cap ? rc->tb->cap * 2 : 4;
-        uint32_t *nd = realloc(rc->tb->data, (size_t)nc * sizeof(uint32_t));
-        if (!nd) { rc->oom = 1; return 1; }
-        rc->tb->data = nd;
-        rc->tb->cap = nc;
-    }
-    rc->tb->data[rc->tb->count++] = v;
-    rc->last = v;
-    rc->have = 1;
-    return 0;
 }
 
 /* ─── Bindings ────────────────────────────────────────────────────────── */
@@ -300,6 +277,11 @@ typedef struct {
     const uint8_t *perm; /* M6: permutation array for OP_LOOKUP_PERM, NULL otherwise */
     uint8_t   perm_storage[8]; /* M6-permsel: frame-local perm for OP_HASH_JOIN;
                                   f->perm points here so it survives backtrack() */
+    /* OP_RANGE lazy generator state (only used when op == OP_RANGE): */
+    dl_iter  *it;         /* owned pull-iterator (NULL for non-range frames) */
+    uint32_t  last;       /* last yielded distinct col0 (dedup) */
+    uint8_t   started;    /* 1 once >=1 value yielded */
+    uint32_t  lo, hi;     /* cached range bounds */
 } vm_frame;
 
 /* ─── Override ────────────────────────────────────────────────────────── */
@@ -365,6 +347,33 @@ static int seek_valid(vm_frame *f, const vm_instr *in, int sc, int ar,
     return seek_valid_perm(f, in, sc, ar, NULL, b);
 }
 
+/* Resume an OP_RANGE lazy generator: pull the next tuple from f->it, skip
+ * col0 values below lo, stop at hi, dedup consecutive col0 runs, and bind X
+ * (fi->slots[0]) to the next distinct col0 in [lo,hi).  Returns 1 on yield,
+ * 0 when exhausted. */
+static int range_resume(vm_frame *f, const vm_instr *fi, bindings *b)
+{
+    uint32_t cols[8];
+    int rc;
+    for (;;) {
+        rc = dl_iter_next(f->it, cols);
+        if (rc == 1) {
+            uint32_t v = cols[0];
+            if (v < f->lo) continue;                  /* still below lo */
+            if (v >= f->hi) return 0;                 /* past hi: exhausted */
+            if (f->started && v == f->last) continue; /* dedup col0 run */
+            f->last = v;
+            f->started = 1;
+            vm_range_yields++;
+            b_load(b, &f->saved);
+            b_try(b, fi->slots[0], v);  /* X unbound in saved; always ok */
+            return 1;
+        }
+        if (rc == 0) return 0;  /* iterator exhausted */
+        return 0;               /* depth overflow (unreachable for arity<=8) */
+    }
+}
+
 /* Backtrack: advance the current frame, then seek a valid tuple.
  * Pops frames that are exhausted.  Returns 1 if a valid tuple was found
  * (sets *ip to the frame's ip+1), 0 if all frames exhausted. */
@@ -373,6 +382,15 @@ static int backtrack(vm_frame *frames, int *sp, bindings *b,
 {
     while (*sp > 0) {
         vm_frame *f = &frames[*sp - 1];
+        if (f->op == OP_RANGE) {
+            const vm_instr *fi = &p[f->ip];
+            if (range_resume(f, fi, b)) { *ip = f->ip + 1; return 1; }
+            dl_iter_close(f->it);
+            f->it = NULL;
+            tbuf_free(&f->tuples);
+            (*sp)--;
+            continue;
+        }
         f->idx++;
         {
             const vm_instr *fi = &p[f->ip];
@@ -1414,36 +1432,26 @@ static long exec_range(dl_db *db, const compiled_rule *cr,
                 ip++;
                 break;
             }
-            /* X unbound: GENERATOR — push a frame of distinct col0 values. */
+            /* X unbound: GENERATOR — push a LAZY resumable frame driven by
+             * the #5 pull-iterator (LIVE view; distinct col0 in [lo,hi)). */
             if (sp >= MAX_FRAMES) return -1;
             {
                 vm_frame *f = &frames[sp];
-                struct range_ctx rc;
                 f->ip = ip;
                 f->op = OP_RANGE;   /* backtrack treats sc == 0 */
                 f->idx = 0;
                 f->perm = NULL;
                 memset(&f->tuples, 0, sizeof(f->tuples));
-                f->tuples.arity = 1;
-                f->tuples.cap = 4;
-                f->tuples.data = malloc((size_t)f->tuples.cap * sizeof(uint32_t));
-                if (!f->tuples.data) return -1;
-                rc.tb = &f->tuples;
-                rc.last = 0;
-                rc.have = 0;
-                rc.oom = 0;
-                if (rel_range_each(r, lo, hi, range_col0_cb, &rc) < 0) {
-                    tbuf_free(&f->tuples);
-                    return -1;
-                }
-                if (rc.oom) { tbuf_free(&f->tuples); return -1; }
-                if (f->tuples.count == 0) {
-                    tbuf_free(&f->tuples);
-                    if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
-                    break;
-                }
-                b_save(&f->saved, &b);
-                if (!seek_valid(f, in, 0, 1, &b)) {
+                f->it = dl_iter_open_live(r, NULL, 0);
+                if (!f->it) return -1;
+                f->lo = lo;
+                f->hi = hi;
+                f->last = 0;
+                f->started = 0;
+                b_save(&f->saved, &b);   /* MUST precede range_resume */
+                if (!range_resume(f, in, &b)) {
+                    dl_iter_close(f->it);
+                    f->it = NULL;
                     tbuf_free(&f->tuples);
                     if (!backtrack(frames, &sp, &b, p, &ip)) { ip = end; }
                     break;
@@ -1603,7 +1611,9 @@ static long exec_range(dl_db *db, const compiled_rule *cr,
 
     /* Clean up remaining frames */
     while (sp > 0) {
-        tbuf_free(&frames[sp - 1].tuples);
+        vm_frame *f = &frames[sp - 1];
+        if (f->it) { dl_iter_close(f->it); f->it = NULL; }
+        tbuf_free(&f->tuples);
         sp--;
     }
 

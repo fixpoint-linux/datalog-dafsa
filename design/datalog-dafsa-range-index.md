@@ -75,7 +75,7 @@ the mutation points your engine already touches (`clone_state` / realloc), under
 the existing **collect-then-mutate** discipline. Fixed arity (≤ 8) makes the
 descent trivially cheap.
 
-### Tier 3 — Succinct sorted array (only if true B-tree point-seek is needed)
+### ~~Tier 3 — Succinct sorted array (only if true B-tree point-seek is needed)~~ *(out-of-scope / overkill — see deferred item 7)*
 
 Elias-Fano or another succinct sorted-array encoding of the keys: ~`log(U/n)`
 bits/key. Gives genuine point-seek / rank-select at B-tree-like cost when a
@@ -164,10 +164,16 @@ In rough priority order. ~~struck-through~~ items are implemented (commit noted)
 3. ~~**`OP_RANGE` VM opcode / range-aware aggregate**~~ — **implemented** as the
    `range(X, Rel, Lo, Hi)` reserved builtin (a `member(X,L)` analog for
    relations) lowered to an `OP_RANGE` opcode: generator (bind X to distinct
-   leading-column values in `[Lo,Hi)`) or filter.  Enumeration reuses
-   rank/select via `rel_range_each` (not the deferred pull-iterator).
-   Two gates: `range` excluded from IVM/DRed/agg/magic/topdown, and `range`
-   over a recursive-SCC relation rejected (stale-read).
+   leading-column values in `[Lo,Hi)`) or filter.  **The generator is now a
+   LAZY resumable generator driven by the #5 pull-iterator** (commit `9d4f2c6`,
+   2026-08-17): an owned `dl_iter*` in `vm_frame`, opened first entry via the
+   LIVE-only `dl_iter_open_live` (never the snapshot-aware open — `vm_execute`
+   runs with `snap_version>0` on re-publish and must read the live `rel->d`),
+   advanced per backtrack re-entry with skip-`<lo`/stop-`≥hi`/dedup-col0, and
+   closed on pop/cleanup.  This replaced the earlier eager `rel_range_each`
+   materialization and gives early termination under a short-circuiting
+   consumer.  Two gates: `range` excluded from IVM/DRed/agg/magic/topdown, and
+   `range` over a recursive-SCC relation rejected (stale-read).
 4. ~~**Snapshot (mmap `dafsa_view`) rank/select**~~ — **implemented**.
    `dl_rank`/`dl_select`/`dl_range_count`/`dl_count` route to the published
    mmap view when `db->snap_version > 0` (exclusive with the in-memory path,
@@ -196,11 +202,17 @@ In rough priority order. ~~struck-through~~ items are implemented (commit noted)
    `vm_frame.perm_storage`; pack/unpack symmetry verified over all 46,233
    perms of arity 1–8. Semantics unchanged — an oracle test asserts
    `g_perm_select=1` vs `0` produce byte-identical query results.
-7. **Tier 1 sparse checkpoint index** and **Tier 3 succinct sorted array**
-   (Elias-Fano) — only if a true B-tree point-seek / random-access is ever
-   needed; the doc's honest ceiling is that the DAFSA cannot give O(log n)
-   arbitrary-value B-tree semantics, so prefer a complementary sorted structure
-   rather than bending the DAFSA.
+7. ~~**Tier 1 sparse checkpoint index** and **Tier 3 succinct sorted array
+   (Elias-Fano)**~~ — **struck as out-of-scope / overkill** (2026-08-16).
+   Tier 1 (seek-to-range + bounded scan) is **subsumed by the pull-based
+   iterator** (#5: `dl_iter_seek` walks to the lower-bound state via
+   O(prefix-length) `trans_find` and resumes DFS, so the explicit checkpoint
+   array is redundant). Tier 3 (Elias-Fano) is **overkill**: it would store the
+   keys a second time, undermining the DAFSA's shared-suffix compression; Tier 2
+   rank/select is already effectively O(1) for arity ≤ 8; and if genuine OLTP
+   point-seek is ever truly needed, a real **B-tree companion** (a complementary
+   sorted structure) beats Elias-Fano anyway. Deferred as an "only if we ever
+   need a B-tree companion" note, not a range-index slice.
 8. **Fine-grained invalidation** — currently coarse (rebuilds on any add/delete,
    including duplicate-add / absent-delete / bad-arg). A precision improvement
    would track only real structural changes; deferred because a DAFSA merge

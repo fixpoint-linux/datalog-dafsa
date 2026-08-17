@@ -199,6 +199,36 @@ dl_iter *dl_iter_open(dl_db *db, const char *rel,
     return it;
 }
 
+/* LIVE-mode open over an already-resolved relation.  Borrows rel->d and NEVER
+ * routes to the snapshot view.  The VM's OP_RANGE must read LIVE: vm_execute
+ * materializes rel->d in place even when snap_version > 0 (re-publish), and
+ * reading the mmap'd snapshot of a PREVIOUS version would silently
+ * mis-evaluate.  Mirrors dl_iter_open's LIVE branch.  Returns NULL on NULL
+ * rel / empty dafsa / k > arity / k > 0 && !leading / OOM. */
+dl_iter *dl_iter_open_live(relation *rel, const uint32_t *leading, uint8_t k)
+{
+    dl_iter *it;
+    uint8_t arity;
+
+    if (!rel) return NULL;
+    arity = rel_arity(rel);
+    if (k > arity) return NULL;
+    if (k > 0 && !leading) return NULL;
+
+    it = calloc(1, sizeof(*it));
+    if (!it) return NULL;
+
+    it->kind = DL_ITER_LIVE;
+    it->arity = arity;
+    it->d = rel_dafsa(rel);   /* borrow rel->d (db owns it) */
+    if (!it->d) { free(it); return NULL; }
+
+    it->k = k;
+    if (k > 0) memcpy(it->leading, leading, (size_t)k * sizeof(uint32_t));
+    iter_reset_stack(it, iter_walk_prefix(it));
+    return it;
+}
+
 int dl_iter_seek(dl_iter *it, const uint32_t *leading, uint8_t k)
 {
     if (!it) return -1;

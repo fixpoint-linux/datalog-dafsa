@@ -178,4 +178,9 @@ extern int vm_agg_runs;
  * (which would also produce correct views — the counter distinguishes them). */
 extern int vm_propagate_runs;
 
+/* Test observable: number of DISTINCT col0 values yielded by OP_RANGE lazy
+ * generators (incremented once per successful range_resume).  Proves the lazy
+ * path short-circuits under an early-stopping consumer. */
+extern long vm_range_yields;
+
 #endif

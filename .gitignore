@@ -32,6 +32,7 @@ build-tmp/
 /tests/test_m12_snap_rank
 /tests/test_m13_iter
 /tests/test_m14_permsel
+/tests/test_m15_vmiter
 
 # scratch db dirs
 dl-test-*/
