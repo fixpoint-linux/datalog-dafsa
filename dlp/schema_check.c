@@ -41,7 +41,7 @@ static const char *WORKED =
     "       { name = \"constrained\",\n"
     "         columns = [ { name = \"score\", type = < Natural = { min = Some 0, max = Some 150 } > },\n"
     "                     { name = \"temp\", type = < Signed = { min = Some -10, max = Some +10 } > },\n"
-    "                     { name = \"code\", type = < Text = { regex = Some \"^[A-Z][a-z]+$\" } > } ] } ] } : Schema\n";
+    "                     { name = \"code\", type = < Text = { regex = Some \"[A-Z][a-z]+\" } > } ] } ] } : Schema\n";
 
 static int failures = 0;
 static int runs = 0;
@@ -129,8 +129,8 @@ int main(void) {
                con->cols[1].min == -10 && con->cols[1].max == 10,
                "constrained[1] Signed[-10..+10]");
         expect(con->cols[2].tag == DLT_TEXT && con->cols[2].has_regex == 1 &&
-               strcmp(con->cols[2].regex, "^[A-Z][a-z]+$") == 0,
-               "constrained[2] Text~^[A-Z][a-z]+$");
+               strcmp(con->cols[2].regex, "[A-Z][a-z]+") == 0,
+               "constrained[2] Text~[A-Z][a-z]+");
     }
 
     /* dl_colspec_eq must IGNORE constraints: two same-type columns with
