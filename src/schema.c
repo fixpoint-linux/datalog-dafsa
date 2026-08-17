@@ -1,10 +1,9 @@
 /*
- * schema.c — dl_schema builder + lookup + (S2) no-op rule-typecheck hook
+ * schema.c — dl_schema builder + lookup.
  *
- * S2: the schema data model is fully implemented (dl_schema_add / dl_schema_find).
- * dl_typecheck_rules is a no-op stub returning 0; the real rule typechecker
- * body is wired in S3 (src/typecheck.c).  The guarded call site in
- * dl_load_rules is live from S2, so S3 only implements this body.
+ * dl_typecheck_rules (declared in schema.h) is implemented in src/typecheck.c
+ * (S3); it is NOT defined here.  The guarded call site in dl_load_rules is live
+ * and resolves to typecheck.o at link time.
  */
 
 #include "schema.h"
@@ -51,18 +50,4 @@ const dl_reldef *dl_schema_find(const dl_schema *s, const char *name)
             return &s->rels[i];
     }
     return NULL;
-}
-
-int dl_typecheck_rules(const dl_schema *schema, void *rules, int n_rules,
-                       char *errbuf, size_t errcap)
-{
-    /* S2: no-op.  The real rule typechecker against `schema` is wired in S3.
-     * Until then a non-NULL attached schema never rejects a program, so
-     * existing tests (which attach none) are unaffected. */
-    (void)schema;
-    (void)rules;
-    (void)n_rules;
-    (void)errbuf;
-    (void)errcap;
-    return 0;
 }

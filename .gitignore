@@ -44,3 +44,7 @@ dl-test-*/
 
 /tests/test_positions
 /tests/test_schema
+/tests/test_typecheck
+
+# emscripten cache
+.cache/

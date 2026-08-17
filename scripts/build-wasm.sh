@@ -42,7 +42,7 @@ RUNTIME='-s EXPORTED_RUNTIME_METHODS=ccall,cwrap,stringToUTF8,UTF8ToString,lengt
 # (which defines main).  dl.c is monolithic and references snapshot.c /
 # vendor/dafsa_view.c / WAL unconditionally — those symbols must resolve at
 # link, but their POSIX/disk paths are dead code in the playground.
-CORE='src/intern.c src/termstore.c src/relation.c src/vrelation.c src/tupleset.c src/parser.c src/compiler.c src/vm.c src/snapshot.c src/regexwalk.c src/permindex.c src/util.c src/dl.c src/iter.c src/magic.c src/topdown.c src/analyze.c src/schema.c vendor/dafsa.c vendor/dafsa_state.c vendor/dafsa_core.c vendor/dafsa_persist.c vendor/dafsa_view.c vendor/dafsa_crc32.c vendor/dafsa_wal.c vendor/dafsa_build.c vendor/dafsa_rank.c vendor/dafsa_view_rank.c'
+CORE='src/intern.c src/termstore.c src/relation.c src/vrelation.c src/tupleset.c src/parser.c src/compiler.c src/vm.c src/snapshot.c src/regexwalk.c src/permindex.c src/util.c src/dl.c src/iter.c src/magic.c src/topdown.c src/analyze.c src/schema.c src/typecheck.c vendor/dafsa.c vendor/dafsa_state.c vendor/dafsa_core.c vendor/dafsa_persist.c vendor/dafsa_view.c vendor/dafsa_crc32.c vendor/dafsa_wal.c vendor/dafsa_build.c vendor/dafsa_rank.c vendor/dafsa_view_rank.c'
 
 EM_CONFIG="$EMCONF" "$EMCC" $COMMON \
     -s EXPORT_NAME=createPlayground \

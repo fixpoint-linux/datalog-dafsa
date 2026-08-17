@@ -7,8 +7,8 @@
  *   2. Validation: dup name, arity 0, arity 9, NULL name/cols rejected.
  *   3. dl_schema_find: found / not-found / NULL args.
  *   4. dl_attach_schema: NULL db -> -1; attach NULL (detach) ok.
- *   5. Attach a real schema, then dl_load_rules a valid tiny program still
- *      compiles (the S2 hook is a no-op returning 0).
+ *   5. Attach a real schema, then dl_load_rules a well-typed tiny program
+ *      compiles (the S3 typechecker runs against the attached schema).
  *   6. Detach (attach NULL) and load again.
  *
  * Standalone, links libdatalog.so.  Uses build-tmp for the scratch db.
@@ -162,6 +162,10 @@ static void test_attach_hook(void)
         dl_coltype cols[] = { DLT_NATURAL, DLT_NATURAL };
         if (dl_schema_add(&s, "edge", 2, cols, 0) != 0) { FAIL("schema seed failed"); return; }
     }
+    {
+        dl_coltype cols[] = { DLT_NATURAL, DLT_NATURAL };
+        if (dl_schema_add(&s, "reach", 2, cols, 1) != 0) { FAIL("schema seed failed"); return; }
+    }
 
     system("rm -rf build-tmp/schema");
 
@@ -178,8 +182,9 @@ static void test_attach_hook(void)
     assert(dl_declare_relation(db, "edge", 2) == 0);
     assert(dl_load_rules(db, "reach(X,Y) :- edge(X,Y).\n") == 0);
 
-    /* Attach a real schema; hook must be a no-op (returns 0) so this loads. */
-    TEST("attach real schema, load still compiles (S2 no-op hook)");
+    /* Attach a real schema; the S3 typechecker must accept this well-typed
+     * program (reach and edge are both declared in the schema). */
+    TEST("attach real schema, load well-typed program compiles");
     if (dl_attach_schema(db, &s) != 0) FAIL("attach returned nonzero");
     else if (dl_load_rules(db, "reach(X,Y) :- edge(X,Y).\n") == 0) PASS();
     else FAIL("load with schema attached failed");

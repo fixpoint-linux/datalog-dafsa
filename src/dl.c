@@ -2072,12 +2072,14 @@ int dl_load_rules(dl_db *db, const char *dl_source)
         return -1;
     }
 
-    /* Dhall schema hook (S2): if a typed schema is attached, typecheck the
-     * parsed rules against it BEFORE compiling.  dl_typecheck_rules is a
-     * no-op stub (returns 0) until S3 wires the real typechecker; the call
-     * site and its error-cleanup live here now.  On failure we free the
-     * parsed rules + parser exactly like the `if (!rules)` branch above and
-     * return -1, leaving the database untouched. */
+    /* Dhall schema hook (S2/S3): if a typed schema is attached, typecheck the
+     * parsed rules against it BEFORE compiling.  dl_typecheck_rules is
+     * implemented in src/typecheck.c (per-rule occurrence-consistency against
+     * the schema's closed world); on failure the diagnostic is written to
+     * errbuf.  The error-cleanup below frees the parsed rules + parser exactly
+     * like the `if (!rules)` branch above and returns -1, leaving the database
+     * untouched.  (Note: the typecheck diagnostic is intentionally not logged
+     * here — the `dlp` tool layer surfaces it to the user.) */
     if (db->schema != NULL) {
         char errbuf[256];
         if (dl_typecheck_rules(db->schema, (void *)rules, n_rules,

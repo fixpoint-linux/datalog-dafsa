@@ -6,9 +6,9 @@
  * before they are compiled.  This header is SELF-CONTAINED: it does NOT
  * include dl_internal.h (which is an internal header, not a public one).
  *
- * S2 scope: schema structs + builder + lookup + a no-op `dl_typecheck_rules`
- * hook.  The real rule typechecker body lands in S3 (src/typecheck.c); the
- * guarded call site in dl_load_rules already exists from S2.
+ * S2 scope: schema structs + builder + lookup + the guarded dl_typecheck_rules
+ * call site in dl_load_rules.  The real rule typechecker body lands in S3
+ * (src/typecheck.c).
  *
  * Capacity caps are defined HERE with distinct names (DL_SCHEMA_*) so they
  * never collide with dl_internal.h's MAX_RELS / compiler.h's MAX_ARITY.
@@ -70,8 +70,7 @@ const dl_reldef *dl_schema_find(const dl_schema *s, const char *name);
  * parser.h).  Returns 0 if the rules typecheck against `schema`, -1 on
  * failure with a human-readable diagnostic written into errbuf (errcap bytes).
  *
- * S2: a no-op stub returning 0 (see schema.c).  The real typechecker body is
- * wired in S3. */
+ * Implemented in src/typecheck.c (S3). */
 int dl_typecheck_rules(const dl_schema *schema, void *rules, int n_rules,
                        char *errbuf, size_t errcap);
 
