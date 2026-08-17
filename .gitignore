@@ -43,3 +43,4 @@ dl-test-*/
 /tests/bench
 
 /tests/test_positions
+/tests/test_schema

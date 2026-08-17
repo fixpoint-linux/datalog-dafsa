@@ -65,6 +65,12 @@ struct dl_db {
     size_t     nrels;
     int        lock_fd;    /* M7: fcntl lock file descriptor, or -1 */
 
+    /* Dhall typed schema (dl_attach_schema).  Borrowed pointer, never owned;
+     * the caller retains the dl_schema.  NULL = no schema attached (the
+     * default, since dl_open2 calloc's the struct).  When non-NULL,
+     * dl_load_rules typechecks parsed rules against it before compiling. */
+    const struct dl_schema *schema;
+
     /* M1: compiled rules */
     compiled_rule **crules;
     int             n_crules;

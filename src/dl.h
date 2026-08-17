@@ -24,6 +24,11 @@ extern "C" {
 
 typedef struct dl_db dl_db;
 
+/* Typed schema for the Dhall rule typechecker (full definition in schema.h,
+ * self-contained).  Forward-declared here so dl_attach_schema below can take
+ * a pointer without dragging schema.h into this public header. */
+typedef struct dl_schema dl_schema;
+
 /* ─── Lifecycle ───────────────────────────────────────────────────────── */
 
 /* Open or create a database directory.  Returns NULL on error. */
@@ -261,6 +266,15 @@ uint64_t dl_range_count_perm(dl_db *db, const char *rel, int perm_id,
 /* Number of permutation indices currently declared on the database (equals
  * db->n_perms).  Useful for tests of automatic perm-index selection. */
 int dl_db_perm_count(const dl_db *db);
+
+/* ─── Schema attach (Dhall typechecker) ────────────────────────────────── */
+
+/* Attach (or detach) a typed schema for rule typechecking.  A non-NULL
+ * schema is consulted by dl_load_rules BEFORE compilation; if the rules fail
+ * to typecheck against it, the load aborts with -1.  Passing NULL detaches.
+ * The caller retains ownership of the schema; the database only stores the
+ * pointer.  Returns 0 on success, -1 on a NULL db. */
+int dl_attach_schema(dl_db *db, const dl_schema *schema);
 
 /* ─── Rule loading & compilation (M1) ──────────────────────────────────── */
 

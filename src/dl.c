@@ -24,6 +24,7 @@
 #include "magic.h"
 #include "topdown.h"
 #include "util.h"
+#include "schema.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -2045,6 +2046,14 @@ static rule *ast_rule_clone(const rule *r)
     return n;
 }
 
+int dl_attach_schema(dl_db *db, const dl_schema *schema)
+{
+    if (!db) return -1;
+    /* Borrowed pointer; NULL detaches.  The caller retains ownership. */
+    db->schema = schema;
+    return 0;
+}
+
 int dl_load_rules(dl_db *db, const char *dl_source)
 {
     parser *p;
@@ -2061,6 +2070,24 @@ int dl_load_rules(dl_db *db, const char *dl_source)
     if (!rules) {
         parse_free(p);
         return -1;
+    }
+
+    /* Dhall schema hook (S2): if a typed schema is attached, typecheck the
+     * parsed rules against it BEFORE compiling.  dl_typecheck_rules is a
+     * no-op stub (returns 0) until S3 wires the real typechecker; the call
+     * site and its error-cleanup live here now.  On failure we free the
+     * parsed rules + parser exactly like the `if (!rules)` branch above and
+     * return -1, leaving the database untouched. */
+    if (db->schema != NULL) {
+        char errbuf[256];
+        if (dl_typecheck_rules(db->schema, (void *)rules, n_rules,
+                               errbuf, sizeof errbuf) != 0) {
+            int i;
+            for (i = 0; i < n_rules; i++) rule_free(rules[i]);
+            free(rules);
+            parse_free(p);
+            return -1;
+        }
     }
 
     if (compile_rules(db, rules, n_rules, &new_crules, &n_compiled) != 0) {
