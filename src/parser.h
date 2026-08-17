@@ -50,6 +50,8 @@ typedef enum {
 typedef struct token {
     token_kind  kind;
     uint32_t    off;        /* byte offset of this token in the source (0-based) */
+    int         line;       /* 1-based line of off in the source (0 = unset) */
+    int         col;        /* 1-based column of off in the source (0 = unset) */
     char       *text;       /* owned; NULL for punctuation tokens */
     uint32_t    ival;       /* integer value (TOK_INT only) */
     struct token **children;/* TOK_LIST: owned element tokens (NULL otherwise) */
@@ -81,6 +83,8 @@ void  expr_free(expr *e);
 typedef struct {
     char   *pred;          /* predicate name */
     uint32_t off;          /* byte offset of this atom's predicate name (0-based) */
+    int     line;          /* 1-based line of this atom's predicate name (0 = unset) */
+    int     col;           /* 1-based column of this atom's predicate name (0 = unset) */
     token **args;          /* array of argument tokens */
     int     nargs;         /* number of arguments */
     int     negated;       /* 1 if preceded by ! */

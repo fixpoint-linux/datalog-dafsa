@@ -28,10 +28,64 @@ struct parser {
     int         ntok;       /* number of tokens */
     int         cur;        /* current token index */
     char       *src_owned;  /* owned copy of source (for parse_create) */
+    uint32_t   *line_starts;/* heap: byte offset of the start of each line;
+                               line i (1-based) starts at line_starts[i-1] */
+    int         nlines;     /* number of entries in line_starts */
     uint32_t    err_off;    /* byte offset of the FIRST recorded error */
     int         has_err;    /* 1 once an error has been recorded */
     char        err_msg[256];/* formatted text of the FIRST recorded error */
 };
+
+/* Build p->line_starts: an array of the byte offset of each line's start,
+ * indexed by (line - 1).  line 1 starts at 0; every '\n' begins the next line
+ * at offset i+1.  On allocation failure nlines stays 0 and position lookup
+ * degrades to (0,0) — harmless, purely additive. */
+static void build_line_starts(parser *p)
+{
+    const char *s = p->src;
+    int cap = 16, n = 0;
+
+    p->line_starts = malloc((size_t)cap * sizeof(uint32_t));
+    if (!p->line_starts) return;
+
+    p->line_starts[n++] = 0;                 /* line 1 */
+    while (*s) {
+        if (*s == '\n') {
+            if (n >= cap) {
+                int nc = cap * 2;
+                uint32_t *ns = realloc(p->line_starts, (size_t)nc * sizeof(uint32_t));
+                if (!ns) { free(p->line_starts); p->line_starts = NULL; n = 0; break; }
+                p->line_starts = ns;
+                cap = nc;
+            }
+            p->line_starts[n++] = (uint32_t)((s + 1) - p->src);
+        }
+        s++;
+    }
+    p->nlines = n;
+}
+
+/* Map a 0-based byte offset to 1-based line/col via p->line_starts (binary
+ * search: greatest line start <= off).  Sets *line and *col; (0,0) when the
+ * table is absent/empty. */
+static void off_to_pos(const parser *p, uint32_t off, int *line, int *col)
+{
+    int lo = 0, hi, best = 0;
+
+    if (!p->line_starts || p->nlines <= 0) {
+        *line = 0;
+        *col = 0;
+        return;
+    }
+    hi = p->nlines - 1;
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (p->line_starts[mid] <= off) { best = mid; lo = mid + 1; }
+        else hi = mid - 1;
+    }
+    *line = best + 1;
+    *col = (int)(off - p->line_starts[best]) + 1;
+}
 
 /* Record a parse error: write the message to stderr BYTE-IDENTICALLY to the
  * pre-LSP parser (vfprintf), AND capture the offset + formatted message so
@@ -101,6 +155,8 @@ static token *tok_dup(const token *t)
     if (!n) return NULL;
     n->kind = t->kind;
     n->off = t->off;
+    n->line = t->line;
+    n->col = t->col;
     n->ival = t->ival;
     if (t->text) {
         n->text = strdup(t->text);
@@ -179,6 +235,7 @@ static int lex(parser *p)
         t = tok_new(TOK_EOF, NULL, 0);
         if (!t) return -1;
         t->off = (uint32_t)(tok_start - p->src);
+        off_to_pos(p, t->off, &t->line, &t->col);
         p->tokens[p->ntok++] = t;
         p->pos = s;
         return 0;
@@ -325,6 +382,7 @@ static int lex(parser *p)
 
     if (!t) return -1;
     t->off = (uint32_t)(tok_start - p->src);
+    off_to_pos(p, t->off, &t->line, &t->col);
     p->tokens[p->ntok++] = t;
     p->pos = s;
     return 0;
@@ -622,6 +680,8 @@ static atom *parse_atom(parser *p)
     a->pred = strdup(pred->text);
     if (!a->pred) { atom_free(a); return NULL; }
     a->off = pred->off;
+    a->line = pred->line;
+    a->col = pred->col;
 
     /* Parse arguments */
     {
@@ -955,6 +1015,8 @@ static atom *parse_body_atom(parser *p)
                 if (!a) return NULL;
                 a->pred = strdup(nm->text);
                 a->off = nm->off;
+                a->line = nm->line;
+                a->col = nm->col;
                 a->negated = negated;
                 if (!a->pred) { atom_free(a); return NULL; }
 
@@ -1209,6 +1271,7 @@ parser *parse_create(const char *source)
     if (!p->src_owned) { free(p); return NULL; }
     p->src = p->src_owned;
     p->pos = p->src;
+    build_line_starts(p);
 
     p->tokens = calloc(MAX_TOKENS, sizeof(token *));
     if (!p->tokens) { free(p->src_owned); free(p); return NULL; }
@@ -1238,6 +1301,7 @@ parser *parse_create_reporting(const char *source)
     if (!p->src_owned) { free(p); return NULL; }
     p->src = p->src_owned;
     p->pos = p->src;
+    build_line_starts(p);
 
     p->tokens = calloc(MAX_TOKENS, sizeof(token *));
     if (!p->tokens) { free(p->src_owned); free(p); return NULL; }
@@ -1313,6 +1377,7 @@ void parse_free(parser *p)
     for (i = 0; i < p->ntok; i++)
         tok_free(p->tokens[i]);
     free(p->tokens);
+    free(p->line_starts);
     free(p->src_owned);
     free(p);
 }

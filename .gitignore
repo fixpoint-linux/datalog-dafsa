@@ -41,3 +41,5 @@ dl-test-*/
 
 # benchmark
 /tests/bench
+
+/tests/test_positions
