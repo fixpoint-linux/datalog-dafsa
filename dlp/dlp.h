@@ -27,6 +27,10 @@ int dlp_schema_load(dl_schema *s, const char *path, char *errbuf, size_t errcap)
  * types only).  Returns NULL if the relation/column is out of range. */
 const char *dlp_schema_colname(const dl_schema *s, const char *rel, int col);
 
+/* Render a human-readable type name for a column spec into `out` (cap bytes).
+ * Shared by `dlp schema` and the query printer. */
+void dlp_coltype_name(const dl_colspec *c, char *out, size_t cap);
+
 /* Scaffold a new project directory: schema.dhall (worked-example template),
  * data/, rules/, .build/.  Returns 0 on success, -1 on failure with errbuf. */
 int dlp_project_init(const char *dir, char *errbuf, size_t errcap);
