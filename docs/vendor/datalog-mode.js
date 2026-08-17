@@ -15,7 +15,11 @@
       { regex: /\b(?:count|sum|min|max|concat|length|lower|upper|prefix|suffix|contains|cons|car|cdr|append|member|range)\b/,
         token: 'keyword' },                                          /* builtins */
       { regex: /[A-Z_][A-Za-z0-9_]*/, token: 'variable-2' },        /* variable (uppercase/_)*/
-      { regex: /[a-z][A-Za-z0-9_]*/, token: 'atom' },               /* predicate / constant (lowercase) */
+      /* A lowercase identifier followed by '(' is a relation/predicate;
+       * otherwise it is a constant.  Lookahead (not consumed) so only the
+       * identifier is colored. */
+      { regex: /[a-z][A-Za-z0-9_]*(?=[ \t]*\()/, token: 'pred' },   /* relation (predicate) */
+      { regex: /[a-z][A-Za-z0-9_]*/, token: 'atom' },               /* constant (lowercase) */
       { regex: /[!<>=+\-*\/%~|]/, token: 'operator' },              /* ! != < <= > >= = + - * / % ~ | */
       { regex: /[(),\[\].]/, token: 'bracket' }                      /* ( ) [ ] . , */
     ]
