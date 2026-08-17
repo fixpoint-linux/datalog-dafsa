@@ -26,13 +26,32 @@
 <main class="wrap">
   <h1>Time Travel</h1>
   <p>
-    Every call to <code>dl_publish_snapshot</code> writes a versioned snapshot
-    directory (<code>snapshots/&lt;N&gt;/</code>) and flips the
-    <code>CURRENT</code> pointer. Old snapshot versions persist on disk, which
-    makes <em>as-of</em> queries possible: read any past snapshot as if it were
-    current, without touching the live routing. Time-travel is available through
-    the C API only — there is no Datalog syntax and no CLI command.
+    Time-travel is a <strong>first-class feature</strong>, not an add-on: because
+    the engine is built around a <em>publish-then-serve</em> lifecycle and keeps
+    every published snapshot by default, the database is a <strong>versioned
+    point-in-time history</strong>. Any past state can be queried as if it were
+    current.
   </p>
+  <p>
+    That buys real capabilities on a batch-write / read-heavy workload:
+  </p>
+  <ul>
+    <li><strong>Audit &amp; as-of analysis</strong> — answer &ldquo;what did this
+      derived relation contain two publishes ago?&rdquo; without a replay or a
+      full rebuild.</li>
+    <li><strong>Immutable history</strong> — every version is a frozen,
+      reproducible view; later writes can never retroactively change it.</li>
+    <li><strong>Diff / evolution</strong> — compare the same goal across versions
+      to see exactly how the database evolved between publishes.</li>
+    <li><strong>Zero-cost snapshotting</strong> — the snapshot <em>is</em> the
+      normal read path (mmap views); keeping history is just not deleting the old
+      version directories.</li>
+  </ul>
+  <div class="note">
+    Time-travel is available through the C API only — there is no Datalog syntax
+    and no CLI command. It reuses the same versioned-snapshot directories and
+    mmap views as the ordinary read path.
+  </div>
 
   <h2 id="versions">Versioned snapshots</h2>
   <p>

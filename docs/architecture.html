@@ -59,6 +59,34 @@
     <code>sym&rarr;str</code> array.
   </p>
 
+  <h2 id="compact">Why the DAFSA makes the store compact</h2>
+  <p>
+    The DAFSA is a <em>minimized acyclic</em> DFA: during construction, states
+    with identical outgoing transition structures are <strong>merged</strong> into
+    one shared state. Because every fact is a fixed-width key ending in a common
+    <code>\0</code> guard, the tails of keys that share a suffix collapse into a
+    single path. A relation of <code>N</code> facts whose keys share long common
+    suffixes stores those suffixes <em>once</em>, not <code>N</code> times.
+  </p>
+  <p>
+    Concretely: a store with thousands of <code>edge(a,b)</code> tuples that all
+    fan out over the same few destination columns keeps the shared tail states
+    exactly once. The whole database is the sum of these per-relation DAFSAs (plus
+    the interner), and the read path is <strong>mmap&rsquo;d zero-copy</strong> —
+    there is no secondary index to maintain and no deserialization; the DAFSA
+    bytes on disk <em>are</em> the queryable structure. This is what lets the
+    engine serve reads as fast as a fact store can, from a footprint that is a
+    fraction of a raw row store for suffix-heavy data.
+  </p>
+  <p>
+    The trade-off: a minimized DAG is not a B-tree. It gives exact-key lookup and
+    prefix enumeration at O(key length), and (via the order-statistics subtree
+    arrays) rank / select / range in time logarithmic in the number of distinct
+    tuples — but it deliberately does not provide arbitrary-value random access.
+    Order statistics and the sorted iterator close most of that gap;
+    see <a href="order-statistics.html">Order Statistics</a>.
+  </p>
+
   <h2 id="lifecycle">Lifecycle: load &rarr; compile &rarr; publish &rarr; serve</h2>
   <ol>
     <li><strong>Load</strong> facts into a database directory

@@ -30,11 +30,39 @@
     minimal-acyclic-DAFSA fact store, compile Datalog rules to a small VM,
     materialize derived relations, and serve reads from an mmap&rsquo;d snapshot.
   </p>
-  <p>
-    The storage thesis is simple: every fact is a <em>fixed-width big-endian
-    key</em>, so the DAFSA&rsquo;s two strongest primitives — exact-key lookup and
-    prefix enumeration — are exactly the two most common join access patterns.
-  </p>
+
+  <h2 id="headline">Two things that stand out</h2>
+  <div class="headline">
+    <div class="headline-card">
+      <h3>A database that <em>shares its suffixes</em> — so it&rsquo;s genuinely
+          compact</h3>
+      <p>
+        Every relation is stored as a <strong>minimized acyclic DAFSA</strong>:
+        common suffix paths between facts are <em>merged into a single shared
+        state</em>, not duplicated. A store that keeps thousands of
+        <code>edge(1,&hellip;)</code> prefixes over the same tail columns is
+        dramatically smaller than a row store, because the shared tails exist
+        once. Reads are <strong>mmap&rsquo;d zero-copy</strong> — the DAFSA is the
+        index, so there is no separate index file and no deserialization on the
+        read path. Exact lookup and prefix enumeration are the two most common
+        join access patterns, and both are native DAFSA primitives.
+      </p>
+      <p><a href="architecture.html#compact">Why the DAFSA makes the store small &rarr;</a></p>
+    </div>
+    <div class="headline-card">
+      <h3>Every publish is a point-in-time — time-travel as a first-class feature</h3>
+      <p>
+        Every <code>dl_publish_snapshot</code> writes an <strong>immutable,
+        versioned snapshot</strong> and keeps the full history by default. That
+        makes <em>as-of</em> queries a native capability: read the database as it
+        was at version <code>n</code> — audit, replay, or diff the evolution of a
+        derived relation — without touching live routing. Old snapshots are
+        <strong>immutable</strong>; later writes never disturb them. Opt-in
+        retention bounds disk growth.
+      </p>
+      <p><a href="time-travel.html">Time-travel &amp; as-of queries &rarr;</a></p>
+    </div>
+  </div>
 
   <h2>Quickstart</h2>
   <pre class="code"><code>make                 # build libdatalog.so, dl CLI, test binaries
