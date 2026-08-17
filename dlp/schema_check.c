@@ -3,7 +3,8 @@
  * Standalone binary: writes the S0-verified worked-example schema.dhall to a
  * temp file, loads+walks it via dlp_schema_load, and asserts the resulting
  * dl_schema is exactly:
- *   node[Text], edge[Text,Text], weight[Text,Natural], tc[Text,Text]
+ *   node[Text], edge[Text,Text], weight[Text,Natural],
+ *   light_edge[Text,Text], tc[Text,Text]
  *
  * Links the same sources as `dlp` (engine core + dhall-c).  Run via
  * `make dlp-check` or manually with ./dlp_schema_check.
@@ -27,8 +28,11 @@ static const char *WORKED =
     "         columns = [ { name = \"src\", type = < Text = True > },\n"
     "                     { name = \"dst\", type = < Text = True > } ] },\n"
     "       { name = \"weight\",\n"
-    "         columns = [ { name = \"label\", type = < Text = True > },\n"
+    "         columns = [ { name = \"src\", type = < Text = True > },\n"
     "                     { name = \"w\", type = < Natural = True > } ] },\n"
+    "       { name = \"light_edge\",\n"
+    "         columns = [ { name = \"src\", type = < Text = True > },\n"
+    "                     { name = \"dst\", type = < Text = True > } ] },\n"
     "       { name = \"tc\",\n"
     "         columns = [ { name = \"src\", type = < Text = True > },\n"
     "                     { name = \"dst\", type = < Text = True > } ] } ] } : Schema\n";
@@ -61,7 +65,7 @@ int main(void) {
     expect(rc == 0, "dlp_schema_load returns 0");
     if (rc != 0) { printf("  errbuf: %s\n", errbuf); return 1; }
 
-    expect(s.n_rels == 4, "n_rels == 4");
+    expect(s.n_rels == 5, "n_rels == 5");
 
     const dl_reldef *node = find(&s, "node");
     expect(node != NULL, "node present");
@@ -80,6 +84,12 @@ int main(void) {
     expect(weight != NULL, "weight present");
     if (weight) {
         expect(weight->arity == 2 && weight->cols[0] == DLT_TEXT && weight->cols[1] == DLT_NATURAL, "weight[Text,Natural]");
+    }
+
+    const dl_reldef *light_edge = find(&s, "light_edge");
+    expect(light_edge != NULL, "light_edge present");
+    if (light_edge) {
+        expect(light_edge->arity == 2 && light_edge->cols[0] == DLT_TEXT && light_edge->cols[1] == DLT_TEXT, "light_edge[Text,Text]");
     }
 
     const dl_reldef *tc = find(&s, "tc");

@@ -12,6 +12,27 @@
 #include <stdarg.h>
 #include <string.h>
 
+/* Column-name table retained from the Dhall schema (S5).
+ *
+ * dl_reldef (src/schema.h) stores column TYPES only; header-name mapping in the
+ * CSV loader needs the column NAMES too.  They are captured here, in relation
+ * index order, during the walk, and exposed via dlp_schema_colname().  Because
+ * dlp loads exactly one schema at a time, a single static table is sufficient.
+ */
+static char colnames[DL_SCHEMA_MAX_RELS][DL_SCHEMA_MAX_ARITY][DL_SCHEMA_NAME_MAX];
+
+/* Return the name of column `col` (0-based) of relation `rel`, or NULL if the
+ * relation/column is out of range. */
+const char *dlp_schema_colname(const dl_schema *s, const char *rel, int col) {
+    if (!s || !rel || col < 0 || col >= DL_SCHEMA_MAX_ARITY) return NULL;
+    for (int i = 0; i < s->n_rels; i++)
+        if (strcmp(s->rels[i].name, rel) == 0) {
+            if (col >= s->rels[i].arity) return NULL;
+            return colnames[i][col];
+        }
+    return NULL;
+}
+
 static char walk_err[256];
 static void walk_error(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt); vsnprintf(walk_err, sizeof walk_err, fmt, ap); va_end(ap);
@@ -81,6 +102,13 @@ static bool build_schema(dl_schema *s, Term *nf) {
         if (arity < 0) return false;
         dl_coltype cols[DL_SCHEMA_MAX_ARITY];
         for (int j = 0; j < arity; j++) {
+            /* Retain the column NAME (S5 header mapping) before the type. */
+            static char cname[DL_SCHEMA_NAME_MAX];
+            Term *cnamet = rec_get(celems[j], "name");
+            if (!cnamet) { walk_error("relation '%s' column %d missing 'name'", rname, j); return false; }
+            if (!text_flat(cnamet, cname, sizeof cname)) return false;
+            if (j < DL_SCHEMA_MAX_ARITY)
+                snprintf(colnames[i][j], sizeof colnames[i][j], "%s", cname);
             Term *type = rec_get(celems[j], "type");
             if (!type) { walk_error("relation '%s' column %d missing 'type'", rname, j); return false; }
             if (!walk_coltype(&cols[j], type)) return false;

@@ -50,7 +50,7 @@ ALL_OBJS = $(VENDOR_OBJS) $(LIB_OBJS)
 
 # ─── Targets ─────────────────────────────────────────────────────────────
 
-.PHONY: all clean test bench test-m1 test-m2 wasm lsp test-lsp dlp dlp_schema_check dlp-check
+.PHONY: all clean test bench test-m1 test-m2 wasm lsp test-lsp dlp dlp_schema_check dlp-check dlp-golden
 
 all: build-tmp libdatalog.so dl
 
@@ -330,7 +330,7 @@ DLP_ENGINE_SRCS = src/intern.c src/termstore.c src/relation.c \
                   vendor/dafsa_crc32.c vendor/dafsa_wal.c vendor/dafsa_build.c \
                   vendor/dafsa_rank.c vendor/dafsa_view_rank.c
 
-DLP_SRCS = dlp/main.c dlp/schema_load.c dlp/init.c
+DLP_SRCS = dlp/main.c dlp/schema_load.c dlp/init.c dlp/csv_load.c dlp/workflow.c
 
 # Use := (not ?=) so the environment's CC=cc does not override cosmocc.
 COSMOCC := cosmocc
@@ -347,6 +347,12 @@ dlp_schema_check: dlp/schema_check.c dlp/schema_load.c $(DLP_ENGINE_SRCS) $(CORE
 dlp-check: dlp dlp_schema_check
 	./dlp_schema_check
 	@rm -rf /tmp/dlp-check-proj && ./dlp/dlp init /tmp/dlp-check-proj && ./dlp/dlp schema /tmp/dlp-check-proj
+
+# S5 golden test: build dlp then run the end-to-end worked-example assertions
+# (good project check/build/query + bug-rule rejection).
+dlp-golden: dlp
+	@tests/dlp_golden.sh ./dlp/dlp
+
 
 # ─── WebAssembly playground ─────────────────────────────────────────────
 # Builds the in-browser language playground (docs/playground.js + .wasm)

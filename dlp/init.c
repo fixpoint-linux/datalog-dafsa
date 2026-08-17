@@ -11,7 +11,7 @@
  * `let ColumnType = < Natural : Bool | Text : Bool >`, union values
  * `< Text = True >` / `< Natural = True >`, and the final body annotated
  * `: Schema`.  The worked example declares node[Text], edge[Text,Text],
- * weight[Text,Natural], tc[Text,Text].
+ * weight[Text,Natural], light_edge[Text,Text], tc[Text,Text].
  */
 #include "dlp.h"
 
@@ -35,8 +35,11 @@
     "         columns = [ { name = \"src\", type = < Text = True > },\n" \
     "                     { name = \"dst\", type = < Text = True > } ] },\n" \
     "       { name = \"weight\",\n" \
-    "         columns = [ { name = \"label\", type = < Text = True > },\n" \
+    "         columns = [ { name = \"src\", type = < Text = True > },\n" \
     "                     { name = \"w\", type = < Natural = True > } ] },\n" \
+    "       { name = \"light_edge\",\n" \
+    "         columns = [ { name = \"src\", type = < Text = True > },\n" \
+    "                     { name = \"dst\", type = < Text = True > } ] },\n" \
     "       { name = \"tc\",\n" \
     "         columns = [ { name = \"src\", type = < Text = True > },\n" \
     "                     { name = \"dst\", type = < Text = True > } ] } ] } : Schema\n"
