@@ -101,9 +101,9 @@ int dl_delete_fact(dl_db *db, const char *rel,
 /* ─── CAS revision API (per-entity compare-and-swap revision counter) ──── */
 
 /* Compare-and-swap the revision counter for `entity`.  If the entity's
- * CURRENT stored revision equals `expected`, atomically replace it with
- * `new_value` (DELETE + ADD of the rev row, WAL-appended + fsync'd, with IVM
- * delta capture) and return 0.  If the current revision differs, returns
+ * CURRENT stored revision equals `expected`, replace it with `new_value`
+ * (DELETE + ADD of the rev row, each WAL-appended + fsync'd, with IVM delta
+ * capture) and return 0.  If the current revision differs, returns
  * DL_E_CONFLICT and makes NO change.  If expected == new_value it is an
  * idempotent no-op returning 0.  Returns -1 on error (NULL db/entity, or the
  * internal "rev" relation could not be ensured).  The first successful CAS on

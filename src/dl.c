@@ -2272,6 +2272,29 @@ int dl_load_rules(dl_db *db, const char *dl_source)
         return -1;
     }
 
+    /* CAS: the "rev" relation is system-reserved (one-tuple-per-entity
+     * revision counter).  Reject any rule that references it as head or
+     * body, so it can never become a derived relation and corrupt the
+     * counter invariant or read-your-writes semantics. */
+    for (int i = 0; i < n_rules; i++) {
+        rule *r = rules[i];
+        if (r->head && r->head->pred && strcmp(r->head->pred, "rev") == 0) {
+            for (int j = 0; j < n_rules; j++) rule_free(rules[j]);
+            free(rules);
+            parse_free(p);
+            return -1;
+        }
+        for (int j = 0; j < r->nbody; j++) {
+            atom *a = r->body[j];
+            if (a && a->pred && strcmp(a->pred, "rev") == 0) {
+                for (int k = 0; k < n_rules; k++) rule_free(rules[k]);
+                free(rules);
+                parse_free(p);
+                return -1;
+            }
+        }
+    }
+
     /* Dhall schema hook (S2/S3): if a typed schema is attached, typecheck the
      * parsed rules against it BEFORE compiling.  dl_typecheck_rules is
      * implemented in src/typecheck.c (per-rule occurrence-consistency against
