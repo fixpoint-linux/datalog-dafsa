@@ -64,6 +64,8 @@ struct dl_db {
     rel_entry  rels[MAX_RELS];
     size_t     nrels;
     int        lock_fd;    /* M7: fcntl lock file descriptor, or -1 */
+    int        rev_rel_id; /* CAS: cached index of the internal "rev" relation
+                              (arity-2 entity→revision), or -1 if unknown */
 
     /* Dhall typed schema (dl_attach_schema).  Borrowed pointer, never owned;
      * the caller retains the dl_schema.  NULL = no schema attached (the

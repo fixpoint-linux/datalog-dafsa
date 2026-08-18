@@ -36,7 +36,8 @@ dl_db  *dl_open(const char *dir);
 void    dl_close(dl_db *db);
 
 /* Error codes for dl_open2 */
-#define DL_E_LOCKED 1   /* database is locked by another writer */
+#define DL_E_LOCKED   1   /* database is locked by another writer */
+#define DL_E_CONFLICT 2   /* CAS: expected revision != current revision */
 
 /* Open with explicit error reporting.  On success, *err_out=0 and handle
  * is returned.  On failure, *err_out is set and NULL is returned.
@@ -96,6 +97,28 @@ int dl_add_fact(dl_db *db, const char *rel,
  * Durable: WAL-appended + fsync'd before in-memory commit. */
 int dl_delete_fact(dl_db *db, const char *rel,
                    const uint32_t *cols, uint8_t arity);
+
+/* ─── CAS revision API (per-entity compare-and-swap revision counter) ──── */
+
+/* Compare-and-swap the revision counter for `entity`.  If the entity's
+ * CURRENT stored revision equals `expected`, atomically replace it with
+ * `new_value` (DELETE + ADD of the rev row, WAL-appended + fsync'd, with IVM
+ * delta capture) and return 0.  If the current revision differs, returns
+ * DL_E_CONFLICT and makes NO change.  If expected == new_value it is an
+ * idempotent no-op returning 0.  Returns -1 on error (NULL db/entity, or the
+ * internal "rev" relation could not be ensured).  The first successful CAS on
+ * a fresh database (or a first write for a given entity) implicitly starts the
+ * entity at current revision 0.
+ *
+ * A caller that reads a revision with dl_rev_get, performs work, then CASes
+ * with the read value as `expected` gets optimistic-concurrency semantics. */
+int dl_cas_revision(dl_db *db, const char *entity,
+                    uint32_t expected, uint32_t new_value);
+
+/* Read the current revision counter for `entity` into *out.  Returns 0 on
+ * success (an entity with no rev row reads as 0), -1 on error (NULL db/entity/
+ * out, or the internal "rev" relation could not be ensured). */
+int dl_rev_get(dl_db *db, const char *entity, uint32_t *out);
 
 /* ─── Query primitives ────────────────────────────────────────────────── */
 

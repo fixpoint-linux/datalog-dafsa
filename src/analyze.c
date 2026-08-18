@@ -256,6 +256,7 @@ int analyze_program(const char *source, dl_db **out_db, analyze_error *err)
     }
     db->dir = NULL;
     db->lock_fd = -1;
+    db->rev_rel_id = -1;  /* CAS: no rev relation on an eval clone */
     db->ir = intern_create();
     db->terms = term_create();
     if (!db->ir || !db->terms) {

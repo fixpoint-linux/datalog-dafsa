@@ -319,6 +319,7 @@ dl_db *dl_open2(const char *dir, int *err_out)
     db = calloc(1, sizeof(*db));
     if (!db) { close(lfd); if (err_out) *err_out = -1; return NULL; }
     db->lock_fd = lfd;
+    db->rev_rel_id = -1;  /* CAS: cached rev relation index (unknown yet) */
 
     db->dir = strdup(dir);
     if (!db->dir) { close(lfd); free(db); if (err_out) *err_out = -1; return NULL; }
@@ -669,6 +670,14 @@ static int dl_declare_relation_kind(dl_db *db, const char *name,
 
     if (!db || !name) return -1;
     if (arity > 8) return -1;   /* 0 = variadic (v2) */
+
+    /* CAS: the "rev" relation is system-reserved with FIXED arity 2
+     * (entity → revision).  Only arity-2 declarations are permitted (the
+     * redeclaration is idempotent via the normal path below). */
+    if (strcmp(name, "rev") == 0 && arity != 2) {
+        fprintf(stderr, "error: relation name 'rev' is reserved (arity must be 2)\n");
+        return -1;
+    }
 
     /* M8: scoped-eval clones have dir==NULL.  A declaration on such a db
      * means a missed head relation slipped through the transform — fail
@@ -1417,6 +1426,10 @@ int dl_add_fact(dl_db *db, const char *rel_name,
 
     if (!db || !rel_name || !cols) return -1;
 
+    /* CAS: "rev" is a system-managed relation — direct inserts are rejected
+     * (use dl_cas_revision). */
+    if (strcmp(rel_name, "rev") == 0) return -1;
+
     idx = find_rel(db, rel_name);
     if (idx < 0) return -1;
 
@@ -1562,6 +1575,10 @@ int dl_delete_fact(dl_db *db, const char *rel_name,
 
     if (!db || !rel_name || !cols) return -1;
 
+    /* CAS: "rev" is a system-managed relation — direct deletes are rejected
+     * (use dl_cas_revision). */
+    if (strcmp(rel_name, "rev") == 0) return -1;
+
     idx = find_rel(db, rel_name);
     if (idx < 0) return -1;
 
@@ -1606,6 +1623,157 @@ int dl_delete_fact(dl_db *db, const char *rel_name,
     db->fixpoint_dirty = 1;
 
     return 1;  /* deleted */
+}
+
+/* ─── CAS revision API (per-entity compare-and-swap) ────────────────────── */
+
+/* Ensure the internal arity-2 "rev" relation (entity_sym → revision) exists,
+ * caching its index in db->rev_rel_id.  Returns the rel_id, or -1 on error. */
+static int ensure_rev_rel(dl_db *db)
+{
+    int idx;
+    if (db->rev_rel_id >= 0)
+        return db->rev_rel_id;
+    idx = find_rel(db, "rev");
+    if (idx < 0) {
+        if (dl_declare_relation(db, "rev", 2) != 0)
+            return -1;
+        idx = find_rel(db, "rev");
+        if (idx < 0) return -1;
+    }
+    db->rev_rel_id = idx;
+    return idx;
+}
+
+/* Sink for the rev relation's single tuple under an entity prefix: records
+ * the revision value and stops the enumeration (a "rev" row is unique per
+ * entity — the entity is the leading column). */
+static int rev_sink_cb(const uint32_t *cols, uint8_t arity, void *user)
+{
+    uint32_t *out = user;
+    (void)arity;
+    *out = cols[1];
+    return 1;  /* stop after the single match */
+}
+
+/* Read the current revision for entity_sym into *out (0 if the entity has no
+ * rev row).  Resolves the rev relation via ensure_rev_rel.  Returns 0 on
+ * success, -1 on error. */
+static int rev_get(dl_db *db, uint32_t entity_sym, uint32_t *out)
+{
+    int rel_id = ensure_rev_rel(db);
+    relation *rel;
+    long n;
+    if (rel_id < 0) return -1;
+    rel = db->rels[rel_id].rel;
+    if (!rel) return -1;
+    *out = 0;
+    n = rel_prefix(rel, &entity_sym, 1, rev_sink_cb, out);
+    if (n < 0) return -1;
+    return 0;
+}
+
+int dl_cas_revision(dl_db *db, const char *entity,
+                    uint32_t expected, uint32_t new_value)
+{
+    int rel_id, rc;
+    uint32_t entity_sym, cur;
+    relation *rel;
+    unsigned char key[33];  /* 4*8+1 */
+    size_t key_len;
+    uint32_t old_cols[2], new_cols[2];
+
+    if (!db || !entity) return -1;
+
+    /* NOTE: a transaction-active guard (db->txn != NULL → -1) is reserved for
+     * a later CAS/transaction slice — no txn field exists in struct dl_db yet. */
+
+    if (expected == new_value) return 0;  /* idempotent no-op */
+
+    rel_id = ensure_rev_rel(db);
+    if (rel_id < 0) return -1;
+    rel = db->rels[rel_id].rel;
+    if (!rel) return -1;
+
+    entity_sym = intern_str(db->ir, entity);
+    if (entity_sym == 0) return -1;  /* OOM */
+
+    if (rev_get(db, entity_sym, &cur) != 0) return -1;
+    if (cur != expected) return DL_E_CONFLICT;  /* no change on conflict */
+
+    /* CAS succeeds: atomically replace the row (entity, cur) → (entity, new). */
+
+    /* Interner-before-WAL invariant (see dl_add_fact): if interning `entity`
+     * created a new sym, make it durable before the WAL records that
+     * reference its sym_id, so crash recovery can decode them. */
+    if (intern_is_dirty(db->ir)) {
+        char *fwd_path = make_path(db, "symbols", ".dafsa");
+        char *rev_path = make_path(db, "symbols", ".array");
+        if (!fwd_path || !rev_path) {
+            free(fwd_path); free(rev_path);
+            return -1;
+        }
+        if (intern_save(db->ir, fwd_path, rev_path) != 0) {
+            free(fwd_path); free(rev_path);
+            return -1;
+        }
+        free(fwd_path); free(rev_path);
+    }
+
+    /* 1. DELETE the old row: WAL-append DEL + fsync, then in-memory delete. */
+    old_cols[0] = entity_sym;
+    old_cols[1] = cur;
+    if (encode_fact_key(key, &key_len, old_cols, 2) != 0) return -1;
+    if (rel_wal_append_del(rel, key, (uint32_t)key_len) != 0) return -1;
+    rc = rel_delete_base(rel, old_cols);
+    if (rc < 0) return -1;
+    if (rc == 1) {
+        permindex_mark_dirty(db, rel_id);
+        if (ivm_capture_delete(db, rel_id, old_cols, 2) != 0)
+            db->full_reeval_pending = 1;
+    }
+
+    /* 2. ADD the new row: WAL-append ADD + fsync, then in-memory add. */
+    new_cols[0] = entity_sym;
+    new_cols[1] = new_value;
+    if (encode_fact_key(key, &key_len, new_cols, 2) != 0) return -1;
+    if (rel_wal_append_add(rel, key, (uint32_t)key_len) != 0) return -1;
+    rc = rel_add_base(rel, new_cols);
+    if (rc < 0) return -1;
+    if (rc == 1) {
+        permindex_mark_dirty(db, rel_id);
+        /* "rev" is an EDB relation (never a rule head), so the +delta path
+         * applies; an OOM forces a full re-eval as the correctness floor. */
+        if (ivm_capture_delta(db, rel_id, new_cols, 2) != 0)
+            db->full_reeval_pending = 1;
+    }
+
+    /* 3. Compaction threshold (mirrors dl_add_fact/dl_delete_fact). */
+    {
+        uint64_t wal_sz = rel_wal_size(rel);
+        uint64_t dafsa_sz = rel_dafsa_size(rel);
+        if (dafsa_sz > 0 && wal_sz > dafsa_sz / 4) {
+            char *path = make_path(db, "rev", ".dafsa");
+            if (path) {
+                rel_compact(rel, path);
+                free(path);
+            }
+        }
+    }
+
+    db->fixpoint_dirty = 1;
+
+    return 0;  /* CAS succeeded */
+}
+
+int dl_rev_get(dl_db *db, const char *entity, uint32_t *out)
+{
+    uint32_t entity_sym;
+    if (!db || !entity || !out) return -1;
+    if (ensure_rev_rel(db) < 0) return -1;
+    entity_sym = intern_str(db->ir, entity);
+    if (entity_sym == 0) return -1;
+    return rev_get(db, entity_sym, out);
 }
 
 /* ─── Interner access (M7) ─────────────────────────────────────────────── */
