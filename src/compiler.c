@@ -1137,10 +1137,11 @@ static int compute_strata(dl_db *db, rule **rules, int n_rules,
      * can slip through and be silently mis-evaluated.  Exiting at the cap
      * with changed still set IS unstratifiable: report it loudly. */
     if (changed) {
-        cerr(0, 
-                "compile error: unstratifiable program — stratification "
-                "fixpoint did not converge (strict dependency cycle through "
-                "negation or range)\n");
+        cerr(0,
+                "compile error: unstratifiable program — negation (or range) "
+                "through a recursion cycle is not supported; only stratified "
+                "negation is (negate a recursive predicate from a strictly-"
+                "higher stratum)\n");
         free(self_loop); free(edges); free(stratum);
         return -1;
     }
@@ -1382,9 +1383,10 @@ static int compute_strata(dl_db *db, rule **rules, int n_rules,
          * loudly rather than silently under-stratifying. */
         if (changed) {
             cerr(0, 
-                    "compile error: unstratifiable program — stratification "
-                    "fixpoint did not converge (strict dependency cycle "
-                    "through negation or range)\n");
+                    "compile error: unstratifiable program — negation (or range) "
+                    "through a recursion cycle is not supported; only stratified "
+                    "negation is (negate a recursive predicate from a strictly-"
+                    "higher stratum)\n");
             free(comp); comp = NULL;
             free(self_loop); free(edges); free(stratum);
             return -1;

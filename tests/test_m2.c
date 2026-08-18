@@ -452,6 +452,91 @@ static void test_reject_negation_cycle(void)
     PASS();
 }
 
+/* ─── Test 4a1: Canonical well-founded rejection (win recursion-through-negation) ── */
+
+static void test_reject_win_negation(void)
+{
+    dl_db *db;
+    const char *rules =
+        "win(X):-move(X,Y),!win(Y).\n";
+
+    TEST("reject: win recursion-through-negation (well-founded)");
+
+    setup_db(&db);
+    assert(dl_declare_relation(db, "move", 2) == 0);
+
+    int ret = dl_load_rules(db, rules);
+    if (ret == 0) {
+        /* Might compile but should fail at compile — check dl_compile too */
+        ret = dl_compile(db);
+    }
+    if (ret == 0) {
+        teardown_db(db);
+        FAIL("expected rejection, got success");
+        return;
+    }
+
+    teardown_db(db);
+    PASS();
+}
+
+/* ─── Test 4a2: Positive — negate recursive predicate from strictly-higher stratum ── */
+
+static void test_neg_recursive_higher_stratum(void)
+{
+    dl_db *db;
+    tuple_set result, expected;
+    const char *rules =
+        "reach(X):-seed(X).\n"
+        "reach(Y):-reach(X),move(X,Y).\n"
+        "isolated(X):-node(X),!reach(X).\n";
+
+    TEST("accept: negate recursive predicate from higher stratum (isolated={5})");
+
+    setup_db(&db);
+
+    /* nodes {1..5}, seed {1}, moves {1->2,2->3,3->4,9->10} */
+    uint32_t nodes[] = {1,2,3,4,5};
+    load_rows(db, "node", 1, nodes, 5);
+
+    uint32_t seeds[] = {1};
+    load_rows(db, "seed", 1, seeds, 1);
+
+    uint32_t moves[] = {1,2, 2,3, 3,4, 9,10};
+    load_rows(db, "move", 2, moves, 4);
+
+    if (dl_load_rules(db, rules) != 0) {
+        teardown_db(db);
+        FAIL("dl_load_rules failed for higher-stratum negation");
+        return;
+    }
+    if (dl_compile(db) != 0) {
+        teardown_db(db);
+        FAIL("dl_compile failed for higher-stratum negation");
+        return;
+    }
+
+    memset(&result, 0, sizeof(result));
+    dl_query(db, "isolated", tset_cb, &result);
+
+    memset(&expected, 0, sizeof(expected));
+    expected.arity = 1;
+    uint32_t iso = 5;
+    tset_cb(&iso, 1, &expected);
+
+    if (!tset_eq(&result, &expected)) {
+        printf("  got %ld tuples, expected %ld\n", result.count, expected.count);
+        tset_free(&result); tset_free(&expected);
+        teardown_db(db);
+        FAIL("isolated mismatch — expected exactly {5}");
+        return;
+    }
+
+    tset_free(&result); tset_free(&expected);
+    teardown_db(db);
+    PASS();
+}
+
 /* ─── Test 4b: Mutual negation (clique) ─────────────────────────────── */
 
 static void test_reject_clique(void)
@@ -1191,6 +1276,8 @@ int main(void)
     test_negation_with_tc();
     test_stratifier_mixed();
     test_reject_negation_cycle();
+    test_reject_win_negation();
+    test_neg_recursive_higher_stratum();
     test_reject_clique();
     test_reject_neg_in_recursion();
     test_reject_unsafe_negation();
