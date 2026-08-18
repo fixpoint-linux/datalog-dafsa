@@ -120,6 +120,46 @@ int dl_cas_revision(dl_db *db, const char *entity,
  * out, or the internal "rev" relation could not be ensured). */
 int dl_rev_get(dl_db *db, const char *entity, uint32_t *out);
 
+/* ─── Transactions (CAS optimistic-concurrency, Slice 2) ───────────────── */
+
+/* Begin a transaction: buffer subsequent dl_txn_* operations and commit them
+ * atomically (one WAL + one fsync) via dl_txn_commit.  Rejects nesting (a
+ * transaction is already open) with -1.  Returns 0 on success. */
+int dl_txn_begin(dl_db *db);
+
+/* Buffer a compare-and-swap of `entity`'s revision (current must equal
+ * `expected`; replaced with `new_value`).  Validation happens at commit, so a
+ * conflict there aborts the WHOLE transaction with DL_E_CONFLICT.  If
+ * expected == new_value it is an idempotent no-op (nothing buffered).  The
+ * entity string is interned eagerly.  Returns 0 on success, -1 on error. */
+int dl_txn_cas(dl_db *db, const char *entity,
+               uint32_t expected, uint32_t new_value);
+
+/* Buffer a fact add inside the transaction.  cols has `arity` u32 values
+ * (already interned, as for dl_add_fact).  The "rev" relation and variadic
+ * relations are rejected (-1).  Returns 0 on success, -1 on error. */
+int dl_txn_add_fact(dl_db *db, const char *rel,
+                    const uint32_t *cols, uint8_t arity);
+
+/* Buffer a fact delete inside the transaction.  Same contract as
+ * dl_txn_add_fact.  Returns 0 on success, -1 on error. */
+int dl_txn_delete_fact(dl_db *db, const char *rel,
+                       const uint32_t *cols, uint8_t arity);
+
+/* Atomically commit the buffered transaction: validate all CAS ops (a
+ * conflict returns DL_E_CONFLICT and applies NOTHING — earlier buffered ops
+ * are discarded, the WAL is untouched), save the interner/term-store if
+ * dirty, append one record per op + a COMMIT marker to the txn WAL, fsync,
+ * then apply all ops in-memory (with IVM delta capture).  An empty
+ * transaction commits trivially (0).  Returns 0 on success, DL_E_CONFLICT on
+ * a CAS conflict, -1 on error. */
+int dl_txn_commit(dl_db *db);
+
+/* Abort the transaction, discarding all buffered ops.  The WAL is never
+ * written, so nothing is durable.  Returns 0 on success, -1 if no transaction
+ * is open. */
+int dl_txn_rollback(dl_db *db);
+
 /* ─── Query primitives ────────────────────────────────────────────────── */
 
 /* Exact lookup: returns 1 if the fact (cols[0..arity-1]) exists, else 0.

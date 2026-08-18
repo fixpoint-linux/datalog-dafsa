@@ -43,7 +43,8 @@ LIB_OBJS = src/intern.o \
            src/topdown.o \
            src/analyze.o \
            src/schema.o \
-           src/typecheck.o
+           src/typecheck.o \
+           src/txnwal.o
 
 # Combined object list used for static links (tests, CLI).
 ALL_OBJS = $(VENDOR_OBJS) $(LIB_OBJS)
@@ -325,6 +326,7 @@ DLP_ENGINE_SRCS = src/intern.c src/termstore.c src/relation.c \
                   src/vm.c src/snapshot.c src/regexwalk.c src/permindex.c \
                   src/util.c src/dl.c src/iter.c src/magic.c src/topdown.c \
                   src/analyze.c src/schema.c src/typecheck.c src/json.c \
+                  src/txnwal.c \
                   vendor/dafsa.c vendor/dafsa_state.c vendor/dafsa_core.c \
                   vendor/dafsa_persist.c vendor/dafsa_view.c \
                   vendor/dafsa_crc32.c vendor/dafsa_wal.c vendor/dafsa_build.c \

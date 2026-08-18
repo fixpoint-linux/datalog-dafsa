@@ -43,6 +43,32 @@
 #define RELK_FIXED    0  /* rel_entry.rel is the single fixed-width relation */
 #define RELK_VARIADIC 1  /* rel_entry.vrel holds one variant per arity 1..8  */
 
+/* ─── Transaction buffer (CAS optimistic-concurrency, Slice 2) ─────────── */
+
+/* Buffered operation kinds inside an open transaction (db->txn). */
+#define TXN_ADD 1
+#define TXN_DEL 2
+#define TXN_CAS 3
+
+/* A single buffered txn operation.  For TXN_ADD/TXN_DEL, `rel_id`/`arity`/
+ * `cols` name the fact; for TXN_CAS, `entity_sym`/`expected`/`next` name the
+ * compare-and-swap on the internal "rev" relation. */
+typedef struct txn_op {
+    int      kind;         /* TXN_ADD / TXN_DEL / TXN_CAS */
+    int      rel_id;       /* TXN_ADD/TXN_DEL: find_rel index of the relation */
+    uint8_t  arity;        /* TXN_ADD/TXN_DEL: fact arity (1..8) */
+    uint32_t cols[8];      /* TXN_ADD/TXN_DEL: fact columns (interned/raw) */
+    uint32_t entity_sym;   /* TXN_CAS: interned entity symbol */
+    uint32_t expected;     /* TXN_CAS: expected current revision */
+    uint32_t next;         /* TXN_CAS: new revision */
+} txn_op;
+
+typedef struct txn {
+    txn_op  *ops;          /* dynamically grown buffer */
+    size_t   nops;         /* number of buffered operations */
+    size_t   cap;          /* allocated capacity of ops */
+} txn;
+
 /* ─── Authoritative dl_db layout ───────────────────────────────────────── */
 
 /* Kind-tagged entry: exactly one of rel / vrel is non-NULL, per `kind`.
@@ -66,6 +92,8 @@ struct dl_db {
     int        lock_fd;    /* M7: fcntl lock file descriptor, or -1 */
     int        rev_rel_id; /* CAS: cached index of the internal "rev" relation
                               (arity-2 entity→revision), or -1 if unknown */
+    txn       *txn;        /* CAS Slice 2: active transaction buffer, or NULL
+                              (NULL = no transaction open) */
 
     /* Dhall typed schema (dl_attach_schema).  Borrowed pointer, never owned;
      * the caller retains the dl_schema.  NULL = no schema attached (the

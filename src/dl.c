@@ -25,6 +25,7 @@
 #include "topdown.h"
 #include "util.h"
 #include "schema.h"
+#include "txnwal.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -55,6 +56,10 @@ static void write_rels_txt(dl_db *db);
 static int  ivm_rel_is_head(dl_db *db, int rel_id);
 static int  ivm_capture_delta(dl_db *db, int rel_id,
                               const uint32_t *cols, uint8_t arity);
+
+/* CAS Slice 2: forward decl for the reopen-time txn WAL replay (defined in
+ * the CAS section below; called from dl_open2 after the rels.txt load). */
+static void replay_txn_wal(dl_db *db);
 
 /* ─── Internal helpers ────────────────────────────────────────────────── */
 
@@ -433,6 +438,11 @@ dl_db *dl_open2(const char *dir, int *err_out)
         free(rels_path);
     }
 
+    /* CAS Slice 2: replay any committed txn WAL prefix (facts written by a
+     * transaction commit that were not yet compacted) into the base
+     * relations, BEFORE any publish, so a crash cannot lose them. */
+    replay_txn_wal(db);
+
     /* M4: detect existing snapshot and fixpoint state */
     db->snap_version = snapshot_read_current(db->dir);
     db->fixpoint_dirty = (db->n_crules > 0) ? 1 : 0;
@@ -445,6 +455,15 @@ void dl_close(dl_db *db)
 {
     size_t i;
     if (!db) return;
+
+    /* CAS Slice 2: an open transaction is never committed implicitly — free
+     * its buffer (roll back) before any compaction/publish so a stale handle
+     * cannot outlive the transaction. */
+    if (db->txn) {
+        free(db->txn->ops);
+        free(db->txn);
+        db->txn = NULL;
+    }
 
     /* M4: close all cached snapshot views */
     vcache_invalidate(db->vcache);
@@ -1049,6 +1068,10 @@ int dl_load_facts(dl_db *db, const char *rel_name, const char *csv_path)
 
     if (!db || !rel_name || !csv_path) return -1;
 
+    /* CAS Slice 2: bulk load while a transaction is open would bypass the txn
+     * buffer and break atomicity — reject. */
+    if (db->txn) return -1;
+
     idx = find_rel(db, rel_name);
     if (idx < 0) return -1;  /* relation not declared */
 
@@ -1416,15 +1439,101 @@ static int dl_add_fact_variadic(dl_db *db, int idx, const char *rel_name,
     return 1;  /* added */
 }
 
+/* CAS Slice 2: apply a fact add to the in-memory BASE of relation `idx` and
+ * capture the IVM delta, mirroring dl_add_fact's in-memory commit EXACTLY
+ * (rel_add_base + permindex + IVM capture / full-reeval fallback +
+ * compaction threshold + fixpoint_dirty).  Shared by the direct path and the
+ * transaction commit so both produce identical derived-view semantics.  The
+ * caller is responsible for the interner/term-store durability ordering and
+ * the WAL (per-relation or txn) append BEFORE calling.  Returns 1 if added,
+ * 0 if already present (no change), -1 on error. */
+static int add_fact_apply(dl_db *db, int idx, const uint32_t *cols,
+                          uint8_t arity)
+{
+    int rc = rel_add_base(db->rels[idx].rel, cols);
+    if (rc < 0) return -1;
+    if (rc == 1) {
+        /* M6: the base grew — any perm index on this relation is stale until
+         * the next permindex_build_dirty (perm DAFSAs are not delta-aware). */
+        permindex_mark_dirty(db, idx);
+
+        /* IVM Slice 1: a base fact added to a RULE-HEAD relation is the mixed
+         * EDB+IDB case (must appear in the view AND propagate) — force a full
+         * re-eval; else capture the +delta.  An OOM capturing the delta falls
+         * back to a full re-eval at publish (never silently mis-evaluate). */
+        if (ivm_rel_is_head(db, idx)) {
+            db->full_reeval_pending = 1;
+        } else if (ivm_capture_delta(db, idx, cols, arity) != 0) {
+            db->full_reeval_pending = 1;
+        }
+    }
+
+    /* Compaction threshold: WAL > 25% of BASE estimate? */
+    {
+        uint64_t wal_sz = rel_wal_size(db->rels[idx].rel);
+        uint64_t dafsa_sz = rel_dafsa_size(db->rels[idx].rel);
+        if (dafsa_sz > 0 && wal_sz > dafsa_sz / 4) {
+            char *path = rel_is_idb(db->rels[idx].rel)
+                       ? make_path(db, db->rels[idx].name, ".base.dafsa")
+                       : make_path(db, db->rels[idx].name, ".dafsa");
+            if (path) {
+                rel_compact(db->rels[idx].rel, path);
+                free(path);
+            }
+        }
+    }
+
+    /* M4: facts changed, mark fixpoint dirty */
+    db->fixpoint_dirty = 1;
+
+    return (rc == 1) ? 1 : 0;
+}
+
+/* CAS Slice 2: apply a fact delete to the in-memory BASE of relation `idx`
+ * and capture the IVM -delta, mirroring dl_delete_fact's in-memory commit
+ * EXACTLY (rel_delete_base + permindex + ivm_capture_delete / full-reeval
+ * fallback + fixpoint_dirty).  Shared by the direct path and the transaction
+ * commit.  The caller handles the WAL append BEFORE calling.  Returns 1 if
+ * deleted, 0 if absent (no change), -1 on error. */
+static int delete_fact_apply(dl_db *db, int idx, const uint32_t *cols,
+                             uint8_t arity)
+{
+    int rc = rel_delete_base(db->rels[idx].rel, cols);
+    if (rc < 0) return -1;
+    if (rc == 1) {
+        /* M6: the base shrank — any perm index on this relation is stale
+         * until the next permindex_build_dirty (perm DAFSAs are not
+         * delta-aware).  Without this, a delete could leave stale tuples
+         * visible through a non-leading (OP_LOOKUP_PERM) join. */
+        permindex_mark_dirty(db, idx);
+
+        /* IVM Slice 3: record the -delta.  If the program is DRed-eligible
+         * the publish path maintains derived views incrementally; otherwise
+         * it falls back to the full fixpoint (the correctness floor).  An
+         * OOM capturing the delta forces the fallback — never silently leave
+         * derived views stale. */
+        if (ivm_capture_delete(db, idx, cols, arity) != 0)
+            db->full_reeval_pending = 1;
+    }
+
+    /* M4: facts changed, mark fixpoint dirty */
+    db->fixpoint_dirty = 1;
+
+    return (rc == 1) ? 1 : 0;
+}
+
 int dl_add_fact(dl_db *db, const char *rel_name,
                 const uint32_t *cols, uint8_t arity)
 {
     int idx;
     unsigned char key[33];  /* 4*8+1 */
     size_t key_len;
-    int rc;
 
     if (!db || !rel_name || !cols) return -1;
+
+    /* CAS Slice 2: a direct write while a transaction is open would mix
+     * buffered and direct WAL writes — reject. */
+    if (db->txn) return -1;
 
     /* CAS: "rev" is a system-managed relation — direct inserts are rejected
      * (use dl_cas_revision). */
@@ -1478,51 +1587,8 @@ int dl_add_fact(dl_db *db, const char *rel_name,
     if (rel_wal_append_add(db->rels[idx].rel, key, (uint32_t)key_len) != 0)
         return -1;
 
-    /* 4. In-memory add to BASE */
-    rc = rel_add_base(db->rels[idx].rel, cols);
-    if (rc < 0) return -1;
-    if (rc == 1) {
-        /* M6: the base grew — any perm index on this relation is stale until
-         * the next permindex_build_dirty (perm DAFSAs are not delta-aware). */
-        permindex_mark_dirty(db, idx);
-    }
-
-    /* 4a. IVM Slice 1: capture the insert delta (AFTER the in-memory commit,
-     * per the interner-before-WAL ordering note — no interner interaction
-     * here).  A base fact added to a RULE-HEAD relation is the mixed EDB+IDB
-     * case (the fact must appear in the view AND propagate) — out of the
-     * Slice 1 class, so force a full re-eval instead of a wrong propagate. */
-    if (rc == 1) {
-        if (ivm_rel_is_head(db, idx)) {
-            db->full_reeval_pending = 1;
-        } else if (ivm_capture_delta(db, idx, cols, arity) != 0) {
-            /* OOM capturing the delta: the base fact is already committed
-             * (base + WAL).  Fall back to a full re-eval at publish rather
-             * than leaving downstream derived views stale (never silently
-             * mis-evaluate). */
-            db->full_reeval_pending = 1;
-        }
-    }
-
-    /* 5. Check compaction threshold: WAL > 25% of BASE estimate? */
-    {
-        uint64_t wal_sz = rel_wal_size(db->rels[idx].rel);
-        uint64_t dafsa_sz = rel_dafsa_size(db->rels[idx].rel);
-        if (dafsa_sz > 0 && wal_sz > dafsa_sz / 4) {
-            char *path = rel_is_idb(db->rels[idx].rel)
-                       ? make_path(db, rel_name, ".base.dafsa")
-                       : make_path(db, rel_name, ".dafsa");
-            if (path) {
-                rel_compact(db->rels[idx].rel, path);
-                free(path);
-            }
-        }
-    }
-
-    /* M4: facts changed, mark fixpoint dirty */
-    db->fixpoint_dirty = 1;
-
-    return 1;  /* added */
+    /* 4. In-memory add + IVM capture (shared with the txn commit path). */
+    return add_fact_apply(db, idx, cols, arity);
 }
 
 /* v2: variadic delete — routes to the variant for `arity`; a successful
@@ -1571,9 +1637,11 @@ int dl_delete_fact(dl_db *db, const char *rel_name,
     int idx;
     unsigned char key[33];
     size_t key_len;
-    int rc;
 
     if (!db || !rel_name || !cols) return -1;
+
+    /* CAS Slice 2: reject a direct write while a transaction is open. */
+    if (db->txn) return -1;
 
     /* CAS: "rev" is a system-managed relation — direct deletes are rejected
      * (use dl_cas_revision). */
@@ -1599,30 +1667,8 @@ int dl_delete_fact(dl_db *db, const char *rel_name,
     if (rel_wal_append_del(db->rels[idx].rel, key, (uint32_t)key_len) != 0)
         return -1;
 
-    /* 3. In-memory delete from BASE */
-    rc = rel_delete_base(db->rels[idx].rel, cols);
-    if (rc < 0) return -1;
-    if (rc == 1) {
-        /* M6: the base shrank — any perm index on this relation is stale
-         * until the next permindex_build_dirty (perm DAFSAs are not
-         * delta-aware).  Without this, a delete could leave stale tuples
-         * visible through a non-leading (OP_LOOKUP_PERM) join. */
-        permindex_mark_dirty(db, idx);
-    }
-
-    /* IVM Slice 3: record the -delta.  If the program is DRed-eligible
-     * (non-recursive, no aggregates, no WALK/LOOKUP_PERM/HASH_JOIN), the
-     * publish path maintains the derived views incrementally via DRed
-     * (over-delete + re-derive); otherwise the dispatch falls back to the
-     * full fixpoint (the correctness floor).  An OOM capturing the delta
-     * forces the fallback — never silently leave derived views stale. */
-    if (ivm_capture_delete(db, idx, cols, arity) != 0)
-        db->full_reeval_pending = 1;
-
-    /* M4: facts changed, mark fixpoint dirty */
-    db->fixpoint_dirty = 1;
-
-    return 1;  /* deleted */
+    /* 3. In-memory delete + IVM capture (shared with the txn commit path). */
+    return delete_fact_apply(db, idx, cols, arity);
 }
 
 /* ─── CAS revision API (per-entity compare-and-swap) ────────────────────── */
@@ -1685,8 +1731,9 @@ int dl_cas_revision(dl_db *db, const char *entity,
 
     if (!db || !entity) return -1;
 
-    /* NOTE: a transaction-active guard (db->txn != NULL → -1) is reserved for
-     * a later CAS/transaction slice — no txn field exists in struct dl_db yet. */
+    /* CAS Slice 2: mixing a direct CAS with an open transaction's buffered
+     * writes would break atomicity — reject. */
+    if (db->txn) return -1;
 
     if (expected == new_value) return 0;  /* idempotent no-op */
 
@@ -1774,6 +1821,355 @@ int dl_rev_get(dl_db *db, const char *entity, uint32_t *out)
     entity_sym = intern_str(db->ir, entity);
     if (entity_sym == 0) return -1;
     return rev_get(db, entity_sym, out);
+}
+
+/* ─── CAS Slice 2: transaction buffer (multi-op atomic commit) ─────────── */
+
+/* Free the transaction buffer and clear db->txn (rollback / abort / after a
+ * successful commit). */
+static void txn_discard(dl_db *db)
+{
+    if (!db->txn) return;
+    free(db->txn->ops);
+    free(db->txn);
+    db->txn = NULL;
+}
+
+/* Append a copy of `op` to the open transaction's buffer.  Returns 0 on
+ * success, -1 on OOM. */
+static int txn_buf_op(dl_db *db, const txn_op *op)
+{
+    txn *t = db->txn;
+    if (t->nops == t->cap) {
+        size_t ncap = t->cap ? t->cap * 2 : 8;
+        txn_op *no = realloc(t->ops, ncap * sizeof(*no));
+        if (!no) return -1;
+        t->ops = no;
+        t->cap = ncap;
+    }
+    t->ops[t->nops++] = *op;
+    return 0;
+}
+
+int dl_txn_begin(dl_db *db)
+{
+    if (!db) return -1;
+    if (db->txn) return -1;   /* reject nested transactions */
+    db->txn = calloc(1, sizeof(*db->txn));
+    return db->txn ? 0 : -1;
+}
+
+int dl_txn_rollback(dl_db *db)
+{
+    if (!db || !db->txn) return -1;
+    txn_discard(db);
+    return 0;
+}
+
+int dl_txn_cas(dl_db *db, const char *entity,
+               uint32_t expected, uint32_t new_value)
+{
+    txn_op op;
+    if (!db || !entity) return -1;
+    if (!db->txn) return -1;
+    if (ensure_rev_rel(db) < 0) return -1;
+    if (expected == new_value) return 0;   /* idempotent no-op */
+    memset(&op, 0, sizeof(op));
+    op.kind = TXN_CAS;
+    op.entity_sym = intern_str(db->ir, entity);
+    if (op.entity_sym == 0) return -1;     /* OOM */
+    /* Reject a second CAS on an already-buffered entity: two CAS ops on the
+     * same entity would both validate against the same pre-commit revision
+     * and both apply, leaving TWO 'rev' rows and violating the entity ->
+     * revision function invariant (rev_get would then read a stale value). */
+    {
+        size_t j;
+        for (j = 0; j < db->txn->nops; j++) {
+            if (db->txn->ops[j].kind == TXN_CAS &&
+                db->txn->ops[j].entity_sym == op.entity_sym)
+                return -1;
+        }
+    }
+    op.expected = expected;
+    op.next = new_value;
+    return txn_buf_op(db, &op);
+}
+
+int dl_txn_add_fact(dl_db *db, const char *rel,
+                    const uint32_t *cols, uint8_t arity)
+{
+    int idx;
+    txn_op op;
+    if (!db || !rel || !cols) return -1;
+    if (!db->txn) return -1;
+    /* "rev" is system-managed — it may only change via dl_txn_cas. */
+    if (strcmp(rel, "rev") == 0) return -1;
+    idx = find_rel(db, rel);
+    if (idx < 0) return -1;
+    /* Txn ops apply via the fixed path's add_fact_apply; variadic relations
+     * (and their per-arity WAL framing) are outside the transaction format. */
+    if (db->rels[idx].kind == RELK_VARIADIC) return -1;
+    if (arity != rel_arity(db->rels[idx].rel)) return -1;
+    memset(&op, 0, sizeof(op));
+    op.kind = TXN_ADD;
+    op.rel_id = idx;
+    op.arity = arity;
+    memcpy(op.cols, cols, sizeof(uint32_t) * arity);
+    return txn_buf_op(db, &op);
+}
+
+int dl_txn_delete_fact(dl_db *db, const char *rel,
+                       const uint32_t *cols, uint8_t arity)
+{
+    int idx;
+    txn_op op;
+    if (!db || !rel || !cols) return -1;
+    if (!db->txn) return -1;
+    if (strcmp(rel, "rev") == 0) return -1;
+    idx = find_rel(db, rel);
+    if (idx < 0) return -1;
+    if (db->rels[idx].kind == RELK_VARIADIC) return -1;
+    if (arity != rel_arity(db->rels[idx].rel)) return -1;
+    memset(&op, 0, sizeof(op));
+    op.kind = TXN_DEL;
+    op.rel_id = idx;
+    op.arity = arity;
+    memcpy(op.cols, cols, sizeof(uint32_t) * arity);
+    return txn_buf_op(db, &op);
+}
+
+int dl_txn_commit(dl_db *db)
+{
+    txn *t;
+    size_t i;
+    if (!db || !db->txn) return -1;
+    t = db->txn;
+
+    /* (a) Empty transaction commits trivially. */
+    if (t->nops == 0) { txn_discard(db); return 0; }
+
+    /* (b) Validate every buffered CAS against the current revision (read-only,
+     * before any WAL write).  A conflict aborts the WHOLE transaction: no
+     * buffered op (including earlier adds) is applied and the WAL is never
+     * touched. */
+    for (i = 0; i < t->nops; i++) {
+        if (t->ops[i].kind == TXN_CAS) {
+            uint32_t cur;
+            if (rev_get(db, t->ops[i].entity_sym, &cur) != 0) {
+                txn_discard(db);
+                return -1;
+            }
+            if (cur != t->ops[i].expected) {
+                txn_discard(db);
+                return DL_E_CONFLICT;
+            }
+        }
+    }
+
+    /* (c) M7 ordering: if new syms / terms were interned by the buffered ops,
+     * make them durable BEFORE the txn WAL records that reference them, so
+     * crash recovery can decode the sym_ids / list handles. */
+    if (intern_is_dirty(db->ir)) {
+        char *fwd_path = make_path(db, "symbols", ".dafsa");
+        char *rev_path = make_path(db, "symbols", ".array");
+        if (!fwd_path || !rev_path) {
+            free(fwd_path); free(rev_path);
+            txn_discard(db);
+            return -1;
+        }
+        if (intern_save(db->ir, fwd_path, rev_path) != 0) {
+            free(fwd_path); free(rev_path);
+            txn_discard(db);
+            return -1;
+        }
+        free(fwd_path); free(rev_path);
+    }
+    if (term_is_dirty(db->terms)) {
+        char *tpath = make_path(db, "terms", ".bin");
+        if (!tpath) { txn_discard(db); return -1; }
+        if (term_save(db->terms, tpath) != 0) {
+            free(tpath);
+            txn_discard(db);
+            return -1;
+        }
+        free(tpath);
+    }
+
+    /* (d) Append one record per buffered op + a COMMIT marker to the txn WAL,
+     * then fsync so the whole transaction is durable before any in-memory
+     * change.  A TXN_CAS op expands to DEL(sym,expected) then ADD(sym,next) on
+     * the "rev" relation. */
+    {
+        txnwal *w = txnwal_open_rw(db->dir);
+        if (!w) { txn_discard(db); return -1; }
+        for (i = 0; i < t->nops; i++) {
+            txn_op *op = &t->ops[i];
+            if (op->kind == TXN_CAS) {
+                uint32_t del_cols[2] = { op->entity_sym, op->expected };
+                uint32_t add_cols[2] = { op->entity_sym, op->next };
+                unsigned char key[33];
+                size_t key_len;
+                encode_fact_key(key, &key_len, del_cols, 2);
+                if (txnwal_append_record(w, "rev", 3, TXNWAL_OP_DEL,
+                                         key, (uint32_t)key_len) != 0) {
+                    txnwal_close(w); txn_discard(db); return -1;
+                }
+                encode_fact_key(key, &key_len, add_cols, 2);
+                if (txnwal_append_record(w, "rev", 3, TXNWAL_OP_ADD,
+                                         key, (uint32_t)key_len) != 0) {
+                    txnwal_close(w); txn_discard(db); return -1;
+                }
+            } else {
+                const char *rname = db->rels[op->rel_id].name;
+                unsigned char key[33];
+                size_t key_len;
+                uint8_t wop = (op->kind == TXN_DEL) ? TXNWAL_OP_DEL
+                                                    : TXNWAL_OP_ADD;
+                encode_fact_key(key, &key_len, op->cols, op->arity);
+                if (txnwal_append_record(w, rname, (uint16_t)strlen(rname),
+                                         wop, key, (uint32_t)key_len) != 0) {
+                    txnwal_close(w); txn_discard(db); return -1;
+                }
+            }
+        }
+        if (txnwal_append_commit(w) != 0) {
+            txnwal_close(w); txn_discard(db); return -1;
+        }
+        if (txnwal_sync(w) != 0) {
+            txnwal_close(w); txn_discard(db); return -1;
+        }
+        txnwal_close(w);
+    }
+
+    /* (e) Apply every buffered op in-memory IN BUFFER ORDER, capturing IVM
+     * deltas exactly as the direct paths do (add_fact_apply/delete_fact_apply
+     * also set fixpoint_dirty).  This reuses the shared helper machinery — no
+     * VM run and no bypass of the publish path. */
+    for (i = 0; i < t->nops; i++) {
+        txn_op *op = &t->ops[i];
+        if (op->kind == TXN_CAS) {
+            int rel_id = ensure_rev_rel(db);
+            uint32_t del_cols[2] = { op->entity_sym, op->expected };
+            uint32_t add_cols[2] = { op->entity_sym, op->next };
+            if (rel_id < 0) { txn_discard(db); return -1; }
+            delete_fact_apply(db, rel_id, del_cols, 2);
+            add_fact_apply(db, rel_id, add_cols, 2);
+        } else if (op->kind == TXN_DEL) {
+            delete_fact_apply(db, op->rel_id, op->cols, op->arity);
+        } else {
+            add_fact_apply(db, op->rel_id, op->cols, op->arity);
+        }
+    }
+
+    /* (f) Success: free the buffer. */
+    txn_discard(db);
+    return 0;
+}
+
+/* ─── CAS Slice 2: reopen-time txn WAL replay ──────────────────────────── */
+
+/* Replay callback: apply one committed txn WAL record to the base relation.
+ * Unknown / variadic relations are skipped (a stale record is harmless).  The
+ * key is the encoded fact key (4*arity+1 bytes); decode it back to columns. */
+struct txn_replay_ctx {
+    dl_db *db;
+    int    touched[MAX_RELS];
+    int    n_touched;
+};
+
+static int txn_replay_cb(const char *rel, uint16_t rel_len, uint8_t op,
+                         const unsigned char *key, uint32_t key_len,
+                         void *user)
+{
+    struct txn_replay_ctx *ctx = (struct txn_replay_ctx *)user;
+    dl_db *db = ctx->db;
+    char name[256];
+    uint32_t cols[8];
+    uint8_t arity;
+    int idx, i;
+
+    if (rel_len >= sizeof(name)) return -1;   /* name too long */
+    memcpy(name, rel, rel_len);
+    name[rel_len] = '\0';
+
+    idx = find_rel(db, name);
+    if (idx < 0) return 0;                    /* stale record: skip */
+    if (db->rels[idx].kind == RELK_VARIADIC) return 0;   /* not a txn target */
+
+    if (key_len < 5 || key_len > 33 || (key_len - 1) % 4 != 0) return -1;
+    arity = (uint8_t)((key_len - 1) / 4);
+    for (i = 0; i < arity; i++) {
+        cols[i] = ((uint32_t)key[4*i] << 24) | ((uint32_t)key[4*i+1] << 16)
+                | ((uint32_t)key[4*i+2] << 8) | (uint32_t)key[4*i+3];
+    }
+
+    if (op == TXNWAL_OP_ADD) {
+        if (rel_add_base(db->rels[idx].rel, cols) < 0) return -1;
+    } else if (op == TXNWAL_OP_DEL) {
+        if (rel_delete_base(db->rels[idx].rel, cols) < 0) return -1;
+    } else {
+        return -1;                            /* bad op in committed prefix */
+    }
+
+    if (!ctx->touched[idx]) {
+        ctx->touched[idx] = 1;
+        ctx->n_touched++;
+    }
+    return 0;
+}
+
+/* Replay the committed prefix of the txn WAL into the base relations at
+ * reopen, compact every touched relation (durable base), then reset the WAL
+ * so the committed records are consumed.  Mirrors the per-relation WAL
+ * replay+compact done by rel_open_writable.  Must run after the rels.txt
+ * load (all relations exist) and before any publish. */
+static void replay_txn_wal(dl_db *db)
+{
+    txnwal *w;
+    off_t good_bytes = 0;
+    struct txn_replay_ctx ctx;
+    size_t i;
+    int compact_failed = 0;
+
+    if (!db || !db->dir) return;
+    w = txnwal_open_rw(db->dir);
+    if (!w) return;   /* no txn.wal / open failed: nothing to replay */
+
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.db = db;
+
+    if (txnwal_replay(w, txn_replay_cb, &ctx, &good_bytes) != 0) {
+        /* Replay error: leave the committed records in txn.wal for a later
+         * open to retry (never drop them on an I/O error). */
+        txnwal_close(w);
+        return;
+    }
+
+    /* Compact each touched relation so the facts are durable in the
+     * per-relation base DAFSA (only then can txn.wal be reset). */
+    for (i = 0; i < db->nrels; i++) {
+        char *path;
+        if (!ctx.touched[i]) continue;
+        if (db->rels[i].kind == RELK_VARIADIC) continue;
+        path = rel_is_idb(db->rels[i].rel)
+             ? make_path(db, db->rels[i].name, ".base.dafsa")
+             : make_path(db, db->rels[i].name, ".dafsa");
+        if (!path) { compact_failed = 1; continue; }
+        if (rel_compact(db->rels[i].rel, path) != 0) compact_failed = 1;
+        free(path);
+    }
+
+    /* If every touched relation compacted, reset txn.wal to the header so the
+     * committed records are consumed; otherwise keep the committed prefix
+     * (drop only the torn tail) so a later open retries the compaction. */
+    if (compact_failed)
+        txnwal_truncate(w, (good_bytes > 16) ? good_bytes : 16);
+    else
+        txnwal_truncate(w, 16);
+    txnwal_close(w);
+
+    if (ctx.n_touched > 0 && !compact_failed)
+        db->fixpoint_dirty = 1;   /* facts changed */
 }
 
 /* ─── Interner access (M7) ─────────────────────────────────────────────── */
@@ -3355,6 +3751,10 @@ int dl_publish_snapshot(dl_db *db)
 #pragma GCC diagnostic ignored "-Wformat-truncation"
 
     if (!db) return -1;
+
+    /* CAS Slice 2: publishing while a transaction is open would capture a
+     * half-applied state — reject. */
+    if (db->txn) return -1;
 
     /* 1. Materialize derived views if rules exist and the fixpoint is dirty.
      * IVM Slice 1/3 dispatch —
