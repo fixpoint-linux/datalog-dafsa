@@ -162,6 +162,8 @@ Public C API in [`src/dl.h`](src/dl.h). All value arrays are u32 (raw ints or sy
 - **Queries:** `dl_lookup`, `dl_prefix`, `dl_query`, `dl_query_bound`, `dl_pattern`
   (callbacks of type `dl_tuple_cb`)
 - **Rules:** `dl_load_rules`, `dl_compile`
+- **CAS / transactions:** `dl_cas_revision`, `dl_rev_get`, `dl_txn_begin`/`dl_txn_cas`/
+  `dl_txn_add_fact`/`dl_txn_delete_fact`/`dl_txn_commit`/`dl_txn_rollback`
 - **Snapshot:** `dl_publish_snapshot`
 - **Fault hooks (test-only):** `dl_set_fault_hook`
 - **Interner:** `dl_intern_str`, `dl_intern_str_of`
@@ -183,8 +185,9 @@ Public C API in [`src/dl.h`](src/dl.h). All value arrays are u32 (raw ints or sy
 | M9 | Arithmetic + comparison builtins (`< <= > >= !=`, `X = E`) | 11 |
 | M9-s | String builtins (concat, length, lower/upper, prefix/suffix/contains) | 9 |
 | IVM | Incremental view maintenance (v2, Slices 0-5) | 25 |
+| CAS | Optimistic concurrency (`rev()`, `dl_cas_revision`, `dl_txn_*` API) | 7 |
 
-Total: 306 test cases across 17 test binaries + a CLI smoke test.
+Total: 313 test cases across 18 test binaries + a CLI smoke test.
 
 ## Documentation site
 
@@ -203,6 +206,9 @@ see [`docs/README.md`](docs/README.md) for how to enable Pages.
 - [`design/datalog-dafsa-dhall-schema.md`](design/datalog-dafsa-dhall-schema.md) — the
   `dlp` typed database-project workflow (Dhall schema, typed CSV/JSON loaders, rule
   typechecking).
+- [`docs/datalog-dafsa-cas.md`](docs/datalog-dafsa-cas.md) — CAS / optimistic-concurrency
+  transactions for the write path (`rev()`, `dl_cas_revision`, the `dl_txn_*` API, txn-WAL
+  crash recovery).
 
 ## Building from Source
 

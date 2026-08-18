@@ -1,6 +1,6 @@
 # CAS / optimistic concurrency for the write path
 
-**Status:** Design/plan — not yet implemented. Tier-1 blocker (#1) for using datalog-dafsa as the jing-memory graph store. Context: the memory MCP writes with `expectedRev`-based compare-and-swap; datalog-dafsa today has no transaction or CAS primitive.
+**Status:** Implemented. CAS + optimistic-concurrency transactions are live in the engine: `rev()` relation, `dl_cas_revision` / `dl_rev_get`, and the `dl_txn_begin / cas / add_fact / delete_fact / commit / rollback` transaction API, with a single atomic txn-WAL + crash recovery (see `src/txnwal.[ch]`). Verified by `tests/test_cas.c` (T1–T6) and the `dl rev / dl cas / dl txn` CLI subcommands. Context: the memory MCP writes with `expectedRev`-based compare-and-swap; datalog-dafsa now has the CAS + transaction primitive to back it.
 
 ## TL;DR
 
@@ -89,12 +89,12 @@ Mechanics:
 - Revisions and txn atomicity are **logical**; physical isolation remains single-writer-locked.
 - Multi-writer concurrency (beyond lock+retry) is explicitly out of scope; the graph is not multi-writer.
 
-## Concrete next slice (if pursued)
+## Implementation status (slices)
 
-1. `rev()` relation + `dl_cas_revision` single-op (no txn yet) — proves CAS works.
-2. `dl_txn_begin/commit/rollback` with buffered WAL — proves multi-op atomicity + crash-safety.
-3. `DL_E_CONFLICT` retry wiring + `test_cas.c`.
-4. Wire the graph write path (jing-memory adapter) onto `dl_txn_*`.
+1. ✅ `rev()` relation + `dl_cas_revision` single-op.
+2. ✅ `dl_txn_begin/commit/rollback` with atomic txn-WAL — multi-op atomicity + crash-safety.
+3. ✅ `DL_E_CONFLICT` retry wiring + `tests/test_cas.c` (T1–T6) + `dl rev / cas / txn` CLI subcommands.
+4. ⏳ Deferred (separate repo): wire the graph write path (jing-memory adapter) onto `dl_txn_*` — read `dl_rev_get`, build a txn (`dl_txn_begin` + `dl_txn_cas(entity,rev,rev+1)` + `dl_txn_add_fact` per observation/relation fact), `dl_txn_commit`, and on `DL_E_CONFLICT` re-read + retry (maps the server's CONFLICT→retry 1:1).
 
 ## References
 

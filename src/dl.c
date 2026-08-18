@@ -2032,6 +2032,10 @@ int dl_txn_commit(dl_db *db)
                 }
             }
         }
+        if (db->fault_hook &&
+            db->fault_hook(DL_FPOINT_TXN_BEFORE_MARKER, db->fault_user) != 0) {
+            txnwal_close(w); txn_discard(db); return -1;
+        }
         if (txnwal_append_commit(w) != 0) {
             txnwal_close(w); txn_discard(db); return -1;
         }

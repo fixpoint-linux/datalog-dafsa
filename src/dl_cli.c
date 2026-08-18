@@ -121,8 +121,11 @@ static void usage(const char *prog)
         "  %s [-d <dir>] publish\n"
         "  %s [-d <dir>] bound <rel> <val> [<val> ...]\n"
         "  %s [-d <dir>] pattern <rel> '<regex>'\n"
+        "  %s [-d <dir>] rev <entity>\n"
+        "  %s [-d <dir>] cas <entity> <expected> <new>\n"
+        "  %s [-d <dir>] txn\n"
         "Values: bare integer -> raw u32; anything else -> interned string\n",
-        prog, prog, prog, prog, prog, prog, prog, prog);
+        prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
     exit(1);
 }
 
@@ -465,6 +468,81 @@ int main(int argc, char **argv)
             }
             if (n == 0)
                 printf("(no results)\n");
+        }
+
+    } else if (strcmp(cmd, "rev") == 0) {
+        const char *entity;
+        uint32_t r;
+
+        if (argp >= argc) usage(argv[0]);
+        entity = argv[argp++];
+
+        if (dl_rev_get(db, entity, &r) != 0) {
+            fprintf(stderr, "dl: rev lookup failed\n");
+            dl_close(db);
+            return 1;
+        }
+        printf("%u\n", r);
+
+    } else if (strcmp(cmd, "cas") == 0) {
+        const char *entity;
+        unsigned long expected, new_value;
+        int rc;
+
+        if (argp + 2 >= argc) usage(argv[0]);
+        entity = argv[argp++];
+        expected = strtoul(argv[argp++], NULL, 10);
+        new_value = strtoul(argv[argp++], NULL, 10);
+
+        rc = dl_cas_revision(db, entity, (uint32_t)expected,
+                             (uint32_t)new_value);
+        if (rc == 0) {
+            printf("ok\n");
+        } else if (rc == DL_E_CONFLICT) {
+            printf("conflict\n");
+        } else {
+            fprintf(stderr, "dl: cas error\n");
+            dl_close(db);
+            return 1;
+        }
+
+    } else if (strcmp(cmd, "txn") == 0) {
+        /* Fixed demo: begin, CAS demo-entity 0->1, add a fact on a small
+         * declared relation, commit; print the result. */
+        uint32_t sym_hello, sym_world;
+        uint32_t cols[2];
+        int rc;
+
+        if (dl_declare_relation(db, "tnotes", 2) != 0) {
+            fprintf(stderr, "dl: cannot declare relation tnotes\n");
+            dl_close(db);
+            return 1;
+        }
+        sym_hello = dl_intern_str(db, "hello");
+        sym_world = dl_intern_str(db, "world");
+        cols[0] = sym_hello; cols[1] = sym_world;
+
+        if (dl_txn_begin(db) != 0) {
+            fprintf(stderr, "dl: txn_begin failed\n");
+            dl_close(db);
+            return 1;
+        }
+        if (dl_txn_cas(db, "demo-entity", 0, 1) != 0 ||
+            dl_txn_add_fact(db, "tnotes", cols, 2) != 0) {
+            fprintf(stderr, "dl: txn buffer failed\n");
+            dl_txn_rollback(db);
+            dl_close(db);
+            return 1;
+        }
+        rc = dl_txn_commit(db);
+        if (rc == 0) {
+            printf("txn committed\n");
+        } else if (rc == DL_E_CONFLICT) {
+            printf("txn conflict\n");
+        } else {
+            fprintf(stderr, "dl: txn commit error\n");
+            dl_close(db);
+            return 1;
         }
 
     } else {
