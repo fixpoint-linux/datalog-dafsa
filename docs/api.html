@@ -145,7 +145,7 @@
   <h2 id="hooks">Fault-injection hooks (test-only)</h2>
   <table class="api">
     <tbody>
-      <tr><td><code>void dl_set_fault_hook(dl_db *db, int (*hook)(dl_fpoint fp, void *user), void *user)</code></td><td>Install a fault-injection hook called at each fpoint during publish (<code>DL_FPOINT_AFTER_REL_SAVE</code>, <code>DL_FPOINT_AFTER_RENAME</code>); non-zero aborts the publish.</td></tr>
+      <tr><td><code>void dl_set_fault_hook(dl_db *db, int (*hook)(dl_fpoint fp, void *user), void *user)</code></td><td>Install a fault-injection hook called at each fpoint during publish (<code>DL_FPOINT_AFTER_REL_SAVE</code>, <code>DL_FPOINT_AFTER_RENAME</code>) and during a transaction commit (<code>DL_FPOINT_TXN_BEFORE_MARKER</code>); non-zero aborts the publish/commit.</td></tr>
     </tbody>
   </table>
 

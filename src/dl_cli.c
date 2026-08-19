@@ -24,8 +24,28 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 
 static const char *DB_DIR = "dl-test-db";
+
+/* Strictly parse a decimal string as an unsigned 32-bit value.  Rejects
+ * empty/whitespace input, trailing garbage, a negative sign, and overflow —
+ * unlike a bare strtoul (which parses "abc" as 0 and truncates silently). */
+static int parse_u32_strict(const char *s, unsigned long *out)
+{
+    char *end = NULL;
+    unsigned long v;
+
+    if (!s || !*s) return 0;
+    if (*s == '-') return 0;                    /* no negatives */
+    errno = 0;
+    v = strtoul(s, &end, 10);
+    if (errno == ERANGE) return 0;              /* overflow */
+    if (!end || *end != '\0') return 0;         /* trailing garbage */
+    if (v > 0xFFFFFFFFUL) return 0;             /* exceeds u32 */
+    *out = v;
+    return 1;
+}
 
 /* Reach into the opaque dl_db handle via the shared internal layout
  * (dl_internal.h) to access the interner for CLI value parsing. */
@@ -486,13 +506,24 @@ int main(int argc, char **argv)
 
     } else if (strcmp(cmd, "cas") == 0) {
         const char *entity;
+        const char *exp_s, *new_s;
         unsigned long expected, new_value;
         int rc;
 
         if (argp + 2 >= argc) usage(argv[0]);
         entity = argv[argp++];
-        expected = strtoul(argv[argp++], NULL, 10);
-        new_value = strtoul(argv[argp++], NULL, 10);
+        exp_s = argv[argp++];
+        new_s = argv[argp++];
+
+        /* Strict unsigned-32 parsing: reject non-numeric input and overflow
+         * instead of silently truncating via strtoul (which parses garbage as
+         * 0, making `dl cas e abc def` look like a conflict). */
+        if (!parse_u32_strict(exp_s, &expected) ||
+            !parse_u32_strict(new_s, &new_value)) {
+            fprintf(stderr, "dl: cas: expected and new must be unsigned 32-bit integers\n");
+            dl_close(db);
+            return 1;
+        }
 
         rc = dl_cas_revision(db, entity, (uint32_t)expected,
                              (uint32_t)new_value);
