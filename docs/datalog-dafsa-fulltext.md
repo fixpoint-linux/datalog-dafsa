@@ -1,6 +1,8 @@
 # Full-text search over observation content
 
-**Status:** Design/plan — not yet implemented. Tier-2 gap (#5) for the jing-memory use case. Multi-token / ranked search over free-text observation content, composed **beside** the graph as a word→doc-id DAFSA. The planned regex-on-symbols gives single-term pattern matching; full-text needs a postings index. **This is the *symbolic half* of hybrid retrieval — see `docs/datalog-dafsa-hybrid-search.md`.**
+**Status:** Implemented. Tier-2 feature. Multi-token / ranked search over free-text observation content, composed **beside** the graph as a word→doc-id DAFSA. The planned regex-on-symbols gives single-term pattern matching; full-text uses a postings index. **This is the *symbolic half* of hybrid retrieval — see `docs/datalog-dafsa-hybrid-search.md`.**
+
+**Design correction (implemented):** The relation store is SET-semantic (DAFSA collapses duplicate keys), so tf-from-duplicate-keys is IMPOSSIBLE. Ranking is based on DISTINCT matched terms per obs_id (more matched → higher). A separate count relation would be needed for true tf ranking (future refinement).
 
 ## TL;DR
 

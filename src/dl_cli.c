@@ -20,11 +20,13 @@
 #include "intern.h"
 #include "snapshot.h"
 #include "regexwalk.h"
+#include "index.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <limits.h>
 
 static const char *DB_DIR = "dl-test-db";
 
@@ -169,8 +171,10 @@ static void usage(const char *prog)
         "  %s [-d <dir>] txn\n"
         "  %s [-d <dir>] traverse <start> [depth] [--max-nodes N]\n"
         "  %s [-d <dir>] obs <node> [--max-obs N]\n"
+        "  %s [-d <dir>] index\n"
+        "  %s [-d <dir>] search '<terms>' [--top N]\n"
         "Values: bare integer -> raw u32; anything else -> interned string\n",
-        prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
+        prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
     exit(1);
 }
 
@@ -690,6 +694,127 @@ int main(int argc, char **argv)
             if (n == 0)
                 printf("(no observations)\n");
         }
+
+    } else if (strcmp(cmd, "index") == 0) {
+        if (argp < argc) {
+            fprintf(stderr, "dl: unexpected argument '%s'\n", argv[argp]);
+            dl_close(db);
+            return 1;
+        }
+
+        {
+            long n = dl_index_observations(db);
+            if (n < 0) {
+                fprintf(stderr, "dl: index failed\n");
+                dl_close(db);
+                return 1;
+            }
+            printf("Indexed %ld postings\n", n);
+        }
+
+    } else if (strcmp(cmd, "search") == 0) {
+        const char *terms_str;
+        unsigned long top_n = 10;
+
+        if (argp >= argc) usage(argv[0]);
+        terms_str = argv[argp++];
+
+        /* Optional --top N */
+        if (argp < argc && strcmp(argv[argp], "--top") == 0) {
+            argp++;
+            if (argp >= argc || !parse_u32_strict(argv[argp], &top_n) || top_n < 1 ||
+                top_n > INT_MAX) {
+                fprintf(stderr, "dl: invalid --top value (must be 1..2147483647)\n");
+                dl_close(db);
+                return 1;
+            }
+            argp++;
+        }
+        if (argp < argc) {
+            fprintf(stderr, "dl: unexpected argument '%s'\n", argv[argp]);
+            dl_close(db);
+            return 1;
+        }
+
+        /* Tokenize the search terms */
+        char **tokens = tokenize(terms_str, NULL);
+        if (!tokens) {
+            fprintf(stderr, "dl: tokenization failed\n");
+            dl_close(db);
+            return 1;
+        }
+
+        /* Count tokens */
+        size_t n_tokens = 0;
+        while (tokens[n_tokens]) n_tokens++;
+
+        if (n_tokens == 0) {
+            fprintf(stderr, "dl: no valid terms in search query\n");
+            token_free(tokens);
+            dl_close(db);
+            return 1;
+        }
+
+        /* Intern all tokens */
+        uint32_t *term_syms = malloc(n_tokens * sizeof(*term_syms));
+        if (!term_syms) {
+            token_free(tokens);
+            dl_close(db);
+            return 1;
+        }
+        size_t i;
+        for (i = 0; i < n_tokens; i++) {
+            term_syms[i] = dl_intern_str(db, tokens[i]);
+            if (term_syms[i] == 0) {
+                fprintf(stderr, "dl: intern failed for term '%s'\n", tokens[i]);
+                free(term_syms);
+                token_free(tokens);
+                dl_close(db);
+                return 1;
+            }
+        }
+        token_free(tokens);
+
+        /* Ensure postings relation exists */
+        if (aux_index_ensure_postings(db) != 0) {
+            fprintf(stderr, "dl: cannot ensure postings relation\n");
+            free(term_syms);
+            dl_close(db);
+            return 1;
+        }
+
+        /* Collect results */
+        uint32_t *obs_ids = malloc(top_n * sizeof(*obs_ids));
+        int *scores = malloc(top_n * sizeof(*scores));
+        if (!obs_ids || !scores) {
+            free(obs_ids);
+            free(scores);
+            free(term_syms);
+            dl_close(db);
+            return 1;
+        }
+
+        int n_results = dl_search_top(db, term_syms, (int)n_tokens,
+                                       obs_ids, scores, (int)top_n);
+        free(term_syms);
+
+        if (n_results < 0) {
+            fprintf(stderr, "dl: search failed\n");
+            free(obs_ids);
+            free(scores);
+            dl_close(db);
+            return 1;
+        }
+
+        /* Print results */
+        for (i = 0; i < (size_t)n_results; i++) {
+            printf("%u (score=%d)\n", obs_ids[i], scores[i]);
+        }
+        if (n_results == 0)
+            printf("(no results)\n");
+
+        free(obs_ids);
+        free(scores);
 
     } else {
         usage(argv[0]);

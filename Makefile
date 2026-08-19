@@ -44,7 +44,8 @@ LIB_OBJS = src/intern.o \
            src/analyze.o \
            src/schema.o \
            src/typecheck.o \
-           src/txnwal.o
+           src/txnwal.o \
+           src/index.o
 
 # Combined object list used for static links (tests, CLI).
 ALL_OBJS = $(VENDOR_OBJS) $(LIB_OBJS)
@@ -170,6 +171,9 @@ tests/test_m13_iter: tests/test_m13_iter.c $(ALL_OBJS)
 tests/test_traverse: tests/test_traverse.c $(ALL_OBJS)
 	$(CC) $(CFLAGS) $(INC) -static -o $@ tests/test_traverse.c $(ALL_OBJS)
 
+tests/test_search: tests/test_search.c $(ALL_OBJS)
+	$(CC) $(CFLAGS) $(INC) -static -o $@ tests/test_search.c $(ALL_OBJS)
+
 tests/test_m14_permsel: tests/test_m14_permsel.c $(ALL_OBJS)
 	$(CC) $(CFLAGS) $(INC) -static -o $@ tests/test_m14_permsel.c $(ALL_OBJS)
 
@@ -195,7 +199,7 @@ bench: tests/bench
 	@echo "=== Running demonstration benchmark ==="
 	LD_LIBRARY_PATH=. ./tests/bench
 
-test: tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4 tests/test_m4_review tests/test_bulk tests/test_m5 tests/test_m5_review tests/test_m6 tests/test_m6_review tests/test_m6_deep_review tests/test_m7 tests/test_cas tests/test_m8_magic tests/test_topdown tests/test_m9_arith tests/test_m9_str tests/test_ivm tests/test_bushy tests/test_vararity tests/test_lists tests/test_m10_rank tests/test_m11_range tests/test_m12_snap_rank tests/test_m13_iter tests/test_m14_permsel tests/test_m15_vmiter tests/test_m16_travel tests/test_positions tests/test_schema tests/test_typecheck tests/test_traverse dl build-tmp
+test: tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4 tests/test_m4_review tests/test_bulk tests/test_m5 tests/test_m5_review tests/test_m6 tests/test_m6_review tests/test_m6_deep_review tests/test_m7 tests/test_cas tests/test_m8_magic tests/test_topdown tests/test_m9_arith tests/test_m9_str tests/test_ivm tests/test_bushy tests/test_vararity tests/test_lists tests/test_m10_rank tests/test_m11_range tests/test_m12_snap_rank tests/test_m13_iter tests/test_m14_permsel tests/test_m15_vmiter tests/test_m16_travel tests/test_positions tests/test_schema tests/test_typecheck tests/test_traverse tests/test_search dl build-tmp
 	@echo "=== Running M0 unit tests ==="
 	LD_LIBRARY_PATH=. ./tests/test_m0
 	@echo ""
@@ -295,6 +299,9 @@ test: tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4 test
 	@echo "=== Running graph traversal tests ==="
 	LD_LIBRARY_PATH=. ./tests/test_traverse
 	@echo ""
+	@echo "=== Running full-text search tests ==="
+	LD_LIBRARY_PATH=. ./tests/test_search
+	@echo ""
 	@echo "=== Running CLI smoke test ==="
 	@sh tests/smoke.sh
 
@@ -392,5 +399,5 @@ clean:
 	      tests/test_m6_review tests/test_bulk \
 	      tests/test_m6_deep_review tests/test_m7 tests/test_m8_magic tests/test_topdown tests/test_m9_arith \
 	      tests/test_m9_str tests/test_ivm tests/test_bushy tests/test_vararity \
-	      tests/test_lists tests/test_m10_rank tests/test_m11_range tests/test_m12_snap_rank tests/test_m13_iter tests/test_m14_permsel tests/test_m15_vmiter tests/test_m16_travel tests/test_positions tests/test_schema tests/test_typecheck tests/test_traverse tests/bench
-	rm -rf /tmp/dl-test-db build-tmp/smoke build-tmp/m1 build-tmp/vararity build-tmp/lists build-tmp/rank build-tmp/m12snap build-tmp/m16travel
+	      tests/test_lists tests/test_m10_rank tests/test_m11_range tests/test_m12_snap_rank tests/test_m13_iter tests/test_m14_permsel tests/test_m15_vmiter tests/test_m16_travel tests/test_positions tests/test_schema tests/test_typecheck tests/test_traverse tests/test_search tests/bench
+	rm -rf /tmp/dl-test-db build-tmp/smoke build-tmp/m1 build-tmp/vararity build-tmp/lists build-tmp/rank build-tmp/m12snap build-tmp/m16travel build-tmp/search
