@@ -28,6 +28,10 @@ void      intern_free(interner *ir);
  * Idempotent: the same string always returns the same id. */
 uint32_t    intern_str(interner *ir, const char *str);
 
+/* NON-MUTATING lookup: return the sym_id for str if already interned, else 0.
+ * Never grows the interner / never marks it dirty (unlike intern_str). */
+uint32_t    intern_str_find(interner *ir, const char *str);
+
 /* Look up a sym_id → string.  Returns NULL if id is out of range. */
 const char *intern_str_of(interner *ir, uint32_t sym_id);
 

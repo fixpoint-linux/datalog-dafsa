@@ -1,6 +1,6 @@
 # Graph traversal / neighbor API
 
-**Status:** Design/plan — not yet implemented. Tier-2 gap (#4) for the jing-memory use case. The memory MCP `traverse` does N-hop BFS returning nodes + observations; datalog-dafsa needs a first-class traversal/neighbor operation.
+**Status:** Implemented (2026-08-19). Tier-2 gap (#4) for the jing-memory use case. Snapshot parity and MCP wiring are documented follow-ups, not yet implemented. The memory MCP `traverse` does N-hop BFS returning nodes + observations; datalog-dafsa needs a first-class traversal/neighbor operation.
 
 ## TL;DR
 
@@ -26,6 +26,8 @@ observation(entity_sym, content_sym)       /* arity 2 */
 
 - Entity/edge/observation **names** are interned sym-ids (matching the string-content regex plan).
 - `observation(entity, content)` — content is a sym-id of the interned text; prefix-enum on `observation(entity, ...)` returns that entity's observations.
+
+> **Note (2026-08-19, implementation):** `dl_traverse` only requires the `edge(from,to,type)` relation; the `entity(name,type)` relation is **not** consulted by the current implementation (traversal is self-contained on `edge`). `dl_node_observations` requires `observation(entity,content)`. Entity *type* resolution and snapshot (mmap-view) traversal are documented follow-ups, not yet wired.
 
 ### Forward + reverse edges
 

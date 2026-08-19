@@ -2184,6 +2184,12 @@ uint32_t dl_intern_str(dl_db *db, const char *str)
     return intern_str(db->ir, str);
 }
 
+uint32_t dl_intern_str_find(dl_db *db, const char *str)
+{
+    if (!db || !db->ir) return 0;
+    return intern_str_find(db->ir, str);
+}
+
 const char *dl_intern_str_of(dl_db *db, uint32_t sym_id)
 {
     if (!db || !db->ir) return NULL;
@@ -4191,4 +4197,292 @@ long dl_pattern(dl_db *db, const char *rel_name, const struct regex_dfa *dfa,
 
     return rel_pattern(db->rels[idx].rel, dfa,
                        (rel_enum_cb)cb, user);
+}
+/* ─── Graph traversal (Tier-2) ───────────────────────────────────────────── */
+
+/* Context for collecting neighbors */
+typedef struct {
+    uint32_t *neighbors;
+    int *n_neighbors;
+    int max_n;
+} neighbor_collect_ctx;
+
+/* Append a neighbor to the buffer, DEDUPLICATING against what is already
+ * present (edge(from,to,type) has a type column, so parallel multi-edges
+ * between the same pair are expected and must NOT crowd out distinct
+ * neighbors — see reviewer-confirmed should-fix).  Bounded by max_n. */
+static int neighbor_push(uint32_t *neighbors, int *n, int max_n, uint32_t node)
+{
+    int i;
+    if (max_n <= 0) return 0;
+    for (i = 0; i < *n; i++) {
+        if (neighbors[i] == node) return 0;   /* already present */
+    }
+    if (*n < max_n) neighbors[(*n)++] = node;
+    return 0;
+}
+
+/* Callback for collecting forward neighbors */
+static int collect_fwd_cb(const uint32_t *cols, uint8_t arity, void *user)
+{
+    (void)arity;
+    neighbor_collect_ctx *ctx = (neighbor_collect_ctx *)user;
+    return neighbor_push(ctx->neighbors, ctx->n_neighbors, ctx->max_n, cols[1]);
+}
+
+/* Callback for collecting reverse neighbors */
+static int collect_rev_cb(const uint32_t *cols, uint8_t arity, void *user)
+{
+    (void)arity;
+    neighbor_collect_ctx *ctx = (neighbor_collect_ctx *)user;
+    return neighbor_push(ctx->neighbors, ctx->n_neighbors, ctx->max_n, cols[1]);
+}
+
+/* Helper to check if a node is in the visited array */
+static int is_visited(uint32_t node, uint32_t *visited, int max_nodes)
+{
+    int i;
+    for (i = 0; i < max_nodes; i++) {
+        if (visited[i] == node) return 1;
+    }
+    return 0;
+}
+
+/* Helper to mark a node as visited */
+static void mark_visited(uint32_t node, uint32_t *visited, int max_nodes)
+{
+    int i;
+    for (i = 0; i < max_nodes; i++) {
+        if (visited[i] == 0) { visited[i] = node; return; }
+    }
+}
+
+/* Collect forward neighbors via edge(from,to,type) */
+static int collect_forward(dl_db *db, uint32_t node,
+                          uint32_t *neighbors, int *n_neighbors, int max_n)
+{
+    int edge_idx = find_rel(db, "edge");
+    if (edge_idx < 0) return -1;
+    if (db->rels[edge_idx].kind == RELK_VARIADIC) return -1;
+    if (db->rels[edge_idx].arity != 3) return -1;
+    relation *edge_rel = db->rels[edge_idx].rel;
+    if (!edge_rel) return -1;
+
+    uint32_t leading[1] = {node};
+    *n_neighbors = 0;
+    neighbor_collect_ctx ctx = {neighbors, n_neighbors, max_n};
+    long rc = rel_prefix(edge_rel, leading, 1, collect_fwd_cb, &ctx);
+    if (rc < 0) return -1;
+    return 0;
+}
+
+/* Collect reverse neighbors via permuted edge */
+static int collect_reverse(dl_db *db, uint32_t node,
+                          uint32_t *neighbors, int *n_neighbors, int max_n)
+{
+    int edge_idx = find_rel(db, "edge");
+    if (edge_idx < 0) return -1;
+    if (db->rels[edge_idx].kind == RELK_VARIADIC) return -1;
+    if (db->rels[edge_idx].arity != 3) return -1;
+
+    uint8_t perm[8] = {1, 0, 2, 0, 0, 0, 0, 0};
+    int perm_id = dl_db_declare_perm(db, edge_idx, 3, perm);
+    if (perm_id < 0) return -1;
+
+    if (db->perms[perm_id].dirty) {
+        if (permindex_build(db, edge_idx, perm_id) != 0)
+            return -1;
+    }
+
+    relation *pidx_rel = dl_db_get_perm_rel(db, edge_idx, perm_id);
+    if (!pidx_rel) return -1;
+
+    uint32_t leading[1] = {node};
+    *n_neighbors = 0;
+    neighbor_collect_ctx ctx = {neighbors, n_neighbors, max_n};
+    long rc = rel_prefix(pidx_rel, leading, 1, collect_rev_cb, &ctx);
+    if (rc < 0) return -1;
+    return 0;
+}
+
+long dl_traverse(dl_db *db, const char *start,
+                 int depth, int max_nodes,
+                 dl_traverse_cb cb, void *user)
+{
+    uint32_t start_sym;
+    uint32_t *visited = NULL;
+    uint32_t *queue = NULL;
+    uint8_t *queue_depth = NULL;
+    uint32_t *fwd_buf = NULL, *rev_buf = NULL;
+    int q_head = 0, q_tail = 0;
+    int visited_count = 0;
+
+    if (!db || !start || !cb || depth < 1 || max_nodes < 1)
+        return -1;
+
+    if (depth > 3) depth = 3;
+    /* Verify edge relation exists with correct arity */
+    {
+        int edge_idx = find_rel(db, "edge");
+        if (edge_idx < 0) return -1;
+        if (db->rels[edge_idx].kind == RELK_VARIADIC) return -1;
+        if (db->rels[edge_idx].arity != 3) return -1;
+    }
+
+    start_sym = dl_intern_str_find(db, start);
+    if (start_sym == 0) return 0;  /* node not in graph: no results, no interner side effect */
+
+    visited = calloc((size_t)max_nodes, sizeof(uint32_t));
+    if (!visited) return -1;
+    queue = malloc((size_t)max_nodes * sizeof(uint32_t));
+    if (!queue) { free(visited); return -1; }
+    queue_depth = malloc((size_t)max_nodes * sizeof(uint8_t));
+    if (!queue_depth) { free(visited); free(queue); return -1; }
+    /* Neighbor buffers sized to the max-nodes frontier bound (NOT a fixed
+     * 256) so a wide node never silently truncates its neighbor list. */
+    fwd_buf = malloc((size_t)max_nodes * sizeof(uint32_t));
+    if (!fwd_buf) { free(visited); free(queue); free(queue_depth); return -1; }
+    rev_buf = malloc((size_t)max_nodes * sizeof(uint32_t));
+    if (!rev_buf) {
+        free(visited); free(queue); free(queue_depth); free(fwd_buf);
+        return -1;
+    }
+
+    visited[0] = start_sym;
+    queue[q_tail] = start_sym;
+    queue_depth[q_tail] = 0;
+    q_tail++;
+    visited_count++;
+
+    if (cb(start_sym, 0, user) != 0) {
+        free(visited); free(queue); free(queue_depth);
+        free(fwd_buf); free(rev_buf);
+        return visited_count;
+    }
+
+    while (q_head < q_tail && q_tail < max_nodes) {
+        uint32_t current = queue[q_head];
+        uint8_t current_depth = queue_depth[q_head];
+        q_head++;
+
+        if (current_depth >= (uint8_t)depth) continue;
+        uint8_t next_depth = (uint8_t)(current_depth + 1);
+
+        /* Forward neighbors */
+        int n_fwd = 0;
+        if (collect_forward(db, current, fwd_buf, &n_fwd, max_nodes) != 0) {
+            free(visited); free(queue); free(queue_depth);
+            free(fwd_buf); free(rev_buf);
+            return -1;  /* edge vanished or rel_prefix failed: propagate, don't degrade */
+        }
+        {
+            int i;
+            for (i = 0; i < n_fwd; i++) {
+                uint32_t nb = fwd_buf[i];
+                if (!is_visited(nb, visited, max_nodes)) {
+                    mark_visited(nb, visited, max_nodes);
+                    if (q_tail < max_nodes) {
+                        queue[q_tail] = nb;
+                        queue_depth[q_tail] = next_depth;
+                        q_tail++;
+                        visited_count++;
+                        if (cb(nb, next_depth, user) != 0) {
+                            free(visited); free(queue); free(queue_depth);
+                            free(fwd_buf); free(rev_buf);
+                            return visited_count;
+                        }
+                    }
+                }
+            }
+        }
+
+        /* Reverse neighbors */
+        int n_rev = 0;
+        if (collect_reverse(db, current, rev_buf, &n_rev, max_nodes) != 0) {
+            free(visited); free(queue); free(queue_depth);
+            free(fwd_buf); free(rev_buf);
+            return -1;  /* perm build failed (e.g. MAX_PERMS exhausted): propagate */
+        }
+        {
+            int i;
+            for (i = 0; i < n_rev; i++) {
+                uint32_t nb = rev_buf[i];
+                if (!is_visited(nb, visited, max_nodes)) {
+                    mark_visited(nb, visited, max_nodes);
+                    if (q_tail < max_nodes) {
+                        queue[q_tail] = nb;
+                        queue_depth[q_tail] = next_depth;
+                        q_tail++;
+                        visited_count++;
+                        if (cb(nb, next_depth, user) != 0) {
+                            free(visited); free(queue); free(queue_depth);
+                            free(fwd_buf); free(rev_buf);
+                            return visited_count;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    free(visited);
+    free(queue);
+    free(queue_depth);
+    free(fwd_buf);
+    free(rev_buf);
+    return visited_count;
+}
+
+/* Context for collecting observations */
+typedef struct {
+    dl_db *db;
+    dl_str_cb cb;
+    void *user;
+    int max_obs;
+    int count;
+} obs_collect_ctx;
+
+/* Callback for collecting observations */
+static int collect_obs_cb(const uint32_t *cols, uint8_t arity, void *user)
+{
+    (void)arity;
+    obs_collect_ctx *ctx = (obs_collect_ctx *)user;
+    const char *content = dl_intern_str_of(ctx->db, cols[1]);
+    if (content) {
+        ctx->count++;
+        if (ctx->cb(content, ctx->user) != 0) return 1;
+    }
+    if (ctx->max_obs > 0 && ctx->count >= ctx->max_obs) return 1;
+    return 0;
+}
+
+long dl_node_observations(dl_db *db, const char *node,
+                          int max_obs, dl_str_cb cb, void *user)
+{
+    int obs_idx;
+    relation *obs_rel;
+    uint32_t node_sym;
+    uint32_t leading[1];
+    obs_collect_ctx ctx;
+    long rc;
+
+    if (!db || !node || !cb) return -1;
+
+    obs_idx = find_rel(db, "observation");
+    if (obs_idx < 0) return -1;
+    if (db->rels[obs_idx].kind == RELK_VARIADIC) return -1;
+    if (db->rels[obs_idx].arity != 2) return -1;
+    obs_rel = db->rels[obs_idx].rel;
+    if (!obs_rel) return -1;
+
+    node_sym = dl_intern_str_find(db, node);
+    if (node_sym == 0) return 0;  /* node not in graph: no observations, no interner side effect */
+
+    leading[0] = node_sym;
+    ctx.db = db; ctx.cb = cb; ctx.user = user;
+    ctx.max_obs = max_obs; ctx.count = 0;
+    rc = rel_prefix(obs_rel, leading, 1, collect_obs_cb, &ctx);
+    if (rc < 0) return -1;
+
+    return ctx.count;
 }

@@ -515,8 +515,40 @@ void dl_set_fault_hook(dl_db *db,
 /* Intern a string, return its sym_id (1-based).  Returns 0 on OOM. */
 uint32_t    dl_intern_str(dl_db *db, const char *str);
 
+/* NON-MUTATING lookup: sym_id for str if already interned, else 0.
+ * Never grows the interner / never marks it dirty (unlike dl_intern_str). */
+uint32_t    dl_intern_str_find(dl_db *db, const char *str);
+
 /* Look up a sym_id → string.  Returns NULL if id is out of range. */
 const char *dl_intern_str_of(dl_db *db, uint32_t sym_id);
+
+/* ─── Graph traversal (Tier-2) ───────────────────────────────────────────── */
+
+/* Callback for dl_traverse: receives (node_sym, depth).
+ * Return non-zero to stop early. */
+typedef int (*dl_traverse_cb)(uint32_t node_sym, uint8_t depth, void *user);
+
+/* BFS traversal over edge(from,to,type) graph from start node.
+ * Both forward and reverse edges are traversed (bidirectional).
+ * depth clamped to 1..3; max_nodes bounds total visited nodes.
+ * cb receives each visited node with its depth from start.
+ * Returns the number of nodes visited, or -1 on error (missing relations,
+ * wrong arity, or intern failure).
+ * Operates on LIVE relations (not snapshot). */
+long dl_traverse(dl_db *db, const char *start,
+                 int depth, int max_nodes,
+                 dl_traverse_cb cb, void *user);
+
+/* Callback for dl_node_observations: receives each observation string.
+ * Return non-zero to stop early. */
+typedef int (*dl_str_cb)(const char *s, void *user);
+
+/* Fetch observations for a node from the observation(node,content) relation.
+ * Resolves content sym_ids via dl_intern_str_of.
+ * Returns the number of observations emitted, or -1 on error.
+ * Operates on LIVE relations (not snapshot). */
+long dl_node_observations(dl_db *db, const char *node,
+                          int max_obs, dl_str_cb cb, void *user);
 
 /* ─── List term-store access (v2 lists, public wrappers) ─────────────────── */
 /* A List column VALUE is a hash-consed list handle in the reserved high range

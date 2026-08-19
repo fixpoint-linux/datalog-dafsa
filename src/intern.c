@@ -84,6 +84,22 @@ void intern_free(interner *ir)
 
 /* ─── Core ops ────────────────────────────────────────────────────────── */
 
+/* NON-MUTATING lookup: same forward-DAFSA walk as intern_str, but never
+ * allocates / never marks dirty.  Returns 0 if absent (or on NULL input). */
+uint32_t intern_str_find(interner *ir, const char *str)
+{
+    size_t slen;
+    struct capture_ctx ctx = {0, 0};
+
+    if (!ir || !str) return 0;
+
+    slen = strlen(str);
+    dafsa_prefix_enum(ir->fwd, (const unsigned char *)str, slen,
+                      capture_cb, &ctx);
+
+    return ctx.found ? ctx.id : 0;
+}
+
 uint32_t intern_str(interner *ir, const char *str)
 {
     size_t slen;

@@ -127,6 +127,29 @@ static int print_tuple(const uint32_t *cols, uint8_t arity, void *user)
     return 0;
 }
 
+/* Callback for traverse: print node name */
+static int traverse_print_cb(uint32_t node_sym, uint8_t depth, void *user)
+{
+    (void)depth;
+    dl_db *db = (dl_db *)user;
+    interner *ir = cli_get_interner(db);
+    const char *s = intern_str_of(ir, node_sym);
+    if (s && *s) {
+        printf("%s\n", s);
+    } else {
+        printf("%u\n", node_sym);
+    }
+    return 0;
+}
+
+/* Callback for obs: print observation string */
+static int obs_print_cb(const char *s, void *user)
+{
+    (void)user;
+    printf("%s\n", s);
+    return 0;
+}
+
 /* ─── Usage ───────────────────────────────────────────────────────────── */
 
 static void usage(const char *prog)
@@ -144,8 +167,10 @@ static void usage(const char *prog)
         "  %s [-d <dir>] rev <entity>\n"
         "  %s [-d <dir>] cas <entity> <expected> <new>\n"
         "  %s [-d <dir>] txn\n"
+        "  %s [-d <dir>] traverse <start> [depth] [--max-nodes N]\n"
+        "  %s [-d <dir>] obs <node> [--max-obs N]\n"
         "Values: bare integer -> raw u32; anything else -> interned string\n",
-        prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
+        prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
     exit(1);
 }
 
@@ -574,6 +599,96 @@ int main(int argc, char **argv)
             fprintf(stderr, "dl: txn commit error\n");
             dl_close(db);
             return 1;
+        }
+
+    } else if (strcmp(cmd, "traverse") == 0) {
+        const char *start;
+        int depth = 1;
+        unsigned long max_nodes = 1000;
+
+        if (argp >= argc) usage(argv[0]);
+        start = argv[argp++];
+
+        /* Optional [depth] then optional [--max-nodes N].  A malformed
+         * numeric arg is an error, not a silent fallback to depth 1. */
+        if (argp < argc && argv[argp][0] == '-' &&
+            strncmp(argv[argp], "--max-nodes", 11) != 0) {
+            fprintf(stderr, "dl: invalid argument '%s'\n", argv[argp]);
+            dl_close(db);
+            return 1;
+        }
+        if (argp < argc && strncmp(argv[argp], "--max-nodes", 11) != 0) {
+            unsigned long d;
+            if (!parse_u32_strict(argv[argp], &d) || d < 1 || d > 3) {
+                fprintf(stderr, "dl: invalid depth '%s' (expect 1..3)\n",
+                        argv[argp]);
+                dl_close(db);
+                return 1;
+            }
+            depth = (int)d;
+            argp++;
+        }
+        if (argp < argc && strcmp(argv[argp], "--max-nodes") == 0) {
+            if (argp + 1 >= argc ||
+                !parse_u32_strict(argv[argp + 1], &max_nodes) ||
+                max_nodes < 1) {
+                fprintf(stderr, "dl: invalid --max-nodes value\n");
+                dl_close(db);
+                return 1;
+            }
+            argp += 2;
+        }
+        if (argp < argc) {
+            fprintf(stderr, "dl: unexpected argument '%s'\n", argv[argp]);
+            dl_close(db);
+            return 1;
+        }
+
+        {
+            long n = dl_traverse(db, start, depth, (int)max_nodes,
+                                  traverse_print_cb, db);
+            if (n < 0) {
+                fprintf(stderr, "dl: traverse failed\n");
+                dl_close(db);
+                return 1;
+            }
+            if (n == 0)
+                printf("(no results)\n");
+        }
+
+    } else if (strcmp(cmd, "obs") == 0) {
+        const char *node;
+        unsigned long max_obs = 100;
+
+        if (argp >= argc) usage(argv[0]);
+        node = argv[argp++];
+
+        if (argp < argc && strcmp(argv[argp], "--max-obs") == 0) {
+            if (argp + 1 >= argc ||
+                !parse_u32_strict(argv[argp + 1], &max_obs) ||
+                max_obs < 1) {
+                fprintf(stderr, "dl: invalid --max-obs value\n");
+                dl_close(db);
+                return 1;
+            }
+            argp += 2;
+        }
+        if (argp < argc) {
+            fprintf(stderr, "dl: unexpected argument '%s'\n", argv[argp]);
+            dl_close(db);
+            return 1;
+        }
+
+        {
+            long n = dl_node_observations(db, node, (int)max_obs,
+                                           obs_print_cb, NULL);
+            if (n < 0) {
+                fprintf(stderr, "dl: obs failed\n");
+                dl_close(db);
+                return 1;
+            }
+            if (n == 0)
+                printf("(no observations)\n");
         }
 
     } else {
