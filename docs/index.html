@@ -107,6 +107,18 @@
       </p>
       <p><a href="cli.html#vsearch">The vector-search CLI commands &rarr;</a></p>
     </div>
+    <div class="headline-card">
+      <span class="n">04</span>
+      <h3>Order statistics — rank, select, range, count</h3>
+      <p>
+        The big-endian encoding means the <strong>extreme prefix is the extreme key</strong>, so
+        <code>rank</code>/<code>select</code>/<code>range_count</code>/<code>count</code> fall out
+        of the DAFSA naturally — with bound + permutation-index variants, a pull-iterator +
+        merge-join, and a lazy range generator. Median, percentiles, and ordered scans are native
+        primitives, not table scans.
+      </p>
+      <p><a href="order-statistics.html">The order-statistics guide &rarr;</a></p>
+    </div>
   </div>
 
   <h2>Quickstart</h2>
