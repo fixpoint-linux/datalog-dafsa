@@ -578,4 +578,9 @@ uint32_t dl_term_cdr(const dl_db *db, uint32_t h);
 }
 #endif
 
+/* Vector tier (semantic half) query path (S2): dl_vector_search,
+ * dl_vector_search_version, dl_vector_rerank + layout constants.  Included
+ * here so the whole public API surface is reachable via dl.h alone. */
+#include "vector.h"
+
 #endif /* DL_H */
