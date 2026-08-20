@@ -28,8 +28,15 @@
 #include <string.h>
 #include <errno.h>
 #include <limits.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 static const char *DB_DIR = "dl-test-db";
+
+/* Directory of this binary (set in main): used to locate ./dl-embed for the
+ * query-encode path, so vsearch works regardless of the caller's cwd. */
+static char g_prog_dir[PATH_MAX] = ".";
 
 /* Strictly parse a decimal string as an unsigned 32-bit value.  Rejects
  * empty/whitespace input, trailing garbage, a negative sign, and overflow —
@@ -102,22 +109,80 @@ static int parse_hex_words(const char *hex_str, uint32_t *words, int n_words)
     return n_words;
 }
 
-/* Escape a string for embedding inside single quotes in a POSIX shell:
- *   '  ->  '\''   (close quote, literal quote, reopen).
- * Guarantees the string is passed as ONE shell word (no command injection,
- * apostrophes safe).  Truncates at cap if it would overflow. */
-static void shell_escape_squote(const char *in, char *out, size_t cap)
+/* Run the dl-embed encode helper: fork + execv (NO shell — the query is
+ * passed as a single argv element, so no shell-quoting/injection surface
+ * exists by construction).  Fills q_sig (VEC_SIG_WORDS) and q_int8
+ * (VEC_IVEC_WORDS) from the helper's "sig_hex ivec_hex" stdout line.
+ * Returns 0 on success, -1 on any failure (message printed). */
+static int run_encode_helper(const char *db_dir, const char *query,
+                             uint32_t *q_sig, uint32_t *q_int8)
 {
-    size_t o = 0;
-    for (const char *p = in; *p && o + 6 < cap; p++) {
-        if (*p == '\'') {
-            if (o + 6 >= cap) break;   /* not enough room: truncate */
-            memcpy(out + o, "'\\''", 4); o += 4;
-        } else {
-            out[o++] = *p;
+    char helper[PATH_MAX + 16];
+    int fds[2];
+    pid_t pid;
+
+    /* resolve dl-embed next to this binary, then ./dl-embed */
+    snprintf(helper, sizeof helper, "%s/dl-embed", g_prog_dir);
+    if (access(helper, X_OK) != 0) {
+        snprintf(helper, sizeof helper, "./dl-embed");
+        if (access(helper, X_OK) != 0) {
+            fprintf(stderr, "dl: dl-embed not found (build it: make dl-embed)\n");
+            return -1;
         }
     }
-    out[o] = '\0';
+
+    if (pipe(fds) != 0) {
+        fprintf(stderr, "dl: pipe failed\n");
+        return -1;
+    }
+    pid = fork();
+    if (pid < 0) {
+        close(fds[0]);
+        close(fds[1]);
+        fprintf(stderr, "dl: fork failed\n");
+        return -1;
+    }
+    if (pid == 0) {
+        char *cargv[6];
+        int i = 0;
+        cargv[i++] = (char *)"dl-embed";
+        cargv[i++] = (char *)"encode";
+        cargv[i++] = (char *)"--db";
+        cargv[i++] = (char *)db_dir;
+        cargv[i++] = (char *)query;
+        cargv[i] = NULL;
+        if (dup2(fds[1], STDOUT_FILENO) < 0) _exit(126);
+        close(fds[0]);
+        close(fds[1]);
+        execv(helper, cargv);
+        _exit(127);
+    }
+    close(fds[1]);
+    {
+        char sig_buf[65], ivec_buf[769];
+        FILE *fp = fdopen(fds[0], "r");
+        int status = 0, ok = 0;
+        if (!fp) {
+            close(fds[0]);
+            waitpid(pid, &status, 0);
+            fprintf(stderr, "dl: fdopen failed\n");
+            return -1;
+        }
+        if (fscanf(fp, "%64s %768s", sig_buf, ivec_buf) == 2) {
+            if (parse_hex_words(sig_buf, q_sig, VEC_SIG_WORDS) == VEC_SIG_WORDS &&
+                parse_hex_words(ivec_buf, q_int8, VEC_IVEC_WORDS) == VEC_IVEC_WORDS)
+                ok = 1;
+        }
+        fclose(fp);
+        if (waitpid(pid, &status, 0) < 0 ||
+            !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+            ok = 0;
+        if (!ok) {
+            fprintf(stderr, "dl: encode helper failed\n");
+            return -1;
+        }
+    }
+    return 0;
 }
 
 /* Callback to collect candidate sym-ids from vector search */
@@ -323,6 +388,17 @@ int main(int argc, char **argv)
     int argp = 1;
 
     if (argc < 2) usage(argv[0]);
+
+    /* record this binary's directory for the dl-embed helper lookup */
+    {
+        size_t n = strlen(argv[0]);
+        if (n >= sizeof g_prog_dir) n = sizeof g_prog_dir - 1;
+        memcpy(g_prog_dir, argv[0], n);
+        g_prog_dir[n] = '\0';
+        char *slash = strrchr(g_prog_dir, '/');
+        if (slash) *slash = '\0';
+        else snprintf(g_prog_dir, sizeof g_prog_dir, ".");
+    }
 
     /* Parse -d <dir> */
     if (argp < argc && strcmp(argv[argp], "-d") == 0) {
@@ -1068,33 +1144,9 @@ int main(int argc, char **argv)
             dl_close(db);
             return 1;
         } else {
-            /* Shell out to Python encode helper.  The query is user-controlled
-             * and interpolated into a shell string — escape single quotes so
-             * it cannot break out (command injection fix, reviewer f1). */
-            char qesc[2048];
-            char cmd_buf[4096];
-            FILE *fp;
-            shell_escape_squote(query_str, qesc, sizeof qesc);
-            snprintf(cmd_buf, sizeof(cmd_buf),
-                     "python3 scripts/embed.py encode --db '%s' '%s' 2>/dev/null",
-                     db_dir, qesc);
-            fp = popen(cmd_buf, "r");
-            if (!fp) {
-                fprintf(stderr, "dl: cannot run encode helper\n");
-                dl_close(db);
-                return 1;
-            }
-            char sig_buf[65], ivec_buf[769];
-            if (fscanf(fp, "%64s %768s", sig_buf, ivec_buf) != 2) {
-                fprintf(stderr, "dl: encode helper failed\n");
-                pclose(fp);
-                dl_close(db);
-                return 1;
-            }
-            pclose(fp);
-            if (parse_hex_words(sig_buf, q_sig, VEC_SIG_WORDS) != VEC_SIG_WORDS ||
-                parse_hex_words(ivec_buf, q_int8, VEC_IVEC_WORDS) != VEC_IVEC_WORDS) {
-                fprintf(stderr, "dl: encode helper returned invalid data\n");
+            /* Encode the query via ./dl-embed (fork+execv — no shell, so
+             * the user-controlled query can never inject commands). */
+            if (run_encode_helper(db_dir, query_str, q_sig, q_int8) != 0) {
                 dl_close(db);
                 return 1;
             }
@@ -1231,33 +1283,9 @@ int main(int argc, char **argv)
             dl_close(db);
             return 1;
         } else {
-            /* Shell out to Python encode helper.  The query is user-controlled
-             * and interpolated into a shell string — escape single quotes so
-             * it cannot break out (command injection fix, reviewer f1). */
-            char qesc[2048];
-            char cmd_buf[4096];
-            FILE *fp;
-            shell_escape_squote(query_str, qesc, sizeof qesc);
-            snprintf(cmd_buf, sizeof(cmd_buf),
-                     "python3 scripts/embed.py encode --db '%s' '%s' 2>/dev/null",
-                     db_dir, qesc);
-            fp = popen(cmd_buf, "r");
-            if (!fp) {
-                fprintf(stderr, "dl: cannot run encode helper\n");
-                dl_close(db);
-                return 1;
-            }
-            char sig_buf[65], ivec_buf[769];
-            if (fscanf(fp, "%64s %768s", sig_buf, ivec_buf) != 2) {
-                fprintf(stderr, "dl: encode helper failed\n");
-                pclose(fp);
-                dl_close(db);
-                return 1;
-            }
-            pclose(fp);
-            if (parse_hex_words(sig_buf, q_sig, VEC_SIG_WORDS) != VEC_SIG_WORDS ||
-                parse_hex_words(ivec_buf, q_int8, VEC_IVEC_WORDS) != VEC_IVEC_WORDS) {
-                fprintf(stderr, "dl: encode helper returned invalid data\n");
+            /* Encode the query via ./dl-embed (fork+execv — no shell, so
+             * the user-controlled query can never inject commands). */
+            if (run_encode_helper(db_dir, query_str, q_sig, q_int8) != 0) {
                 dl_close(db);
                 return 1;
             }

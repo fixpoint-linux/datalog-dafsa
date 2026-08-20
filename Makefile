@@ -53,7 +53,7 @@ ALL_OBJS = $(VENDOR_OBJS) $(LIB_OBJS)
 
 # ─── Targets ─────────────────────────────────────────────────────────────
 
-.PHONY: all clean test bench test-m1 test-m2 wasm lsp test-lsp dlp dlp_schema_check dlp-check dlp-golden
+.PHONY: all clean test bench test-m1 test-m2 wasm lsp test-lsp dlp dlp_schema_check dlp-check dlp-golden dl-embed fetch-model embed-test
 
 all: build-tmp libdatalog.so dl
 
@@ -184,6 +184,71 @@ tests/test_vector_search: tests/test_vector_search.c $(ALL_OBJS)
 tests/test_vector_cli: tests/test_vector_cli.c $(ALL_OBJS)
 	$(CC) $(CFLAGS) $(INC) -static -o $@ tests/test_vector_cli.c $(ALL_OBJS) -lm
 
+# ─── dl-embed: vector-tier embed tool (ggml C++; OPT-IN) ─────────────────
+# Requires (host, once):  git submodule update --init vendor/ggml   (pinned
+# v0.20.2, commit 8c63e70)  +  cmake on PATH.  ggml builds under its OWN
+# cmake flags (relaxed) — the project -Werror stays scoped to src/ tests/
+# vendor/dafsa and is NOT applied to ggml or to src/embed's ggml include.
+# The default `all`/`test` targets never require ggml or the model; dl-embed
+# and its gates are separate opt-in targets (`make dl-embed`, `make embed-test`).
+
+GGML_SRC   := vendor/ggml
+GGML_BUILD := build-tmp/ggml
+GGML_CMAKE := $(GGML_BUILD)/CMakeCache.txt
+GGML_LIBS  := $(GGML_BUILD)/src/libggml.a \
+              $(GGML_BUILD)/src/ggml-cpu/libggml-cpu.a \
+              $(GGML_BUILD)/src/libggml-base.a
+EMBED_CXXFLAGS := -O2 -Wall -Wextra -std=c++17 -Ivendor/ggml/include -Isrc
+EMBED_OBJS := src/embed/itq.o src/embed/tokenizer.o src/embed/bert.o \
+              src/embed/csv_emit.o src/embed/dl_driver.o src/embed/dl-embed.o
+
+# fail fast (before any g++) if the submodule is not materialized
+.PHONY: ggml-check
+ggml-check:
+	@test -f $(GGML_SRC)/CMakeLists.txt || { echo "vendor/ggml missing — run: git submodule update --init vendor/ggml"; exit 2; }
+
+$(GGML_CMAKE): ggml-check $(GGML_SRC)/CMakeLists.txt
+	cmake -S $(GGML_SRC) -B $(GGML_BUILD) -DCMAKE_BUILD_TYPE=Release \
+	      -DGGML_BUILD_EXAMPLES=OFF -DGGML_BUILD_TESTS=OFF \
+	      -DGGML_CUDA=OFF -DGGML_METAL=OFF -DGGML_VULKAN=OFF -DGGML_OPENCL=OFF
+
+$(GGML_LIBS): $(GGML_CMAKE)
+	$(MAKE) -C $(GGML_BUILD) ggml ggml-cpu
+
+src/embed/%.o: src/embed/%.cpp | ggml-check
+	g++ $(EMBED_CXXFLAGS) -c -o $@ $<
+
+dl-embed: $(EMBED_OBJS) $(GGML_LIBS)
+	g++ $(EMBED_CXXFLAGS) -o $@ $(EMBED_OBJS) \
+	    -L$(GGML_BUILD)/src -L$(GGML_BUILD)/src/ggml-cpu \
+	    -lggml -lggml-cpu -lggml-base -lpthread -lm
+
+# Model (never committed): bge-small-en-v1.5 GGUF, ~67 MB f16.
+MODEL_URL  := https://huggingface.co/CompendiumLabs/bge-small-en-v1.5-gguf/resolve/main/bge-small-en-v1.5-f16.gguf
+MODEL_DIR  ?= $(if $(XDG_CACHE_HOME),$(XDG_CACHE_HOME),$(HOME)/.cache)/datalog-dafsa/models
+MODEL_PATH := $(MODEL_DIR)/bge-small-en-v1.5-f16.gguf
+
+fetch-model:
+	@mkdir -p $(MODEL_DIR)
+	curl -L --fail --progress-bar -o $(MODEL_PATH) $(MODEL_URL)
+	@ls -l $(MODEL_PATH)
+
+# Offline embed-math suite (tokenizer + ITQ vs numpy/LAPACK goldens; no ggml).
+tests/test_embed_math: tests/test_embed_math.cpp src/embed/itq.cpp src/embed/tokenizer.cpp
+	g++ -O2 -Wall -Wextra -Werror -std=c++17 -Isrc \
+	    tests/test_embed_math.cpp src/embed/itq.cpp src/embed/tokenizer.cpp -o $@ -lm
+
+# Engine-side byte-identity + emission round-trip (links the C engine only).
+tests/test_embed: tests/test_embed.c $(ALL_OBJS)
+	$(CC) $(CFLAGS) $(INC) -static -o $@ tests/test_embed.c $(ALL_OBJS) -lm
+
+# Full dl-embed gate: build + self-test (golden embeddings when the model is
+# present; offline checks otherwise).
+embed-test: dl-embed tests/test_embed tests/test_embed_math
+	./tests/test_embed
+	./tests/test_embed_math
+	./dl-embed self-test
+
 tests/test_m14_permsel: tests/test_m14_permsel.c $(ALL_OBJS)
 	$(CC) $(CFLAGS) $(INC) -static -o $@ tests/test_m14_permsel.c $(ALL_OBJS)
 
@@ -209,7 +274,7 @@ bench: tests/bench
 	@echo "=== Running demonstration benchmark ==="
 	LD_LIBRARY_PATH=. ./tests/bench
 
-test: tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4 tests/test_m4_review tests/test_bulk tests/test_m5 tests/test_m5_review tests/test_m6 tests/test_m6_review tests/test_m6_deep_review tests/test_m7 tests/test_cas tests/test_m8_magic tests/test_topdown tests/test_m9_arith tests/test_m9_str tests/test_ivm tests/test_bushy tests/test_vararity tests/test_lists tests/test_m10_rank tests/test_m11_range tests/test_m12_snap_rank tests/test_m13_iter tests/test_m14_permsel tests/test_m15_vmiter tests/test_m16_travel tests/test_positions tests/test_schema tests/test_typecheck tests/test_traverse tests/test_search tests/test_vector_storage tests/test_vector_cli dl build-tmp
+test: tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4 tests/test_m4_review tests/test_bulk tests/test_m5 tests/test_m5_review tests/test_m6 tests/test_m6_review tests/test_m6_deep_review tests/test_m7 tests/test_cas tests/test_m8_magic tests/test_topdown tests/test_m9_arith tests/test_m9_str tests/test_ivm tests/test_bushy tests/test_vararity tests/test_lists tests/test_m10_rank tests/test_m11_range tests/test_m12_snap_rank tests/test_m13_iter tests/test_m14_permsel tests/test_m15_vmiter tests/test_m16_travel tests/test_positions tests/test_schema tests/test_typecheck tests/test_traverse tests/test_search tests/test_vector_storage tests/test_vector_cli tests/test_embed_math tests/test_embed dl build-tmp
 	@echo "=== Running M0 unit tests ==="
 	LD_LIBRARY_PATH=. ./tests/test_m0
 	@echo ""
@@ -312,6 +377,14 @@ test: tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4 test
 	@echo "=== Running full-text search tests ==="
 	LD_LIBRARY_PATH=. ./tests/test_search
 	@echo ""
+	@echo "=== Running embed math (tokenizer + ITQ vs numpy/LAPACK goldens) tests ==="
+	./tests/test_embed_math
+	@echo ""
+	@echo "=== Running embed byte-identity tests ==="
+	./tests/test_embed
+	@echo ""
+	@if [ -x ./dl-embed ]; then echo "=== Running dl-embed self-test ==="; ./dl-embed self-test || exit 1; else echo "=== dl-embed not built (needs vendor/ggml + model: see make dl-embed) — skipping ==="; fi
+	@echo ""
 	@echo "=== Running CLI smoke test ==="
 	@sh tests/smoke.sh
 
@@ -409,5 +482,8 @@ clean:
 	      tests/test_m6_review tests/test_bulk \
 	      tests/test_m6_deep_review tests/test_m7 tests/test_m8_magic tests/test_topdown tests/test_m9_arith \
 	      tests/test_m9_str tests/test_ivm tests/test_bushy tests/test_vararity \
-	      tests/test_lists tests/test_m10_rank tests/test_m11_range tests/test_m12_snap_rank tests/test_m13_iter tests/test_m14_permsel tests/test_m15_vmiter tests/test_m16_travel tests/test_positions tests/test_schema tests/test_typecheck tests/test_traverse tests/test_search tests/test_vector_storage tests/test_vector_search tests/test_vector_cli tests/bench
+	      tests/test_lists tests/test_m10_rank tests/test_m11_range tests/test_m12_snap_rank tests/test_m13_iter tests/test_m14_permsel tests/test_m15_vmiter tests/test_m16_travel tests/test_positions tests/test_schema tests/test_typecheck tests/test_traverse tests/test_search tests/test_vector_storage tests/test_vector_search tests/test_vector_cli tests/test_embed_math tests/test_embed tests/bench
+	rm -f dl-embed src/embed/itq.o src/embed/tokenizer.o src/embed/bert.o \
+	      src/embed/csv_emit.o src/embed/dl_driver.o src/embed/dl-embed.o
+	rm -rf build-tmp/ggml
 	rm -rf /tmp/dl-test-db build-tmp/smoke build-tmp/m1 build-tmp/vararity build-tmp/lists build-tmp/rank build-tmp/m12snap build-tmp/m16travel build-tmp/search

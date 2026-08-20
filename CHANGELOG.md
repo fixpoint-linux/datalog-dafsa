@@ -459,3 +459,40 @@ First milestone-complete release: M0–M7 of the DAFSA-backed Datalog engine.
 - Durable interner (atomic save, ordered before WAL records).
 - Incremental `dl_add_fact`/`dl_delete_fact` with per-relation WAL, idempotent
   replay, and compaction at 25%. 14 tests.
+
+### GGML C-embedding migration — vector tier embed pipeline in C++ (`dl-embed`)
+- **Python dependency removed**: `scripts/embed.py` deleted; the S3/S4 embed
+  + encode pipeline is now the standalone C++ tool `dl-embed` (src/embed/).
+- **ggml vendored** as a git submodule at `vendor/ggml`, pinned to v0.20.2
+  (commit 8c63e70, GPG-verified tag).  Explicit upstream-library exception
+  in vendor/README.md; built via cmake (CPU-only) into build-tmp/ggml static
+  libs — ggml never sees the project -Werror, and the engine/libdatalog.so/dl
+  build is unchanged (gcc -static -Werror, no ggml link).
+- **From-scratch components** (all under src/embed/):
+  - `bert.{h,cpp}` — GGUF loader + bge-small-en-v1.5 BERT forward pass on
+    ggml (POST-LN, learned position+type embeddings, token_embd_norm,
+    attn_output_norm/layer_output_norm (+older output_norm fallback),
+    exact-erf GELU, no pooler — CLS + L2), mirroring llama.cpp's LLM_ARCH_BERT.
+  - `tokenizer.{h,cpp}` — BertTokenizer-compatible basic preprocessing +
+    greedy WordPiece with single-[UNK]-per-word semantics, vocab from GGUF
+    metadata.
+  - `itq.{h,cpp}` — dependency-free port of fit_itq_basis/itq_encode/
+    quantize_int8_global: cyclic-Jacobi PCA, one-sided-Jacobi SVD,
+    Gram-Schmidt QR, numpy-legacy-MT19937 randn stream (bit-parity verified).
+  - `vec_bits.h` — band_slice/pack4_le/float32_bits, byte-identical to
+    src/vector.c (proven by tests/test_embed round-trip through the REAL
+    dl_vector_search/rerank engine paths).
+  - `csv_emit`, `dl_driver` (fork/execv, shell-free), `dl-embed` main.
+- **CLI**: dl vsearch/vhybrid encode path now fork+execv's ./dl-embed (no
+  popen, no shell — command-injection surface removed with the shell itself).
+- **Model**: bge-small-en-v1.5-f16.gguf (~67 MB) downloaded on demand to
+  ~/.cache/datalog-dafsa/models/ (make fetch-model / dl-embed fetch-model);
+  never committed.  Opt-in targets: `make dl-embed`, `make embed-test`;
+  `make test` runs dl-embed self-test only if the binary exists.
+- **Tests**: tests/test_embed_math (38 checks: MT19937-vs-numpy stream,
+  Jacobi/QR/SVD vs LAPACK goldens, ITQ fit determinism+orthonormality,
+  encode/quantize semantics, WordPiece+basic-tokenizer goldens) and
+  tests/test_embed (engine-side byte identity).  Offline gates all green;
+  the model-dependent gates (golden-embedding cosine >= 0.9999, S4 oracle
+  >= 99%) run host-side once `git submodule update --init vendor/ggml` +
+  `make fetch-model` are done — see scripts/gen_golden.py for the fixture.
