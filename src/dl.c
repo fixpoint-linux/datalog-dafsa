@@ -19,6 +19,7 @@
 #include "vm.h"
 #include "snapshot.h"
 #include "regexwalk.h"
+#include "dafsa.h"
 #include "tupleset.h"
 #include "permindex.h"
 #include "magic.h"
@@ -4137,9 +4138,18 @@ void dl_set_fault_hook(dl_db *db,
     db->fault_user = user;
 }
 
-/* ─── Regex pattern query ──────────────────────────────────────────────── */
+/* Callback for symbols_dfa_walk to add sym_ids to a sym_set */
 
-long dl_pattern(dl_db *db, const char *rel_name, const struct regex_dfa *dfa,
+/* ─── Regex pattern query ──────────────────────────────────────────────── */
+/* Callback for symbols_dfa_walk to add sym_ids to a sym_set */
+static int symset_add_cb(uint32_t sym_id, void *user)
+{
+    sym_set *set = (sym_set *)user;
+    return symset_add(set, sym_id);
+}
+
+
+long dl_pattern(dl_db *db, const char *rel_name, uint8_t col, const struct regex_dfa *dfa,
                 dl_tuple_cb cb, void *user)
 {
     int idx;
@@ -4159,8 +4169,19 @@ long dl_pattern(dl_db *db, const char *rel_name, const struct regex_dfa *dfa,
         if (!manifest_find_rel_ex(sdir, rel_name, &arity, &variadic))
             return -1;
 
+        /* Build sym_set via symbols_dfa_walk_view on snapshot symbols.dafsa */
+        char sym_path[16384];
+        snprintf(sym_path, sizeof(sym_path), "%s/symbols.dafsa", sdir);
+        v = dafsa_view_open(sym_path);
+        if (!v) return -1;
+        sym_set set;
+        if (symset_init(&set) != 0) { dafsa_view_close(v); return -1; }
+        long ns = symbols_dfa_walk_view(v, dfa, symset_add_cb, &set);
+        dafsa_view_close(v);
+        if (ns < 0) { symset_free(&set); return -1; }
+
         if (variadic) {
-            /* v2: pattern walk fanned out over the per-variant views. */
+            /* v2: filter fanned out over the per-variant views */
             uint8_t present[MAX_VAR_ARITY + 1];
             long total = 0;
             uint8_t a;
@@ -4171,32 +4192,44 @@ long dl_pattern(dl_db *db, const char *rel_name, const struct regex_dfa *dfa,
                 if (!present[a]) continue;
                 if (snprintf(vname, sizeof(vname), "%s.%d",
                              rel_name, (int)a) >= (int)sizeof(vname))
-                    return -1;
+                    { symset_free(&set); return -1; }
                 v = view_open_cached(db->vcache, vname, sdir);
-                if (!v) return -1;
-                n = view_pattern(v, a, dfa, cb, user);
-                if (n < 0) return -1;
+                if (!v) { symset_free(&set); return -1; }
+                n = view_filter_col(v, a, col, &set, cb, user);
+                if (n < 0) { symset_free(&set); return -1; }
                 total += n;
             }
+            symset_free(&set);
             return total;
         }
 
         v = view_open_cached(db->vcache, rel_name, sdir);
-        if (!v) return -1;
-
-        return view_pattern(v, arity, dfa, cb, user);
+        if (!v) { symset_free(&set); return -1; }
+        long n = view_filter_col(v, arity, col, &set, cb, user);
+        symset_free(&set);
+        return n;
     }
 
     /* In-memory path */
     idx = find_rel(db, rel_name);
     if (idx < 0) return -1;
 
-    /* v2: pattern walk fanned out over present variants. */
-    if (db->rels[idx].kind == RELK_VARIADIC)
-        return vrel_pattern(db->rels[idx].vrel, dfa, (rel_enum_cb)cb, user);
+    /* Build sym_set via symbols_dfa_walk on live symbols DAFSA */
+    sym_set set;
+    if (symset_init(&set) != 0) return -1;
+    long ns = symbols_dfa_walk(intern_fwd(db->ir), dfa, symset_add_cb, &set);
+    if (ns < 0) { symset_free(&set); return -1; }
 
-    return rel_pattern(db->rels[idx].rel, dfa,
-                       (rel_enum_cb)cb, user);
+    /* v2: filter fanned out over present variants */
+    if (db->rels[idx].kind == RELK_VARIADIC) {
+        long n = vrel_filter_col(db->rels[idx].vrel, col, &set, (rel_enum_cb)cb, user);
+        symset_free(&set);
+        return n;
+    }
+
+    long n = rel_filter_col(db->rels[idx].rel, col, &set, (rel_enum_cb)cb, user);
+    symset_free(&set);
+    return n;
 }
 /* ─── Graph traversal (Tier-2) ───────────────────────────────────────────── */
 

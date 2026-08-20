@@ -442,6 +442,48 @@ long view_pattern(void *view_handle, uint8_t arity,
     return ctx.count;
 }
 
+/* Filter callback context for view_filter_col */
+struct vfilter_ctx {
+    uint8_t arity;
+    uint8_t col;
+    const struct sym_set *set;
+    dl_tuple_cb cb;
+    void *user;
+    long count;
+};
+
+static int vfilter_cb(const uint32_t *cols, uint8_t arity, void *user)
+{
+    struct vfilter_ctx *ctx = (struct vfilter_ctx *)user;
+    if (ctx->col < arity && symset_contains(ctx->set, cols[ctx->col])) {
+        ctx->count++;
+        return ctx->cb(cols, ctx->arity, ctx->user);
+    }
+    return 0;
+}
+
+long view_filter_col(void *view_handle, uint8_t arity, uint8_t col,
+                     const struct sym_set *set,
+                     dl_tuple_cb cb, void *user)
+{
+    struct vfilter_ctx ctx;
+
+    if (!view_handle || !set || !cb) return -1;
+    if (col >= arity) return 0;  /* out of range: no matches */
+
+    ctx.arity = arity;
+    ctx.col = col;
+    ctx.set = set;
+    ctx.cb = cb;
+    ctx.user = user;
+    ctx.count = 0;
+
+    /* Enumerate all tuples via view_prefix with k=0 and filter */
+    long n = view_prefix(view_handle, arity, NULL, 0, vfilter_cb, &ctx);
+    if (n < 0) return -1;
+    return ctx.count;
+}
+
 /* ─── View order-statistics (rank/select/range_count/count) ───────────── */
 
 /* Encode arity u32 cols as u32BE + trailing 0x00 (4*arity+1 bytes),

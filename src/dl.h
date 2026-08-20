@@ -454,11 +454,12 @@ long dl_query_topdown_adorn(dl_db *db, const char *goal_rel,
 /* Forward declaration (full struct in regexwalk.h) */
 struct regex_dfa;
 
-/* Enumerate all tuples in a relation whose full key matches the compiled
- * regex DFA.  Reads from snapshot if published, else falls back to
- * in-memory path.  Returns tuple count or -1 on error. */
-long dl_pattern(dl_db *db, const char *rel, const struct regex_dfa *dfa,
-                dl_tuple_cb cb, void *user);
+
+/* Enumerate all tuples in a relation whose column string content matches the
+ * compiled regex DFA.  col is 0-based column index (default 0).
+ * Reads from snapshot if published, else falls back to in-memory path. */
+long dl_pattern(dl_db *db, const char *rel_name, uint8_t col, const struct regex_dfa *dfa,
+               dl_tuple_cb cb, void *user);
 
 /* ─── Snapshot publish (M4) ────────────────────────────────────────────── */
 

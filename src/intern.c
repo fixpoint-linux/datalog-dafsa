@@ -163,6 +163,13 @@ const char *intern_str_of(interner *ir, uint32_t sym_id)
     return ir->rev[sym_id - 1];
 }
 
+/* ─── Accessors ───────────────────────────────────────────────────────── */
+
+const dafsa *intern_fwd(const interner *ir)
+{
+    return ir ? ir->fwd : NULL;
+}
+
 /* ─── Persistence ─────────────────────────────────────────────────────── */
 
 int intern_save(interner *ir, const char *fwd_path, const char *rev_path)

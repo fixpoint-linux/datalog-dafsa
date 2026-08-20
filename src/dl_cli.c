@@ -165,7 +165,7 @@ static void usage(const char *prog)
         "  %s [-d <dir>] qmagic '<rule>' | <file.dl> <goal-rel> [-a <adorn>] <val> [<val> ...]\n"
         "  %s [-d <dir>] publish\n"
         "  %s [-d <dir>] bound <rel> <val> [<val> ...]\n"
-        "  %s [-d <dir>] pattern <rel> '<regex>'\n"
+        "  %s [-d <dir>] pattern <rel> [<col>] '<regex>'\n"
         "  %s [-d <dir>] rev <entity>\n"
         "  %s [-d <dir>] cas <entity> <expected> <new>\n"
         "  %s [-d <dir>] txn\n"
@@ -488,12 +488,24 @@ int main(int argc, char **argv)
                 printf("(no results)\n");
         }
 
+
     } else if (strcmp(cmd, "pattern") == 0) {
         const char *rel_name;
+        uint8_t col = 0;
         const char *pattern;
 
         if (argp >= argc) usage(argv[0]);
         rel_name = argv[argp++];
+
+        /* Optional column argument */
+        if (argp < argc) {
+            char *endptr;
+            long col_val = strtol(argv[argp], &endptr, 10);
+            if (*endptr == 0 && col_val >= 0 && col_val <= 255) {
+                col = (uint8_t)col_val;
+                argp++;
+            }
+        }
 
         if (argp >= argc) usage(argv[0]);
         pattern = argv[argp++];
@@ -501,14 +513,13 @@ int main(int argc, char **argv)
         {
             regex_dfa *dfa = regex_compile(pattern);
             if (dfa->errmsg) {
-                fprintf(stderr, "dl: bad pattern '%s': %s\n",
-                        pattern, dfa->errmsg);
+                fprintf(stderr, "dl: bad pattern\n");
                 regex_dfa_free(dfa);
                 dl_close(db);
                 return 1;
             }
 
-            long n = dl_pattern(db, rel_name, dfa, print_tuple, db);
+            long n = dl_pattern(db, rel_name, col, dfa, print_tuple, db);
             regex_dfa_free(dfa);
             if (n < 0) {
                 fprintf(stderr, "dl: pattern query failed\n");

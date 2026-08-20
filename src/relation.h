@@ -237,11 +237,22 @@ long rel_range_each(const relation *rel, uint32_t lo, uint32_t hi,
 
 /* Forward declaration (full struct in regexwalk.h) */
 struct regex_dfa;
+struct sym_set;
 
 /* Walk full keys of the relation matching the compiled regex pattern.
  * Enumerates complete tuples whose full DAFSA key (4*arity+1 bytes)
- * matches the regex DFA.  Returns count or -1 on error. */
+ * matches the regex DFA.  Returns count or -1 on error.
+ * DEPRECATED: kept for backward compatibility with raw-DAFSA tests.
+ * Use rel_filter_col for column string-content matching. */
 long rel_pattern(const relation *rel, const struct regex_dfa *dfa,
                  rel_enum_cb cb, void *user);
+
+/* Filter tuples by column string-content regex match.
+ * Builds a sym_set of matching sym_ids via symbols_dfa_walk on db->ir->fwd,
+ * then enumerates all tuples and calls cb only when cols[col] is in the set.
+ * Returns count or -1 on error. */
+long rel_filter_col(const relation *rel, uint8_t col,
+                    const struct sym_set *set,
+                    rel_enum_cb cb, void *user);
 
 #endif /* RELATION_H */

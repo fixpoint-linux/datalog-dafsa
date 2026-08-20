@@ -438,10 +438,13 @@ First milestone-complete release: M0–M7 of the DAFSA-backed Datalog engine.
   (+16 adversarial review).
 
 ### M5 — Regex/pattern walker
-- Regex → NFA → dense DFA compiler; full-key byte matching with implicit `^...$`.
+- Regex → NFA → dense DFA compiler; **column string-content** matching with
+  implicit `^...$` (matched against the symbols-table text of the selected
+  column, not the raw binary key).
 - Automaton-intersection product walkers (in-memory + mmap) with cycle-safe
   visited set; DFA state cap (50k) with early-abort for pathological patterns.
-- `dl_pattern`, CLI `dl pattern`, and `OP_WALK` VM instruction via `~ '<regex>'`.
+- `dl_pattern`, CLI `dl pattern <rel> [<col>] '<regex>'`, and `OP_WALK` VM
+  instruction via `~ [k] '<regex>'` (optional 0-based column index, default 0).
 - 25 tests (+60 adversarial review).
 
 ### M6 — Permutation indices + hash-join

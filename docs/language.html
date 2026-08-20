@@ -294,13 +294,20 @@ q(X, Lo, Hi) :- bounds(Lo, Hi), range(X, r, Lo, Hi).   # var bounds
   <h2 id="regex">Regex patterns</h2>
   <p>
     A body atom may carry a regex pattern written as a <em>single-quoted</em>
-    string after a tilde: <code>pred(...) ~ 'pattern'</code>. The pattern is
-    compiled to a DFA and matched against the full key. In the CLI, use
-    <code>pattern</code> for standalone regex queries.
+    string after a tilde: <code>pred(...) ~ 'pattern'</code> or, to target a
+    specific column, <code>pred(...) ~ k 'pattern'</code> where <code>k</code>
+    is a 0-based integer column index (default 0 = leading column). The pattern
+    is compiled to a DFA and matched against the <em>string content</em> of that
+    column's value (via the symbols table), not the raw binary key — so
+    <code>~ 'a.*'</code> means "column's text starts with <code>a</code>". An
+    integer (non-string) column matches nothing. In the CLI, use
+    <code>pattern &lt;rel&gt; [&lt;col&gt;] '&lt;pattern&gt;'</code> for
+    standalone regex queries.
   </p>
-  <pre class="code"><code>q(X, Y) :- edge(X, Y) ~ '(a|b).*'.</code></pre>
+  <pre class="code"><code>q(X, Y) :- edge(X, Y) ~ 1 '(a|b).*'.   # filter on column 1's text</code></pre>
   <p>
-    A negated pattern atom is not supported (compile error). In rules, patterns
+    A negated pattern atom is not supported (compile error). A column index out
+    of range for the atom is also a compile error. In rules, patterns
     are compiled at load time; a bad regex is a loud error.
   </p>
 

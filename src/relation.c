@@ -953,3 +953,43 @@ long rel_pattern(const relation *rel, const struct regex_dfa *dfa,
     if (n < 0) return -1;
     return ctx.count;
 }
+
+/* Filter callback context for rel_filter_col */
+struct filter_ctx {
+    uint8_t col;
+    const struct sym_set *set;
+    rel_enum_cb cb;
+    void *user;
+    long count;
+};
+
+static int filter_cb(const uint32_t *cols, uint8_t arity, void *user)
+{
+    struct filter_ctx *ctx = (struct filter_ctx *)user;
+    if (ctx->col < arity && symset_contains(ctx->set, cols[ctx->col])) {
+        ctx->count++;
+        return ctx->cb(cols, arity, ctx->user);
+    }
+    return 0;
+}
+
+long rel_filter_col(const relation *rel, uint8_t col,
+                    const struct sym_set *set,
+                    rel_enum_cb cb, void *user)
+{
+    struct filter_ctx ctx;
+
+    if (!rel || !set || !cb) return -1;
+    if (col >= rel->arity) return 0;  /* out of range: no matches */
+
+    ctx.col = col;
+    ctx.set = set;
+    ctx.cb = cb;
+    ctx.user = user;
+    ctx.count = 0;
+
+    /* Enumerate all tuples and filter by column membership */
+    long n = rel_prefix(rel, NULL, 0, filter_cb, &ctx);
+    if (n < 0) return -1;
+    return ctx.count;
+}

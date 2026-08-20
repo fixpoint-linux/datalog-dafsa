@@ -14,8 +14,14 @@
 #include <stdint.h>
 #include <stdio.h>
 
+/* Forward declaration for dafsa */
+typedef struct dafsa dafsa;
+
 /* Opaque handle */
 typedef struct interner interner;
+
+/* Return the forward DAFSA (symbols DAFSA) from an interner. */
+const dafsa *intern_fwd(const interner *ir);
 
 /* ─── Lifecycle ───────────────────────────────────────────────────────── */
 

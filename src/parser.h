@@ -91,6 +91,7 @@ typedef struct {
     int     aggregate;     /* 1 if aggregate (count/sum/min/max) */
     token  *agg_op;        /* aggregate operator token, NULL if not agg */
     char   *pattern;       /* M5: regex pattern string (from ~ '...'), or NULL */
+    int     pattern_col;   /* M5-symbols: column index for ~ pattern (0-based, default 0) */
     expr   *arith;         /* M9: arithmetic expr tree for `X = E` atoms,
                               NULL for every other atom kind */
 } atom;

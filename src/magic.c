@@ -295,6 +295,7 @@ static atom *atom_copy(const atom *src, const char *new_pred)
         a->pattern = strdup(src->pattern);
         if (!a->pattern) { atom_free_local(a); return NULL; }
     }
+    a->pattern_col = src->pattern_col;
     if (src->agg_op) {
         a->agg_op = tok_dup(src->agg_op);
         if (!a->agg_op) { atom_free_local(a); return NULL; }

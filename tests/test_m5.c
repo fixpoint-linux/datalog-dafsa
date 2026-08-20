@@ -593,41 +593,58 @@ static void setup_db(dl_db **db_out, const char *suffix)
 
 static void test_snapshot_pattern(void)
 {
-    TEST("snapshot dl_pattern");
+    TEST("snapshot dl_pattern string filter");
 
     dl_db *db;
     setup_db(&db, "snap");
 
-    dl_declare_relation(db, "edge", 2);
-    dl_declare_relation(db, "node", 1);
+    dl_declare_relation(db, "p", 2);
 
-    /* Load some facts */
-    uint32_t e1[] = {1, 2};
-    uint32_t e2[] = {1, 3};
-    uint32_t e3[] = {2, 4};
-    relation *rel = rel_create(2);
-    rel_add(rel, e1);
-    rel_add(rel, e2);
-    rel_add(rel, e3);
+    /* Load string facts: p(alice,nyc), p(bob,la), p(carol,sf) */
+    {
+        char csv_path[256];
+        snprintf(csv_path, sizeof(csv_path), "build-tmp/m5snap.csv");
+        FILE *f = fopen(csv_path, "w");
+        fprintf(f, "alice,nyc\nbob,la\ncarol,sf\n");
+        fclose(f);
+        CHECK(dl_load_facts(db, "p", csv_path) == 3, "loaded 3 facts");
+    }
 
-    /* Save and publish */
-    /* We can't easily call rel_save into the snapshot dir via dl_open,
-     * so let's use the in-memory path */
-    regex_dfa *dfa = regex_compile("\\x00\\x00\\x00\\x01.*");
-    CHECK(!dfa->errmsg, dfa->errmsg);
+    /* Publish a snapshot so dl_pattern routes through <sdir>/symbols.dafsa */
+    CHECK(dl_publish_snapshot(db) == 0, "publish");
 
-    tset ts = {0};
-    long n = dl_pattern(db, "edge", dfa, tset_cb, &ts);
-    /* dl_pattern in non-snapshot path goes to find_rel,
-     * but "edge" is an empty relation (just declared, no facts loaded
-     * via dl_load_facts).  So we expect 0.  We'll test the in-memory
-     * path properly via rel_pattern above.
-     * For snapshot path, we need a publish first. */
-    CHECK(n == 0, "no facts in empty declared rel");
+    /* col0 'a.*' -> alice row only */
+    {
+        regex_dfa *dfa = regex_compile("a.*");
+        CHECK(!dfa->errmsg, dfa->errmsg);
+        tset ts = {0};
+        long n = dl_pattern(db, "p", 0, dfa, tset_cb, &ts);
+        CHECK(n == 1, "snapshot col0 count 1");
+        uint32_t alice = dl_intern_str_find(db, "alice");
+        uint32_t nyc   = dl_intern_str_find(db, "nyc");
+        uint32_t exp[] = {alice, nyc};
+        CHECK(alice && nyc, "alice/nyc interned");
+        CHECK(tset_contains(&ts, exp), "contains (alice,nyc)");
+        tset_free(&ts);
+        regex_dfa_free(dfa);
+    }
 
-    tset_free(&ts);
-    regex_dfa_free(dfa);
-    rel_free(rel);
+    /* col1 'l.*' -> bob,la and dave-la rows: col1 values nyc,la,sf -> 'l.*' matches la */
+    {
+        regex_dfa *dfa = regex_compile("l.*");
+        CHECK(!dfa->errmsg, dfa->errmsg);
+        tset ts = {0};
+        long n = dl_pattern(db, "p", 1, dfa, tset_cb, &ts);
+        CHECK(n == 1, "snapshot col1 count 1");
+        uint32_t bob = dl_intern_str_find(db, "bob");
+        uint32_t la  = dl_intern_str_find(db, "la");
+        uint32_t exp[] = {bob, la};
+        CHECK(bob && la, "bob/la interned");
+        CHECK(tset_contains(&ts, exp), "contains (bob,la)");
+        tset_free(&ts);
+        regex_dfa_free(dfa);
+    }
+
     dl_close(db);
     PASS();
 }
@@ -643,34 +660,47 @@ static void test_walk_instruction(void)
 
     dl_declare_relation(db, "p", 2);
 
-    /* Load facts: p(1,2), p(1,3), p(2,4) */
+    /* Load string facts: p(alice,bob), p(bob,la), p(carol,sf) */
     {
         char csv_path[256];
         snprintf(csv_path, sizeof(csv_path), "build-tmp/m5walk.csv");
         FILE *f = fopen(csv_path, "w");
-        fprintf(f, "1,2\n1,3\n2,4\n");
+        fprintf(f, "alice,bob\nbob,la\ncarol,sf\n");
         fclose(f);
-        dl_load_facts(db, "p", csv_path);
+        CHECK(dl_load_facts(db, "p", csv_path) == 3, "loaded 3 facts");
     }
 
-    /* Rule: q(X,Y) :- p(X,Y) ~ '\\x00\\x00\\x00\\x01.*' */
-    const char *rule_src =
-        "q(X,Y) :- p(X,Y) ~ '\\x00\\x00\\x00\\x01.*'.";
-    int rc = dl_load_rules(db, rule_src);
-    CHECK(rc == 0, "rule loaded");
+    /* Rule: q(X,Y) :- p(X,Y) ~ 'a.*'.  col0 starts with 'a' -> alice */
+    {
+        const char *rule_src = "q(X,Y) :- p(X,Y) ~ 'a.*'.";
+        int rc = dl_load_rules(db, rule_src);
+        CHECK(rc == 0, "rule loaded");
+        tset ts = {0};
+        long n = dl_query(db, "q", tset_cb, &ts);
+        CHECK(n == 1, "1 result");
+        uint32_t alice = dl_intern_str_find(db, "alice");
+        uint32_t bob   = dl_intern_str_find(db, "bob");
+        uint32_t exp[] = {alice, bob};
+        CHECK(alice && bob, "alice/bob interned");
+        CHECK(tset_contains(&ts, exp), "contains (alice,bob)");
+        tset_free(&ts);
+    }
 
-    /* Compile and query */
-    tset ts = {0};
-    long n = dl_query(db, "q", tset_cb, &ts);
-    CHECK(n == 2, "2 results");
-    uint32_t exp1[] = {1, 2};
-    uint32_t exp2[] = {1, 3};
-    uint32_t exp3[] = {2, 4};
-    CHECK(tset_contains(&ts, exp1), "contains (1,2)");
-    CHECK(tset_contains(&ts, exp2), "contains (1,3)");
-    CHECK(!tset_contains(&ts, exp3), "not (2,4)");
+    /* Rule with explicit column 1: r(X,Y) :- p(X,Y) ~ 1 'b.*'. col1 starts 'b' -> bob */
+    {
+        const char *rule_src = "r(X,Y) :- p(X,Y) ~ 1 'b.*'.";
+        int rc = dl_load_rules(db, rule_src);
+        CHECK(rc == 0, "rule loaded");
+        tset ts = {0};
+        long n = dl_query(db, "r", tset_cb, &ts);
+        CHECK(n == 1, "1 result");
+        uint32_t alice = dl_intern_str_find(db, "alice");
+        uint32_t bob   = dl_intern_str_find(db, "bob");
+        uint32_t exp[] = {alice, bob};
+        CHECK(tset_contains(&ts, exp), "contains (alice,bob)");
+        tset_free(&ts);
+    }
 
-    tset_free(&ts);
     dl_close(db);
     PASS();
 }
@@ -687,13 +717,12 @@ static void test_walk_all_match(void)
         char csv_path[256];
         snprintf(csv_path, sizeof(csv_path), "build-tmp/m5walkall.csv");
         FILE *f = fopen(csv_path, "w");
-        fprintf(f, "10\n20\n30\n");
+        fprintf(f, "alice\nbob\ncarol\n");
         fclose(f);
-        dl_load_facts(db, "r", csv_path);
+        CHECK(dl_load_facts(db, "r", csv_path) == 3, "loaded 3 facts");
     }
 
-    const char *rule_src =
-        "s(X) :- r(X) ~ '.*'.";
+    const char *rule_src = "s(X) :- r(X) ~ '.*'.";
     int rc = dl_load_rules(db, rule_src);
     CHECK(rc == 0, "rule loaded");
 
@@ -723,6 +752,294 @@ static void test_walk_syntax_error(void)
     dl_close(db);
     PASS();
 }
+
+/* ─── Symbol-DAFSA walker tests (M5-symbols) ──────────────────────────── */
+
+/* Build a symbols DAFSA from (str, id) pairs.  Keys: utf8_str, NUL, id_u32BE. */
+static dafsa *build_sym_dafsa(const char **strs, const uint32_t *ids, int n)
+{
+    dafsa *d = dafsa_create();
+    CHECK_RET(d, "dafsa_create", NULL);
+    unsigned char key[1024];
+    for (int i = 0; i < n; i++) {
+        size_t sl = strlen(strs[i]);
+        if (sl + 1 + 4 > sizeof(key)) { dafsa_free(d); return NULL; }
+        memcpy(key, strs[i], sl);
+        key[sl] = 0x00;
+        key[sl + 1] = (unsigned char)((ids[i] >> 24) & 0xFF);
+        key[sl + 2] = (unsigned char)((ids[i] >> 16) & 0xFF);
+        key[sl + 3] = (unsigned char)((ids[i] >> 8) & 0xFF);
+        key[sl + 4] = (unsigned char)(ids[i] & 0xFF);
+        if (dafsa_add_n(d, key, sl + 1 + 4) < 0) { dafsa_free(d); return NULL; }
+    }
+    return d;
+}
+
+/* Collect sym_ids into a set */
+typedef struct {
+    uint32_t *ids;
+    int n, cap;
+} sym_id_set;
+
+static int sym_id_cb(uint32_t sym_id, void *user)
+{
+    sym_id_set *s = (sym_id_set *)user;
+    if (s->n >= s->cap) {
+        int nc = s->cap ? s->cap * 2 : 16;
+        uint32_t *ni = realloc(s->ids, (size_t)nc * sizeof(uint32_t));
+        if (!ni) return -1;
+        s->ids = ni; s->cap = nc;
+    }
+    s->ids[s->n++] = sym_id;
+    return 0;
+}
+
+static int sym_id_set_contains(const sym_id_set *s, uint32_t id)
+{
+    for (int i = 0; i < s->n; i++)
+        if (s->ids[i] == id) return 1;
+    return 0;
+}
+
+static void test_symbols_walk_unit(void)
+{
+    TEST("symbols_dfa_walk unit: anchor, .*, alternation, no-match");
+
+    const char *strs[] = {"alice", "bob", "ab", "zz"};
+    const uint32_t ids[] = {1, 2, 3, 4};
+    dafsa *d = build_sym_dafsa(strs, ids, 4);
+    CHECK(d != NULL, "build");
+
+    /* (a1) anchored literal 'alice' -> id 1 */
+    {
+        regex_dfa *dfa = regex_compile("alice");
+        CHECK(!dfa->errmsg, dfa->errmsg);
+        sym_id_set s = {0};
+        long n = symbols_dfa_walk(d, dfa, sym_id_cb, &s);
+        CHECK(n == 1, "count 1");
+        CHECK(s.n == 1 && s.ids[0] == 1, "id 1");
+        free(s.ids);
+        regex_dfa_free(dfa);
+    }
+    /* (a2) '.*' -> all 4 */
+    {
+        regex_dfa *dfa = regex_compile(".*");
+        CHECK(!dfa->errmsg, dfa->errmsg);
+        sym_id_set s = {0};
+        long n = symbols_dfa_walk(d, dfa, sym_id_cb, &s);
+        CHECK(n == 4, "count 4");
+        for (int i = 0; i < 4; i++)
+            CHECK(sym_id_set_contains(&s, ids[i]), "all ids");
+        free(s.ids);
+        regex_dfa_free(dfa);
+    }
+    /* (a3) alternation 'a.*|b.*' -> alice(1), bob(2), ab(3) */
+    {
+        regex_dfa *dfa = regex_compile("a.*|b.*");
+        CHECK(!dfa->errmsg, dfa->errmsg);
+        sym_id_set s = {0};
+        long n = symbols_dfa_walk(d, dfa, sym_id_cb, &s);
+        CHECK(n == 3, "count 3");
+        CHECK(sym_id_set_contains(&s, 1), "id 1");
+        CHECK(sym_id_set_contains(&s, 2), "id 2");
+        CHECK(sym_id_set_contains(&s, 3), "id 3");
+        free(s.ids);
+        regex_dfa_free(dfa);
+    }
+    /* (a4) no-match 'qqq' -> 0 */
+    {
+        regex_dfa *dfa = regex_compile("qqq");
+        CHECK(!dfa->errmsg, dfa->errmsg);
+        sym_id_set s = {0};
+        long n = symbols_dfa_walk(d, dfa, sym_id_cb, &s);
+        CHECK(n == 0, "count 0");
+        free(s.ids);
+        regex_dfa_free(dfa);
+    }
+
+    dafsa_free(d);
+    PASS();
+}
+
+/* (f) symbols_dfa_walk_view parity vs in-memory */
+static void test_symbols_walk_view_parity(void)
+{
+    TEST("symbols_dfa_walk_view parity vs in-memory");
+
+    const char *strs[] = {"alice", "bob", "ab", "zz", "carol"};
+    const uint32_t ids[] = {1, 2, 3, 4, 5};
+    dafsa *d = build_sym_dafsa(strs, ids, 5);
+    CHECK(d != NULL, "build");
+
+    const char *path = "build-tmp/m5sym.dafsa";
+    CHECK(dafsa_save(d, path) == 0, "save");
+    dafsa_view *v = dafsa_view_open(path);
+    CHECK(v != NULL, "view open");
+
+    regex_dfa *dfa = regex_compile("a.*|b.*");
+    CHECK(!dfa->errmsg, dfa->errmsg);
+
+    sym_id_set in_mem = {0};
+    long n_mem = symbols_dfa_walk(d, dfa, sym_id_cb, &in_mem);
+
+    sym_id_set in_view = {0};
+    long n_view = symbols_dfa_walk_view(v, dfa, sym_id_cb, &in_view);
+
+    CHECK(n_mem == n_view, "same count");
+    CHECK(n_mem == 3, "expect 3 (alice, bob, ab)");
+    for (int i = 0; i < in_mem.n; i++)
+        CHECK(sym_id_set_contains(&in_view, in_mem.ids[i]), "parity id");
+    for (int i = 0; i < in_view.n; i++)
+        CHECK(sym_id_set_contains(&in_mem, in_view.ids[i]), "parity id (rev)");
+
+    free(in_mem.ids);
+    free(in_view.ids);
+    regex_dfa_free(dfa);
+    dafsa_view_close(v);
+    dafsa_free(d);
+    PASS();
+}
+
+/* (b) int-column '~' -> empty */
+static void test_walk_int_column_empty(void)
+{
+    TEST("OP_WALK on int column -> empty");
+
+    dl_db *db;
+    setup_db(&db, "walkint");
+
+    dl_declare_relation(db, "p", 1);
+    {
+        char csv_path[256];
+        snprintf(csv_path, sizeof(csv_path), "build-tmp/m5walkint.csv");
+        FILE *f = fopen(csv_path, "w");
+        fprintf(f, "10\n20\n30\n");
+        fclose(f);
+        CHECK(dl_load_facts(db, "p", csv_path) == 3, "loaded 3 facts");
+    }
+
+    const char *rule_src = "q(X) :- p(X) ~ '.*'.";
+    int rc = dl_load_rules(db, rule_src);
+    CHECK(rc == 0, "rule loaded");
+
+    tset ts = {0};
+    long n = dl_query(db, "q", tset_cb, &ts);
+    CHECK(n == 0, "0 results (int column)");
+
+    tset_free(&ts);
+    dl_close(db);
+    PASS();
+}
+
+/* (c) column-index col0 vs col1 via dl_pattern in-memory */
+static void test_pattern_col_index(void)
+{
+    TEST("dl_pattern col0 vs col1 in-memory");
+
+    dl_db *db;
+    setup_db(&db, "patcol");
+
+    dl_declare_relation(db, "p", 2);
+    {
+        char csv_path[256];
+        snprintf(csv_path, sizeof(csv_path), "build-tmp/m5patcol.csv");
+        FILE *f = fopen(csv_path, "w");
+        fprintf(f, "alice,nyc\nbob,la\ncarol,sf\n");
+        fclose(f);
+        CHECK(dl_load_facts(db, "p", csv_path) == 3, "loaded 3 facts");
+    }
+
+    {
+        regex_dfa *dfa = regex_compile("a.*");
+        CHECK(!dfa->errmsg, dfa->errmsg);
+        tset ts = {0};
+        long n = dl_pattern(db, "p", 0, dfa, tset_cb, &ts);
+        CHECK(n == 1, "col0 count 1");
+        uint32_t alice = dl_intern_str_find(db, "alice");
+        uint32_t nyc   = dl_intern_str_find(db, "nyc");
+        uint32_t exp[] = {alice, nyc};
+        CHECK(tset_contains(&ts, exp), "contains (alice,nyc)");
+        tset_free(&ts);
+        regex_dfa_free(dfa);
+    }
+    {
+        regex_dfa *dfa = regex_compile("l.*");
+        CHECK(!dfa->errmsg, dfa->errmsg);
+        tset ts = {0};
+        long n = dl_pattern(db, "p", 1, dfa, tset_cb, &ts);
+        CHECK(n == 1, "col1 count 1");
+        uint32_t bob = dl_intern_str_find(db, "bob");
+        uint32_t la  = dl_intern_str_find(db, "la");
+        uint32_t exp[] = {bob, la};
+        CHECK(tset_contains(&ts, exp), "contains (bob,la)");
+        tset_free(&ts);
+        regex_dfa_free(dfa);
+    }
+
+    dl_close(db);
+    PASS();
+}
+
+/* (d) out-of-range col -> compile error */
+static void test_walk_col_out_of_range(void)
+{
+    TEST("OP_WALK out-of-range column -> compile error");
+
+    dl_db *db;
+    setup_db(&db, "walkcol");
+
+    dl_declare_relation(db, "p", 2);
+    {
+        char csv_path[256];
+        snprintf(csv_path, sizeof(csv_path), "build-tmp/m5walkcol.csv");
+        FILE *f = fopen(csv_path, "w");
+        fprintf(f, "alice,bob\n");
+        fclose(f);
+        CHECK(dl_load_facts(db, "p", csv_path) == 1, "loaded 1 fact");
+    }
+
+    int rc = dl_load_rules(db, "q(X,Y) :- p(X,Y) ~ 2 'a.*'.");
+    CHECK(rc != 0, "out-of-range col rejected");
+
+    dl_close(db);
+    PASS();
+}
+
+/* Cross-check every emitted sym_id against dl_intern_str_of */
+static void test_pattern_sym_id_crosscheck(void)
+{
+    TEST("dl_pattern sym_ids resolve via dl_intern_str_of");
+
+    dl_db *db;
+    setup_db(&db, "patxref");
+
+    dl_declare_relation(db, "p", 1);
+    {
+        char csv_path[256];
+        snprintf(csv_path, sizeof(csv_path), "build-tmp/m5patxref.csv");
+        FILE *f = fopen(csv_path, "w");
+        fprintf(f, "alice\nbob\ncarol\n");
+        fclose(f);
+        CHECK(dl_load_facts(db, "p", csv_path) == 3, "loaded 3 facts");
+    }
+
+    regex_dfa *dfa = regex_compile(".*");
+    CHECK(!dfa->errmsg, dfa->errmsg);
+    tset ts = {0};
+    long n = dl_pattern(db, "p", 0, dfa, tset_cb, &ts);
+    CHECK(n == 3, "3 results");
+    for (long i = 0; i < ts.count; i++) {
+        uint32_t sym = ts.data[(size_t)i * ts.arity];
+        const char *str = dl_intern_str_of(db, sym);
+        CHECK(str != NULL, "sym_id resolves");
+        if (str) CHECK(strlen(str) > 0, "non-empty string");
+    }
+    tset_free(&ts);
+    regex_dfa_free(dfa);
+    dl_close(db);
+    PASS();
+}
+
 
 /* ─── Property test: deterministic correctness checks ──────────────────── */
 
@@ -904,6 +1221,14 @@ int main(void)
     test_walk_instruction();
     test_walk_all_match();
     test_walk_syntax_error();
+
+    /* Symbol-DAFSA walkers */
+    test_symbols_walk_unit();
+    test_symbols_walk_view_parity();
+    test_walk_int_column_empty();
+    test_pattern_col_index();
+    test_walk_col_out_of_range();
+    test_pattern_sym_id_crosscheck();
 
     /* Property test */
     test_property_random();

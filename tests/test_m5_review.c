@@ -436,7 +436,7 @@ static void t_e01_empty_rel(void) {
     regex_dfa *dfa = regex_compile(".*");
     CHECK(!dfa->errmsg,"ok");
     long cnt=0;
-    long n = dl_pattern(db,"e",dfa,count_cb,&cnt);
+    long n = dl_pattern(db,"e",0,dfa,count_cb,&cnt);
     CHECK(n==0 && cnt==0,"zero");
     regex_dfa_free(dfa); dl_close(db); PASS();
 }
@@ -445,36 +445,61 @@ static void t_e02_nonexistent(void) {
     TEST("E02 dl_pattern nonexistent → -1");
     dl_db *db = dl_open("build-tmp/m5rev_e02");
     regex_dfa *dfa = regex_compile(".*");
-    long n = dl_pattern(db,"nope",dfa,NULL,NULL);
+    long n = dl_pattern(db,"nope",0,dfa,NULL,NULL);
     CHECK(n==-1,"-1");
     regex_dfa_free(dfa); dl_close(db); PASS();
 }
 
 static void t_e03_inmemory(void) {
-    TEST("E03 dl_pattern in-memory path");
+    TEST("E03 dl_pattern in-memory path (string-content)");
     dl_db *db = dl_open("build-tmp/m5rev_e03");
     dl_declare_relation(db,"p",2);
     { char p[256]; snprintf(p,sizeof(p),"build-tmp/m5rev_e03.csv");
-      FILE *f=fopen(p,"w"); fprintf(f,"1,2\n1,3\n2,1\n"); fclose(f);
-      dl_load_facts(db,"p",p); }
-    regex_dfa *dfa = regex_compile("\\x00\\x00\\x00\\x01.*");
+      FILE *f=fopen(p,"w"); fprintf(f,"alice,bob\nalice,carol\nbob,alice\n"); fclose(f);
+      CHECK(dl_load_facts(db,"p",p)==3,"3 facts"); }
+    /* col0 'a.*' -> alice rows: (alice,bob),(alice,carol) */
+    regex_dfa *dfa = regex_compile("a.*");
+    CHECK(!dfa->errmsg, dfa->errmsg);
     long cnt=0;
-    long n = dl_pattern(db,"p",dfa,count_cb,&cnt);
-    CHECK(n==2 && cnt==2, "2 matching rows");
-    regex_dfa_free(dfa); dl_close(db); PASS();
+    long n = dl_pattern(db,"p",0,dfa,count_cb,&cnt);
+    CHECK(n==2 && cnt==2, "2 matching rows (col0 alice)");
+    regex_dfa_free(dfa);
+
+    /* col1 'b.*' -> col1 starting with 'b' -> bob: (alice,bob) */
+    dfa = regex_compile("b.*");
+    CHECK(!dfa->errmsg, dfa->errmsg);
+    cnt=0;
+    n = dl_pattern(db,"p",1,dfa,count_cb,&cnt);
+    CHECK(n==1 && cnt==1, "1 matching row (col1 bob)");
+    regex_dfa_free(dfa);
+
+    /* int column: col on raw-int relation matches nothing */
+    dl_declare_relation(db,"ints",1);
+    { char p[256]; snprintf(p,sizeof(p),"build-tmp/m5rev_e03i.csv");
+      FILE *f=fopen(p,"w"); fprintf(f,"10\n20\n"); fclose(f);
+      CHECK(dl_load_facts(db,"ints",p)==2,"2 int facts"); }
+    dfa = regex_compile(".*");
+    CHECK(!dfa->errmsg, dfa->errmsg);
+    cnt=0;
+    n = dl_pattern(db,"ints",0,dfa,count_cb,&cnt);
+    CHECK(n==0 && cnt==0, "int column matches nothing");
+    regex_dfa_free(dfa);
+
+    dl_close(db); PASS();
 }
 
 /* ─── F: OP_WALK edge cases ────────────────────────────────────────────── */
 
 static void t_f01_walk_edb(void) {
-    TEST("F01 OP_WALK on EDB");
+    TEST("F01 OP_WALK on EDB (string-content)");
     dl_db *db = dl_open("build-tmp/m5rev_f01");
     dl_declare_relation(db,"e",2);
     { char p[256]; snprintf(p,sizeof(p),"build-tmp/m5rev_f01.csv");
-      FILE *f=fopen(p,"w"); fprintf(f,"1,10\n2,20\n3,30\n"); fclose(f);
-      dl_load_facts(db,"e",p); }
+      FILE *f=fopen(p,"w"); fprintf(f,"alice,nyc\nbob,la\ncarol,sf\n"); fclose(f);
+      CHECK(dl_load_facts(db,"e",p)==3,"3 facts"); }
     int rc = dl_load_rules(db,"q(X,Y) :- e(X,Y) ~ '.*'.");
     CHECK(rc==0,"compiles");
+    { long cnt=0; long n=dl_query(db,"q",count_cb,&cnt); CHECK(n==3&&cnt==3,"all 3 match"); }
     dl_close(db); PASS();
 }
 
@@ -488,14 +513,15 @@ static void t_f02_syntax_err(void) {
 }
 
 static void t_f03_walk_idb(void) {
-    TEST("F03 OP_WALK on IDB body");
+    TEST("F03 OP_WALK on IDB body (string-content)");
     dl_db *db = dl_open("build-tmp/m5rev_f03");
     dl_declare_relation(db,"e",2);
     { char p[256]; snprintf(p,sizeof(p),"build-tmp/m5rev_f03.csv");
-      FILE *f=fopen(p,"w"); fprintf(f,"1,2\n1,3\n"); fclose(f);
-      dl_load_facts(db,"e",p); }
+      FILE *f=fopen(p,"w"); fprintf(f,"alice,bob\nalice,carol\n"); fclose(f);
+      CHECK(dl_load_facts(db,"e",p)==2,"2 facts"); }
     CHECK(dl_load_rules(db,"tc(X,Y) :- e(X,Y).")==0,"r1");
-    CHECK(dl_load_rules(db,"f(X,Y) :- tc(X,Y) ~ '\\x00\\x00\\x00\\x01.*'.")==0,"r2");
+    CHECK(dl_load_rules(db,"f(X,Y) :- tc(X,Y) ~ 'a.*'.")==0,"r2");
+    { long cnt=0; long n=dl_query(db,"f",count_cb,&cnt); CHECK(n==2&&cnt==2,"2 IDB matches (col0 alice)"); }
     dl_close(db); PASS();
 }
 

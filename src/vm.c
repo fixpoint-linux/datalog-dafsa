@@ -517,6 +517,13 @@ static int mat_join_build(const tuple_set *L, const tuple_set *R, int c,
  *
  * Returns number of tuples produced, or -1 on error.
  */
+
+/* Callback for symbols_dfa_walk to add sym_ids to a sym_set */
+static int symset_add_cb(uint32_t sym_id, void *user)
+{
+    sym_set *set = (sym_set *)user;
+    return symset_add(set, sym_id);
+}
 static long exec_range(dl_db *db, const compiled_rule *cr,
                        int start, int end,
                        const vm_override *ov, int n_ov,
@@ -616,6 +623,7 @@ static long exec_range(dl_db *db, const compiled_rule *cr,
             break;
         }
 
+
         /* ── OP_WALK: full scan with regex pattern filter ───────────── */
         case OP_WALK: {
             if (sp >= MAX_FRAMES) return -1;
@@ -638,8 +646,14 @@ static long exec_range(dl_db *db, const compiled_rule *cr,
             if (!r) { ip = end; break; }
             f->tuples.arity = in->b;
 
-            /* Use rel_pattern to enumerate matching tuples */
-            rel_pattern((const void *)r, dfa, tbuf_cb, &f->tuples);
+            /* Build sym_set via symbols_dfa_walk on symbols DAFSA */
+            sym_set set;
+            if (symset_init(&set) != 0) { ip = end; break; }
+            long ns = symbols_dfa_walk(intern_fwd(db->ir), dfa, symset_add_cb, &set);
+            if (ns < 0) { symset_free(&set); ip = end; break; }
+            /* Use rel_filter_col to enumerate matching tuples */
+            rel_filter_col((const void *)r, in->c, &set, tbuf_cb, &f->tuples);
+            symset_free(&set);
 
             if (f->tuples.count == 0) {
                 tbuf_free(&f->tuples);

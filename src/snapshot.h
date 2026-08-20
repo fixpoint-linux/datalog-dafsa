@@ -52,12 +52,20 @@ void *view_open_cached(view_cache_slot *vcache,
 
 /* Forward declaration (full struct in regexwalk.h) */
 struct regex_dfa;
+struct sym_set;
 
 /* Walk a dafsa_view with a regex pattern, enumerating matching tuples.
- * Mirrors rel_pattern semantics (full-key match, decode u32BE columns). */
+ * Mirrors rel_pattern semantics (full-key match, decode u32BE columns).
+ * DEPRECATED: kept for backward compatibility with raw-DAFSA tests. */
 long view_pattern(void *view_handle, uint8_t arity,
                   const struct regex_dfa *dfa,
                   dl_tuple_cb cb, void *user);
+
+/* Filter view tuples by column string-content regex match.
+ * Enumerates all tuples and calls cb only when cols[col] is in the set. */
+long view_filter_col(void *view_handle, uint8_t arity, uint8_t col,
+                     const struct sym_set *set,
+                     dl_tuple_cb cb, void *user);
 
 /* ─── View order-statistics (rank/select/range_count/count) ───────────── */
 

@@ -1164,12 +1164,20 @@ static atom *parse_body_atom(parser *p)
         if (!a) return NULL;
         a->negated = negated;
 
-        /* M5: check for ~ 'pattern' suffix */
+        /* M5: check for ~ [k] 'pattern' suffix (k is optional 0-based col) */
         {
             token *t = peek(p);
             if (t && t->kind == TOK_TILDE) {
                 advance(p);
+                /* Parse optional column index: ~ [k] or ~ k */
                 t = peek(p);
+                if (t && t->kind == TOK_INT) {
+                    a->pattern_col = (int)t->ival;
+                    advance(p);
+                    t = peek(p);
+                } else {
+                    a->pattern_col = 0;  /* default to column 0 */
+                }
                 if (!t || t->kind != TOK_STRING) {
                     perr(p, peek(p) ? peek(p)->off : 0, "parser: expected pattern string "
                             "after '~'\n");

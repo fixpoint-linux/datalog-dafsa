@@ -232,7 +232,7 @@ static void bench_regex(void)
 
     double t0 = now();
     cnt_ctx cnt = {0};
-    long n = dl_pattern(db, "r", dfa, count_cb, &cnt);
+    long n = dl_pattern(db, "r", 0, dfa, count_cb, &cnt);
     double dt = now() - t0;
     regex_dfa_free(dfa);
     if (n < 0) {

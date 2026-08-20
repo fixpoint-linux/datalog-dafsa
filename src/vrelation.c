@@ -10,6 +10,7 @@
  */
 
 #include "vrelation.h"
+#include "regexwalk.h"
 
 #include <stdlib.h>
 
@@ -159,6 +160,29 @@ long vrel_pattern(const vrelation *v, const struct regex_dfa *dfa,
         n = rel_pattern(r, dfa, cb, user);
         if (n < 0) return -1;
         total += n;
+    }
+    return total;
+}
+
+long vrel_filter_col(const vrelation *v, uint8_t col,
+                     const struct sym_set *set,
+                     rel_enum_cb cb, void *user)
+{
+    long total = 0;
+    uint8_t a;
+
+    if (!v || !set || !cb) return -1;
+
+    for (a = 1; a <= MAX_VAR_ARITY; a++) {
+        relation *r = v->variants[a];
+        long n;
+        if (!r) continue;
+        /* Only filter if the variant has enough columns */
+        if (col < rel_arity(r)) {
+            n = rel_filter_col(r, col, set, cb, user);
+            if (n < 0) return -1;
+            total += n;
+        }
     }
     return total;
 }

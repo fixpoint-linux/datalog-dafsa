@@ -25,8 +25,13 @@
 #include "relation.h"
 #include <stdint.h>
 
+struct sym_set;
+
 /* Per-variant arity cap UNCHANGED (<=8, 33-byte key).  Raising the arity cap
  * itself is a separate item — variable arity does not change key width. */
+
+/* Forward declaration for sym_set (from regexwalk.h) */
+struct sym_set;
 #define MAX_VAR_ARITY 8
 
 typedef struct vrelation vrelation;
@@ -87,9 +92,15 @@ long vrel_prefix(const vrelation *v, const uint32_t *leading, uint8_t k,
 long vrel_prefix_base(const vrelation *v, const uint32_t *leading, uint8_t k,
                       rel_enum_cb cb, void *user);
 
-/* Regex pattern walk fanned out over present variants. */
+/* Regex pattern walk fanned out over present variants.
+ * DEPRECATED: kept for backward compatibility with raw-DAFSA tests. */
 long vrel_pattern(const vrelation *v, const struct regex_dfa *dfa,
                   rel_enum_cb cb, void *user);
+
+/* Filter tuples by column string-content regex match across variants. */
+long vrel_filter_col(const vrelation *v, uint8_t col,
+                     const struct sym_set *set,
+                     rel_enum_cb cb, void *user);
 
 /* ─── Stats ────────────────────────────────────────────────────────────── */
 

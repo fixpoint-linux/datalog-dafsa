@@ -79,6 +79,45 @@ long regex_dfa_walk(const dafsa *d, const regex_dfa *dfa,
 long regex_dfa_walk_view(const dafsa_view *v, const regex_dfa *dfa,
                          regex_walk_cb cb, void *user);
 
+/* ─── Symbol DAFSA walkers (M5-symbols: match string content, emit sym_ids) ─── */
+
+/* Callback type for symbol walks: receives a matched sym_id. */
+typedef int (*sym_walk_cb)(uint32_t sym_id, void *user);
+
+/* Open-addressing u32 hash set for sym_ids. */
+#define SYMSET_INIT_CAP 64
+
+typedef struct sym_set sym_set;
+struct sym_set {
+    uint32_t *keys;
+    int       cap;
+    int       used;
+};
+
+/* Initialize a sym_set. Returns 0 on success, -1 on OOM. */
+int symset_init(sym_set *s);
+
+/* Free a sym_set. NULL-safe. */
+void symset_free(sym_set *s);
+
+/* Add a sym_id to the set. Returns 0 on success, -1 on OOM. */
+int symset_add(sym_set *s, uint32_t sym_id);
+
+/* Check if sym_id is in the set. Returns 1 if present, 0 otherwise. */
+int symset_contains(const sym_set *s, uint32_t sym_id);
+
+/* Walk the symbols DAFSA (keys: utf8_str, NUL, sym_id_u32BE), matching the
+ * regex against the string portion (before NUL), emitting matched sym_ids.
+ * Uses product DFS with visited set. Returns number of matched sym_ids, or -1.
+ * The symbols DAFSA must have the structure: string bytes -> 0x00 -> 4 u32BE bytes.
+ */
+long symbols_dfa_walk(const dafsa *d, const regex_dfa *dfa,
+                      sym_walk_cb cb, void *user);
+
+/* Same as symbols_dfa_walk but for a mmap'd dafsa_view. */
+long symbols_dfa_walk_view(const dafsa_view *v, const regex_dfa *dfa,
+                           sym_walk_cb cb, void *user);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1435,6 +1435,7 @@ typedef struct {
     const rule    *r;
     const int     *bri;       /* body atom -> rel id (-1 for non-relational) */
     const uint8_t *pat_idx;   /* body atom -> pattern index, 0xFF if none     */
+    const uint8_t *pat_col;   /* body atom -> pattern column index          */
     v_tab         *vt;
     i_buf         *ib;
     int           *cc;        /* constant-slot counter                        */
@@ -1679,7 +1680,7 @@ static int emit_nonleading_join(dl_db *db, const rule *r, const atom *curr,
  * parent hash join enforces the equality (the cross-subtree-probe
  * correctness rule).  `is_first` forces a full scan (first atom of a scope). */
 static int emit_pos_atom(dl_db *db, const rule *r, int bi, const int *bri,
-                         const uint8_t *pat_idx, uint64_t bound, int is_first,
+                         const uint8_t *pat_idx, const uint8_t *pat_col, uint64_t bound, int is_first,
                          v_tab *vt, i_buf *ib, int *cc, const int *recursive)
 {
     const atom *curr = r->body[bi];
@@ -1705,6 +1706,7 @@ static int emit_pos_atom(dl_db *db, const rule *r, int bi, const int *bri,
         uint8_t ts[8];
         ip->op = OP_WALK;
         ip->imm = pat_idx[bi];
+        ip->c = pat_col[bi];
         ip->a = (uint8_t)bri[bi];
         ip->b = (uint8_t)curr->nargs;
         ip->body_idx = (uint8_t)bi;
@@ -1824,7 +1826,7 @@ static int emit_leftdeep_seq(emit_ctx *ec, const int *atoms, int n,
     uint64_t bound = 0;
     int i;
     for (i = 0; i < n; i++) {
-        if (emit_pos_atom(ec->db, ec->r, atoms[i], ec->bri, ec->pat_idx,
+        if (emit_pos_atom(ec->db, ec->r, atoms[i], ec->bri, ec->pat_idx, ec->pat_col,
                           bound, i == 0, ec->vt, ec->ib, ec->cc, ec->recursive) != 0)
             return -1;
         bound |= ec->mask[atoms[i]];
@@ -1951,13 +1953,16 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata,
     int         n_pat   = 0;
     int         pat_cap = 0;
     uint8_t    *pat_idx = NULL;  /* pat_idx[bi] = pattern index, or 0xFF if none */
+    uint8_t    *pat_col = NULL;  /* pat_col[bi] = column index for pattern (0-based) */
 
     /* ── M5: compile patterns from body atoms ────────────────────────── */
     pat_idx = malloc((size_t)r->nbody * sizeof(uint8_t));
-    if (!pat_idx) goto fail;
-    for (i = 0; i < r->nbody; i++)
-        pat_idx[i] = 0xFF;
-
+    pat_col = malloc((size_t)r->nbody * sizeof(uint8_t));
+    if (!pat_idx || !pat_col) { free(pat_idx); free(pat_col); goto fail; }
+    for (i = 0; i < r->nbody; i++) {
+        pat_idx[i] = 0xFF;     /* no pattern by default */
+        pat_col[i] = 0;        /* default column */
+    }
     for (bi = 0; bi < r->nbody; bi++) {
         atom *ba = r->body[bi];
         if (!ba->pattern) continue;
@@ -1965,6 +1970,12 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata,
             cerr(r->off, "compile error: negated pattern atom not supported "
                     "(rule '%s')\n", r->head->pred); goto fail;
         }
+        /* Validate pattern_col against atom arity */
+        if (ba->pattern_col < 0 || ba->pattern_col >= ba->nargs) {
+            cerr(r->off, "compile error: pattern column out of range for atom");
+            goto fail;
+        }
+        pat_col[bi] = (uint8_t)ba->pattern_col;
         regex_dfa *dfa = regex_compile(ba->pattern);
         if (dfa->errmsg) {
             cerr(r->off, "compile error: bad regex pattern '%s': %s "
@@ -2557,7 +2568,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata,
                 reorder_pos_atoms(db, bri, mask, pos, n_pos);
 
             memset(&ec, 0, sizeof(ec));
-            ec.db = db; ec.r = r; ec.bri = bri; ec.pat_idx = pat_idx;
+            ec.db = db; ec.r = r; ec.bri = bri; ec.pat_idx = pat_idx; ec.pat_col = pat_col;
             ec.vt = &vt; ec.ib = &ib; ec.cc = &cc; ec.mask = mask;
             ec.do_bushy = g_bushy && (agg == NULL) && !any_pattern;
             ec.recursive = recursive;
@@ -2655,6 +2666,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata,
             if (pat_idx[first_pos] != 0xFF) {
                 ip->op = OP_WALK;
                 ip->imm = pat_idx[first_pos];  /* pattern index */
+                ip->c = pat_col[first_pos];
             } else {
                 ip->op = OP_SCAN;
             }
@@ -2749,6 +2761,7 @@ static compiled_rule *compile_one(dl_db *db, rule *r, int *rel_strata,
                 /* Pattern atom: always full scan with regex filter */
                 ip->op = OP_WALK;
                 ip->imm = pat_idx[bi];
+                ip->c = pat_col[bi];
                 ip->a = (uint8_t)bri[bi];
                 ip->b = (uint8_t)curr->nargs;
                 ip->body_idx = (uint8_t)bi;
@@ -3190,6 +3203,7 @@ fail:
     }
     v_free(&vt); i_free(&ib); free(bri);
     free(pat_idx);
+    free(pat_col);
     if (pat_dfa) {
         for (i = 0; i < n_pat; i++) regex_dfa_free(pat_dfa[i]);
         free(pat_dfa);

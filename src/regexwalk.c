@@ -1287,3 +1287,279 @@ long regex_dfa_walk_view(const dafsa_view *v, const regex_dfa *dfa,
     vs_free(&ctx.visited);
     return ctx.count;
 }
+
+/* ─── Symbol DAFSA walkers ───────────────────────────────────────────────── */
+
+
+int symset_init(sym_set *s)
+{
+    s->cap = SYMSET_INIT_CAP;
+    s->used = 0;
+    s->keys = calloc((size_t)s->cap, sizeof(uint32_t));
+    return s->keys ? 0 : -1;
+}
+
+void symset_free(sym_set *s)
+{
+    free(s->keys);
+    s->keys = NULL;
+    s->cap = s->used = 0;
+}
+
+static uint32_t symset_hash(uint32_t k)
+{
+    uint32_t h = 2166136261u;
+    h ^= (k >> 24) & 0xFF;
+    h *= 16777619u;
+    h ^= (k >> 16) & 0xFF;
+    h *= 16777619u;
+    h ^= (k >> 8) & 0xFF;
+    h *= 16777619u;
+    h ^= k & 0xFF;
+    h *= 16777619u;
+    return h;
+}
+
+static int symset_grow(sym_set *s)
+{
+    int old_cap = s->cap;
+    int new_cap = old_cap * 2;
+    uint32_t *old_keys = s->keys;
+    uint32_t *new_keys = calloc((size_t)new_cap, sizeof(uint32_t));
+    if (!new_keys) return -1;
+    int i;
+    for (i = 0; i < old_cap; i++) {
+        if (old_keys[i] != 0) {
+            uint32_t h = symset_hash(old_keys[i]);
+            size_t idx = (size_t)(h & (uint32_t)((size_t)new_cap - 1));
+            while (new_keys[idx] != 0)
+                idx = (idx + 1) & (size_t)(new_cap - 1);
+            new_keys[idx] = old_keys[i];
+        }
+    }
+    free(old_keys);
+    s->keys = new_keys;
+    s->cap = new_cap;
+    return 0;
+}
+
+int symset_add(sym_set *s, uint32_t sym_id)
+{
+    if (sym_id == 0) return 0;
+    if (s->used * 4 >= s->cap * 3) {
+        if (symset_grow(s) != 0) return -1;
+    }
+    uint32_t h = symset_hash(sym_id);
+    size_t idx = (size_t)(h & (uint32_t)((size_t)s->cap - 1));
+    while (s->keys[idx] != 0) {
+        if (s->keys[idx] == sym_id) return 0;
+        idx = (idx + 1) & (size_t)(s->cap - 1);
+    }
+    s->keys[idx] = sym_id;
+    s->used++;
+    return 0;
+}
+
+int symset_contains(const sym_set *s, uint32_t sym_id)
+{
+    if (sym_id == 0) return 0;
+    uint32_t h = symset_hash(sym_id);
+    size_t idx = (size_t)(h & (uint32_t)((size_t)s->cap - 1));
+    while (s->keys[idx] != 0) {
+        if (s->keys[idx] == sym_id) return 1;
+        idx = (idx + 1) & (size_t)(s->cap - 1);
+    }
+    return 0;
+}
+
+/* Read sym_id from 4-byte u32BE payload following NUL */
+static uint32_t read_sym_id(const dafsa *d, unsigned int s, int *bad)
+{
+    uint32_t id = 0;
+    unsigned int cur = s;
+    for (int i = 0; i < 4; i++) {
+        const State *st = &d->states[cur];
+        if (st->ntrans != 1) { *bad = 1; return 0xFFFFFFFFu; }
+        const Edge *e = &trans_arr_c(st)[0];
+        id = (id << 8) | e->sym;
+        cur = e->target;
+    }
+    return id;
+}
+
+/* Product DFS for symbols_dfa_walk */
+typedef struct {
+    const dafsa *d;
+    const regex_dfa *dfa;
+    sym_walk_cb cb;
+    void *user;
+    visited_set visited;
+    long count;
+} sym_prod_ctx;
+
+static int sym_prod_dfs(sym_prod_ctx *ctx, unsigned int dstate,
+                       uint32_t rstate, size_t depth)
+{
+    const State *s;
+    uint32_t j;
+    int on_stack;
+    uint64_t vkey;
+    int rc;
+
+    if (depth >= 4096) return 0;
+
+    s = &ctx->d->states[dstate];
+
+    /* Check for NUL terminator + accepting regex state */
+    for (j = 0; j < s->ntrans; j++) {
+        const Edge *e = &trans_arr_c(s)[j];
+        if (e->sym == 0x00 && ctx->dfa->accept[rstate]) {
+            int bad = 0;
+            uint32_t sym_id = read_sym_id(ctx->d, e->target, &bad);
+            if (!bad) {
+                ctx->count++;
+                if (ctx->cb(sym_id, ctx->user) != 0)
+                    return 1;
+            }
+        }
+    }
+
+    vkey = ((uint64_t)dstate << 32) | (uint64_t)rstate;
+    on_stack = vs_try_insert(&ctx->visited, vkey);
+    if (on_stack < 0) return -1;
+    if (on_stack == 1) return 0;
+
+    rc = 0;
+    for (j = 0; j < s->ntrans; j++) {
+        const Edge *e = &trans_arr_c(s)[j];
+        unsigned char sym = e->sym;
+        if (sym == 0x00) continue;
+        uint32_t next_rs = ctx->dfa->trans[(size_t)rstate * 256 + sym];
+        if (next_rs == DFA_DEAD) continue;
+        rc = sym_prod_dfs(ctx, e->target, next_rs, depth + 1);
+        if (rc != 0) break;
+    }
+
+    vs_remove(&ctx->visited, vkey);
+    return rc;
+}
+
+long symbols_dfa_walk(const dafsa *d, const regex_dfa *dfa,
+                      sym_walk_cb cb, void *user)
+{
+    sym_prod_ctx ctx;
+    if (!d || !dfa || !cb) return -1;
+    if (dfa->n_states == 0) return 0;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.d = d;
+    ctx.dfa = dfa;
+    ctx.cb = cb;
+    ctx.user = user;
+    if (vs_init(&ctx.visited) != 0) return -1;
+    sym_prod_dfs(&ctx, d->initial, 0, 0);
+    vs_free(&ctx.visited);
+    return ctx.count;
+}
+
+/* Product DFS for symbols_dfa_walk_view */
+typedef struct {
+    const dafsa_view *v;
+    const regex_dfa *dfa;
+    sym_walk_cb cb;
+    void *user;
+    visited_set visited;
+    long count;
+} sym_prod_view_ctx;
+
+static int sym_prod_view_dfs(sym_prod_view_ctx *ctx, uint32_t dstate,
+                            uint32_t rstate, size_t depth)
+{
+    int on_stack;
+    uint64_t vkey;
+    int rc;
+
+    if (depth >= 4096) return 0;
+
+    /* Check for NUL terminator + accepting regex state */
+    {
+        const uint8_t *cur = ctx->v->csr + ctx->v->state_off[dstate];
+        unsigned char sym;
+        uint32_t tgt;
+        while (view_edge_next(ctx->v, dstate, &cur, &sym, &tgt) == 0) {
+            if (sym == 0x00 && ctx->dfa->accept[rstate]) {
+                /* Reconstruct the 4-byte u32BE payload following the NUL.
+                 * Mirrors read_sym_id: each of the 4 payload nodes must have
+                 * exactly one outgoing edge (the next payload byte). */
+                int bad = 0;
+                uint32_t sym_id = 0;
+                uint32_t cur2 = tgt;
+                for (int i = 0; i < 4; i++) {
+                    const uint8_t *cur_p = ctx->v->csr + ctx->v->state_off[cur2];
+                    unsigned char sym_p;
+                    uint32_t tgt_p;
+                    /* First edge must exist (the payload byte). */
+                    if (view_edge_next(ctx->v, cur2, &cur_p, &sym_p, &tgt_p) != 0) {
+                        bad = 1;
+                        break;
+                    }
+                    /* A second edge on the same node means malformed payload. */
+                    {
+                        const uint8_t *cur_p2 = cur_p;
+                        unsigned char sym_p2;
+                        uint32_t tgt_p2;
+                        if (view_edge_next(ctx->v, cur2, &cur_p2, &sym_p2, &tgt_p2) == 0) {
+                            bad = 1;
+                            break;
+                        }
+                    }
+                    sym_id = (sym_id << 8) | sym_p;
+                    cur2 = tgt_p;
+                }
+                if (!bad) {
+                    ctx->count++;
+                    if (ctx->cb(sym_id, ctx->user) != 0)
+                        return 1;
+                }
+            }
+        }
+    }
+
+    vkey = ((uint64_t)dstate << 32) | (uint64_t)rstate;
+    on_stack = vs_try_insert(&ctx->visited, vkey);
+    if (on_stack < 0) return -1;
+    if (on_stack == 1) return 0;
+
+    rc = 0;
+    {
+        const uint8_t *cur = ctx->v->csr + ctx->v->state_off[dstate];
+        unsigned char sym;
+        uint32_t tgt;
+        while (view_edge_next(ctx->v, dstate, &cur, &sym, &tgt) == 0) {
+            if (sym == 0x00) continue;
+            uint32_t next_rs = ctx->dfa->trans[(size_t)rstate * 256 + sym];
+            if (next_rs == DFA_DEAD) continue;
+            rc = sym_prod_view_dfs(ctx, tgt, next_rs, depth + 1);
+            if (rc != 0) break;
+        }
+    }
+
+    vs_remove(&ctx->visited, vkey);
+    return rc;
+}
+
+long symbols_dfa_walk_view(const dafsa_view *v, const regex_dfa *dfa,
+                           sym_walk_cb cb, void *user)
+{
+    sym_prod_view_ctx ctx;
+    if (!v || !dfa || !cb) return -1;
+    if (dfa->n_states == 0) return 0;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.v = v;
+    ctx.dfa = dfa;
+    ctx.cb = cb;
+    ctx.user = user;
+    if (vs_init(&ctx.visited) != 0) return -1;
+    sym_prod_view_dfs(&ctx, v->initial, 0, 0);
+    vs_free(&ctx.visited);
+    return ctx.count;
+}
