@@ -57,6 +57,7 @@ dl-test-*/
 /tests/test_search
 /tests/test_vector_storage
 /tests/test_vector_search
+/tests/test_vector_cli
 
 # emscripten cache
 .cache/

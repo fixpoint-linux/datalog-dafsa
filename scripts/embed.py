@@ -215,17 +215,46 @@ def itq_encode(v, B):
 
 def quantize_int8(v):
     """Quantize a normalized float32 vector to int8.
-    
+
     v: numpy array of shape (VEC_D,) — normalized
     returns: numpy array of shape (VEC_D,) with int8 values
+
+    NOTE: this uses a PER-VECTOR scale (v / max(|v|)), which makes |v| not
+    comparable across vectors and degrades the exact-cosine int8 re-rank
+    (reviewer F2).  For the real pipeline use quantize_int8_global with the
+    corpus-wide scale; this per-vector form is retained for the synthetic
+    self-test / backward compat.
     """
-    # Scale to [-127, 127] preserving sign
-    # v / (max(|v|, 1e-12)) * 127
     max_abs = np.max(np.abs(v))
     if max_abs < 1e-12:
         max_abs = 1e-12
     scaled = v / max_abs * 127.0
     return np.clip(scaled, -127, 127).astype(np.int8)
+
+
+def quantize_int8_global(v, gscale):
+    """Quantize a normalized float32 vector to int8 using a GLOBAL scale.
+
+    gscale is the corpus-wide max(|v|) over all embedded vectors, so every
+    vector (including the query) is scaled by the SAME factor.  This keeps
+    |v| comparable across vectors, which is what makes the int8 re-rank
+    agree with float-exact cosine (F2 fix).  The encode helper MUST use the
+    identical gscale the corpus was emitted with.
+    """
+    if gscale < 1e-12:
+        gscale = 1e-12
+    scaled = v / gscale * 127.0
+    return np.clip(scaled, -127, 127).astype(np.int8)
+
+
+def corpus_global_scale(embeddings):
+    """GLOBAL int8 scale: max over all entity vectors of max(|v|)."""
+    g = 0.0
+    for v in embeddings.values():
+        m = float(np.max(np.abs(v)))
+        if m > g:
+            g = m
+    return g
 
 
 # ─── DL CLI helpers ───────────────────────────────────────────────────────────
@@ -410,24 +439,27 @@ def test_end_to_end_synthetic():
         np.random.seed(42)
         X = np.array([embeddings[name] for name, _ in entities])
         B = fit_itq_basis(X)
-        
+
+        # GLOBAL int8 scale (F2), consistent with the real pipeline
+        gscale = corpus_global_scale(embeddings)
+
         # Encode each entity
         sig_facts = {j: [] for j in range(VEC_M)}  # band_value -> entity_sym_id
         vec_q_facts = []  # (entity_sym_id, chunk_idx, packed_u32)
-        
+
         for name, sym_id in entities:
             v = embeddings[name]
-            
+
             # ITQ encode
             sig = itq_encode(v, B)
-            
+
             # Emit sig_j facts
             for j in range(VEC_M):
                 band_val = band_slice(sig, j)
                 sig_facts[j].append((band_val, sym_id))
-            
-            # Quantize to int8
-            vi8 = quantize_int8(v)
+
+            # Quantize to int8 (GLOBAL corpus scale, F2)
+            vi8 = quantize_int8_global(v, gscale)
             
             # Emit vec_q facts
             for chunk_idx in range(VEC_IVEC_WORDS):
@@ -497,16 +529,138 @@ def run_self_test():
     print("=== All self-tests passed ===\n")
 
 
+# ─── Encode subcommand (S4) ────────────────────────────────────────────────────
+
+def load_itq_basis(db_dir):
+    """Load ITQ basis from the store or from persisted files.
+    
+    Tries to load from __itq_basis__ relation via dl prefix, or falls back to
+    itq_basis.npy + vector_metadata.txt from the embed pipeline.
+    Returns: numpy array of shape (VEC_D, VEC_C) with float32 values
+    """
+    # Try to load from the DB's __itq_basis__ relation
+    try:
+        lines = dl_prefix(db_dir, ITQ_BASIS_REL)
+        if lines and len(lines) == VEC_D * VEC_C:
+            basis = np.zeros((VEC_D, VEC_C), dtype=np.float32)
+            for line in lines:
+                if not line.strip():
+                    continue
+                parts = line.split()
+                if len(parts) >= 3:
+                    i = int(parts[0])
+                    j = int(parts[1])
+                    bits = int(parts[2])
+                    # Convert bits back to float32 (big-endian)
+                    basis[i, j] = bits_to_float32(bits)
+            return basis
+    except Exception:
+        pass
+    
+    # Fall back to persisted files
+    basis_path = os.path.join(db_dir, "itq_basis.npy")
+    if os.path.exists(basis_path):
+        return np.load(basis_path)
+    
+    # Fall back to current directory
+    if os.path.exists("itq_basis.npy"):
+        return np.load("itq_basis.npy")
+    
+    raise RuntimeError("Could not load ITQ basis. Run embed.py first or provide --db with a populated DB.")
+
+
+def load_metadata(db_dir):
+    """Load vector_metadata.txt into a dict (D, c, m, qscale)."""
+    meta = {}
+    path = os.path.join(db_dir, "vector_metadata.txt")
+    if os.path.exists(path):
+        with open(path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                if '=' in line:
+                    k, v = line.split('=', 1)
+                    meta[k.strip()] = v.strip()
+    return meta
+
+
+def cmd_encode(args):
+    """Encode a query string: embed -> ITQ encode -> quantize -> print hex."""
+    query = args.query
+
+    # Try to import fastembed
+    try:
+        import fastembed
+    except ImportError:
+        print("Error: fastembed not installed. Install with:", file=sys.stderr)
+        print("  pip install fastembed", file=sys.stderr)
+        sys.exit(1)
+
+    # Embed the query string
+    model = fastembed.TextEmbedding(model_name=args.model)
+    v = model.embed(query)
+    assert v.shape == (VEC_D,), f"Unexpected embedding shape: {v.shape}"
+    assert v.dtype == np.float32, f"Unexpected embedding dtype: {v.dtype}"
+
+    # Normalize
+    norm = np.linalg.norm(v)
+    if norm < 1e-12:
+        norm = 1e-12
+    v = v / norm
+
+    # Load ITQ basis
+    db_path = args.db if args.db else "."
+    B = load_itq_basis(db_path)
+
+    # Load the GLOBAL int8 scale the corpus was emitted with (F2).  If absent
+    # (pre-F2 corpus), fall back to per-vector scaling so the encode still
+    # round-trips structurally — but the oracle will then fail the gate.
+    gscale = None
+    meta = load_metadata(db_path)
+    try:
+        gscale = float(meta.get("qscale", ""))
+    except ValueError:
+        gscale = None
+
+    # ITQ encode to signature
+    sig = itq_encode(v, B)
+
+    # Quantize to int8 (GLOBAL scale to match the corpus, F2)
+    vi8 = quantize_int8_global(v, gscale) if gscale else quantize_int8(v)
+
+    # Print q_sig (8 u32 hex) and q_int8 (96 u32 hex) in CLI-parseable format
+    # Format: q_sig_hex q_int8_hex (space-separated, each is concatenated hex words)
+    sig_hex = "".join(f"{w:08x}" for w in sig)
+    ivec_hex = "".join(f"{pack4_le(vi8[i*4:(i+1)*4]):08x}" for i in range(VEC_IVEC_WORDS))
+
+    print(f"{sig_hex} {ivec_hex}")
+
+
 # ─── Main embed pipeline ───────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Vector tier embed pipeline (S3)")
+    parser = argparse.ArgumentParser(description="Vector tier embed pipeline (S3) + encode helper (S4)")
+    sub = parser.add_subparsers(dest="cmd")
+
+    # `embed.py encode '<query>' [--db DIR] [--model NAME]`
+    enc = sub.add_parser("encode", help="Embed a query and print q_sig_hex q_int8_hex")
+    enc.add_argument("query", help="Query string to embed")
+    enc.add_argument("--db", default=None, help="Database dir holding the ITQ basis (default: ./)")
+    enc.add_argument("--model", default="BAAI/bge-small-en-v1.5",
+                     help="FastEmbed model name (default: BAAI/bge-small-en-v1.5)")
+
+    # Main embed pipeline flags.
     parser.add_argument("--db", help="Database directory (required unless --self-test)")
     parser.add_argument("--self-test", action="store_true", help="Run self-tests only")
     parser.add_argument("--model", default="BAAI/bge-small-en-v1.5",
                         help="FastEmbed model name (default: BAAI/bge-small-en-v1.5)")
     args = parser.parse_args()
-    
+
+    if args.cmd == "encode":
+        cmd_encode(args)
+        return
+
     if args.self_test:
         run_self_test()
         return
@@ -588,13 +742,20 @@ def main():
     basis_path = os.path.join(db_dir, "itq_basis.npy")
     np.save(basis_path, B)
     print(f"Saved ITQ basis to {basis_path}")
-    
+
+    # GLOBAL int8 quantization scale (F2): one corpus-wide max(|v|) so |v| is
+    # comparable across vectors.  Persisted so the encode helper and the S4
+    # oracle quantize queries identically to the corpus.
+    gscale = corpus_global_scale(embeddings)
+    print(f"GLOBAL int8 scale: {gscale}")
+
     # Also save metadata
     metadata_path = os.path.join(db_dir, "vector_metadata.txt")
     with open(metadata_path, 'w') as f:
         f.write(f"D={VEC_D}\n")
         f.write(f"c={VEC_C}\n")
         f.write(f"m={VEC_M}\n")
+        f.write(f"qscale={gscale}\n")
     print(f"Saved metadata to {metadata_path}")
     
     # Encode each entity
@@ -620,8 +781,8 @@ def main():
             band_val = band_slice(sig, j)
             sig_facts[j].append((band_val, sym_id))
         
-        # Quantize to int8
-        vi8 = quantize_int8(v)
+        # Quantize to int8 (GLOBAL corpus scale, F2)
+        vi8 = quantize_int8_global(v, gscale)
         
         # Emit vec_q facts
         for chunk_idx in range(VEC_IVEC_WORDS):

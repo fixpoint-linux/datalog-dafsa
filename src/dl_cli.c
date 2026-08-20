@@ -21,6 +21,7 @@
 #include "snapshot.h"
 #include "regexwalk.h"
 #include "index.h"
+#include "vector.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -79,6 +80,121 @@ static uint32_t cli_parse_value(dl_db *db, const char *s)
     return intern_str(ir, s);
 }
 
+/* Parse a concatenated hex string into an array of u32 values.
+ * hex_str is a string of hex digits (no spaces, no 0x prefix).
+ * Returns the number of u32 values parsed, or -1 on error.
+ * n_words is the expected number of u32 values (e.g., VEC_SIG_WORDS=8, VEC_IVEC_WORDS=96). */
+static int parse_hex_words(const char *hex_str, uint32_t *words, int n_words)
+{
+    size_t hex_len = strlen(hex_str);
+    if (hex_len != (size_t)(n_words * 8)) {
+        return -1;  /* Each u32 is 8 hex digits */
+    }
+    
+    for (int i = 0; i < n_words; i++) {
+        char buf[9];
+        memcpy(buf, hex_str + i * 8, 8);
+        buf[8] = '\0';
+        if (sscanf(buf, "%8x", &words[i]) != 1) {
+            return -1;
+        }
+    }
+    return n_words;
+}
+
+/* Escape a string for embedding inside single quotes in a POSIX shell:
+ *   '  ->  '\''   (close quote, literal quote, reopen).
+ * Guarantees the string is passed as ONE shell word (no command injection,
+ * apostrophes safe).  Truncates at cap if it would overflow. */
+static void shell_escape_squote(const char *in, char *out, size_t cap)
+{
+    size_t o = 0;
+    for (const char *p = in; *p && o + 6 < cap; p++) {
+        if (*p == '\'') {
+            if (o + 6 >= cap) break;   /* not enough room: truncate */
+            memcpy(out + o, "'\\''", 4); o += 4;
+        } else {
+            out[o++] = *p;
+        }
+    }
+    out[o] = '\0';
+}
+
+/* Callback to collect candidate sym-ids from vector search */
+struct vec_cand_collector {
+    uint32_t *syms;
+    int capacity;
+    int count;
+};
+
+static int collect_vec_cand(uint32_t entity_sym, int score, void *user)
+{
+    struct vec_cand_collector *c = (struct vec_cand_collector *)user;
+    (void)score;
+    if (c->count < c->capacity) {
+        c->syms[c->count++] = entity_sym;
+    }
+    return 0;
+}
+
+/* Callback to print ranked results from rerank */
+struct vec_result_printer {
+    dl_db *db;
+    int printed;
+};
+
+/* Forward declarations: print_value / print_list are defined below but used
+ * by the rerank callback above. */
+static void print_value(dl_db *db, uint32_t v, int depth);
+
+static int print_vec_result(uint32_t entity_sym, int score, void *user)
+{
+    struct vec_result_printer *p = (struct vec_result_printer *)user;
+    (void)score;
+    print_value(p->db, entity_sym, 0);
+    printf("\n");
+    p->printed++;
+    return 0;
+}
+
+/* Ascending u32 comparison (for qsort/bsearch on sym-id sets). */
+static int cmp_u32(const void *pa, const void *pb)
+{
+    uint32_t a = *(const uint32_t *)pa;
+    uint32_t b = *(const uint32_t *)pb;
+    return (a > b) - (a < b);
+}
+
+/* Callback: capture the entity sym (col 0) of the observation row whose
+ * content (col 1) equals the target obs_id. */
+struct obs_entity_ctx {
+    uint32_t target;
+    uint32_t entity;
+};
+
+static int collect_obs_entity(const uint32_t *cols, uint8_t arity, void *user)
+{
+    struct obs_entity_ctx *c = (struct obs_entity_ctx *)user;
+    (void)arity;
+    if (c->target && cols[1] == c->target) {
+        c->entity = cols[0];
+        return 1;   /* stop: obs_id is unique in observation */
+    }
+    return 0;
+}
+
+/* Map a lexical obs_id (content sym) to the entity sym that owns it, via the
+ * observation(entity, content) relation.  Returns 0 if the observation
+ * relation is absent or the obs_id has no row. */
+static uint32_t obs_to_entity(dl_db *db, uint32_t obs_id)
+{
+    struct obs_entity_ctx c = { obs_id, 0 };
+    long n = dl_prefix(db, "observation", NULL, 0, collect_obs_entity, &c);
+    if (n < 0)
+        return 0;
+    return c.entity;
+}
+
 /* Print a column value: resolve list handles (EXACT, first), then string
  * symbols (reverse-map heuristic), then raw ints.  Lists are first so list
  * printing is exact even though int-vs-symbol stays heuristic (B6). */
@@ -129,6 +245,21 @@ static int print_tuple(const uint32_t *cols, uint8_t arity, void *user)
     return 0;
 }
 
+/* Callback for dl_prefix --raw: print one tuple as raw u32 columns (no symbol
+ * reverse-mapping).  Machine-consumable (used by the S4 oracle/embed parsers
+ * which need the exact packed ints). */
+static int print_tuple_raw(const uint32_t *cols, uint8_t arity, void *user)
+{
+    uint8_t i;
+    (void)user;
+    for (i = 0; i < arity; i++) {
+        if (i > 0) printf(" ");
+        printf("%u", cols[i]);
+    }
+    printf("\n");
+    return 0;
+}
+
 /* Callback for traverse: print node name */
 static int traverse_print_cb(uint32_t node_sym, uint8_t depth, void *user)
 {
@@ -173,9 +304,12 @@ static void usage(const char *prog)
         "  %s [-d <dir>] obs <node> [--max-obs N]\n"
         "  %s [-d <dir>] index\n"
         "  %s [-d <dir>] search '<terms>' [--top N] [--version N] (--version 0 = current)\n"
+        "  %s [-d <dir>] vsearch '<query>' [--k N] [--radius R] [--version V] [--sig <hex64>] [--ivec <hex768>]\n"
+        "  %s [-d <dir>] vhybrid '<terms>' '<query>' [--k N] [--radius R] [--version V]\n"
         "  %s [-d <dir>] versions\n"
-        "Values: bare integer -> raw u32; anything else -> interned string\n",
-        prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
+        "Values: bare integer -> raw u32; anything else -> interned string\n"
+        "Hex args: concatenated hex digits (no spaces, no 0x prefix)\n",
+        prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
     exit(1);
 }
 
@@ -306,9 +440,15 @@ int main(int argc, char **argv)
         const char *rel_name;
         uint32_t leading[8];
         uint8_t k;
+        int raw = 0;
 
         if (argp >= argc) usage(argv[0]);
         rel_name = argv[argp++];
+
+        if (argp < argc && strcmp(argv[argp], "--raw") == 0) {
+            raw = 1;
+            argp++;
+        }
 
         k = 0;
         while (argp < argc && k < 8) {
@@ -319,7 +459,7 @@ int main(int argc, char **argv)
 
         {
             long n = dl_prefix(db, rel_name, leading, k,
-                               print_tuple, db);
+                               raw ? print_tuple_raw : print_tuple, db);
             if (n < 0) {
                 fprintf(stderr, "dl: prefix query failed\n");
                 dl_close(db);
@@ -843,6 +983,428 @@ int main(int argc, char **argv)
 
         free(obs_ids);
         free(scores);
+
+    } else if (strcmp(cmd, "vsearch") == 0) {
+        const char *query_str;
+        unsigned long k = 10;
+        unsigned long radius = 2;
+        unsigned long version = 0;
+        const char *sig_hex = NULL;
+        const char *ivec_hex = NULL;
+        int cand_only = 0;
+
+        if (argp >= argc) usage(argv[0]);
+        query_str = argv[argp++];
+
+        while (argp < argc) {
+            if (strcmp(argv[argp], "--k") == 0) {
+                argp++;
+                if (argp >= argc || !parse_u32_strict(argv[argp], &k) || k < 1 || k > INT_MAX) {
+                    fprintf(stderr, "dl: invalid --k value\n");
+                    dl_close(db);
+                    return 1;
+                }
+                argp++;
+            } else if (strcmp(argv[argp], "--radius") == 0) {
+                argp++;
+                if (argp >= argc || !parse_u32_strict(argv[argp], &radius)) {
+                    fprintf(stderr, "dl: invalid --radius value\n");
+                    dl_close(db);
+                    return 1;
+                }
+                argp++;
+            } else if (strcmp(argv[argp], "--version") == 0) {
+                argp++;
+                if (argp >= argc || !parse_u32_strict(argv[argp], &version)) {
+                    fprintf(stderr, "dl: invalid --version value\n");
+                    dl_close(db);
+                    return 1;
+                }
+                argp++;
+            } else if (strcmp(argv[argp], "--sig") == 0) {
+                argp++;
+                if (argp >= argc) {
+                    fprintf(stderr, "dl: --sig requires a hex string\n");
+                    dl_close(db);
+                    return 1;
+                }
+                sig_hex = argv[argp++];
+            } else if (strcmp(argv[argp], "--ivec") == 0) {
+                argp++;
+                if (argp >= argc) {
+                    fprintf(stderr, "dl: --ivec requires a hex string\n");
+                    dl_close(db);
+                    return 1;
+                }
+                ivec_hex = argv[argp++];
+            } else if (strcmp(argv[argp], "--cand-only") == 0) {
+                argp++;
+                cand_only = 1;
+            } else {
+                fprintf(stderr, "dl: unexpected argument '%s'\n", argv[argp]);
+                dl_close(db);
+                return 1;
+            }
+        }
+
+        /* Parse or encode query signature and int8 vector */
+        uint32_t q_sig[VEC_SIG_WORDS];
+        uint32_t q_int8[VEC_IVEC_WORDS];
+
+        if (sig_hex && ivec_hex) {
+            /* Programmatic path: use provided hex */
+            if (parse_hex_words(sig_hex, q_sig, VEC_SIG_WORDS) != VEC_SIG_WORDS) {
+                fprintf(stderr, "dl: invalid --sig (need 64 hex chars = 8 u32)\n");
+                dl_close(db);
+                return 1;
+            }
+            if (parse_hex_words(ivec_hex, q_int8, VEC_IVEC_WORDS) != VEC_IVEC_WORDS) {
+                fprintf(stderr, "dl: invalid --ivec (need 768 hex chars = 96 u32)\n");
+                dl_close(db);
+                return 1;
+            }
+        } else if (sig_hex || ivec_hex) {
+            fprintf(stderr, "dl: provide both --sig and --ivec, or neither\n");
+            dl_close(db);
+            return 1;
+        } else {
+            /* Shell out to Python encode helper.  The query is user-controlled
+             * and interpolated into a shell string — escape single quotes so
+             * it cannot break out (command injection fix, reviewer f1). */
+            char qesc[2048];
+            char cmd_buf[4096];
+            FILE *fp;
+            shell_escape_squote(query_str, qesc, sizeof qesc);
+            snprintf(cmd_buf, sizeof(cmd_buf),
+                     "python3 scripts/embed.py encode --db '%s' '%s' 2>/dev/null",
+                     db_dir, qesc);
+            fp = popen(cmd_buf, "r");
+            if (!fp) {
+                fprintf(stderr, "dl: cannot run encode helper\n");
+                dl_close(db);
+                return 1;
+            }
+            char sig_buf[65], ivec_buf[769];
+            if (fscanf(fp, "%64s %768s", sig_buf, ivec_buf) != 2) {
+                fprintf(stderr, "dl: encode helper failed\n");
+                pclose(fp);
+                dl_close(db);
+                return 1;
+            }
+            pclose(fp);
+            if (parse_hex_words(sig_buf, q_sig, VEC_SIG_WORDS) != VEC_SIG_WORDS ||
+                parse_hex_words(ivec_buf, q_int8, VEC_IVEC_WORDS) != VEC_IVEC_WORDS) {
+                fprintf(stderr, "dl: encode helper returned invalid data\n");
+                dl_close(db);
+                return 1;
+            }
+        }
+
+        /* Collect candidates from vector search */
+        uint32_t *cand_syms = malloc(k * 10 * sizeof(*cand_syms));
+        if (!cand_syms) {
+            fprintf(stderr, "dl: OOM\n");
+            dl_close(db);
+            return 1;
+        }
+        struct vec_cand_collector collector = {cand_syms, (int)(k * 10), 0};
+
+        long n_cand;
+        if (version == 0) {
+            n_cand = dl_vector_search(db, q_sig, (int)(k * 10), (int)radius,
+                                       collect_vec_cand, &collector);
+        } else {
+            n_cand = dl_vector_search_version(db, (uint32_t)version, q_sig,
+                                               (int)(k * 10), (int)radius,
+                                               collect_vec_cand, &collector);
+        }
+        if (n_cand < 0) {
+            fprintf(stderr, "dl: vector search failed\n");
+            free(cand_syms);
+            dl_close(db);
+            return 1;
+        }
+
+        /* Re-rank candidates (or, with --cand-only, print the raw MIH
+         * candidate set — used by the S4 int8-vs-float precision oracle). */
+        struct vec_result_printer printer = {db, 0};
+        long n_results;
+        if (cand_only) {
+            for (int i = 0; i < collector.count; i++)
+                printf("%u\n", cand_syms[i]);
+            n_results = collector.count;
+        } else if (version == 0) {
+            n_results = dl_vector_rerank(db, q_int8, cand_syms, collector.count,
+                                          (int)k, print_vec_result, &printer);
+        } else {
+            n_results = dl_vector_rerank(db, q_int8, cand_syms, collector.count,
+                                          (int)k, print_vec_result, &printer);
+        }
+        if (n_results < 0) {
+            fprintf(stderr, "dl: vector rerank failed\n");
+            free(cand_syms);
+            dl_close(db);
+            return 1;
+        }
+
+        if (!cand_only && printer.printed == 0)
+            printf("(no results)\n");
+
+        free(cand_syms);
+
+    } else if (strcmp(cmd, "vhybrid") == 0) {
+        const char *terms_str, *query_str;
+        unsigned long k = 10;
+        unsigned long radius = 2;
+        unsigned long version = 0;
+        const char *sig_hex = NULL;
+        const char *ivec_hex = NULL;
+
+        if (argp + 1 >= argc) usage(argv[0]);
+        terms_str = argv[argp++];
+        query_str = argv[argp++];
+
+        while (argp < argc) {
+            if (strcmp(argv[argp], "--k") == 0) {
+                argp++;
+                if (argp >= argc || !parse_u32_strict(argv[argp], &k) || k < 1 || k > INT_MAX) {
+                    fprintf(stderr, "dl: invalid --k value\n");
+                    dl_close(db);
+                    return 1;
+                }
+                argp++;
+            } else if (strcmp(argv[argp], "--radius") == 0) {
+                argp++;
+                if (argp >= argc || !parse_u32_strict(argv[argp], &radius)) {
+                    fprintf(stderr, "dl: invalid --radius value\n");
+                    dl_close(db);
+                    return 1;
+                }
+                argp++;
+            } else if (strcmp(argv[argp], "--version") == 0) {
+                argp++;
+                if (argp >= argc || !parse_u32_strict(argv[argp], &version)) {
+                    fprintf(stderr, "dl: invalid --version value\n");
+                    dl_close(db);
+                    return 1;
+                }
+                argp++;
+            } else if (strcmp(argv[argp], "--sig") == 0) {
+                argp++;
+                if (argp >= argc) {
+                    fprintf(stderr, "dl: --sig requires a hex string\n");
+                    dl_close(db);
+                    return 1;
+                }
+                sig_hex = argv[argp++];
+            } else if (strcmp(argv[argp], "--ivec") == 0) {
+                argp++;
+                if (argp >= argc) {
+                    fprintf(stderr, "dl: --ivec requires a hex string\n");
+                    dl_close(db);
+                    return 1;
+                }
+                ivec_hex = argv[argp++];
+            } else {
+                fprintf(stderr, "dl: unexpected argument '%s'\n", argv[argp]);
+                dl_close(db);
+                return 1;
+            }
+        }
+
+        /* Parse or encode the query signature and int8 vector. */
+        uint32_t q_sig[VEC_SIG_WORDS];
+        uint32_t q_int8[VEC_IVEC_WORDS];
+        if (sig_hex && ivec_hex) {
+            if (parse_hex_words(sig_hex, q_sig, VEC_SIG_WORDS) != VEC_SIG_WORDS) {
+                fprintf(stderr, "dl: invalid --sig (need 64 hex chars = 8 u32)\n");
+                dl_close(db);
+                return 1;
+            }
+            if (parse_hex_words(ivec_hex, q_int8, VEC_IVEC_WORDS) != VEC_IVEC_WORDS) {
+                fprintf(stderr, "dl: invalid --ivec (need 768 hex chars = 96 u32)\n");
+                dl_close(db);
+                return 1;
+            }
+        } else if (sig_hex || ivec_hex) {
+            fprintf(stderr, "dl: provide both --sig and --ivec, or neither\n");
+            dl_close(db);
+            return 1;
+        } else {
+            /* Shell out to Python encode helper.  The query is user-controlled
+             * and interpolated into a shell string — escape single quotes so
+             * it cannot break out (command injection fix, reviewer f1). */
+            char qesc[2048];
+            char cmd_buf[4096];
+            FILE *fp;
+            shell_escape_squote(query_str, qesc, sizeof qesc);
+            snprintf(cmd_buf, sizeof(cmd_buf),
+                     "python3 scripts/embed.py encode --db '%s' '%s' 2>/dev/null",
+                     db_dir, qesc);
+            fp = popen(cmd_buf, "r");
+            if (!fp) {
+                fprintf(stderr, "dl: cannot run encode helper\n");
+                dl_close(db);
+                return 1;
+            }
+            char sig_buf[65], ivec_buf[769];
+            if (fscanf(fp, "%64s %768s", sig_buf, ivec_buf) != 2) {
+                fprintf(stderr, "dl: encode helper failed\n");
+                pclose(fp);
+                dl_close(db);
+                return 1;
+            }
+            pclose(fp);
+            if (parse_hex_words(sig_buf, q_sig, VEC_SIG_WORDS) != VEC_SIG_WORDS ||
+                parse_hex_words(ivec_buf, q_int8, VEC_IVEC_WORDS) != VEC_IVEC_WORDS) {
+                fprintf(stderr, "dl: encode helper returned invalid data\n");
+                dl_close(db);
+                return 1;
+            }
+        }
+
+        /* Get lexical candidates */
+        char **tokens = tokenize(terms_str, NULL);
+        if (!tokens) {
+            fprintf(stderr, "dl: tokenization failed\n");
+            dl_close(db);
+            return 1;
+        }
+        size_t n_tokens = 0;
+        while (tokens[n_tokens]) n_tokens++;
+        if (n_tokens == 0) {
+            fprintf(stderr, "dl: no valid terms\n");
+            token_free(tokens);
+            dl_close(db);
+            return 1;
+        }
+
+        uint32_t *term_syms = malloc(n_tokens * sizeof(*term_syms));
+        if (!term_syms) {
+            token_free(tokens);
+            dl_close(db);
+            return 1;
+        }
+        for (size_t i = 0; i < n_tokens; i++) {
+            term_syms[i] = dl_intern_str(db, tokens[i]);
+            if (term_syms[i] == 0) {
+                fprintf(stderr, "dl: intern failed for '%s'\n", tokens[i]);
+                free(term_syms);
+                token_free(tokens);
+                dl_close(db);
+                return 1;
+            }
+        }
+        token_free(tokens);
+
+        uint32_t *lex_ids = malloc(k * 10 * sizeof(*lex_ids));
+        int *lex_scores = malloc(k * 10 * sizeof(*lex_scores));
+        if (!lex_ids || !lex_scores) {
+            free(lex_ids);
+            free(lex_scores);
+            free(term_syms);
+            dl_close(db);
+            return 1;
+        }
+
+        int n_lex;
+        if (version == 0) {
+            n_lex = dl_search_top(db, term_syms, (int)n_tokens,
+                                   lex_ids, lex_scores, (int)(k * 10));
+        } else {
+            n_lex = dl_search_top_version(db, (uint32_t)version, term_syms, (int)n_tokens,
+                                           lex_ids, lex_scores, (int)(k * 10));
+        }
+        free(term_syms);
+        if (n_lex < 0) {
+            fprintf(stderr, "dl: lexical search failed\n");
+            free(lex_ids);
+            free(lex_scores);
+            dl_close(db);
+            return 1;
+        }
+
+        /* Get vector candidates */
+        uint32_t *vec_syms = malloc(k * 10 * sizeof(*vec_syms));
+        if (!vec_syms) {
+            free(lex_ids);
+            free(lex_scores);
+            dl_close(db);
+            return 1;
+        }
+        struct vec_cand_collector vec_collector = {vec_syms, (int)(k * 10), 0};
+        long n_vec;
+        if (version == 0) {
+            n_vec = dl_vector_search(db, q_sig, (int)(k * 10), (int)radius,
+                                     collect_vec_cand, &vec_collector);
+        } else {
+            n_vec = dl_vector_search_version(db, (uint32_t)version, q_sig,
+                                             (int)(k * 10), (int)radius,
+                                             collect_vec_cand, &vec_collector);
+        }
+        if (n_vec < 0) {
+            fprintf(stderr, "dl: vector search failed\n");
+            free(vec_syms);
+            free(lex_ids);
+            free(lex_scores);
+            dl_close(db);
+            return 1;
+        }
+
+        /* INTERSECT: build a sorted set of ENTITY sym-ids from the lexical
+           results (dl_search_top returns obs/content sym-ids; map each to its
+           owning entity via the observation relation), keep only the vector
+           candidates that are also lexical hits, then re-rank the
+           intersection by exact int8 cosine (post-hoc join on sym-ids). */
+        uint32_t *inter = malloc((size_t)vec_collector.count * sizeof(*inter));
+        if (!inter) {
+            fprintf(stderr, "dl: OOM\n");
+            free(vec_syms);
+            free(lex_ids);
+            free(lex_scores);
+            dl_close(db);
+            return 1;
+        }
+        {
+            int n_lex_ent = 0;
+            for (int i = 0; i < n_lex; i++) {
+                uint32_t e = obs_to_entity(db, lex_ids[i]);
+                if (e != 0)
+                    lex_ids[n_lex_ent++] = e;
+            }
+            n_lex = n_lex_ent;
+        }
+        int n_inter = 0;
+        qsort(lex_ids, (size_t)n_lex, sizeof(lex_ids[0]), cmp_u32);
+        for (int i = 0; i < vec_collector.count; i++) {
+            if (bsearch(&vec_syms[i], lex_ids, (size_t)n_lex,
+                        sizeof(lex_ids[0]), cmp_u32))
+                inter[n_inter++] = vec_syms[i];
+        }
+
+        if (n_inter > 0) {
+            struct vec_result_printer printer = { db, 0 };
+            long n_rank = dl_vector_rerank(db, q_int8, inter, n_inter,
+                                           (int)k, print_vec_result, &printer);
+            if (n_rank < 0) {
+                fprintf(stderr, "dl: vector rerank failed\n");
+                free(inter);
+                free(vec_syms);
+                free(lex_ids);
+                free(lex_scores);
+                dl_close(db);
+                return 1;
+            }
+            if (printer.printed == 0)
+                printf("(no results)\n");
+        } else {
+            printf("(no results)\n");
+        }
+
+        free(inter);
+        free(vec_syms);
+        free(lex_ids);
+        free(lex_scores);
 
     } else if (strcmp(cmd, "versions") == 0) {
         if (argp < argc) {
