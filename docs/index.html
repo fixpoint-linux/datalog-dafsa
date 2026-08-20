@@ -177,6 +177,11 @@ Snapshot published.</code></pre>
         <td>Per-relation WAL + fsync, single-writer lock, atomic snapshot publish, mmap read path</td>
         <td><a href="architecture.html#durability">Architecture &sect; durability</a></td>
       </tr>
+      <tr>
+        <td>Search</td>
+        <td>Full-text <code>dl search</code> (version-aware) + semantic <code>dl vsearch</code>/<code>dl vhybrid</code>: MIH-over-ITQ vector retrieval with in-store int8 re-rank, all snapshot-versioned</td>
+        <td><a href="datalog-dafsa-vector-search.html">Vector Search</a></td>
+      </tr>
     </tbody>
   </table>
 

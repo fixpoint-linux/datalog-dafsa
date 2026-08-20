@@ -37,7 +37,8 @@ def main():
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "w") as f:
         for t in TEXTS:
-            v = model.embed(t)
+            # fastembed 0.8 `embed()` returns a generator of one embedding.
+            v = next(model.embed(t))
             assert v.shape == (384,) and v.dtype == np.float32
             norm = np.linalg.norm(v)
             if norm < 1e-12:

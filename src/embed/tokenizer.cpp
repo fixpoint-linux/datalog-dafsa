@@ -276,36 +276,39 @@ int wp_init(wp_vocab *v) {
     for (int i = 0; i < v->n; i++) { tmp[i].text = v->texts[i]; tmp[i].id = i; }
     qsort(tmp, (size_t)v->n, sizeof(wp_entry), wp_cmp);
     for (int i = 0; i < v->n; i++) v->sorted[i] = tmp[i].id;
-    free(tmp);
-    return 0;
-}
-
-/* Contiguous sorted entries cached in a file-static block keyed by the
- * handle (dl-embed and the tests use a single active vocab at a time). */
-static wp_entry *g_entries = NULL;
-static const wp_vocab *g_entries_owner = NULL;
-
-static wp_entry *vocab_entries(const wp_vocab *v) {
-    if (g_entries_owner == v && g_entries) return g_entries;
-    free(g_entries);
-    g_entries = (wp_entry *)malloc(sizeof(wp_entry) * (size_t)v->n);
-    if (!g_entries) return NULL;
+    /* keep the sorted-by-text entry array INSIDE the handle: a process-global
+     * cache keyed by pointer goes stale when a new vocab lands at a recycled
+     * stack/heap address (observed: second vocab silently using the first
+     * one's index -> wrong UNKs). */
+    v->entries = tmp;
+    /* Detect the vocab string convention: llama.cpp's convert_hf_to_gguf.py
+     * re-encodes BERT WordPiece vocabs for GGUF as
+     *   initial piece  "word"  ->  "\xe2\x96\x81word"   (U+2581 prefix)
+     *   continuation   "##ing" ->  "ing"                (bare)
+     * A classic HF vocab never contains U+2581 tokens, so any token starting
+     * with the 3-byte marker is unambiguous evidence of the WPM encoding
+     * (the CompendiumLabs bge-small GGUFs ship exactly this). */
+    v->wpm_style = 0;
     for (int i = 0; i < v->n; i++) {
-        g_entries[i].text = v->texts[v->sorted[i]];
-        g_entries[i].id = v->sorted[i];
+        if ((unsigned char)v->texts[i][0] == 0xE2 &&
+            (unsigned char)v->texts[i][1] == 0x96 &&
+            (unsigned char)v->texts[i][2] == 0x81) {
+            v->wpm_style = 1;
+            break;
+        }
     }
-    g_entries_owner = v;
-    return g_entries;
+    return 0;
 }
 
 void wp_free(wp_vocab *v) {
     free(v->sorted);
     v->sorted = NULL;
-    if (g_entries_owner == v) { free(g_entries); g_entries = NULL; g_entries_owner = NULL; }
+    free(v->entries);
+    v->entries = NULL;
 }
 
 static int vocab_lookup(const wp_vocab *v, const char *text) {
-    wp_entry *ent = vocab_entries(v);
+    wp_entry *ent = (wp_entry *)v->entries;
     if (!ent) return -1;
     wp_entry *hit = (wp_entry *)bsearch(text, ent, (size_t)v->n,
                                         sizeof(wp_entry), wp_cmp_key);
@@ -327,17 +330,24 @@ int wp_wordpiece(const wp_vocab *v, const char *word, int unk_id,
     while (start < wl) {
         int end = wl, matched = -1;
         while (start < end) {
-            char qbuf[300];
+            char qbuf[304];
             int plen = end - start;
             if (plen > 255) { end--; continue; }
-            if (start > 0) {
+            /* Candidate lookup key depends on the vocab's string convention:
+             * classic HF: "piece" (initial) / "##cont" (continuation);
+             * llama.cpp WPM: "\xe2\x96\x81piece" (initial) / "cont" (bare). */
+            int off = 0;
+            if (v->wpm_style) {
+                if (start == 0) {
+                    qbuf[0] = (char)0xE2; qbuf[1] = (char)0x96; qbuf[2] = (char)0x81;
+                    off = 3;
+                }
+            } else if (start > 0) {
                 qbuf[0] = '#'; qbuf[1] = '#';
-                memcpy(qbuf + 2, word + start, (size_t)plen);
-                qbuf[2 + plen] = '\0';
-            } else {
-                memcpy(qbuf, word + start, (size_t)plen);
-                qbuf[plen] = '\0';
+                off = 2;
             }
+            memcpy(qbuf + off, word + start, (size_t)plen);
+            qbuf[off + plen] = '\0';
             matched = vocab_lookup(v, qbuf);
             if (matched >= 0) break;
             end--;

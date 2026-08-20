@@ -1,9 +1,15 @@
 /*
  * bert.cpp — bge-small-en-v1.5 BERT forward pass on ggml (CPU).
  *
- * Load pattern follows ggml's own GGUF examples (gpt-2/yolo): init with
- * no_alloc=true so the metadata ctx receives SHAPED tensor structs, then
- * point each tensor's data at (uint8_t*)gguf->data + tensor offset.
+ * Load pattern follows ggml's own GGUF handling (gguf.cpp): init with
+ * no_alloc=false so gguf reads the tensor-data blob into a ggml_context
+ * and wires every tensor's ->data at the right offset itself — no manual
+ * pointer arithmetic on our side (gguf_context is opaque in gguf.h).
+ *
+ * Graphs run on the CPU backend (ggml-backend API, as in ggml's
+ * examples/magika + yolo): weights live in a plain ggml_context, and
+ * ggml_backend_cpu_graph_compute is a direct ggml_graph_compute over those
+ * pointers, so no backend-buffer allocation is needed for CPU-only compute.
  *
  * The attention op sequence is derived from ggml's shape algebra and
  * matches llama.cpp's build_attn:
@@ -11,11 +17,13 @@
  *   Qp = permute(0,2,1,3) -> {head_dim, n, n_head}
  *   Kp = permute(0,2,1,3) -> {head_dim, n, n_head}
  *   kq = mul_mat(Kp, Qp)  -> {n_kv, n_q, n_head}      (contract ne0 = head_dim)
- *   kq = soft_max_ext(kq, NULL, NULL, 1/sqrt(head_dim), 0)   (softmax over keys)
- *   Vp = permute(2,0,1,3) -> {n, head_dim, n_head}
+ *   kq = soft_max_ext(kq, NULL, 1/sqrt(head_dim), 0)  (softmax over keys)
+ *   Vp = permute(1,2,0,3) -> {n, head_dim, n_head}
  *   o  = mul_mat(Vp, kq)  -> {n_q, head_dim, n_head}   (contract ne0 = keys)
- *   op = permute(1,2,0,3) -> {head_dim, n_head, n}     (token-major buffer)
+ *   op = permute(0,2,1,3) -> {head_dim, n_head, n}     (token-major buffer)
  *   attn = cont + reshape_2d(n_embd, n)
+ * NB ggml_permute MOVE semantics: ne_out[axis_i] = ne_in[i] (ggml.c), i.e.
+ * the args say WHERE each input dim lands — NOT ne_out[i] = ne_in[axis_i].
  * ggml aborts on any ne0 mismatch in mul_mat, so a wrong dance fails loudly
  * at graph-build time rather than silently corrupting embeddings.
  */
@@ -23,28 +31,28 @@
 
 #include "ggml.h"
 #include "gguf.h"
+#include "ggml-backend.h"
+#include "ggml-cpu.h"
 
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
+/* worker threads for the CPU backend forward pass */
+#define BERT_N_THREADS 4
+
 /* ── helpers ────────────────────────────────────────────────────────────── */
 
-static ggml_tensor *find_tensor_or_null(ggml_context *ctx, gguf_context *gf,
-                                        const char *name) {
-    ggml_tensor *t = ggml_get_tensor(ctx, name);
-    if (!t) return NULL;
-    int idx = gguf_find_tensor(gf, name);
-    if (idx < 0) return NULL;
-    t->data = (uint8_t *)gf->data + gguf_get_tensor_offset(gf, idx);
-    return t;
+/* no_alloc=false load: gguf already pointed each tensor's ->data into the
+ * blob inside the ggml_context, so lookup is a plain name query. */
+static ggml_tensor *find_tensor_or_null(ggml_context *ctx, const char *name) {
+    return ggml_get_tensor(ctx, name);
 }
 
-static ggml_tensor *require_tensor(ggml_context *ctx, gguf_context *gf,
-                                   const char *name, char *err, size_t errlen,
-                                   const char *why) {
-    ggml_tensor *t = find_tensor_or_null(ctx, gf, name);
+static ggml_tensor *require_tensor(ggml_context *ctx, const char *name,
+                                   char *err, size_t errlen, const char *why) {
+    ggml_tensor *t = find_tensor_or_null(ctx, name);
     if (!t) {
         snprintf(err, errlen, "required GGUF tensor '%s' missing (%s)", name, why);
         return NULL;
@@ -53,16 +61,15 @@ static ggml_tensor *require_tensor(ggml_context *ctx, gguf_context *gf,
 }
 
 /* try primary name, then fallback; NULL if neither exists */
-static ggml_tensor *find2(ggml_context *ctx, gguf_context *gf,
-                          const char *a, const char *b) {
-    ggml_tensor *t = find_tensor_or_null(ctx, gf, a);
+static ggml_tensor *find2(ggml_context *ctx, const char *a, const char *b) {
+    ggml_tensor *t = find_tensor_or_null(ctx, a);
     if (t) return t;
-    if (b) return find_tensor_or_null(ctx, gf, b);
+    if (b) return find_tensor_or_null(ctx, b);
     return NULL;
 }
 
 static int kv_f32(gguf_context *gf, const char *key, float *out) {
-    int id = gguf_find_key(gf, key);
+    int64_t id = gguf_find_key(gf, key);
     if (id < 0) return -1;
     if (gguf_get_kv_type(gf, id) != GGUF_TYPE_FLOAT32) return -1;
     *out = gguf_get_val_f32(gf, id);
@@ -70,7 +77,7 @@ static int kv_f32(gguf_context *gf, const char *key, float *out) {
 }
 
 static int kv_i32(gguf_context *gf, const char *key, int32_t *out) {
-    int id = gguf_find_key(gf, key);
+    int64_t id = gguf_find_key(gf, key);
     if (id < 0) return -1;
     enum gguf_type t = gguf_get_kv_type(gf, id);
     if (t == GGUF_TYPE_INT32) { *out = gguf_get_val_i32(gf, id); return 0; }
@@ -96,7 +103,7 @@ int bert_load(const char *path, bert_model *m, char *err, size_t errlen) {
 
     ggml_context *meta = NULL;
     struct gguf_init_params ip;
-    ip.no_alloc = true;
+    ip.no_alloc = false;   /* gguf reads the blob + wires t->data itself */
     ip.ctx = &meta;
     gguf_context *gf = gguf_init_from_file(path, ip);
     if (!gf) { snprintf(err, errlen, "cannot open GGUF '%s'", path); return -1; }
@@ -104,27 +111,37 @@ int bert_load(const char *path, bert_model *m, char *err, size_t errlen) {
     /* embeddings + norms */
     m->gf = gf;
     m->wctx = meta;
-    m->tok_embd = require_tensor(meta, gf, "token_embd.weight", err, errlen,
+    m->tok_embd = require_tensor(meta, "token_embd.weight", err, errlen,
                                  "token embeddings");
     if (!m->tok_embd) return -1;
-    m->pos_embd = find2(meta, gf, "position_embd.weight", "pos_embd.weight");
+    m->pos_embd = find2(meta, "position_embd.weight", "pos_embd.weight");
     if (!m->pos_embd) {
         snprintf(err, errlen, "position embeddings missing (position_embd.weight / pos_embd.weight)");
         return -1;
     }
-    m->tok_types = find_tensor_or_null(meta, gf, "token_types.weight");
-    m->embd_norm_w = require_tensor(meta, gf, "token_embd_norm.weight", err, errlen,
+    m->tok_types = find_tensor_or_null(meta, "token_types.weight");
+    m->embd_norm_w = require_tensor(meta, "token_embd_norm.weight", err, errlen,
                                     "BertEmbeddings.LayerNorm — REQUIRED for bge");
     if (!m->embd_norm_w) return -1;
-    m->embd_norm_b = find_tensor_or_null(meta, gf, "token_embd_norm.bias");
-    m->out_norm_w = require_tensor(meta, gf, "output_norm.weight", err, errlen,
-                                   "final encoder LayerNorm");
-    if (!m->out_norm_w) return -1;
-    m->out_norm_b = find_tensor_or_null(meta, gf, "output_norm.bias");
+    m->embd_norm_b = find_tensor_or_null(meta, "token_embd_norm.bias");
+    /* Final encoder LayerNorm is OPTIONAL by presence: HF BERT has no
+     * separate final norm — the last block's post-FFN layer_output_norm IS
+     * the final norm, and the CompendiumLabs bge GGUF ships it that way (no
+     * output_norm tensor at all).  Conversions that DO add output_norm
+     * still get it applied (see bert_embed_ids). */
+    m->out_norm_w = find_tensor_or_null(meta, "output_norm.weight");
+    m->out_norm_b = m->out_norm_w
+        ? find_tensor_or_null(meta, "output_norm.bias") : NULL;
 
     m->n_embd  = (int)m->tok_embd->ne[0];
     m->n_vocab = (int)m->tok_embd->ne[1];
     m->n_pos   = (int)m->pos_embd->ne[1];
+
+    if (m->n_embd <= 0 || m->n_vocab <= 0 || m->n_pos <= 0) {
+        snprintf(err, errlen, "degenerate model geometry (n_embd=%d n_vocab=%d n_pos=%d)",
+                 m->n_embd, m->n_vocab, m->n_pos);
+        return -1;
+    }
 
     /* layer count: highest N with blk.N.attn_q.weight present */
     char name[64];
@@ -177,91 +194,89 @@ int bert_load(const char *path, bert_model *m, char *err, size_t errlen) {
         char fb[64];
         snprintf(name,  sizeof name,  "blk.%d.attn_q.weight", l);
         snprintf(fb,    sizeof fb,    "blk.%d.attn_q.bias", l);
-        m->wq[l] = require_tensor(meta, gf, name, err, errlen, "attn q");
+        m->wq[l] = require_tensor(meta, name, err, errlen, "attn q");
         if (!m->wq[l]) return -1;
-        m->bq[l] = find_tensor_or_null(meta, gf, fb);
+        m->bq[l] = find_tensor_or_null(meta, fb);
 
         snprintf(name, sizeof name, "blk.%d.attn_k.weight", l);
         snprintf(fb,   sizeof fb,   "blk.%d.attn_k.bias", l);
-        m->wk[l] = require_tensor(meta, gf, name, err, errlen, "attn k");
+        m->wk[l] = require_tensor(meta, name, err, errlen, "attn k");
         if (!m->wk[l]) return -1;
-        m->bk[l] = find_tensor_or_null(meta, gf, fb);
+        m->bk[l] = find_tensor_or_null(meta, fb);
 
         snprintf(name, sizeof name, "blk.%d.attn_v.weight", l);
         snprintf(fb,   sizeof fb,   "blk.%d.attn_v.bias", l);
-        m->wv[l] = require_tensor(meta, gf, name, err, errlen, "attn v");
+        m->wv[l] = require_tensor(meta, name, err, errlen, "attn v");
         if (!m->wv[l]) return -1;
-        m->bv[l] = find_tensor_or_null(meta, gf, fb);
+        m->bv[l] = find_tensor_or_null(meta, fb);
 
         snprintf(name, sizeof name, "blk.%d.attn_output.weight", l);
         snprintf(fb,   sizeof fb,   "blk.%d.attn_output.bias", l);
-        m->wo[l] = require_tensor(meta, gf, name, err, errlen, "attn out proj");
+        m->wo[l] = require_tensor(meta, name, err, errlen, "attn out proj");
         if (!m->wo[l]) return -1;
-        m->bo[l] = find_tensor_or_null(meta, gf, fb);
+        m->bo[l] = find_tensor_or_null(meta, fb);
 
         snprintf(name, sizeof name, "blk.%d.attn_output_norm.weight", l);
         snprintf(fb,   sizeof fb,   "blk.%d.attn_output_norm.bias", l);
-        m->attn_norm_w[l] = require_tensor(meta, gf, name, err, errlen,
+        m->attn_norm_w[l] = require_tensor(meta, name, err, errlen,
                                            "post-attn LayerNorm");
         if (!m->attn_norm_w[l]) return -1;
-        m->attn_norm_b[l] = find_tensor_or_null(meta, gf, fb);
+        m->attn_norm_b[l] = find_tensor_or_null(meta, fb);
 
         snprintf(name, sizeof name, "blk.%d.ffn_up.weight", l);
         snprintf(fb,   sizeof fb,   "blk.%d.ffn_up.bias", l);
-        m->up_w[l] = require_tensor(meta, gf, name, err, errlen, "ffn up");
+        m->up_w[l] = require_tensor(meta, name, err, errlen, "ffn up");
         if (!m->up_w[l]) return -1;
-        m->up_b[l] = find_tensor_or_null(meta, gf, fb);
+        m->up_b[l] = find_tensor_or_null(meta, fb);
 
         snprintf(name, sizeof name, "blk.%d.ffn_down.weight", l);
         snprintf(fb,   sizeof fb,   "blk.%d.ffn_down.bias", l);
-        m->down_w[l] = require_tensor(meta, gf, name, err, errlen, "ffn down");
+        m->down_w[l] = require_tensor(meta, name, err, errlen, "ffn down");
         if (!m->down_w[l]) return -1;
-        m->down_b[l] = find_tensor_or_null(meta, gf, fb);
+        m->down_b[l] = find_tensor_or_null(meta, fb);
 
         /* post-FFN LN: current name layer_output_norm, older conversions
          * use output_norm — accept either (by presence). */
         snprintf(name, sizeof name, "blk.%d.layer_output_norm.weight", l);
         snprintf(fb,   sizeof fb,   "blk.%d.layer_output_norm.bias", l);
-        m->ffn_norm_w[l] = find2(meta, gf, name, nullptr);
+        m->ffn_norm_w[l] = find2(meta, name, nullptr);
         if (m->ffn_norm_w[l]) {
-            m->ffn_norm_b[l] = find_tensor_or_null(meta, gf, fb);
+            m->ffn_norm_b[l] = find_tensor_or_null(meta, fb);
         } else {
             snprintf(name, sizeof name, "blk.%d.output_norm.weight", l);
             snprintf(fb,   sizeof fb,   "blk.%d.output_norm.bias", l);
-            m->ffn_norm_w[l] = require_tensor(meta, gf, name, err, errlen,
+            m->ffn_norm_w[l] = require_tensor(meta, name, err, errlen,
                                               "post-FFN LayerNorm");
             if (!m->ffn_norm_w[l]) return -1;
-            m->ffn_norm_b[l] = find_tensor_or_null(meta, gf, fb);
+            m->ffn_norm_b[l] = find_tensor_or_null(meta, fb);
         }
     }
 
     /* tokenizer vocab from metadata: tokenizer.ggml.tokens [+ token_type] */
-    int kid = gguf_find_key(gf, "tokenizer.ggml.tokens");
-    int ntok = 0;
-    const char *const *toks = NULL;
+    int64_t kid = gguf_find_key(gf, "tokenizer.ggml.tokens");
+    size_t ntok = 0;
     if (kid >= 0 && gguf_get_kv_type(gf, kid) == GGUF_TYPE_ARRAY &&
         gguf_get_arr_type(gf, kid) == GGUF_TYPE_STRING) {
         ntok = gguf_get_arr_n(gf, kid);
-        toks = (const char *const *)gguf_get_arr_data(gf, kid);
     }
-    if (ntok <= 0 || !toks) {
+    if (ntok == 0 || ntok > (size_t)1 << 24) {
         snprintf(err, errlen, "tokenizer.ggml.tokens missing — not a tokenizer GGUF");
         return -1;
     }
-    /* copy strings: GGUF string arrays may live in scratch that stays valid,
-     * but we own copies to be safe. */
+    /* string arrays are element-accessed via gguf_get_arr_str (the backing
+     * store is not a char** array); we own strdup copies. */
     m->vocab_storage = (char **)calloc(ntok, sizeof(char *));
     if (!m->vocab_storage) { snprintf(err, errlen, "OOM vocab"); return -1; }
-    for (int i = 0; i < ntok; i++) {
-        const char *s = toks[i] ? toks[i] : "";
-        m->vocab_storage[i] = strdup(s);
+    for (size_t i = 0; i < ntok; i++) {
+        const char *s = gguf_get_arr_str(gf, kid, i);
+        m->vocab_storage[i] = strdup(s ? s : "");
     }
-    int32_t *types = NULL;
-    int tid = gguf_find_key(gf, "tokenizer.ggml.token_type");
+    const int32_t *types = NULL;
+    int64_t tid = gguf_find_key(gf, "tokenizer.ggml.token_type");
     if (tid >= 0 && gguf_get_kv_type(gf, tid) == GGUF_TYPE_ARRAY &&
         gguf_get_arr_type(gf, tid) == GGUF_TYPE_INT32) {
         if (gguf_get_arr_n(gf, tid) == ntok)
-            types = (int32_t *)gguf_get_arr_data(gf, tid);
+            types = (const int32_t *)gguf_get_arr_data(gf, tid);
     }
     if (types) {
         m->types_storage = (int32_t *)malloc(sizeof(int32_t) * ntok);
@@ -269,8 +284,19 @@ int bert_load(const char *path, bert_model *m, char *err, size_t errlen) {
     }
     m->vocab.texts = (const char *const *)m->vocab_storage;
     m->vocab.types = m->types_storage;
-    m->vocab.n = ntok;
+    m->vocab.n = (int)ntok;
     if (wp_init(&m->vocab) != 0) { snprintf(err, errlen, "OOM vocab index"); return -1; }
+
+    /* tokenizer vocab and the token-embedding table must agree: a mismatched
+     * GGUF would otherwise hand get_rows row ids >= token_embd rows and die
+     * inside a GGML_ASSERT abort instead of a clean load error. */
+    if (m->n_vocab != m->vocab.n) {
+        snprintf(err, errlen,
+                 "vocab mismatch: tokenizer.ggml.tokens has %d entries but "
+                 "token_embd.weight has %d rows",
+                 m->vocab.n, m->n_vocab);
+        return -1;
+    }
 
     /* special ids by exact text (robust across vocab layouts) */
     int id;
@@ -280,8 +306,19 @@ int bert_load(const char *path, bert_model *m, char *err, size_t errlen) {
     if ((id = wp_find_exact(&m->vocab, "[PAD]")) >= 0) m->pad_id = id;
 
     int32_t ctx = 0;
-    if (kv_i32(gf, "bert.context_length", &ctx) == 0 && ctx > 0)
-        m->max_len = ctx < m->n_pos ? ctx : m->n_pos;
+    if (kv_i32(gf, "bert.context_length", &ctx) == 0 && ctx > 0 && ctx < m->n_pos)
+        m->max_len = ctx;
+    else
+        m->max_len = m->n_pos;   /* always clamp to the position table */
+
+    /* CPU compute backend — created last so no failure path above has to
+     * clean it up.  Owns the worker threads reused across forward passes. */
+    m->backend = ggml_backend_cpu_init();
+    if (!m->backend) {
+        snprintf(err, errlen, "ggml_backend_cpu_init failed");
+        return -1;
+    }
+    ggml_backend_cpu_set_n_threads(m->backend, BERT_N_THREADS);
 
     return 0;
 }
@@ -298,6 +335,7 @@ void bert_free(bert_model *m) {
     free(m->attn_norm_w); free(m->attn_norm_b);
     free(m->up_w); free(m->up_b); free(m->down_w); free(m->down_b);
     free(m->ffn_norm_w); free(m->ffn_norm_b);
+    if (m->backend) ggml_backend_free(m->backend);
     if (m->wctx) ggml_free(m->wctx);
     if (m->gf) gguf_free(m->gf);
     memset(m, 0, sizeof *m);
@@ -320,9 +358,14 @@ int bert_embed_ids(bert_model *m, const int *ids, int n_ids, float *out,
         return -1;
     }
 
-    /* compute ctx: intermediates for n<=512 x 12 layers fit easily in 256MB */
+    /* compute ctx: intermediates + mul_mat work buffers scale ~O(n)+O(n^2).
+     * Measured peak on bge-small f16 (12 layers, 384 embd, n_ff 1536):
+     *   n=128 ->  98.5 MB,  n=256 -> 234.6 MB,  n=512 -> 620 MB
+     * i.e. roughly 0.24MB + n*620KB + n^2*1.15KB; size with ~30% headroom. */
     struct ggml_init_params cp;
-    cp.mem_size   = 256u * 1024u * 1024u;
+    cp.mem_size   = 32u * 1024u * 1024u
+                  + (size_t)n * 704u * 1024u
+                  + (size_t)n * (size_t)n * 1536u;
     cp.mem_buffer = NULL;
     cp.no_alloc   = false;
     ggml_context *ctx = ggml_init(cp);
@@ -358,12 +401,20 @@ int bert_embed_ids(bert_model *m, const int *ids, int n_ids, float *out,
         ggml_tensor *kq = ggml_mul_mat(ctx, K, Q);
         /* single unpadded sequence: every position attends (no mask; the
          * padding mask in bert.cpp is all-valid here), no ALiBi. */
-        kq = ggml_soft_max_ext(ctx, kq, NULL, NULL, kq_scale, 0.0f);
+        kq = ggml_soft_max_ext(ctx, kq, NULL, kq_scale, 0.0f);
 
-        ggml_tensor *Vp =
-            ggml_permute(ctx, ggml_reshape_3d(ctx, V, head_dim, n_head, n), 2, 0, 1, 3);
+        /* cont() materializes the permuted view: mul_mat requires its first
+         * operand non-transposed (row-major strides), which a permuted view
+         * of {head_dim, n_head, n} is not (llama.cpp does the same for V). */
+        ggml_tensor *Vp = ggml_cont(
+            ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, V, head_dim, n_head, n),
+                              1, 2, 0, 3));
         ggml_tensor *o = ggml_mul_mat(ctx, Vp, kq);
-        o = ggml_permute(ctx, o, 1, 2, 0, 3);
+        /* ggml_permute MOVE semantics: ne_out[axis_i] = ne_in[i], so
+         * (0,2,1,3) turns {head_dim, n, n_head} into {head_dim, n_head, n} —
+         * the token-major buffer reshape_2d below expects (matches
+         * llama.cpp's KQV merge). */
+        o = ggml_permute(ctx, o, 0, 2, 1, 3);
         o = ggml_cont(ctx, o);
         o = ggml_reshape_2d(ctx, o, n_embd, n);
 
@@ -382,12 +433,23 @@ int bert_embed_ids(bert_model *m, const int *ids, int n_ids, float *out,
         h = build_norm(ctx, h, m->ffn_norm_w[l], m->ffn_norm_b[l], m->eps);
     }
 
-    h = build_norm(ctx, h, m->out_norm_w, m->out_norm_b, m->eps);
+    /* Optional final norm: absent in HF-faithful BERT GGUFs (bge-small),
+     * where the last block's post-FFN layer_output_norm already IS the final
+     * encoder LayerNorm — applying another norm there would corrupt every
+     * embedding.  Apply only when the GGUF actually ships output_norm. */
+    if (m->out_norm_w)
+        h = build_norm(ctx, h, m->out_norm_w, m->out_norm_b, m->eps);
 
-    ggml_cgraph *gf = ggml_new_graph(ctx);
-    ggml_build_forward_expand(gf, h);
-    int n_threads = 4;
-    ggml_graph_compute_with_ctx(ctx, gf, n_threads);
+    /* run on the CPU backend (weights + intermediates live in plain
+     * ggml_contexts, which is fine for CPU-only compute — the CPU backend's
+     * graph_compute is a direct ggml_graph_compute over those pointers). */
+    ggml_cgraph *gcalc = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gcalc, h);
+    if (ggml_backend_graph_compute(m->backend, gcalc) != GGML_STATUS_SUCCESS) {
+        snprintf(err, errlen, "ggml_backend_graph_compute failed");
+        ggml_free(ctx);
+        return -1;
+    }
 
     /* CLS pooling: token 0 is the first n_embd floats (ne0 contiguous). */
     const float *hidden = (const float *)h->data;
@@ -404,8 +466,12 @@ int bert_embed_ids(bert_model *m, const int *ids, int n_ids, float *out,
 int bert_embed(bert_model *m, const char *text, float *out,
                char *err, size_t errlen) {
     int ids[1024];
+    /* never let GGUF metadata (max_len) grow past the physical buffer:
+     * wp_tokenize truncates to whichever limit is smaller. */
+    int cap = m->max_len < (int)(sizeof ids / sizeof ids[0])
+            ? m->max_len : (int)(sizeof ids / sizeof ids[0]);
     int n = wp_tokenize(&m->vocab, text, m->cls_id, m->sep_id, m->unk_id,
-                        ids, m->max_len);
+                        ids, cap);
     if (n < 2) { snprintf(err, errlen, "tokenization produced %d ids", n); return -1; }
     return bert_embed_ids(m, ids, n, out, err, errlen);
 }
@@ -415,13 +481,13 @@ int bert_embed(bert_model *m, const char *text, float *out,
 void bert_dump_tensors(const char *path) {
     ggml_context *meta = NULL;
     struct gguf_init_params ip;
-    ip.no_alloc = true;
+    ip.no_alloc = true;   /* dump reads names/dims only — skip the blob */
     ip.ctx = &meta;
     gguf_context *gf = gguf_init_from_file(path, ip);
     if (!gf) { fprintf(stderr, "cannot open GGUF '%s'\n", path); return; }
-    int n = gguf_get_n_tensors(gf);
-    printf("GGUF %s: %d tensors\n", path, n);
-    for (int i = 0; i < n; i++) {
+    int64_t n = gguf_get_n_tensors(gf);
+    printf("GGUF %s: %lld tensors\n", path, (long long)n);
+    for (int64_t i = 0; i < n; i++) {
         const char *name = gguf_get_tensor_name(gf, i);
         ggml_tensor *t = ggml_get_tensor(meta, name);
         if (!t) { printf("  %-40s <no meta>\n", name); continue; }
@@ -439,11 +505,11 @@ void bert_dump_tensors(const char *path) {
         "attention.layer_norm_epsilon", "tokenizer.ggml.model",
     };
     for (const char *k : keys) {
-        int id = gguf_find_key(gf, k);
+        int64_t id = gguf_find_key(gf, k);
         if (id < 0) continue;
         enum gguf_type t = gguf_get_kv_type(gf, id);
         if (t == GGUF_TYPE_STRING)
-            printf("kv %-36s (string) %s\n", k, gguf_get_val_string(gf, id));
+            printf("kv %-36s (string) %s\n", k, gguf_get_val_str(gf, id));
         else if (t == GGUF_TYPE_FLOAT32)
             printf("kv %-36s (f32) %g\n", k, gguf_get_val_f32(gf, id));
         else if (t == GGUF_TYPE_INT32)

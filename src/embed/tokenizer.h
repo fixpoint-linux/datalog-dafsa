@@ -8,9 +8,11 @@
  *   - basic tokenizer preprocessing: clean_text (drop control/format chars,
  *     map whitespace to space), CJK-char space padding, lowercasing with
  *     accent stripping (NFD + drop combining marks), punctuation splitting.
- *   - WordPiece: greedy longest-match, first subword bare, later subwords
- *     with "##" prefix; if ANY position fails, the WHOLE word becomes a
- *     single [UNK] (HF semantics — NOT per-char UNKs).
+ *   - WordPiece: greedy longest-match; the first subword is looked up bare
+ *     ("piece", or "▁piece" in the llama.cpp WPM encoding) and later subwords
+ *     with a "##" prefix ("##cont", or bare "cont" in WPM encoding); if ANY
+ *     position fails, the WHOLE word becomes a single [UNK] (HF semantics —
+ *     NOT per-char UNKs).
  */
 #ifndef EMBED_TOKENIZER_H
 #define EMBED_TOKENIZER_H
@@ -29,6 +31,16 @@ typedef struct {
     int                n;
     /* internal sorted index for bsearch (built by wp_init) */
     int               *sorted; /* n entries: vocab ids sorted by text */
+    /* internal: entries sorted by text, parallel to `sorted` (built by
+     * wp_init, freed by wp_free) — Opaque; avoids any process-global cache. */
+    void              *entries;
+    /* Vocab string convention, auto-detected by wp_init:
+     * 0 = classic HF WordPiece ("piece" / "##cont");
+     * 1 = llama.cpp WPM encoding ("▁piece" / "cont") — initial pieces carry a
+     *     U+2581 prefix and continuations are bare (llama.cpp's
+     *     convert_hf_to_gguf.py re-encodes BERT vocabs this way, and the
+     *     CompendiumLabs bge GGUFs ship it). */
+    int                wpm_style;
 } wp_vocab;
 
 int  wp_init(wp_vocab *v);      /* builds the sorted index; 0 ok, -1 OOM */

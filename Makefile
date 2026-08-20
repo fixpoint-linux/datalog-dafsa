@@ -53,7 +53,7 @@ ALL_OBJS = $(VENDOR_OBJS) $(LIB_OBJS)
 
 # ─── Targets ─────────────────────────────────────────────────────────────
 
-.PHONY: all clean test bench test-m1 test-m2 wasm lsp test-lsp dlp dlp_schema_check dlp-check dlp-golden dl-embed fetch-model embed-test
+.PHONY: all clean test bench test-m1 test-m2 wasm lsp test-lsp dlp dlp_schema_check dlp-check dlp-golden dl-embed fetch-model embed-test fxstore fxstore-golden
 
 all: build-tmp libdatalog.so dl
 
@@ -196,7 +196,7 @@ GGML_SRC   := vendor/ggml
 GGML_BUILD := build-tmp/ggml
 GGML_CMAKE := $(GGML_BUILD)/CMakeCache.txt
 GGML_LIBS  := $(GGML_BUILD)/src/libggml.a \
-              $(GGML_BUILD)/src/ggml-cpu/libggml-cpu.a \
+              $(GGML_BUILD)/src/libggml-cpu.a \
               $(GGML_BUILD)/src/libggml-base.a
 EMBED_CXXFLAGS := -O2 -Wall -Wextra -std=c++17 -Ivendor/ggml/include -Isrc
 EMBED_OBJS := src/embed/itq.o src/embed/tokenizer.o src/embed/bert.o \
@@ -210,22 +210,29 @@ ggml-check:
 $(GGML_CMAKE): ggml-check $(GGML_SRC)/CMakeLists.txt
 	cmake -S $(GGML_SRC) -B $(GGML_BUILD) -DCMAKE_BUILD_TYPE=Release \
 	      -DGGML_BUILD_EXAMPLES=OFF -DGGML_BUILD_TESTS=OFF \
-	      -DGGML_CUDA=OFF -DGGML_METAL=OFF -DGGML_VULKAN=OFF -DGGML_OPENCL=OFF
+	      -DGGML_CUDA=OFF -DGGML_METAL=OFF -DGGML_VULKAN=OFF -DGGML_OPENCL=OFF \
+	      -DBUILD_SHARED_LIBS=OFF -DGGML_OPENMP=OFF
 
 $(GGML_LIBS): $(GGML_CMAKE)
 	$(MAKE) -C $(GGML_BUILD) ggml ggml-cpu
 
-src/embed/%.o: src/embed/%.cpp | ggml-check
+EMBED_HDRS := src/embed/bert.h src/embed/tokenizer.h src/embed/itq.h \
+              src/embed/csv_emit.h src/embed/dl_driver.h src/embed/vec_bits.h
+
+src/embed/%.o: src/embed/%.cpp $(EMBED_HDRS) | ggml-check
 	g++ $(EMBED_CXXFLAGS) -c -o $@ $<
 
 dl-embed: $(EMBED_OBJS) $(GGML_LIBS)
 	g++ $(EMBED_CXXFLAGS) -o $@ $(EMBED_OBJS) \
-	    -L$(GGML_BUILD)/src -L$(GGML_BUILD)/src/ggml-cpu \
+	    -L$(GGML_BUILD)/src \
 	    -lggml -lggml-cpu -lggml-base -lpthread -lm
 
-# Model (never committed): bge-small-en-v1.5 GGUF, ~67 MB f16.
+# Model: bge-small-en-v1.5 GGUF, ~67 MB f16.  The repo-local `models/` copy is
+# tracked with git-lfs (see .gitattributes); `fetch-model` (re)downloads the
+# canonical file into that dir and is also how a fresh clone materializes it
+# before `git lfs pull`.
 MODEL_URL  := https://huggingface.co/CompendiumLabs/bge-small-en-v1.5-gguf/resolve/main/bge-small-en-v1.5-f16.gguf
-MODEL_DIR  ?= $(if $(XDG_CACHE_HOME),$(XDG_CACHE_HOME),$(HOME)/.cache)/datalog-dafsa/models
+MODEL_DIR  ?= models
 MODEL_PATH := $(MODEL_DIR)/bge-small-en-v1.5-f16.gguf
 
 fetch-model:
@@ -242,11 +249,21 @@ tests/test_embed_math: tests/test_embed_math.cpp src/embed/itq.cpp src/embed/tok
 tests/test_embed: tests/test_embed.c $(ALL_OBJS)
 	$(CC) $(CFLAGS) $(INC) -static -o $@ tests/test_embed.c $(ALL_OBJS) -lm
 
+# bert_load contract test on a synthetic GGUF (needs ggml libs, NOT the
+# model): pins that a bge-layout GGUF WITHOUT output_norm loads (the real
+# CompendiumLabs GGUF ships no final encoder norm) while output_norm, when
+# present, is still applied.
+tests/test_bert_load: tests/test_bert_load.cpp src/embed/bert.o src/embed/tokenizer.o $(GGML_LIBS)
+	g++ $(EMBED_CXXFLAGS) -o $@ tests/test_bert_load.cpp src/embed/bert.o \
+	    src/embed/tokenizer.o -L$(GGML_BUILD)/src \
+	    -lggml -lggml-cpu -lggml-base -lpthread -lm
+
 # Full dl-embed gate: build + self-test (golden embeddings when the model is
 # present; offline checks otherwise).
-embed-test: dl-embed tests/test_embed tests/test_embed_math
+embed-test: dl-embed tests/test_embed tests/test_embed_math tests/test_bert_load
 	./tests/test_embed
 	./tests/test_embed_math
+	./tests/test_bert_load
 	./dl-embed self-test
 
 tests/test_m14_permsel: tests/test_m14_permsel.c $(ALL_OBJS)
@@ -457,6 +474,29 @@ dlp-check: dlp dlp_schema_check
 dlp-golden: dlp
 	@tests/dlp_golden.sh ./dlp/dlp
 
+# ─── fxstore (fxstore tool) — OPT-IN, links the engine + dhall-c ────────
+# A NEW top-level tool that manages a content-addressed package store.
+# Built with cosmocc (the dhall-c interpreter is not gcc-clean for this link)
+# and is NOT part of the default `make`/`make test` (which stay gcc-only and
+# never touch dhall-c).  Usage:
+#   make fxstore            # uses $(CURDIR)/../dhall-c by default
+#   make fxstore DHALLC=/path/to/dhall-c
+#   make fxstore-golden    # build + run the fxstore golden test harness
+
+# fxstore sources: CLI + the five core units (packageset walker, canonical
+# derivation serializer, datalog closure fixpoint, store txn/GC, recipe
+# executor + bwrap sandbox).
+FXSTORE_SRCS = fxstore/main.c fxstore/packageset.c fxstore/derivation.c \
+               fxstore/closure.c fxstore/store.c fxstore/build.c
+
+# Reuse the same dhall-c core and engine source sets as dlp.
+fxstore: $(FXSTORE_SRCS) $(DLP_ENGINE_SRCS) $(CORE_SRCS) fxstore/fxstore.h
+	$(COSMOCC) $(DLP_CFLAGS) -o fxstore/fxstore $(FXSTORE_SRCS) $(DLP_ENGINE_SRCS) $(CORE_SRCS)
+
+# Verification harness: placeholder for later unit (golden test).
+fxstore-golden: fxstore
+	@echo "fxstore-golden: placeholder — later unit wires the test"
+
 
 # ─── WebAssembly playground ─────────────────────────────────────────────
 # Builds the in-browser language playground (docs/playground.js + .wasm)
@@ -477,12 +517,13 @@ clean:
 	rm -f libdatalog.so dl dl-lsp dlp/dlp dlp_schema_check
 	rm -f dlp/dlp.aarch64.elf dlp/dlp.com.dbg \
 	      dlp_schema_check.aarch64.elf dlp_schema_check.com.dbg
+	rm -f fxstore/fxstore fxstore/fxstore.aarch64.elf fxstore/fxstore.com.dbg
 	rm -f tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4 \
 	      tests/test_m4_review tests/test_m5 tests/test_m5_review tests/test_m6 \
 	      tests/test_m6_review tests/test_bulk \
 	      tests/test_m6_deep_review tests/test_m7 tests/test_m8_magic tests/test_topdown tests/test_m9_arith \
 	      tests/test_m9_str tests/test_ivm tests/test_bushy tests/test_vararity \
-	      tests/test_lists tests/test_m10_rank tests/test_m11_range tests/test_m12_snap_rank tests/test_m13_iter tests/test_m14_permsel tests/test_m15_vmiter tests/test_m16_travel tests/test_positions tests/test_schema tests/test_typecheck tests/test_traverse tests/test_search tests/test_vector_storage tests/test_vector_search tests/test_vector_cli tests/test_embed_math tests/test_embed tests/bench
+	      tests/test_lists tests/test_m10_rank tests/test_m11_range tests/test_m12_snap_rank tests/test_m13_iter tests/test_m14_permsel tests/test_m15_vmiter tests/test_m16_travel tests/test_positions tests/test_schema tests/test_typecheck tests/test_traverse tests/test_search tests/test_vector_storage tests/test_vector_search tests/test_vector_cli tests/test_embed_math tests/test_embed tests/test_bert_load tests/bench
 	rm -f dl-embed src/embed/itq.o src/embed/tokenizer.o src/embed/bert.o \
 	      src/embed/csv_emit.o src/embed/dl_driver.o src/embed/dl-embed.o
 	rm -rf build-tmp/ggml

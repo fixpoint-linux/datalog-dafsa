@@ -28,11 +28,12 @@
 <main class="wrap">
   <h1>CLI Reference</h1>
   <p>
-    The <code>dl</code> binary is the command-line front end. There are exactly
-    8 subcommands. The database directory defaults to <code>dl-test-db</code>
-    and can be set with <code>-d &lt;dir&gt;</code>. Command values that parse
-    as bare integers are stored raw as u32; anything else is interned to a
-    string symbol id.
+    The <code>dl</code> binary is the command-line front end. It has
+    commands for loading facts, querying relations, publishing snapshots,
+    and the search tier (full-text + semantic). The database directory
+    defaults to <code>dl-test-db</code> and can be set with
+    <code>-d &lt;dir&gt;</code>. Command values that parse as bare integers
+    are stored raw as u32; anything else is interned to a string symbol id.
   </p>
   <pre class="code"><code>dl [-d &lt;dir&gt;] load    &lt;csv&gt; --rel &lt;name&gt;
 dl [-d &lt;dir&gt;] lookup  &lt;rel&gt; &lt;val&gt; [&lt;val&gt; ...]
@@ -41,7 +42,11 @@ dl [-d &lt;dir&gt;] query   '&lt;rule&gt;' | &lt;file.dl&gt; &lt;goal-rel&gt;
 dl [-d &lt;dir&gt;] qmagic  '&lt;rule&gt;' | &lt;file.dl&gt; &lt;goal-rel&gt; [-a &lt;adorn&gt;] &lt;val&gt; [&lt;val&gt; ...]
 dl [-d &lt;dir&gt;] publish
 dl [-d &lt;dir&gt;] bound   &lt;rel&gt; &lt;val&gt; [&lt;val&gt; ...]
-dl [-d &lt;dir&gt;] pattern &lt;rel&gt; '&lt;regex&gt;'</code></pre>
+dl [-d &lt;dir&gt;] pattern &lt;rel&gt; '&lt;regex&gt;'
+dl [-d &lt;dir&gt;] search  '&lt;terms&gt;' [--top N] [--version N]
+dl [-d &lt;dir&gt;] vsearch '&lt;query&gt;' [--k N] [--radius R] [--version V] [--sig &lt;hex&gt;] [--ivec &lt;hex&gt;]
+dl [-d &lt;dir&gt;] vhybrid '&lt;terms&gt;' '&lt;query&gt;' [--k N] [--radius R] [--version V]
+dl [-d &lt;dir&gt;] versions</code></pre>
 
   <h2 id="load">load</h2>
   <p>Load facts from a headerless CSV file into a relation (arity 1&ndash;8).</p>
@@ -136,13 +141,38 @@ Snapshot published.</code></pre>
   <pre class="code"><code>$ ./dl -d /tmp/db pattern edge '(a|b).*'</code></pre>
   <p>A bad pattern is a loud error.</p>
 
+  <h2 id="search">search</h2>
+  <p>Full-text search over the <code>__postings__</code> index: AND-intersect
+  the tokenized terms and rank by co-occurrence. <code>--version N</code>
+  queries the index as-of a published snapshot (0 = live).</p>
+  <pre class="code"><code>$ ./dl -d /tmp/db search 'gpu rental' --top 10
+$ ./dl -d /tmp/db search 'gpu rental' --top 10 --version 3</code></pre>
+
+  <h2 id="vsearch">vsearch</h2>
+  <p>Semantic vector search: embed the query with the bge-small model
+  (via the <code>dl-embed</code> tool), retrieve MIH candidates from the
+  <code>__sig*__</code> postings, and re-rank by in-store int8 cosine.
+  Accepts <code>--sig</code>/<code>--ivec</code> hex for a programmatic path
+  that needs no model.</p>
+  <pre class="code"><code>$ ./dl -d /tmp/db vsearch 'affordable GPU rental' --k 10</code></pre>
+
+  <h2 id="vhybrid">vhybrid</h2>
+  <p>Lexical &cap; semantic hybrid: intersect <code>search</code> results with
+  <code>vsearch</code> candidates, then re-rank the intersection.</p>
+  <pre class="code"><code>$ ./dl -d /tmp/db vhybrid 'gpu rental' 'affordable GPU rental' --k 10</code></pre>
+
+  <h2 id="versions">versions</h2>
+  <p>List the published snapshot versions (ascending).</p>
+  <pre class="code"><code>$ ./dl -d /tmp/db versions</code></pre>
+
   <h2 id="scope">What is <em>not</em> in the CLI</h2>
   <p>
     The top-down / QSQ path (<code>dl_query_topdown</code> /
     <code>dl_query_topdown_adorn</code>) is available only through the C API —
     there is <strong>no</strong> <code>topdown</code> CLI subcommand. Likewise,
-    order-statistics (rank / select / range / count) and time-travel (as-of
-    queries) are C-API only; they have no CLI command.
+    order-statistics (rank / select / range / count) are C-API only. The
+    semantic search tier relies on the <code>dl-embed</code> companion tool
+    (built with <code>make dl-embed</code>) for query-time embedding.
   </p>
 
 </main>

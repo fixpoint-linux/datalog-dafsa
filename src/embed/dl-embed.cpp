@@ -28,6 +28,7 @@
 #include "vec_bits.h"
 
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -51,18 +52,34 @@ static char g_model_path[4096];
 
 static void die(const char *msg) { fprintf(stderr, "dl-embed: %s\n", msg); exit(1); }
 
+/* snprintf that dies on truncation instead of silently cutting a path. */
+static void pathf(char *dst, size_t cap, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(dst, cap, fmt, ap);
+    va_end(ap);
+    if (n < 0 || (size_t)n >= cap) die("path too long");
+}
+
+static int file_exists(const char *p);   /* forward decl (defined below) */
+
 static void resolve_paths(const char *argv0) {
     snprintf(g_repo_dir, sizeof g_repo_dir, "%s", argv0);
     char *slash = strrchr(g_repo_dir, '/');
     if (slash) *slash = '\0';
     else snprintf(g_repo_dir, sizeof g_repo_dir, ".");
-    snprintf(g_dl_path, sizeof g_dl_path, "%s/dl", g_repo_dir);
+    pathf(g_dl_path, sizeof g_dl_path, "%s/dl", g_repo_dir);
 
     const char *env = getenv("DL_EMBED_MODEL");
     if (env && *env) {
         snprintf(g_model_path, sizeof g_model_path, "%s", env);
         return;
     }
+    /* Prefer the repo-local, git-lfs-tracked model (models/<MODEL_NAME>);
+     * fall back to the per-user cache path (for dev/fetch-on-demand). */
+    pathf(g_model_path, sizeof g_model_path, "%s/models/" MODEL_NAME, g_repo_dir);
+    if (file_exists(g_model_path)) return;
+
     const char *cache = getenv("XDG_CACHE_HOME");
     char base[4096];
     if (cache && *cache) snprintf(base, sizeof base, "%s/datalog-dafsa/models", cache);
@@ -71,7 +88,7 @@ static void resolve_paths(const char *argv0) {
         if (!home || !*home) home = "/tmp";
         snprintf(base, sizeof base, "%s/.cache/datalog-dafsa/models", home);
     }
-    snprintf(g_model_path, sizeof g_model_path, "%s/" MODEL_NAME, base);
+    pathf(g_model_path, sizeof g_model_path, "%s/" MODEL_NAME, base);
 }
 
 static int file_exists(const char *p) {
@@ -200,8 +217,8 @@ static int fetch_model(void) {
     snprintf(dir, sizeof dir, "%s", g_model_path);
     char *slash = strrchr(dir, '/');
     if (slash) *slash = '\0';
-    snprintf(cmd, sizeof cmd, "mkdir -p '%s' && curl -L --fail --progress-bar -o '%s' '%s'",
-             dir, g_model_path, MODEL_URL);
+    pathf(cmd, sizeof cmd, "mkdir -p '%s' && curl -L --fail --progress-bar -o '%s' '%s'",
+          dir, g_model_path, MODEL_URL);
     printf("downloading %s\n  -> %s\n", MODEL_URL, g_model_path);
     fflush(stdout);
     int rc = system(cmd);
@@ -210,7 +227,11 @@ static int fetch_model(void) {
                         "model manually at\n  %s\n", rc, g_model_path);
         return 1;
     }
-    printf("done (%lld bytes)\n", (long long)0);
+    struct stat st;
+    if (stat(g_model_path, &st) == 0)
+        printf("done (%lld bytes)\n", (long long)st.st_size);
+    else
+        printf("done\n");
     return 0;
 }
 
@@ -412,6 +433,7 @@ int main(int argc, char **argv) {
             "  pipeline --db DIR     embed corpus + emit vector relations\n"
             "  encode --db DIR QRY   print 'sig_hex ivec_hex' for a query\n"
             "  embed QRY             print the raw 384-float embedding\n"
+            "  tokenize QRY          print token ids + strings (debug)\n"
             "  self-test             math/tokenizer (+model if present)\n"
             "  dump-tensors [PATH]   list GGUF tensors\n"
             "  fetch-model           download the bge-small GGUF\n");
@@ -433,6 +455,32 @@ int main(int argc, char **argv) {
         self_test_rng_and_math();
         self_test_model();
         printf("self-test OK\n");
+        return 0;
+    }
+
+    if (strcmp(cmd, "tokenize") == 0) {
+        if (argc < 3) die("tokenize requires a query string");
+        char err[512];
+        if (!file_exists(g_model_path)) {
+            fprintf(stderr, "model missing: %s\n", g_model_path);
+            return 1;
+        }
+        bert_model m;
+        if (bert_load(g_model_path, &m, err, sizeof err) != 0) die(err);
+        int ids[1024];
+        int cap = m.max_len < (int)(sizeof ids / sizeof ids[0])
+                ? m.max_len : (int)(sizeof ids / sizeof ids[0]);
+        int n = wp_tokenize(&m.vocab, argv[2], m.cls_id, m.sep_id, m.unk_id,
+                            ids, cap);
+        if (n < 1) die("tokenization produced no ids");
+        printf("n=%d ids:", n);
+        for (int i = 0; i < n; i++) printf(" %d", ids[i]);
+        printf("\ntokens:");
+        for (int i = 0; i < n; i++)
+            printf(" [%s]", ids[i] >= 0 && ids[i] < m.vocab.n
+                             ? m.vocab.texts[ids[i]] : "?");
+        printf("\n");
+        bert_free(&m);
         return 0;
     }
 

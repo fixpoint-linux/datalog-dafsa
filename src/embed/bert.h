@@ -23,17 +23,22 @@
 struct ggml_context;
 struct gguf_context;
 struct ggml_tensor;
+struct ggml_backend;
 
 typedef struct {
-    gguf_context *gf;        /* owns the mmapped tensor data            */
-    ggml_context *wctx;      /* weight tensor structs (no_alloc)        */
+    gguf_context *gf;        /* gguf metadata (kv store)                 */
+    ggml_context *wctx;      /* weight tensors + loaded data blob        */
+    ggml_backend *backend;   /* CPU backend (owns the compute threads)   */
     int   n_layer, n_embd, n_head, n_vocab, n_pos;
     float eps;
 
     /* embeddings */
     ggml_tensor *tok_embd, *pos_embd, *tok_types;
     ggml_tensor *embd_norm_w, *embd_norm_b;
-    ggml_tensor *out_norm_w, *out_norm_b;      /* final norm */
+    ggml_tensor *out_norm_w, *out_norm_b;      /* final norm (OPTIONAL: absent
+                                                  in HF-faithful bge GGUFs —
+                                                  last blk.layer_output_norm
+                                                  IS the final norm there)   */
 
     /* per layer */
     ggml_tensor **wq, **bq, **wk, **bk, **wv, **bv;

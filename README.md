@@ -33,6 +33,37 @@ CSV values that parse as integers are stored raw as u32; anything else is intern
 to a symbol id. The database directory defaults to `dl-test-db` and can be overridden
 with `-d <dir>`.
 
+### Semantic search
+
+The vector tier adds meaning-aware retrieval on top of the full-text index, all stored
+in-relation and snapshot-versioned:
+
+```sh
+# Full-text (lexical) — AND-intersect + rank, version-aware.
+./dl -d /tmp/db search 'gpu rental' --top 10
+
+# Semantic vector search — bge-small embedding + MIH retrieval + int8 re-rank.
+./dl -d /tmp/db vsearch 'affordable GPU rental' --k 10
+
+# Hybrid — lexical ∩ semantic, then re-rank.
+./dl -d /tmp/db vhybrid 'gpu rental' 'affordable GPU rental' --k 10
+```
+
+Semantic embedding is provided by the `dl-embed` companion tool (C++, ggml-based):
+
+```sh
+make dl-embed          # build ./dl-embed (needs cmake + the vendored ggml submodule)
+make fetch-model       # ensure the bge-small GGUF is present under models/
+./dl-embed self-test   # golden-embedding gate (cosine >= 0.9999 vs the reference model)
+./dl-embed pipeline --db /tmp/db   # embed the entity corpus into the vector index
+```
+
+The model (`models/bge-small-en-v1.5-f16.gguf`, ~67 MB) is tracked with **git-lfs**;
+a fresh clone materializes it with `git lfs pull` (or `make fetch-model`). `dl-embed`
+resolves the model from the repo-local `models/` first, then the per-user cache. See
+[`docs/datalog-dafsa-vector-search.md`](docs/datalog-dafsa-vector-search.md) for the
+full design (MIH over ITQ, in-store int8 re-rank, snapshot consistency).
+
 ## How It Works
 
 **The linchpin: fixed-width big-endian encoding.** Every fact of arity `a` is encoded
@@ -213,12 +244,17 @@ see [`docs/README.md`](docs/README.md) for how to enable Pages.
 ## Building from Source
 
 Requires `gcc`, `make`, and POSIX headers (`-D_POSIX_C_SOURCE=200809L`), targeting
-`c11`. No third-party dependencies — the DAFSA engine is vendored under `vendor/`.
+`c11`. No third-party dependencies for the engine itself — the DAFSA engine is
+vendored under `vendor/`.
 
 - `make` builds `libdatalog.so`, the `dl` CLI, and all test binaries.
 - Test and CLI binaries are **statically linked** for portability.
 - The build sets `TMPDIR` to `./build-tmp`; the CLI's default database directory is
   `dl-test-db` unless `-d <dir>` is given.
+- The **semantic tier** (`dl-embed`, `dl vsearch`/`vhybrid`) is opt-in and adds a
+  vendored [ggml](https://github.com/ggml-org/ggml) submodule (v0.20.2) + `cmake`:
+  `git submodule update --init vendor/ggml && make dl-embed`. It is not built by
+  the default `make`/`make test`. The model is git-lfs-tracked under `models/`.
 
 ## License
 

@@ -3,6 +3,16 @@
 All notable changes to this project are documented in this file.
 
 ## [Unreleased]
+- **GGML C-embedding migration**: the semantic-tier embed pipeline moved from
+  Python (`scripts/embed.py`, removed) to a C++ `dl-embed` tool backed by a
+  vendored ggml submodule (v0.20.2). bge-small-en-v1.5 runs as a real GGUF
+  (git-lfs-tracked under `models/`); `bert.cpp` loads it and runs the BERT
+  forward pass (CLS-pooled, L2-normalized). WordPiece tokenizer auto-detects
+  the llama.cpp WPM vocab convention. Golden-embedding gate matches the
+  reference model to cosine >= 0.9999. `dl vsearch`/`vhybrid` now embed queries
+  in-process via `fork/execve` of `dl-embed` (no shell — the prior command-
+  injection surface is gone). Deep-reviewed: fixed a GGUF-metadata stack
+  overflow, a compute-pool abort on long inputs, and a tokenizer stale-cache.
 - **Full-text search time-travel**: `dl_search_version` and `dl_search_top_version` query the postings index as-of a published snapshot version, enabling "search as it was at time T".  Uses `dl_query_bound_version` under the hood; sym_ids are stable across versions (append-only interner).  CLI: `dl search '<terms>' --version N` and `dl versions` to list all published versions.  Error contract: returns -1 for version==0, nonexistent version, or absent `__postings__` relation (not 0 results).  Tests in test_search.c.
 
 ### Added
@@ -386,6 +396,29 @@ All notable changes to this project are documented in this file.
   workload ever emerges, interpreter-level optimization comes first, not a JIT.
 
 ### Fixed
+- **dl-embed GGML BERT load + attention graph (caught by the real bge-small
+  GGUF)**. Three bugs in `src/embed/bert.cpp`, none of which had ever executed
+  because `bert_load` always died first on the missing `output_norm` tensor:
+  (1) `output_norm.weight` was REQUIRED, but HF BERT/bge has no separate final
+  encoder LayerNorm — the last block's post-FFN `layer_output_norm` IS the
+  final norm and the CompendiumLabs GGUF ships no `output_norm` at all. It is
+  now optional-by-presence: loaded with `find_tensor_or_null` and applied in
+  `bert_embed_ids` only when the GGUF actually ships it (conversions that add
+  it still get it applied). (2) The attention V-permute was written as if
+  `ggml_permute` used gather semantics (`ne_out[i] = ne_in[axis_i]`), but ggml
+  uses MOVE semantics (`ne_out[axis_i] = ne_in[i]`, ggml.c) — `permute(V,
+  2,0,1,3)` produced `{n_head, n, head_dim}` instead of `{n, head_dim,
+  n_head}`, aborting at graph-build in `ggml_mul_mat`; correct is `(1,2,0,3)`
+  (llama.cpp's V), and the permuted view is now wrapped in `ggml_cont` because
+  `mul_mat` requires a non-transposed first operand. (3) The KQV output merge
+  used `(1,2,0,3)` where llama.cpp uses `(0,2,1,3)` — shapes reshaped fine but
+  the contiguous buffer was head-interleaved instead of token-major, silently
+  corrupting every embedding. New `tests/test_bert_load.cpp` pins all of this
+  offline on a synthetic bge-layout GGUF (no 67 MB model needed): load w/o
+  `output_norm` + finite L2-normalized forward output, optional final norm
+  applied when present (A/B output divergence), missing-required-tensor error
+  intact. Full battery: test_embed_math 38/38, test_embed 3/3, vector
+  storage/search/cli 10/5/4, `dl-embed self-test` OK.
 - **Silent wrong answer in the semi-naive fixpoint for multi-recursive-atom
   rules** (`dl_query_magic` returned a too-small result, e.g. `tc(1,?)` = 5
   tuples when it should be 6).  Root cause: a non-delta `OP_LOOKUP` recursive

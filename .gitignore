@@ -61,3 +61,10 @@ dl-test-*/
 
 # emscripten cache
 .cache/
+
+# embed tool binaries
+/dl-embed
+/tests/test_embed
+/tests/test_embed_math
+/tests/test_bert_load
+# NOTE: tests/data/bge_golden.txt is a SOURCE artifact — commit it, never ignore it.
