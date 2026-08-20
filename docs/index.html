@@ -3,22 +3,23 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>datalog-dafsa — a DAFSA-backed Datalog engine in C</title>
+<title>datalog-dafsa — a DAFSA-backed Datalog engine that time-travels</title>
+<meta name="description" content="datalog-dafsa: a DAFSA-backed Datalog engine in C. Facts into an on-disk minimal-acyclic-DAFSA store, rules to a small VM, reads from an mmap'd snapshot — with native, first-class time travel.">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
 
 <header class="site">
   <div class="wrap">
-    <a class="brand" href="index.html">datalog-dafsa</a>
+    <a class="brand" href="index.html"><span class="fx">fx</span>://datalog-dafsa</a>
     <nav>
       <a href="index.html">Overview</a>
       <a href="language.html">Language</a>
       <a href="cli.html">CLI</a>
       <a href="api.html">C API</a>
       <a href="architecture.html">Architecture</a>
-      <a href="order-statistics.html">Order Stats</a>
       <a href="time-travel.html">Time Travel</a>
+      <a href="order-statistics.html">Order Stats</a>
       <a href="typed-projects.html">Typed Projects</a>
       <a class="nav-cta" href="playground.html">Playground</a>
     </nav>
@@ -26,11 +27,13 @@
 </header>
 
 <main class="wrap">
-  <h1>datalog-dafsa</h1>
+
+  <h1>A DAFSA-backed Datalog engine that <span class="fx">never forgets itself</span>.</h1>
   <p>
-    A DAFSA-backed Datalog engine written in C. You load facts into an on-disk
-    minimal-acyclic-DAFSA fact store, compile Datalog rules to a small VM,
-    materialize derived relations, and serve reads from an mmap&rsquo;d snapshot.
+    Load facts into an on-disk <strong>minimal-acyclic-DAFSA</strong> store, compile
+    Datalog rules to a small VM, materialize derived relations, and serve reads from an
+    mmap&rsquo;d snapshot. Every publish is an immutable, versioned point-in-time — so
+    <strong>time travel is a first-class feature</strong>, not an afterthought.
   </p>
 
   <div class="cta-banner">
@@ -41,49 +44,68 @@
     <a class="cta-btn" href="playground.html">Open the Playground &rarr;</a>
   </div>
 
-  <h2 id="headline">Two things that stand out</h2>
+  <h2>The headline: time travel</h2>
+  <div class="hint" style="font-family:var(--mono);font-size:13px;color:var(--accent2);">// dl_publish_snapshot · dl_snapshot_versions · dl_query_version</div>
+  <p>
+    Every <code>dl_publish_snapshot</code> writes an <strong>immutable, versioned
+    snapshot</strong> and keeps the full history by default. The database is
+    <strong>content-addressed by construction</strong> — the timeline is its complete
+    history. Read it as it was at any version with an <em>as-of</em> query, diff or
+    replay the evolution of a derived relation, and roll back — without ever losing the
+    record of what happened.
+  </p>
+  <div class="timeline"><span class="k">$</span> ./dl -d db versions
+<span class="c">v042</span> <span class="dim">2026-08-18 09:12 · published · ok</span>
+<span class="c">v041</span> <span class="dim">2026-08-17 22:04 · published · ok</span>
+<span class="c">v040</span> <span class="dim">2026-08-17 18:55 · rolled-forward to v042</span>
+...
+<span class="k">$</span> ./dl -d db search 'gpu rental' --top 10 --version 39   <span class="dim"># as-of a past snapshot</span>
+<span class="k">$</span> ./dl -d db versions                                  <span class="dim"># the full history</span></div>
+  <ul class="checks">
+    <li><b>Immutable snapshots</b> — later writes never disturb a published version.</li>
+    <li><b>As-of queries</b> — <code>dl_query_version</code>, <code>dl_search_version</code>,
+        and <code>dl_vector_search_version</code> read the exact past state.</li>
+    <li><b>Opt-in retention</b> — keep N snapshots, prune the rest, done.</li>
+  </ul>
+  <p><a href="time-travel.html">The time-travel &amp; as-of guide &rarr;</a></p>
+
+  <h2>What else stands out</h2>
   <div class="headline">
     <div class="headline-card">
-      <h3>A database that <em>shares its suffixes</em> — so it&rsquo;s genuinely
-          compact</h3>
+      <span class="n">01</span>
+      <h3>A database that <em>shares its suffixes</em> — genuinely compact</h3>
       <p>
-        Every relation is stored as a <strong>minimized acyclic DAFSA</strong>:
-        common suffix paths between facts are <em>merged into a single shared
-        state</em>, not duplicated. A store that keeps thousands of
-        <code>edge(1,&hellip;)</code> prefixes over the same tail columns is
-        dramatically smaller than a row store, because the shared tails exist
-        once. Reads are <strong>mmap&rsquo;d zero-copy</strong> — the DAFSA is the
-        index, so there is no separate index file and no deserialization on the
-        read path. Exact lookup and prefix enumeration are the two most common
-        join access patterns, and both are native DAFSA primitives.
+        Every relation is stored as a <strong>minimized acyclic DAFSA</strong>: common
+        suffix paths between facts merge into a single shared state, not duplicated. Reads
+        are <strong>mmap&rsquo;d zero-copy</strong> — the DAFSA <em>is</em> the index, so
+        there&rsquo;s no separate index file and no deserialization on the read path. Exact
+        lookup and prefix enumeration are the two most common join access patterns, and both
+        are native DAFSA primitives.
       </p>
       <p><a href="architecture.html#compact">Why the DAFSA makes the store small &rarr;</a></p>
     </div>
     <div class="headline-card">
-      <h3>Every publish is a point-in-time — time-travel as a first-class feature</h3>
+      <span class="n">02</span>
+      <h3>Typed projects — schema, validated data, typechecked rules</h3>
       <p>
-        Every <code>dl_publish_snapshot</code> writes an <strong>immutable,
-        versioned snapshot</strong> and keeps the full history by default. That
-        makes <em>as-of</em> queries a native capability: read the database as it
-        was at version <code>n</code> — audit, replay, or diff the evolution of a
-        derived relation — without touching live routing. Old snapshots are
-        <strong>immutable</strong>; later writes never disturb them. Opt-in
-        retention bounds disk growth.
-      </p>
-      <p><a href="time-travel.html">Time-travel &amp; as-of queries &rarr;</a></p>
-    </div>
-    <div class="headline-card">
-      <h3>Typed projects — schema, validated data, and typechecked rules</h3>
-      <p>
-        The <code>dlp</code> tool defines the database schema in Dhall
-        (<code>schema.dhall</code>), validates and coerces CSV/JSON data against
-        it, and <strong>typechecks every rule</strong> before compilation. A
-        variable can&rsquo;t silently be <code>Natural</code> in one atom and
-        <code>Text</code> in another — mixed-type rules are rejected with
-        <code>file:line:col</code> diagnostics. Closed-world and typed, so type
-        errors surface early instead of mis-evaluating.
+        The <code>dlp</code> tool defines the schema in Dhall (<code>schema.dhall</code>),
+        validates and coerces CSV/JSON data against it, and <strong>typechecks every rule</strong>
+        before compilation. Mixed-type rules are rejected with <code>file:line:col</code>
+        diagnostics — type errors surface early instead of mis-evaluating.
       </p>
       <p><a href="typed-projects.html">The typed project workflow &rarr;</a></p>
+    </div>
+    <div class="headline-card">
+      <span class="n">03</span>
+      <h3>Search — full-text <em>and</em> semantic, both versioned</h3>
+      <p>
+        <code>dl search</code> is AND-intersect full-text over a postings index. The vector
+        tier adds <strong>semantic</strong> retrieval (<code>dl vsearch</code> /
+        <code>dl vhybrid</code>): bge-small embeddings via the <code>dl-embed</code> tool,
+        MIH-over-ITQ candidate retrieval, and in-store int8 re-rank — all stored in-relation
+        and snapshot-versioned like everything else.
+      </p>
+      <p><a href="cli.html#vsearch">The vector-search CLI commands &rarr;</a></p>
     </div>
   </div>
 
@@ -93,52 +115,41 @@ make test            # run the full test suite
 make bench           # run the demonstration benchmark</code></pre>
 
   <p>
-    The <code>dl</code> CLI loads facts and answers queries. The database
-    directory defaults to <code>dl-test-db</code> and can be overridden with
-    <code>-d &lt;dir&gt;</code>.
+    The <code>dl</code> CLI loads facts and answers queries. The database directory
+    defaults to <code>dl-test-db</code> and can be overridden with <code>-d &lt;dir&gt;</code>.
   </p>
 
-  <pre class="code"><code>$ cat edges.csv
-1,2
-1,3
-2,3
-2,4
-3,5
+  <pre class="code"><span class="c"># Load a headerless CSV (arity 1-8) into a relation.</span>
+<span class="k">$</span> ./dl -d /tmp/db load edges.csv --rel edge
+<span class="g">Loaded 5 facts into edge</span>
 
-# Load a headerless CSV (arity 1-8) into a relation.
-$ ./dl -d /tmp/db load edges.csv --rel edge
-Loaded 5 facts into edge
+<span class="c"># Exact lookup + prefix enumeration.</span>
+<span class="k">$</span> ./dl -d /tmp/db lookup edge 1 2
+<span class="g">found</span>
+<span class="k">$</span> ./dl -d /tmp/db prefix edge 2
+<span class="g">2 3
+2 4</span>
 
-# Exact lookup.
-$ ./dl -d /tmp/db lookup edge 1 2
-found
-
-# Prefix enumeration (bind leading columns).
-$ ./dl -d /tmp/db prefix edge 2
-2 3
-2 4
-
-# Run a Datalog rule (compile + publish + query in one step):
-# transitive closure of edge.
-$ ./dl -d /tmp/db query 'tc(X,Y) :- edge(X,Y). tc(X,Y) :- edge(X,Z), tc(Z,Y).' tc
-1 2
+<span class="c"># Transitive closure via a Datalog rule.</span>
+<span class="k">$</span> ./dl -d /tmp/db query 'tc(X,Y) :- edge(X,Y). tc(X,Y) :- edge(X,Z), tc(Z,Y).' tc
+<span class="g">1 2
 1 3
 1 4
 1 5
 2 3
 2 4
 2 5
-3 5
+3 5</span>
 
-# Publish a snapshot for read-only serving.
-$ ./dl -d /tmp/db publish
-Snapshot published.</code></pre>
+<span class="c"># Publish a snapshot — an immutable point-in-time.</span>
+<span class="k">$</span> ./dl -d /tmp/db publish
+<span class="g">Snapshot published.</span></code></pre>
 
   <p>
-    CSV values that parse as integers are stored raw as u32; anything else is
-    interned to a symbol id. Other commands include <code>bound</code>,
-    <code>pattern</code> (regex), and <code>qmagic</code> (magic-sets).
-    See <a href="cli.html">the CLI reference</a>.
+    CSV values that parse as integers are stored raw as u32; anything else is interned to a
+    symbol id. Other commands include <code>bound</code>, <code>pattern</code> (regex),
+    <code>qmagic</code> (magic-sets), <code>search</code>, <code>vsearch</code>,
+    <code>vhybrid</code>, and <code>versions</code>. See <a href="cli.html">the CLI reference</a>.
   </p>
 
   <h2>Feature summary</h2>
@@ -148,39 +159,39 @@ Snapshot published.</code></pre>
     </thead>
     <tbody>
       <tr>
-        <td>DAFSA storage</td>
-        <td>Fixed-width u32BE key encoding; one DAFSA + WAL per relation; symbol interner; WAL + compaction</td>
+        <td class="name">Time travel</td>
+        <td>Immutable versioned snapshots, as-of queries (<code>dl_query_version</code>, <code>dl_search_version</code>, <code>dl_vector_search_version</code>), opt-in retention</td>
+        <td><a href="time-travel.html">Time Travel</a></td>
+      </tr>
+      <tr>
+        <td class="name">DAFSA storage</td>
+        <td>Fixed-width u32BE key encoding; one DAFSA + WAL per relation; symbol interner; WAL + compaction; mmap zero-copy reads</td>
         <td><a href="architecture.html">Architecture</a></td>
       </tr>
       <tr>
-        <td>Datalog syntax</td>
+        <td class="name">Datalog syntax</td>
         <td>Facts, rules, recursion, negation, aggregates (count/sum/min/max), equality, comparisons, arithmetic, strings, lists, range, regex</td>
         <td><a href="language.html">Language Reference</a></td>
       </tr>
       <tr>
-        <td>Evaluation strategies</td>
+        <td class="name">Evaluation</td>
         <td>Semi-naive fixpoint, stratified negation, bushy joins, permutation-index selection + hash-join, magic-sets / QSQ top-down, incremental view maintenance</td>
         <td><a href="architecture.html#strategies">Architecture &sect; strategies</a></td>
       </tr>
       <tr>
-        <td>Order statistics</td>
+        <td class="name">Order statistics</td>
         <td>rank / select / range_count / count, bound + perm variants, pull-iterator + merge-join, lazy range generator</td>
         <td><a href="order-statistics.html">Order Statistics</a></td>
       </tr>
       <tr>
-        <td>Time-travel</td>
-        <td>Versioned snapshots, as-of queries, opt-in retention</td>
-        <td><a href="time-travel.html">Time Travel</a></td>
-      </tr>
-      <tr>
-        <td>Durability</td>
+        <td class="name">Durability</td>
         <td>Per-relation WAL + fsync, single-writer lock, atomic snapshot publish, mmap read path</td>
         <td><a href="architecture.html#durability">Architecture &sect; durability</a></td>
       </tr>
       <tr>
-        <td>Search</td>
-        <td>Full-text <code>dl search</code> (version-aware) + semantic <code>dl vsearch</code>/<code>dl vhybrid</code>: MIH-over-ITQ vector retrieval with in-store int8 re-rank, all snapshot-versioned</td>
-        <td><a href="datalog-dafsa-vector-search.html">Vector Search</a></td>
+        <td class="name">Search</td>
+        <td>Full-text <code>dl search</code> + semantic <code>dl vsearch</code>/<code>dl vhybrid</code> (bge-small via <code>dl-embed</code>, MIH-over-ITQ, in-store int8 re-rank), all versioned</td>
+        <td><a href="cli.html#vsearch">Vector Search</a></td>
       </tr>
     </tbody>
   </table>
@@ -188,19 +199,19 @@ Snapshot published.</code></pre>
   <h2>Reference pages</h2>
   <ul>
     <li><a href="language.html">Language Reference</a> — the complete rule language.</li>
-    <li><a href="cli.html">CLI Reference</a> — the 8 <code>dl</code> subcommands.</li>
+    <li><a href="cli.html">CLI Reference</a> — the <code>dl</code> subcommands.</li>
     <li><a href="api.html">C API Reference</a> — the full <code>dl.h</code> surface.</li>
     <li><a href="architecture.html">Architecture</a> — storage thesis, lifecycle, join &amp; evaluation strategies.</li>
-    <li><a href="order-statistics.html">Order Statistics</a> — rank / select / range / count and the sorted iterator.</li>
     <li><a href="time-travel.html">Time Travel</a> — versioned snapshots and as-of queries.</li>
+    <li><a href="order-statistics.html">Order Statistics</a> — rank / select / range / count and the sorted iterator.</li>
     <li><a href="typed-projects.html">Typed Projects</a> — schema.dhall + validated data + typechecked rules.</li>
   </ul>
 </main>
 
 <footer class="site-foot">
   <div class="wrap">
-    Datalog engine source lives in the <code>datalog-dafsa</code> repository; the
-    public C API is <code>src/dl.h</code>. No JavaScript is used on this site.
+    Datalog engine source lives in <a href="https://github.com/fixpoint-linux/datalog-dafsa">github.com/fixpoint-linux/datalog-dafsa</a>;
+    part of the <a href="https://github.com/fixpoint-linux">fixpoint-linux</a> org. No JavaScript is used on this site.
   </div>
 </footer>
 
