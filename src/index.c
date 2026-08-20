@@ -215,6 +215,26 @@ static int collect_term_obs_ids(dl_db *db, uint32_t term_sym, int_set *set)
     return 0;
 }
 
+/* Collect all obs_ids for a single term from a specific snapshot version.
+ * Uses dl_query_bound_version to query the __postings__ relation as-of `version`. */
+static int collect_term_obs_ids_version(dl_db *db, uint32_t version, uint32_t term_sym, int_set *set)
+{
+    int_set_free(set);
+    int_set_init(set);
+
+    collect_ctx ctx = {set, 0};
+
+    long n = dl_query_bound_version(db, version, POSTINGS_REL_NAME,
+                                     &term_sym, 1,
+                                     collect_obs_id_cb, &ctx);
+    /* dl_query_bound_version returns -1 if the relation is ABSENT from that
+     * version OR version==0/nonexistent.  This is the error contract we must
+     * propagate (not treat as 0 results). */
+    if (n < 0 || ctx.error) return -1;
+
+    return 0;
+}
+
 /* Intersect multiple obs_id sets using smallest-first strategy.
  * Returns a new set containing the intersection, or NULL on OOM. */
 static int_set *int_set_intersect(int_set **sets, int n_sets)
@@ -427,6 +447,145 @@ int dl_search_top(dl_db *db, const uint32_t *terms, int n_terms,
     top_ctx ctx = {obs_ids_out, scores_out, limit, 0};
 
     long n = dl_search(db, terms, n_terms, top_search_cb, &ctx);
+    if (n < 0) return -1;
+    return ctx.count;
+}
+
+/* Version-aware search: same AND-intersect + rank logic as dl_search,
+ * but collects each term's obs_ids as-of a published snapshot `version` via
+ * dl_query_bound_version on the "__postings__" relation.
+ * Since the sym_id space is append-only/never-reused, pre-interned term sym_ids
+ * are valid across versions — no re-interning needed.
+ *
+ * Returns the number of results emitted, or -1 on error (NULL db, n_terms == 0,
+ * version == 0, nonexistent version, or __postings__ relation absent from that
+ * version). */
+long dl_search_version(dl_db *db, uint32_t version, const uint32_t *terms, int n_terms,
+                       dl_search_cb cb, void *user)
+{
+    if (!db || version == 0 || !terms || n_terms <= 0 || !cb)
+        return -1;
+
+    /* Collect obs_id sets for each term */
+    int_set **sets = calloc((size_t)n_terms, sizeof(*sets));
+    if (!sets) return -1;
+
+    int i;
+    int collect_err = 0;
+    int all_empty = 1;
+    for (i = 0; i < n_terms; i++) {
+        sets[i] = malloc(sizeof(**sets));
+        if (!sets[i]) {
+            for (int j = 0; j < i; j++) {
+                int_set_free(sets[j]);
+                free(sets[j]);
+            }
+            free(sets);
+            return -1;
+        }
+        int_set_init(sets[i]);
+
+        /* collect_term_obs_ids_version returns 0 for an ABSENT term (empty set, valid)
+         * and -1 for a genuine error (__postings__ relation absent from that version
+         * OR version==0/nonexistent).  A genuine error must NOT be treated as "0 results". */
+        if (collect_term_obs_ids_version(db, version, terms[i], sets[i]) < 0) {
+            collect_err = 1;
+            break;
+        }
+        if (sets[i]->count > 0)
+            all_empty = 0;
+    }
+
+    if (collect_err) {
+        for (int j = 0; j <= i; j++) {
+            int_set_free(sets[j]);
+            free(sets[j]);
+        }
+        free(sets);
+        return -1;
+    }
+
+    /* If any term has no postings, the AND is empty */
+    if (all_empty) {
+        for (i = 0; i < n_terms; i++) {
+            int_set_free(sets[i]);
+            free(sets[i]);
+        }
+        free(sets);
+        return 0;
+    }
+
+    /* Intersect all sets */
+    int_set *intersection = int_set_intersect(sets, n_terms);
+
+    /* Free the individual sets */
+    for (i = 0; i < n_terms; i++) {
+        int_set_free(sets[i]);
+        free(sets[i]);
+    }
+    free(sets);
+
+    if (!intersection)
+        return -1;
+
+    /* Score each result: for AND search, all results match all terms.
+     * Since the relation store is SET-semantic (DAFSA collapses duplicates),
+     * we cannot compute tf from duplicate keys.  We rank by the number of
+     * distinct matched terms per obs_id.  For AND search, this is always n_terms.
+     */
+
+    /* Build scored results */
+    if (intersection->count == 0) {
+        int_set_free(intersection);
+        free(intersection);
+        return 0;  /* disjoint terms -> no matches, not an error */
+    }
+
+    scored_result *results = malloc(intersection->count * sizeof(*results));
+    if (!results) {
+        int_set_free(intersection);
+        free(intersection);
+        return -1;
+    }
+
+    size_t k;
+    for (k = 0; k < intersection->count; k++) {
+        results[k].obs_id = intersection->data[k];
+        results[k].score = n_terms;  /* All matched all terms */
+    }
+
+    /* Sort by score descending */
+    qsort(results, intersection->count, sizeof(*results), scored_result_cmp);
+
+    /* Emit via callback.  Count the emission BEFORE invoking the cb so a
+     * callback that stops early still counts the result it consumed (mirrors
+     * dl_prefix's count-before-callback semantics). */
+    long emitted = 0;
+    for (k = 0; k < intersection->count; k++) {
+        emitted++;
+        if (cb(results[k].obs_id, results[k].score, user) != 0)
+            break;
+    }
+
+    free(results);
+    int_set_free(intersection);
+    free(intersection);
+
+    return emitted;
+}
+
+/* Version-aware convenience: dl_search_version with a --top N limit.
+ * Same contract as dl_search_top but for a specific snapshot version.
+ * Returns the number of results (<= limit), or -1 on error. */
+int dl_search_top_version(dl_db *db, uint32_t version, const uint32_t *terms, int n_terms,
+                         uint32_t *obs_ids_out, int *scores_out, int limit)
+{
+    if (!db || version == 0 || !terms || n_terms <= 0 || !obs_ids_out || !scores_out || limit <= 0)
+        return -1;
+
+    top_ctx ctx = {obs_ids_out, scores_out, limit, 0};
+
+    long n = dl_search_version(db, version, terms, n_terms, top_search_cb, &ctx);
     if (n < 0) return -1;
     return ctx.count;
 }

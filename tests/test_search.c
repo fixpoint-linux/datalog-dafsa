@@ -463,6 +463,173 @@ static void t_index_observations_no_relation(void)
     dl_close(db);
 }
 
+/* ─── Version-aware search tests ──────────────────────────────────────────── */
+
+static void t_search_version_basic(void)
+{
+    char dir[512];
+    dl_db *db = fresh_db(dir, sizeof(dir), "t_search_version_basic");
+
+    TEST("dl_search_version basic time-travel");
+    
+    aux_index_ensure_postings(db);
+    
+    /* Build v1: doc1 + doc2 */
+    uint32_t term1 = dl_intern_str(db, "hello");
+    uint32_t term2 = dl_intern_str(db, "world");
+    uint32_t obs1 = dl_intern_str(db, "doc1");
+    uint32_t obs2 = dl_intern_str(db, "doc2");
+    
+    aux_index_add_posting(db, term1, obs1);
+    aux_index_add_posting(db, term2, obs1);
+    aux_index_add_posting(db, term1, obs2);
+    
+    /* Publish v1 */
+    if (dl_publish_snapshot(db) != 0) {
+        FAIL("failed to publish v1");
+        dl_close(db);
+        return;
+    }
+    
+    /* Get version list - should have at least 1 version */
+    uint32_t versions[10];
+    long n_versions = dl_snapshot_versions(db, versions, 10);
+    if (n_versions < 1) { FAIL("expected at least 1 version"); dl_close(db); return; }
+    uint32_t v1 = versions[0];
+    
+    /* Search as-of v1 for "hello world" - should return obs1 (has both terms) */
+    uint32_t terms[2] = {term1, term2};
+    uint32_t results[10];
+    int scores[10];
+    int n = dl_search_top_version(db, v1, terms, 2, results, scores, 10);
+    if (n != 1) { FAIL("expected 1 result as-of v1"); dl_close(db); return; }
+    if (results[0] != obs1) { FAIL("expected obs1 as-of v1"); dl_close(db); return; }
+    
+    /* Add doc3 with both terms */
+    uint32_t obs3 = dl_intern_str(db, "doc3");
+    aux_index_add_posting(db, term1, obs3);
+    aux_index_add_posting(db, term2, obs3);
+    
+    /* Publish v2 */
+    if (dl_publish_snapshot(db) != 0) {
+        FAIL("failed to publish v2");
+        dl_close(db);
+        return;
+    }
+    
+    /* Get version list again */
+    n_versions = dl_snapshot_versions(db, versions, 10);
+    if (n_versions < 2) { FAIL("expected at least 2 versions"); dl_close(db); return; }
+    uint32_t v2 = versions[1];
+    
+    /* Search as-of v1 again - should still return only obs1 */
+    n = dl_search_top_version(db, v1, terms, 2, results, scores, 10);
+    if (n != 1) { FAIL("expected 1 result as-of v1 (after v2)"); dl_close(db); return; }
+    if (results[0] != obs1) { FAIL("expected obs1 as-of v1 (after v2)"); dl_close(db); return; }
+    
+    /* Search as-of v2 - should return obs1 and obs3 */
+    n = dl_search_top_version(db, v2, terms, 2, results, scores, 10);
+    if (n != 2) { FAIL("expected 2 results as-of v2"); dl_close(db); return; }
+    
+    PASS();
+    dl_close(db);
+}
+
+static void t_search_version_top_limit(void)
+{
+    char dir[512];
+    dl_db *db = fresh_db(dir, sizeof(dir), "t_search_version_top");
+
+    TEST("dl_search_top_version with limit");
+    
+    aux_index_ensure_postings(db);
+    
+    /* Build v1 with multiple docs */
+    uint32_t term = dl_intern_str(db, "test");
+    int i;
+    for (i = 0; i < 5; i++) {
+        char name[16];
+        snprintf(name, sizeof(name), "obs%d", i);
+        uint32_t obs = dl_intern_str(db, name);
+        aux_index_add_posting(db, term, obs);
+    }
+    
+    if (dl_publish_snapshot(db) != 0) {
+        FAIL("failed to publish");
+        dl_close(db);
+        return;
+    }
+    
+    uint32_t versions[10];
+    long n_versions = dl_snapshot_versions(db, versions, 10);
+    if (n_versions < 1) { FAIL("expected at least 1 version"); dl_close(db); return; }
+    
+    /* Search with limit 3 */
+    uint32_t results[10];
+    int scores[10];
+    int n = dl_search_top_version(db, versions[0], &term, 1, results, scores, 3);
+    if (n != 3) { FAIL("expected 3 results (limited)"); dl_close(db); return; }
+    
+    PASS();
+    dl_close(db);
+}
+
+static void t_search_version_no_postings(void)
+{
+    char dir[512];
+    dl_db *db = fresh_db(dir, sizeof(dir), "t_search_version_no_postings");
+
+    TEST("dl_search_version when __postings__ doesn't exist in that version");
+    
+    /* Publish a snapshot WITHOUT any postings */
+    if (dl_publish_snapshot(db) != 0) {
+        FAIL("failed to publish");
+        dl_close(db);
+        return;
+    }
+    
+    uint32_t versions[10];
+    long n_versions = dl_snapshot_versions(db, versions, 10);
+    if (n_versions < 1) { FAIL("expected at least 1 version"); dl_close(db); return; }
+    
+    /* Now add postings to live db */
+    aux_index_ensure_postings(db);
+    uint32_t term = dl_intern_str(db, "test");
+    uint32_t obs = dl_intern_str(db, "doc1");
+    aux_index_add_posting(db, term, obs);
+    
+    /* Search as-of v1 (which has no __postings__) - should return -1 */
+    uint32_t results[10];
+    int scores[10];
+    int n = dl_search_top_version(db, versions[0], &term, 1, results, scores, 10);
+    if (n != -1) { FAIL("expected -1 when __postings__ absent from version"); dl_close(db); return; }
+    
+    PASS();
+    dl_close(db);
+}
+
+static void t_search_version_nonexistent(void)
+{
+    char dir[512];
+    dl_db *db = fresh_db(dir, sizeof(dir), "t_search_version_nonexistent");
+
+    TEST("dl_search_version with nonexistent version");
+    
+    aux_index_ensure_postings(db);
+    uint32_t term = dl_intern_str(db, "test");
+    uint32_t obs = dl_intern_str(db, "doc1");
+    aux_index_add_posting(db, term, obs);
+    
+    /* Search with a version that doesn't exist - should return -1 */
+    uint32_t results[10];
+    int scores[10];
+    int n = dl_search_top_version(db, 999999, &term, 1, results, scores, 10);
+    if (n != -1) { FAIL("expected -1 for nonexistent version"); dl_close(db); return; }
+    
+    PASS();
+    dl_close(db);
+}
+
 int main(void)
 {
     printf("=== test_search ===\n");
@@ -491,6 +658,12 @@ int main(void)
     /* dl_index_observations tests */
     t_index_observations();
     t_index_observations_no_relation();
+    
+    /* Version-aware search tests */
+    t_search_version_basic();
+    t_search_version_top_limit();
+    t_search_version_no_postings();
+    t_search_version_nonexistent();
     
     printf("\n");
     if (tests_failed == 0)

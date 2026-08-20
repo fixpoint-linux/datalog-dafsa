@@ -3,6 +3,7 @@
 All notable changes to this project are documented in this file.
 
 ## [Unreleased]
+- **Full-text search time-travel**: `dl_search_version` and `dl_search_top_version` query the postings index as-of a published snapshot version, enabling "search as it was at time T".  Uses `dl_query_bound_version` under the hood; sym_ids are stable across versions (append-only interner).  CLI: `dl search '<terms>' --version N` and `dl versions` to list all published versions.  Error contract: returns -1 for version==0, nonexistent version, or absent `__postings__` relation (not 0 results).  Tests in test_search.c.
 
 ### Added
 - **v2 — time-travel / as-of snapshot queries**: query any PAST published

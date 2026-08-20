@@ -172,9 +172,10 @@ static void usage(const char *prog)
         "  %s [-d <dir>] traverse <start> [depth] [--max-nodes N]\n"
         "  %s [-d <dir>] obs <node> [--max-obs N]\n"
         "  %s [-d <dir>] index\n"
-        "  %s [-d <dir>] search '<terms>' [--top N]\n"
+        "  %s [-d <dir>] search '<terms>' [--top N] [--version N] (--version 0 = current)\n"
+        "  %s [-d <dir>] versions\n"
         "Values: bare integer -> raw u32; anything else -> interned string\n",
-        prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
+        prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
     exit(1);
 }
 
@@ -726,25 +727,35 @@ int main(int argc, char **argv)
     } else if (strcmp(cmd, "search") == 0) {
         const char *terms_str;
         unsigned long top_n = 10;
+        unsigned long version = 0;  /* 0 means live (current) */
 
         if (argp >= argc) usage(argv[0]);
         terms_str = argv[argp++];
 
-        /* Optional --top N */
-        if (argp < argc && strcmp(argv[argp], "--top") == 0) {
-            argp++;
-            if (argp >= argc || !parse_u32_strict(argv[argp], &top_n) || top_n < 1 ||
-                top_n > INT_MAX) {
-                fprintf(stderr, "dl: invalid --top value (must be 1..2147483647)\n");
+        /* Parse optional flags in any order */
+        while (argp < argc) {
+            if (strcmp(argv[argp], "--top") == 0) {
+                argp++;
+                if (argp >= argc || !parse_u32_strict(argv[argp], &top_n) || top_n < 1 ||
+                    top_n > INT_MAX) {
+                    fprintf(stderr, "dl: invalid --top value (must be 1..2147483647)\n");
+                    dl_close(db);
+                    return 1;
+                }
+                argp++;
+            } else if (strcmp(argv[argp], "--version") == 0) {
+                argp++;
+                if (argp >= argc || !parse_u32_strict(argv[argp], &version)) {
+                    fprintf(stderr, "dl: invalid --version value\n");
+                    dl_close(db);
+                    return 1;
+                }
+                argp++;
+            } else {
+                fprintf(stderr, "dl: unexpected argument '%s'\n", argv[argp]);
                 dl_close(db);
                 return 1;
             }
-            argp++;
-        }
-        if (argp < argc) {
-            fprintf(stderr, "dl: unexpected argument '%s'\n", argv[argp]);
-            dl_close(db);
-            return 1;
         }
 
         /* Tokenize the search terms */
@@ -805,8 +816,14 @@ int main(int argc, char **argv)
             return 1;
         }
 
-        int n_results = dl_search_top(db, term_syms, (int)n_tokens,
+        int n_results;
+        if (version == 0) {
+            n_results = dl_search_top(db, term_syms, (int)n_tokens,
                                        obs_ids, scores, (int)top_n);
+        } else {
+            n_results = dl_search_top_version(db, (uint32_t)version, term_syms, (int)n_tokens,
+                                               obs_ids, scores, (int)top_n);
+        }
         free(term_syms);
 
         if (n_results < 0) {
@@ -826,6 +843,29 @@ int main(int argc, char **argv)
 
         free(obs_ids);
         free(scores);
+
+    } else if (strcmp(cmd, "versions") == 0) {
+        if (argp < argc) {
+            fprintf(stderr, "dl: unexpected argument '%s'\n", argv[argp]);
+            dl_close(db);
+            return 1;
+        }
+
+        {
+            uint32_t versions[256];
+            long n = dl_snapshot_versions(db, versions, 256);
+            if (n < 0) {
+                fprintf(stderr, "dl: versions query failed\n");
+                dl_close(db);
+                return 1;
+            }
+            size_t i;
+            for (i = 0; i < (size_t)n; i++) {
+                printf("%u\n", versions[i]);
+            }
+            if (n == 0)
+                printf("(no versions published)\n");
+        }
 
     } else {
         usage(argv[0]);

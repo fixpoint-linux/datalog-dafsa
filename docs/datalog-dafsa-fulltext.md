@@ -56,10 +56,36 @@ dl search "heap nursery" --top 10
 | File | Change |
 |---|---|
 | `src/index.c` (new) | tokenizer; postings build; `dl_search` (per-term enum → intersect → rank); incremental add/delete |
+| `src/index.h` | `dl_search`, `dl_search_top`, `dl_search_version`, `dl_search_top_version` |
 | `src/dl.h` / `src/dl.c` | `dl_search`, `dl_index_observation`, postings relation wiring |
-| `src/dl_cli.c` | `dl search <terms>` |
+| `src/dl_cli.c` | `dl search <terms>` [--version N], `dl versions` |
 | `docs/` | this doc |
 | `tests/` | `test_search.c`: single/multi-term AND, no-match, ranking order, incremental add/delete, snapshot parity |
+
+## Time-travel / Version-aware search
+
+Full-text search supports **time-travel** via snapshot versions.  The same AND-intersect + rank logic runs against a published snapshot's `__postings__` relation instead of the live index.
+
+```c
+/* Search as-of a specific snapshot version */
+long dl_search_version(dl_db *db, uint32_t version, const uint32_t *terms, int n_terms,
+                       dl_search_cb cb, void *user);
+
+/* Top-N version-aware search */
+int dl_search_top_version(dl_db *db, uint32_t version, const uint32_t *terms, int n_terms,
+                         uint32_t *obs_ids_out, int *scores_out, int limit);
+```
+
+Since the sym_id space is append-only and never reused, term sym_ids interned in the live database are valid across all snapshot versions — no re-interning is needed.
+
+**Error contract:** Returns -1 if `version == 0`, the version doesn't exist, or the `__postings__` relation is absent from that snapshot version.  An absent term (empty postings set) returns 0 results, not an error.
+
+CLI:
+```bash
+dl versions                    # List all published snapshot versions
+dl search 'hello world' --version 1  # Search as-of snapshot version 1
+dl search 'hello' --version 2 --top 5  # Top-5 results as-of version 2
+```
 
 ## Honest ceiling
 

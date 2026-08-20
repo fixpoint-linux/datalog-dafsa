@@ -73,6 +73,26 @@ long dl_search(dl_db *db, const uint32_t *terms, int n_terms,
 int dl_search_top(dl_db *db, const uint32_t *terms, int n_terms,
                   uint32_t *obs_ids_out, int *scores_out, int limit);
 
+/* Version-aware search: same AND-intersect + rank logic as dl_search,
+ * but collects each term's obs_ids as-of a published snapshot `version` via
+ * dl_query_bound_version on the "__postings__" relation.
+ * Since the sym_id space is append-only/never-reused, pre-interned term sym_ids
+ * are valid across versions — no re-interning needed.
+ *
+ * Returns the number of results emitted, or -1 on error (NULL db, n_terms == 0,
+ * version == 0, nonexistent version, or __postings__ relation absent from that
+ * version).  Note: -1 fires only when __postings__ was never DECLARED at the
+ * time that version was published; a declared-but-empty __postings__ in the
+ * version yields 0 results, not an error. */
+long dl_search_version(dl_db *db, uint32_t version, const uint32_t *terms, int n_terms,
+                       dl_search_cb cb, void *user);
+
+/* Version-aware convenience: dl_search_version with a --top N limit.
+ * Same contract as dl_search_top but for a specific snapshot version.
+ * Returns the number of results (<= limit), or -1 on error. */
+int dl_search_top_version(dl_db *db, uint32_t version, const uint32_t *terms, int n_terms,
+                         uint32_t *obs_ids_out, int *scores_out, int limit);
+
 /* Index all observations: walks the observation(entity, content) relation,
  * tokenizes each content string, interns each term, and adds postings.
  * Returns the number of postings added, or -1 on error.
