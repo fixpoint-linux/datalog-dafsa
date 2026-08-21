@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>datalog-dafsa — a DAFSA-backed Datalog engine that time-travels</title>
+<meta name="description" content="datalog-dafsa: a DAFSA-backed Datalog engine with time-travel queries, vector search, and order statistics. Built with Elm and the mfe-framework. Part of fixpoint-linux.">
+<script type="importmap">
+{
+  "imports": {
+    "@mfe/core": "/vendor/@mfe/core/index.js",
+    "@mfe/framework": "/vendor/@mfe/framework/index.js",
+    "dafsa-landing": "/datalog-dafsa/shell/mfe/dafsa-page.js",
+    "dafsa-language": "/datalog-dafsa/shell/mfe/dafsa-page.js",
+    "dafsa-cli": "/datalog-dafsa/shell/mfe/dafsa-page.js",
+    "dafsa-api": "/datalog-dafsa/shell/mfe/dafsa-page.js",
+    "dafsa-architecture": "/datalog-dafsa/shell/mfe/dafsa-page.js",
+    "dafsa-time-travel": "/datalog-dafsa/shell/mfe/dafsa-page.js",
+    "dafsa-vector-search": "/datalog-dafsa/shell/mfe/dafsa-page.js",
+    "dafsa-order-statistics": "/datalog-dafsa/shell/mfe/dafsa-page.js",
+    "dafsa-typed-projects": "/datalog-dafsa/shell/mfe/dafsa-page.js",
+    "dafsa-playground": "/datalog-dafsa/shell/mfe/dafsa-playground.js",
+    "fixpoint-landing": "/shell/mfe/fixpoint-landing.js"
+  }
+}
+</script>
+</head>
+<body>
+<div id="app" ssr>
+  <div class="fixpoint-root">
+    <div data-mfe="dafsa-landing"><!-- ssg.mjs injects --></div>
+  </div>
+</div>
+<script type="module" src="/datalog-dafsa/shell/shell.js"></script>
+</body>
+</html>

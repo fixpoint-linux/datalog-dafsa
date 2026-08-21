@@ -68,3 +68,9 @@ dl-test-*/
 /tests/test_embed_math
 /tests/test_bert_load
 # NOTE: tests/data/bge_golden.txt is a SOURCE artifact — commit it, never ignore it.
+
+# Elm + MFE build artifacts
+node_modules/
+elm-stuff/
+dist/
+/vendor/@mfe/

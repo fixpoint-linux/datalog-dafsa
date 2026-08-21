@@ -1,0 +1,12 @@
+<!--
+  shell/templates/dafsa-landing.html — the route template for '/datalog-dafsa'.
+
+  The [data-mfe="dafsa-landing"] element is the slot the shell's reconcile
+  mounts the Elm dafsa MFE into, and — on the statically pre-rendered page —
+  the exact element that scripts/ssg.mjs fills with the Elm view at build time.
+  The empty slot here mirrors the one embedded in shell/index.html so a
+  client-side re-render (non-SSR path) produces the same structure.
+-->
+<div class="fixpoint-root">
+  <div data-mfe="dafsa-landing"></div>
+</div>

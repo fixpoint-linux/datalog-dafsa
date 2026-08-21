@@ -2,6 +2,15 @@
 	path = vendor/ggml
 	url = https://github.com/ggml-org/ggml
 	branch = v0.20.2
+[submodule "vendor/design"]
+	path = vendor/design
+	url = https://github.com/fixpoint-linux/design.git
+[submodule "vendor/mfe-framework"]
+	path = vendor/mfe-framework
+	url = https://github.com/fixpoint-linux/mfe-framework.git
+[submodule "vendor/dhake"]
+	path = vendor/dhake
+	url = https://github.com/fixpoint-linux/dhake.git
 [submodule "vendor/dafsa"]
 	path = vendor/dafsa
 	url = https://github.com/fixpoint-linux/dafsa.git

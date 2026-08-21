@@ -1,0 +1,32 @@
+{
+    "name": "datalog-dafsa",
+    "version": "1.0.0",
+    "description": "**datalog-dafsa** is a DAFSA-backed Datalog engine with time-travel queries, vector search, and order statistics. Built with Elm and the mfe-framework.",
+    "main": "index.js",
+    "directories": {
+        "doc": "dist",
+        "test": "tests"
+    },
+    "scripts": {
+        "build": "./vendor/dhake/dhake.com dist/index.html"
+    },
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/fixpoint-linux/datalog-dafsa.git"
+    },
+    "keywords": [],
+    "type": "module",
+    "bugs": {
+        "url": "https://github.com/fixpoint-linux/datalog-dafsa/issues"
+    },
+    "homepage": "https://github.com/fixpoint-linux/datalog-dafsa#readme",
+    "devDependencies": {
+        "elm": "^0.19.2-0",
+        "elm-format": "^0.8.8",
+        "happy-dom": "^20.11.6"
+    },
+    "allowScripts": {
+        "elm@0.19.2-0": true,
+        "elm-format@0.8.8": true
+    }
+}
