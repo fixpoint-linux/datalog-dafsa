@@ -2903,13 +2903,15 @@ playgroundView =
                 ]
                 ]
             }
-        , Fixpoint.Callout.warn
-            [ text "Not supported in the browser: "
-            , code [] [ text "publish" ]
-            , text "/snapshot, time-travel (as-of) queries, variadic relations, and the WAL / incremental-maintenance API -- all of which require the disk-backed engine."
-            ]
-        , Fixpoint.Callout.note
-            [ text "Rendering caveat: the engine uses the CLI's value heuristic, so a raw integer result (including one inside a list literal) that happens to equal a small symbol id can display as that symbol instead of the number. This is the documented B6 int-vs-symbol collision -- a display heuristic, not a bug. Examples above use integer data to stay unambiguous."
+        , div [ class "wrap" ]
+            [ Fixpoint.Callout.warn
+                [ text "Not supported in the browser: "
+                , code [] [ text "publish" ]
+                , text "/snapshot, time-travel (as-of) queries, variadic relations, and the WAL / incremental-maintenance API -- all of which require the disk-backed engine."
+                ]
+            , Fixpoint.Callout.note
+                [ text "Rendering caveat: the engine uses the CLI's value heuristic, so a raw integer result (including one inside a list literal) that happens to equal a small symbol id can display as that symbol instead of the number. This is the documented B6 int-vs-symbol collision -- a display heuristic, not a bug. Examples above use integer data to stay unambiguous."
+                ]
             ]
         , Fixpoint.Section.view
             { id = "rebuild"
