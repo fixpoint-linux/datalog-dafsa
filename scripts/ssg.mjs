@@ -15,17 +15,16 @@
  *       to globalThis, so `Elm` lands on `globalThis.Elm`. The bundle is loaded
  *       exactly once and reused across all pages — loading it again would hit
  *       Elm's `_Debug_crash(6)` ("name clash") on `_Platform_mergeExportsProd`.
- *   3.  For each content page (from PAGES, excluding playground):
+ *   3.  For each content page (from PAGES, now including playground):
  *         - Creates a detached root `<div>`
  *         - Calls `Elm.Main.init({ node, flags: { pathname: page.path } })`
  *         - Waits for the initial render to flush
  *         - Reads back `node.innerHTML` — the pre-rendered page markup
  *   4.  Wraps the rendered markup in a full HTML document (import map + the
  *       page's template slot) and writes dist/<dir>/index.html.
- *   5.  For the playground page: writes dist/playground/index.html as a bare
- *       shell with an EMPTY data-mfe="dafsa-playground" slot (the MFE builds
- *       everything at mount time — the interactive WASM/CodeMirror cannot be
- *       pre-rendered).
+ *   5.  The playground page is now pre-rendered like other content pages (Elm
+ *       renders the hero/sections; the <datalog-playground> custom element is empty
+ *       in static HTML and boots client-side).
  *   6.  Copies shell/ to dist/ and vendor/@mfe to dist/vendor/@mfe.
  *   7.  Copies the playground static assets from docs/ to dist/ (emscripten
  *       resolves *.wasm relative to the script's own directory, so they must be
@@ -67,7 +66,7 @@ const IMPORT_MAP = `{
     "dafsa-vector-search": "/datalog-dafsa/shell/mfe/dafsa-page.js",
     "dafsa-order-statistics": "/datalog-dafsa/shell/mfe/dafsa-page.js",
     "dafsa-typed-projects": "/datalog-dafsa/shell/mfe/dafsa-page.js",
-    "dafsa-playground": "/datalog-dafsa/shell/mfe/dafsa-playground.js",
+    "dafsa-playground": "/datalog-dafsa/shell/mfe/dafsa-page.js",
     "fixpoint-landing": "/shell/mfe/fixpoint-landing.js"
   }
 }`;
@@ -239,17 +238,6 @@ async function main() {
     mkdirSync(outputDir, { recursive: true });
     writeFileSync(outputPath, finalHtml);
     log(`  wrote ${outputPath} (${finalHtml.length} bytes)`);
-  }
-
-  // The playground page is NOT pre-rendered (interactive WASM/CodeMirror).
-  const playgroundPage = PAGES.find((p) => p.slot === 'dafsa-playground');
-  if (playgroundPage) {
-    const outputDir = join(DIST, playgroundPage.dir);
-    const outputPath = join(outputDir, 'index.html');
-    const finalHtml = wrapDocument(playgroundPage.title, playgroundPage.title, slotHtml(playgroundPage.slot));
-    mkdirSync(outputDir, { recursive: true });
-    writeFileSync(outputPath, finalHtml);
-    log(`wrote ${outputPath} (playground shell, ${finalHtml.length} bytes)`);
   }
 
   // Copy shell/ to dist/ (templates + mfe modules + pages.js + shell.js).

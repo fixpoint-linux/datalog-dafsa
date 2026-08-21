@@ -111,7 +111,7 @@ export const PAGES = [
     template: 'dafsa-playground',
     dir: 'playground',
     title: 'Playground — datalog-dafsa',
-    type: 'playground',
+    type: 'content',
   },
 ];
 

@@ -1,5 +1,14 @@
-// shell/mfe/dafsa-page.js — the datalog-dafsa docs pages (all 9 content pages)
+// shell/mfe/dafsa-page.js — the datalog-dafsa docs pages (all 10 content pages)
 // as ONE @mfe MFE module backed by a single Elm bundle.
+//
+// Ten data-mfe slots (dafsa-landing, dafsa-language, dafsa-cli, dafsa-api,
+// dafsa-architecture, dafsa-time-travel, dafsa-vector-search,
+// dafsa-order-statistics, dafsa-typed-projects, dafsa-playground) all resolve
+// to THIS module via the import map. The playground slot uses the
+// <datalog-playground> custom element for the interactive editor.
+//
+// Import the custom element module to register <datalog-playground> before Elm renders.
+import './playground-element.js';
 //
 // Nine data-mfe slots (dafsa-landing, dafsa-language, dafsa-cli, dafsa-api,
 // dafsa-architecture, dafsa-time-travel, dafsa-vector-search,
