@@ -87,6 +87,7 @@ in  { targets =
                   , "shell/pages.js"
                   , "shell/shell.js"
                   , "shell/templates/dafsa-landing.html"
+                  , "shell/templates/fixpoint.html"
                   , "shell/templates/dafsa-language.html"
                   , "shell/templates/dafsa-cli.html"
                   , "shell/templates/dafsa-api.html"

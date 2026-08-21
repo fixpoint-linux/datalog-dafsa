@@ -1,0 +1,13 @@
+<!--
+  shell/templates/fixpoint.html — the route template for '/'.
+
+  The [data-mfe="fixpoint-landing"] element is the slot the shell's reconcile
+  mounts the (cross-origin, via import map) fixpointlinux.org Elm landing MFE
+  into. This route is client-only: it is not pre-rendered by ssg.mjs, and is
+  loaded on-demand when the user navigates to the fixpoint-linux home. ssg.mjs
+  copies the whole shell/ directory into dist/, so this template ships
+  automatically.
+-->
+<div class="fixpoint-root">
+  <div data-mfe="fixpoint-landing"></div>
+</div>
