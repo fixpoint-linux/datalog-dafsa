@@ -109,7 +109,8 @@ navView =
             ]
         , extra =
             [ a [ class "home", href "https://fixpointlinux.org/datalog-dafsa/playground/", attribute "data-mfe-route" "/datalog-dafsa/playground" ] [ text "Playground" ]
-            , Fixpoint.Nav.homeLink "https://fixpointlinux.org/" "fixpoint-linux"
+            , a [ class "home", href "https://fixpointlinux.org/", attribute "data-mfe-route" "/" ]
+                [ text "fixpoint-linux" ]
             ]
         }
 
