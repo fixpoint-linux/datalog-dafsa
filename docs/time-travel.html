@@ -10,7 +10,7 @@
 
 <header class="site">
   <div class="wrap">
-    <a class="brand" href="index.html">datalog-dafsa</a>
+    <a class="brand" href="index.html"><span class="fx">fx</span>://datalog-dafsa</a>
     <nav>
       <a href="index.html">Overview</a>
       <a href="language.html">Language</a>
@@ -50,11 +50,6 @@
       normal read path (mmap views); keeping history is just not deleting the old
       version directories.</li>
   </ul>
-  <div class="note">
-    Time-travel is available through the C API only — there is no Datalog syntax
-    and no CLI command. It reuses the same versioned-snapshot directories and
-    mmap views as the ordinary read path.
-  </div>
 
   <h2 id="cli">From the CLI</h2>
   <p>
