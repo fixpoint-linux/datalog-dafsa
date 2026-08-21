@@ -215,6 +215,18 @@ function clearChildren(node) {
   while (node.firstChild) node.removeChild(node.firstChild);
 }
 
+/** Wait until `element` is attached to the live document. */
+function waitConnected(element) {
+  if (element.isConnected) return Promise.resolve();
+  return new Promise((resolve) => {
+    const check = () => {
+      if (element.isConnected) resolve();
+      else requestAnimationFrame(check);
+    };
+    requestAnimationFrame(check);
+  });
+}
+
 /** The MFE lifecycle, per @mfe/core types.ts. */
 export default {
   async mount(element, ctx) {
@@ -234,7 +246,12 @@ export default {
     style.textContent = PLAYGROUND_CSS;
     disposers.push(ctx.host.addHeadTag(style));
     headTags.set(element, disposers);
-    // 3. Load factories (cached) then re-run playground-ui.js against the fresh DOM.
+    // 3. Wait until the slot is attached to the live document, then load the
+    //    factories and re-run playground-ui.js against the fresh DOM.
+    //    playground-ui.js is an IIFE that captures its DOM element references
+    //    (document.getElementById('program') etc.) at load time, so it MUST run
+    //    only once #program is actually reachable via the document.
+    await waitConnected(element);
     await loadFactories();
     await loadScript(`${BASE}/playground-ui.js`);
     live.set(element, true);
