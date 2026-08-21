@@ -89,7 +89,7 @@ subscriptions _ = Sub.none
 
 view : Model -> Html Msg
 view model =
-    div [] [ Fixpoint.Style.stylesheet, navView, pageView model, footerView ]
+    div [] [ Fixpoint.Style.stylesheet, navView, div [ class "wrap" ] [ pageView model ], footerView ]
 
 
 navView : Html Msg
