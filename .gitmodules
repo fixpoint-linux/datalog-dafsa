@@ -2,3 +2,6 @@
 	path = vendor/ggml
 	url = https://github.com/ggml-org/ggml
 	branch = v0.20.2
+[submodule "vendor/dafsa"]
+	path = vendor/dafsa
+	url = https://github.com/fixpoint-linux/dafsa.git

@@ -8,20 +8,20 @@ LDFLAGS  = -shared -fPIC
 TMPDIR   = $(CURDIR)/build-tmp
 export TMPDIR
 
-INC      = -Ivendor -Isrc
+INC      = -Ivendor/dafsa -Isrc
 
-# ─── Vendor objects (DAFSA engine, vendored from jing-meta) ─────────────
+# ─── Vendor objects (DAFSA engine, submodule fixpoint-linux/dafsa) ───────
 
-VENDOR_OBJS = vendor/dafsa.o \
-              vendor/dafsa_state.o \
-              vendor/dafsa_core.o \
-              vendor/dafsa_persist.o \
-              vendor/dafsa_view.o \
-              vendor/dafsa_crc32.o \
-              vendor/dafsa_wal.o \
-              vendor/dafsa_build.o \
-              vendor/dafsa_rank.o \
-              vendor/dafsa_view_rank.o
+VENDOR_OBJS = vendor/dafsa/dafsa.o \
+              vendor/dafsa/dafsa_state.o \
+              vendor/dafsa/dafsa_core.o \
+              vendor/dafsa/dafsa_persist.o \
+              vendor/dafsa/dafsa_view.o \
+              vendor/dafsa/dafsa_crc32.o \
+              vendor/dafsa/dafsa_wal.o \
+              vendor/dafsa/dafsa_build.o \
+              vendor/dafsa/dafsa_rank.o \
+              vendor/dafsa/dafsa_view_rank.o
 
 # ─── Our library objects ─────────────────────────────────────────────────
 
@@ -79,7 +79,7 @@ test-lsp: dl-lsp
 
 # ─── Vendor rules ────────────────────────────────────────────────────────
 
-vendor/%.o: vendor/%.c vendor/dafsa.h vendor/dafsa_internal.h
+vendor/dafsa/%.o: vendor/dafsa/%.c vendor/dafsa/dafsa.h vendor/dafsa/dafsa_internal.h
 	$(CC) $(CFLAGS) $(INC) -c -o $@ $<
 
 # ─── Library rules ───────────────────────────────────────────────────────
@@ -446,16 +446,16 @@ DLP_ENGINE_SRCS = src/intern.c src/termstore.c src/relation.c \
                   src/util.c src/dl.c src/iter.c src/magic.c src/topdown.c \
                   src/analyze.c src/schema.c src/typecheck.c src/json.c \
                   src/txnwal.c \
-                  vendor/dafsa.c vendor/dafsa_state.c vendor/dafsa_core.c \
-                  vendor/dafsa_persist.c vendor/dafsa_view.c \
-                  vendor/dafsa_crc32.c vendor/dafsa_wal.c vendor/dafsa_build.c \
-                  vendor/dafsa_rank.c vendor/dafsa_view_rank.c
+                  vendor/dafsa/dafsa.c vendor/dafsa/dafsa_state.c vendor/dafsa/dafsa_core.c \
+                  vendor/dafsa/dafsa_persist.c vendor/dafsa/dafsa_view.c \
+                  vendor/dafsa/dafsa_crc32.c vendor/dafsa/dafsa_wal.c vendor/dafsa/dafsa_build.c \
+                  vendor/dafsa/dafsa_rank.c vendor/dafsa/dafsa_view_rank.c
 
 DLP_SRCS = dlp/main.c dlp/schema_load.c dlp/init.c dlp/csv_load.c dlp/json_load.c dlp/workflow.c
 
 # Use := (not ?=) so the environment's CC=cc does not override cosmocc.
 COSMOCC := cosmocc
-DLP_CFLAGS = -std=c11 -O2 -g -Wall -Wextra -I$(DHALLC)/src -Ivendor -Isrc
+DLP_CFLAGS = -std=c11 -O2 -g -Wall -Wextra -I$(DHALLC)/src -Ivendor/dafsa -Isrc
 
 dlp: $(DLP_SRCS) $(DLP_ENGINE_SRCS) $(CORE_SRCS) dlp/dlp.h
 	$(COSMOCC) $(DLP_CFLAGS) -o dlp/dlp $(DLP_SRCS) $(DLP_ENGINE_SRCS) $(CORE_SRCS)
@@ -490,7 +490,7 @@ wasm:
 # ─── Clean ───────────────────────────────────────────────────────────────
 
 clean:
-	rm -f vendor/*.o src/*.o
+	rm -f vendor/dafsa/*.o src/*.o
 	rm -f libdatalog.so dl dl-lsp dlp/dlp dlp_schema_check
 	rm -f dlp/dlp.aarch64.elf dlp/dlp.com.dbg \
 	      dlp_schema_check.aarch64.elf dlp_schema_check.com.dbg
