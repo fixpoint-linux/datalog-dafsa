@@ -53,7 +53,7 @@ ALL_OBJS = $(VENDOR_OBJS) $(LIB_OBJS)
 
 # ─── Targets ─────────────────────────────────────────────────────────────
 
-.PHONY: all clean test bench test-m1 test-m2 wasm lsp test-lsp dlp dlp_schema_check dlp-check dlp-golden dl-embed fetch-model embed-test fxstore fxstore-golden
+.PHONY: all clean test bench test-m1 test-m2 wasm lsp test-lsp dlp dlp_schema_check dlp-check dlp-golden dl-embed fetch-model embed-test
 
 all: build-tmp libdatalog.so dl
 
@@ -474,29 +474,6 @@ dlp-check: dlp dlp_schema_check
 dlp-golden: dlp
 	@tests/dlp_golden.sh ./dlp/dlp
 
-# ─── fxstore (fxstore tool) — OPT-IN, links the engine + dhall-c ────────
-# A NEW top-level tool that manages a content-addressed package store.
-# Built with cosmocc (the dhall-c interpreter is not gcc-clean for this link)
-# and is NOT part of the default `make`/`make test` (which stay gcc-only and
-# never touch dhall-c).  Usage:
-#   make fxstore            # uses $(CURDIR)/../dhall-c by default
-#   make fxstore DHALLC=/path/to/dhall-c
-#   make fxstore-golden    # build + run the fxstore golden test harness
-
-# fxstore sources: CLI + the five core units (packageset walker, canonical
-# derivation serializer, datalog closure fixpoint, store txn/GC, recipe
-# executor + bwrap sandbox).
-FXSTORE_SRCS = fxstore/main.c fxstore/packageset.c fxstore/derivation.c \
-               fxstore/closure.c fxstore/store.c fxstore/build.c
-
-# Reuse the same dhall-c core and engine source sets as dlp.
-fxstore: $(FXSTORE_SRCS) $(DLP_ENGINE_SRCS) $(CORE_SRCS) fxstore/fxstore.h
-	$(COSMOCC) $(DLP_CFLAGS) -o fxstore/fxstore $(FXSTORE_SRCS) $(DLP_ENGINE_SRCS) $(CORE_SRCS)
-
-# Verification harness: placeholder for later unit (golden test).
-fxstore-golden: fxstore
-	@echo "fxstore-golden: placeholder — later unit wires the test"
-
 
 # ─── WebAssembly playground ─────────────────────────────────────────────
 # Builds the in-browser language playground (docs/playground.js + .wasm)
@@ -517,7 +494,6 @@ clean:
 	rm -f libdatalog.so dl dl-lsp dlp/dlp dlp_schema_check
 	rm -f dlp/dlp.aarch64.elf dlp/dlp.com.dbg \
 	      dlp_schema_check.aarch64.elf dlp_schema_check.com.dbg
-	rm -f fxstore/fxstore fxstore/fxstore.aarch64.elf fxstore/fxstore.com.dbg
 	rm -f tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4 \
 	      tests/test_m4_review tests/test_m5 tests/test_m5_review tests/test_m6 \
 	      tests/test_m6_review tests/test_bulk \
