@@ -215,7 +215,13 @@ function clearChildren(node) {
   while (node.firstChild) node.removeChild(node.firstChild);
 }
 
-/** Wait until `element` is attached to the live document. */
+/**
+ * Wait until `element` is attached to the live document. The framework
+ * reconciles a DETACHED template clone and only appends it to the DOM after
+ * every MFE `mount()` resolves, so a mount that blocks here would deadlock.
+ * Call this only in an async post-mount continuation (never awaited inline in
+ * a way that blocks mount's own promise from resolving).
+ */
 function waitConnected(element) {
   if (element.isConnected) return Promise.resolve();
   return new Promise((resolve) => {
@@ -225,6 +231,19 @@ function waitConnected(element) {
     };
     requestAnimationFrame(check);
   });
+}
+
+/**
+ * Load the emscripten factories (cached) and then re-run playground-ui.js
+ * against the fresh DOM, once the slot is attached to the live document.
+ * playground-ui.js is an IIFE that captures its DOM element references
+ * (document.getElementById('program') etc.) at load time, so it MUST run only
+ * once #program is actually reachable via the document.
+ */
+async function bootPlayground(element) {
+  await waitConnected(element);
+  await loadFactories();
+  await loadScript(`${BASE}/playground-ui.js`);
 }
 
 /** The MFE lifecycle, per @mfe/core types.ts. */
@@ -246,14 +265,12 @@ export default {
     style.textContent = PLAYGROUND_CSS;
     disposers.push(ctx.host.addHeadTag(style));
     headTags.set(element, disposers);
-    // 3. Wait until the slot is attached to the live document, then load the
-    //    factories and re-run playground-ui.js against the fresh DOM.
-    //    playground-ui.js is an IIFE that captures its DOM element references
-    //    (document.getElementById('program') etc.) at load time, so it MUST run
-    //    only once #program is actually reachable via the document.
-    await waitConnected(element);
-    await loadFactories();
-    await loadScript(`${BASE}/playground-ui.js`);
+    // 3. Kick off script boot in a non-blocking continuation. mount() must
+    //    resolve NOW so the framework appends the (already content-filled)
+    //    slot to the document; only once connected do we load the factories +
+    //    playground-ui.js. A mount that awaited connection here would never
+    //    resolve (the append happens only after mount resolves).
+    void bootPlayground(element);
     live.set(element, true);
   },
 
