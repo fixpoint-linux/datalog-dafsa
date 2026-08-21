@@ -32,24 +32,6 @@ body {
 
 .wrap { max-width: 780px; margin: 0 auto; padding: 0 24px; }
 
-/* ─── Link back to fixpoint-linux (thin bar above the nav, right side) ─ */
-
-.toplink { background: var(--bg); border-bottom: 1px solid var(--line); }
-.toplink .wrap {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  height: 30px;
-}
-.toplink a {
-  font-family: var(--mono);
-  font-size: 12px;
-  color: var(--dim);
-  text-decoration: none;
-  white-space: nowrap;
-}
-.toplink a:hover { color: var(--accent); }
-
 /* ─── Sticky top navigation ─────────────────────────────────────────── */
 
 .site {
@@ -93,6 +75,14 @@ body {
 }
 
 .site nav a:hover { color: var(--fg); text-decoration: none; }
+
+/* External link back to fixpoint-linux, rightmost in the nav. */
+.site nav a.ext {
+  color: var(--accent);
+  font-weight: 600;
+  margin-left: 6px;
+}
+.site nav a.ext:hover { color: var(--accent2); text-decoration: none; }
 
 /* Prominent "Playground" nav item (call to action). */
 .site nav a.nav-cta {
