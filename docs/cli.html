@@ -19,6 +19,7 @@
       <a href="architecture.html">Architecture</a>
       <a href="order-statistics.html">Order Stats</a>
       <a href="time-travel.html">Time Travel</a>
+      <a href="vector-search.html">Vector Search</a>
       <a href="typed-projects.html">Typed Projects</a>
       <a href="playground.html">Playground</a>
     </nav>
@@ -124,8 +125,29 @@ $ ./dl -d /tmp/db qmagic \
     or cross-predicate mutual recursion are rejected with a diagnostic.
   </p>
 
+  <h2 id="time">Time travel</h2>
+  <p>
+    The CLI exposes the snapshot timeline directly. <code>publish</code> writes an immutable,
+    versioned snapshot; <code>versions</code> lists the history; <code>bound</code> reads the
+    current snapshot view; and the search tier accepts <code>--version N</code> to query
+    <em>as-of</em> a past snapshot. Together these make time-traveling queries a first-class
+    CLI capability.
+  </p>
+  <pre class="code"><code><span class="c"># Record a point-in-time, then inspect the history.</span>
+<span class="k">$</span> <span class="g">./dl -d /tmp/db publish</span>
+<span class="g">Snapshot published.</span>
+<span class="k">$</span> <span class="g">./dl -d /tmp/db versions</span>
+<span class="g">1
+2
+3</span>
+
+<span class="c"># Search as-of a past snapshot (full-text + semantic).</span>
+<span class="k">$</span> <span class="g">./dl -d /tmp/db search 'gpu rental' --top 10 --version 2</span>
+<span class="k">$</span> <span class="g">./dl -d /tmp/db vsearch 'GPU rental' --k 10 --version 2</span></code></pre>
+  <p>See <a href="time-travel.html">the time-travel guide</a> for the full as-of API.</p>
+
   <h2 id="publish">publish</h2>
-  <p>Atomically publish a versioned snapshot of the database.</p>
+  <p>Atomically publish a versioned snapshot of the database — the write side of time travel.</p>
   <pre class="code"><code>$ ./dl -d /tmp/db publish
 Snapshot published.</code></pre>
   <p>After publishing, <code>query</code> reads from mmap instead of running the VM.</p>
@@ -153,8 +175,9 @@ $ ./dl -d /tmp/db search 'gpu rental' --top 10 --version 3</code></pre>
   (via the <code>dl-embed</code> tool), retrieve MIH candidates from the
   <code>__sig*__</code> postings, and re-rank by in-store int8 cosine.
   Accepts <code>--sig</code>/<code>--ivec</code> hex for a programmatic path
-  that needs no model.</p>
+  that needs no model, and <code>--version V</code> to search as-of a snapshot.</p>
   <pre class="code"><code>$ ./dl -d /tmp/db vsearch 'affordable GPU rental' --k 10</code></pre>
+  <p>See <a href="vector-search.html">the vector-search page</a> for the full semantic tier.</p>
 
   <h2 id="vhybrid">vhybrid</h2>
   <p>Lexical &cap; semantic hybrid: intersect <code>search</code> results with
@@ -162,7 +185,7 @@ $ ./dl -d /tmp/db search 'gpu rental' --top 10 --version 3</code></pre>
   <pre class="code"><code>$ ./dl -d /tmp/db vhybrid 'gpu rental' 'affordable GPU rental' --k 10</code></pre>
 
   <h2 id="versions">versions</h2>
-  <p>List the published snapshot versions (ascending).</p>
+  <p>List the published snapshot versions (ascending) — the timeline.</p>
   <pre class="code"><code>$ ./dl -d /tmp/db versions</code></pre>
 
   <h2 id="scope">What is <em>not</em> in the CLI</h2>

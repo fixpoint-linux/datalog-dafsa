@@ -14,10 +14,9 @@ This directory is a static, dependency-free documentation site for the
 - `order-statistics.html` — rank / select / range_count / count, bound + perm
   variants, pull-iterator + merge-join, lazy range generator.
 - `time-travel.html` — versioned snapshots, as-of queries, retention.
-- `datalog-dafsa-vector-search.html` — the semantic vector-search tier
-  (MIH-over-ITQ, `dl vsearch`/`dl vhybrid`). Note: the site also ships the
-  Markdown design docs; `datalog-dafsa-vector-search` is one of them (served
-  as a static Markdown page).
+- `vector-search.html` — the semantic vector-search tier (MIH-over-ITQ,
+  `dl vsearch`/`dl vhybrid`, the `dl-embed` bge-small tool, in-store int8
+  re-rank).
 - `playground.html` — an interactive in-browser evaluator (WebAssembly).
 - `playground-ui.js` — the committed page glue + wasm bridge (loaded by
   `playground.html` after the factory).

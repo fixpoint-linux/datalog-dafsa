@@ -19,6 +19,7 @@
       <a href="api.html">C API</a>
       <a href="architecture.html">Architecture</a>
       <a href="time-travel.html">Time Travel</a>
+      <a href="vector-search.html">Vector Search</a>
       <a href="order-statistics.html">Order Stats</a>
       <a href="typed-projects.html">Typed Projects</a>
       <a class="nav-cta" href="playground.html">Playground</a>
@@ -105,7 +106,7 @@
         MIH-over-ITQ candidate retrieval, and in-store int8 re-rank — all stored in-relation
         and snapshot-versioned like everything else.
       </p>
-      <p><a href="cli.html#vsearch">The vector-search CLI commands &rarr;</a></p>
+      <p><a href="vector-search.html">The vector-search tier &rarr;</a></p>
     </div>
     <div class="headline-card">
       <span class="n">04</span>
@@ -131,7 +132,7 @@ make bench           # run the demonstration benchmark</code></pre>
     defaults to <code>dl-test-db</code> and can be overridden with <code>-d &lt;dir&gt;</code>.
   </p>
 
-  <pre class="code"><span class="c"># Load a headerless CSV (arity 1-8) into a relation.</span>
+  <pre class="code"><code><span class="c"># Load a headerless CSV (arity 1-8) into a relation.</span>
 <span class="k">$</span> ./dl -d /tmp/db load edges.csv --rel edge
 <span class="g">Loaded 5 facts into edge</span>
 
@@ -203,7 +204,7 @@ make bench           # run the demonstration benchmark</code></pre>
       <tr>
         <td class="name">Search</td>
         <td>Full-text <code>dl search</code> + semantic <code>dl vsearch</code>/<code>dl vhybrid</code> (bge-small via <code>dl-embed</code>, MIH-over-ITQ, in-store int8 re-rank), all versioned</td>
-        <td><a href="cli.html#vsearch">Vector Search</a></td>
+        <td><a href="vector-search.html">Vector Search</a></td>
       </tr>
     </tbody>
   </table>
@@ -215,6 +216,7 @@ make bench           # run the demonstration benchmark</code></pre>
     <li><a href="api.html">C API Reference</a> — the full <code>dl.h</code> surface.</li>
     <li><a href="architecture.html">Architecture</a> — storage thesis, lifecycle, join &amp; evaluation strategies.</li>
     <li><a href="time-travel.html">Time Travel</a> — versioned snapshots and as-of queries.</li>
+    <li><a href="vector-search.html">Vector Search</a> — semantic <code>dl vsearch</code>/<code>dl vhybrid</code>, bge-small via <code>dl-embed</code>.</li>
     <li><a href="order-statistics.html">Order Statistics</a> — rank / select / range / count and the sorted iterator.</li>
     <li><a href="typed-projects.html">Typed Projects</a> — schema.dhall + validated data + typechecked rules.</li>
   </ul>

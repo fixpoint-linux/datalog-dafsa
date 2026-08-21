@@ -19,6 +19,7 @@
       <a href="architecture.html">Architecture</a>
       <a href="order-statistics.html">Order Stats</a>
       <a href="time-travel.html">Time Travel</a>
+      <a href="vector-search.html">Vector Search</a>
       <a href="typed-projects.html">Typed Projects</a>
       <a href="playground.html">Playground</a>
     </nav>
@@ -54,6 +55,26 @@
     and no CLI command. It reuses the same versioned-snapshot directories and
     mmap views as the ordinary read path.
   </div>
+
+  <h2 id="cli">From the CLI</h2>
+  <p>
+    The <code>dl</code> CLI exposes the timeline directly — record a point-in-time with
+    <code>publish</code>, list the history with <code>versions</code>, and run queries
+    <em>as-of</em> a past snapshot with <code>--version N</code>:
+  </p>
+  <pre class="code"><code>$ ./dl -d /tmp/db publish
+Snapshot published.
+
+$ ./dl -d /tmp/db versions
+1
+2
+3
+
+# Query as-of a past snapshot — full-text and semantic search both support --version.
+$ ./dl -d /tmp/db search 'gpu rental' --top 10 --version 2
+$ ./dl -d /tmp/db vsearch 'GPU rental' --k 10 --version 2</code></pre>
+  <p>The version-aware C API is <code>dl_query_version</code>, <code>dl_search_version</code>,
+  and <code>dl_vector_search_version</code> (see <a href="api.html">the C API</a>).</p>
 
   <h2 id="versions">Versioned snapshots</h2>
   <p>

@@ -19,6 +19,7 @@
       <a href="architecture.html">Architecture</a>
       <a href="order-statistics.html">Order Stats</a>
       <a href="time-travel.html">Time Travel</a>
+      <a href="vector-search.html">Vector Search</a>
       <a href="typed-projects.html">Typed Projects</a>
       <a href="playground.html">Playground</a>
     </nav>
@@ -31,8 +32,9 @@
     The public C API is declared in <code>src/dl.h</code>. All value arrays are
     u32 (raw integers or interned symbol ids). The handle type is the opaque
     <code>dl_db</code>. This page documents the complete surface, grouped by
-    area. See also <a href="order-statistics.html">Order Statistics</a> and
-    <a href="time-travel.html">Time Travel</a> for the larger feature groups.
+    area. See also <a href="order-statistics.html">Order Statistics</a>,
+    <a href="time-travel.html">Time Travel</a>, and
+    <a href="vector-search.html">Vector Search</a> for the larger feature groups.
   </p>
 
   <h2 id="lifecycle">Lifecycle</h2>
@@ -141,6 +143,19 @@
     </tbody>
   </table>
   <p>Details and examples are on the <a href="time-travel.html">Time Travel</a> page.</p>
+
+  <h2 id="search">Search &amp; vector search</h2>
+  <table class="api">
+    <tbody>
+      <tr><td><code>long dl_search(dl_db *db, const uint32_t *terms, int n_terms, dl_search_cb cb, void *user)</code></td><td>Full-text search: AND-intersect tokenized terms over the postings index, rank by co-occurrence.</td></tr>
+      <tr><td><code>long dl_search_version(dl_db *db, uint32_t version, const uint32_t *terms, int n_terms, dl_search_cb cb, void *user)</code></td><td>Full-text search as-of a snapshot version.</td></tr>
+      <tr><td><code>long dl_vector_search(dl_db *db, const uint32_t *q_sig, int k, int r, dl_vec_cb cb, void *user)</code></td><td>Semantic vector search (LIVE): MIH candidate retrieval over <code>__sig{j}__</code> postings for a pre-encoded 8-word ITQ signature, then live-entity filter. Emits band-match counts via <code>dl_vec_cb</code>.</td></tr>
+      <tr><td><code>long dl_vector_search_version(dl_db *db, uint32_t version, const uint32_t *q_sig, int k, int r, dl_vec_cb cb, void *user)</code></td><td>Same, as-of a snapshot version (reads <code>__sig{j}__</code> + <code>entity</code> via <code>dl_query_bound_version</code>).</td></tr>
+      <tr><td><code>long dl_vector_rerank(dl_db *db, const uint32_t *q_int8, const uint32_t *cand_syms, int n_cand, int k, dl_vec_cb cb, void *user)</code></td><td>Exact int8-cosine re-rank of a candidate set over <code>__vec_q__</code>, by signed int64 cross-multiply (no float). Emits exact-cosine order via <code>dl_vec_cb</code>.</td></tr>
+    </tbody>
+  </table>
+  <p>The semantic tier is documented on the <a href="vector-search.html">Vector Search</a> page;
+      embedding is done by the <code>dl-embed</code> tool (bge-small via ggml), not the C API.</p>
 
   <h2 id="hooks">Fault-injection hooks (test-only)</h2>
   <table class="api">

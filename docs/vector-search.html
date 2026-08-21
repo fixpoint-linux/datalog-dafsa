@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vector Search — datalog-dafsa</title>
+<meta name="description" content="Semantic vector search in datalog-dafsa: bge-small embeddings via dl-embed, MIH-over-ITQ candidate retrieval, in-store int8 re-rank. dl vsearch / dl vhybrid.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site">
+  <div class="wrap">
+    <a class="brand" href="index.html"><span class="fx">fx</span>://datalog-dafsa</a>
+    <nav>
+      <a href="index.html">Overview</a>
+      <a href="language.html">Language</a>
+      <a href="cli.html">CLI</a>
+      <a href="api.html">C API</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="time-travel.html">Time Travel</a>
+      <a href="vector-search.html">Vector Search</a>
+      <a href="order-statistics.html">Order Stats</a>
+      <a href="typed-projects.html">Typed Projects</a>
+      <a class="nav-cta" href="playground.html">Playground</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <h1>Semantic <span class="fx">vector search</span></h1>
+  <p>
+    Meaning-aware retrieval on top of the full-text index. The engine embeds text with a real
+    bge-small model (via the <code>dl-embed</code> C++ tool), retrieves candidates with
+    <strong>multi-index hashing (MIH) over ITQ bit-codes</strong>, and re-ranks by exact
+    int8 cosine — all stored in-relation and <strong>snapshot-versioned</strong> like
+    everything else.
+  </p>
+
+  <h2>Quickstart</h2>
+  <p>
+    The vector tier is opt-in and adds a vendored <a href="https://github.com/ggml-org/ggml">ggml</a>
+    submodule (v0.20.2) plus the model:
+  </p>
+  <pre class="code"><code><span class="c"># One-time: materialize ggml + the bge-small model (git-lfs tracked).</span>
+<span class="k">$</span> <span class="g">git submodule update --init vendor/ggml</span>
+<span class="k">$</span> <span class="g">git lfs pull</span>             <span class="c"># models/bge-small-en-v1.5-f16.gguf (67 MB)</span>
+<span class="k">$</span> <span class="g">make dl-embed</span>           <span class="c"># build ./dl-embed (needs cmake)</span>
+<span class="k">$</span> <span class="g">./dl-embed self-test</span>   <span class="c"># golden-embedding gate (cosine &gt;= 0.9999 vs reference)</span>
+
+<span class="c"># Embed the corpus into the vector index (18 relations + one publish).</span>
+<span class="k">$</span> <span class="g">./dl-embed pipeline --db /tmp/db</span>
+
+<span class="c"># Query it.</span>
+<span class="k">$</span> <span class="g">./dl -d /tmp/db vsearch 'affordable GPU rental' --k 10</span>
+<span class="k">$</span> <span class="g">./dl -d /tmp/db vhybrid 'gpu rental' 'affordable GPU rental' --k 10</span></code></pre>
+
+  <h2>How it works</h2>
+  <p>
+    Each entity is embedded and <strong>binarized to a 256-bit ITQ signature</strong>. The
+    signature is split into <code>m=16</code> <strong>bands</strong>; for band <code>j</code> the
+    store keeps a fixed-arity relation <code>__sig{j}__(band_u32, entity_sym_id)</code> — a
+    postings index from bit-substring to entity sym-id, the same shape as the full-text postings.
+  </p>
+  <pre class="code"><code>__sig0__..__sig15__   (arity 2)  band_value -&gt; entity_sym_id    MIH candidate postings
+__vec_q__            (arity 3)  entity_sym_id, chunk_idx, packed_4x_int8_u32   re-rank vectors
+__itq_basis__        (arity 3)  dim_i, dim_j, float32_bits_u32   ITQ encode matrix (pinned)</code></pre>
+  <p>
+    A query embeds the text with the same model, ITQ-encodes it, then for each band enumerates the
+    query&rsquo;s substring variants within the pigeonhole budget <code>&lfloor;r/m&rfloor;</code>,
+    probes each via <code>dl_prefix</code> over <code>__sig{j}__</code>, unions the candidates
+    across bands, <strong>filters to live entities</strong>, and re-ranks by exact integer int8
+    cosine. All reads are snapshot-versioned like any other relation, so
+    <code>dl_vector_search_version</code> and <code>dl search --version</code> give you
+    <strong>time-travelling semantic search</strong> for free.
+  </p>
+
+  <h2>The CLI</h2>
+
+  <h3>vsearch</h3>
+  <p>Semantic vector search over the MIH postings + int8 re-rank.</p>
+  <pre class="code"><code>dl [-d &lt;dir&gt;] vsearch '&lt;query&gt;' [--k N] [--radius R] [--version V]
+                                  [--sig &lt;hex64&gt;] [--ivec &lt;hex768&gt;]</code></pre>
+  <p>
+    <code>--version V</code> queries as-of a published snapshot (0 = live). For a programmatic
+    path with no model, pass the pre-encoded query as <code>--sig</code> (8 u32 = 64 hex) and
+    <code>--ivec</code> (96 u32 = 768 hex).
+  </p>
+
+  <h3>vhybrid</h3>
+  <p>Lexical &cap; semantic hybrid: intersect <code>search</code> results with
+  <code>vsearch</code> candidates, then re-rank the intersection.</p>
+  <pre class="code"><code>dl [-d &lt;dir&gt;] vhybrid '&lt;terms&gt;' '&lt;query&gt;' [--k N] [--radius R] [--version V]</code></pre>
+
+  <h3>search (full-text)</h3>
+  <p>The symbolic half: AND-intersect tokenized terms over <code>__postings__</code> and rank by
+  co-occurrence. <code>--version N</code> queries as-of a snapshot.</p>
+  <pre class="code"><code>dl [-d &lt;dir&gt;] search '&lt;terms&gt;' [--top N] [--version N]</code></pre>
+
+  <h2>dl-embed</h2>
+  <p>The C++ embedding tool (ggml-based). It runs the real <strong>bge-small-en-v1.5</strong>
+  model in-process — the weights are the actual pretrained model (git-lfs tracked under
+  <code>models/</code>), not a re-implementation. The C++ provides the inference runtime:
+  GGUF load + BERT forward pass + CLS pooling + L2 normalization, a WordPiece tokenizer that
+  auto-detects the llama.cpp WPM vocab convention, and the ITQ fit/encode + int8 quantization.</p>
+  <pre class="code"><code>dl-embed pipeline --db DIR     embed corpus + emit vector relations + publish
+dl-embed encode --db DIR QRY   print 'sig_hex ivec_hex' for a query (CLI consumes this)
+dl-embed embed QRY             print the raw 384-float embedding
+dl-embed tokenize QRY          print token ids + strings (debug)
+dl-embed self-test             math/tokenizer checks (+ golden-embedding gate if model present)
+dl-embed dump-tensors [PATH]   list GGUF tensors
+dl-embed fetch-model           download the bge-small GGUF to models/</code></pre>
+  <p>
+    The <code>dl vsearch</code>/<code>vhybrid</code> commands <code>fork/execve</code>
+    <code>dl-embed encode</code> to embed the query (no shell, no Python). The golden gate
+    (<code>./dl-embed self-test</code>) embeds reference strings and asserts cosine &ge; 0.9999
+    against the reference model — the numeric proof that the C++ forward pass is correct.
+  </p>
+
+  <h2>Design</h2>
+  <p>
+    The full design of record lives in the design docs:
+    <a href="datalog-dafsa-vector-search.md">datalog-dafsa-vector-search.md</a> (MIH over ITQ,
+    the integration seam, honest ceiling) and the int8-in-store note. In short: in-store MIH is
+    competitive with HNSW at <strong>~1e5&ndash;1e6 entities</strong> and wins the consolidation
+    story — one identity space, one snapshot, one WAL, one crash-recovery story.
+  </p>
+
+</main>
+
+<footer class="site-foot">
+  <div class="wrap">
+    Back to <a href="index.html">overview</a>. See also
+    <a href="cli.html">CLI</a>, <a href="api.html">C API</a>.
+  </div>
+</footer>
+
+</body>
+</html>
