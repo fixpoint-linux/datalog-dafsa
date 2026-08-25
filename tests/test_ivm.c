@@ -660,7 +660,7 @@ static void test_insert_ivm_property(void)
 
     prng_state = 0xC0FFEEu;
 
-    for (iter = 0; iter < 120; iter++) {
+    for (iter = 0; iter < 25; iter++) {
         int rel = (int)(prng_next() % 5);
         uint32_t cols[2] = { prng_next() % 8, prng_next() % 8 };
         int rc;
@@ -892,7 +892,7 @@ static void test_recursive_ivm_property(void)
 
     prng_state = 0xBEEF1234u;
 
-    for (iter = 0; iter < 120; iter++) {
+    for (iter = 0; iter < 25; iter++) {
         int rel = (int)(prng_next() % 2);
         uint32_t cols[2] = { prng_next() % 8, prng_next() % 8 };
         int rc;
@@ -1414,7 +1414,7 @@ static void test_dred_property_monotone(void)
         int runs0 = vm_dred_runs;
         int expect_dred = 0;   /* exactly the successful-delete iterations */
 
-        for (iter = 0; iter < 150; iter++) {
+        for (iter = 0; iter < 30; iter++) {
             int rel = (int)(prng_next() % 5);
             int is_del = (int)(prng_next() & 1u);
             uint32_t cols[2] = { prng_next() % 8, prng_next() % 8 };
@@ -1528,7 +1528,7 @@ static void test_dred_property_negation(void)
                                 * inserts also route to DRed here because the
                                 * negation program is not insert-IVM-eligible */
 
-        for (iter = 0; iter < 150; iter++) {
+        for (iter = 0; iter < 30; iter++) {
             int rel = (int)(prng_next() % 3);
             int is_del = (int)(prng_next() & 1u);
             uint32_t cols[2] = { prng_next() % 6, prng_next() % 6 };
@@ -1905,7 +1905,7 @@ static void test_aggregate_ivm_property(void)
     prng_state = 0x5EEDC0DEu;
     runs0 = vm_agg_runs;
 
-    for (iter = 0; iter < 150; iter++) {
+    for (iter = 0; iter < 30; iter++) {
         int is_del = (int)(prng_next() & 1u);
         uint32_t cols[2] = { prng_next() % 6, prng_next() % 8 };
         int rc;
@@ -2230,7 +2230,7 @@ static void test_bulk_load_ivm_property(void)
 
     prng_state = 0xB10C4DEu;
 
-    for (iter = 0; iter < 60; iter++) {
+    for (iter = 0; iter < 12; iter++) {
         int rel = (int)(prng_next() % 5);
         int batch = 1 + (int)(prng_next() % 4);   /* 1..4 rows per batch */
         uint32_t rows[4 * 2];

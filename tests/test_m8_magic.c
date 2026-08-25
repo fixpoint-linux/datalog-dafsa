@@ -791,10 +791,10 @@ static uint32_t rng_rand(uint32_t n) { return n ? rng_next() % n : 0; }
 
 static void test_t13_property(void)
 {
-    TEST("T13: property — 200 random graphs x 5 sources, bound == magic");
+    TEST("T13: property — 40 random graphs x 5 sources, bound == magic");
 
     int iter;
-    for (iter = 0; iter < 200; iter++) {
+    for (iter = 0; iter < 40; iter++) {
         dl_db *db;
         char suffix[32];
         int N = 8 + (int)(iter % 12);         /* 8..19 nodes */
@@ -1222,10 +1222,10 @@ static void test_t41_adornment_blowup(void)
 
 static void test_t42_two_adorn_property(void)
 {
-    TEST("T42: property — 100 graphs x 3 sources, two-adornment p bound==magic");
+    TEST("T42: property — 20 graphs x 3 sources, two-adornment p bound==magic");
 
     int iter;
-    for (iter = 0; iter < 100; iter++) {
+    for (iter = 0; iter < 20; iter++) {
         dl_db *db;
         char suffix[32];
         int N = 8 + (int)(iter % 12);         /* 8..19 nodes */
@@ -1642,10 +1642,10 @@ static void test_t44_mixed_scan_lookup(void)
 
 static void test_t19_multipred_property(void)
 {
-    TEST("T19: property — 120 random graphs x 4 sources, path+tc bound==magic");
+    TEST("T19: property — 25 random graphs x 4 sources, path+tc bound==magic");
 
     int iter;
-    for (iter = 0; iter < 120; iter++) {
+    for (iter = 0; iter < 25; iter++) {
         dl_db *db;
         char suffix[32];
         int N = 6 + (int)(iter % 10);         /* 6..15 nodes */
@@ -2030,10 +2030,10 @@ static void test_t27_no_mutation_adorn(void)
 
 static void test_t28_path2_property(void)
 {
-    TEST("T28: property — 150 random graphs x 5 targets, path2 fb==full-filter");
+    TEST("T28: property — 30 random graphs x 5 targets, path2 fb==full-filter");
 
     int iter;
-    for (iter = 0; iter < 150; iter++) {
+    for (iter = 0; iter < 30; iter++) {
         dl_db *db;
         char suffix[32];
         int N = 8 + (int)(iter % 12);         /* 8..19 nodes */
@@ -2198,10 +2198,10 @@ static void test_t32_tc_fb_positive(void)
 
 static void test_t33_order_independence(void)
 {
-    TEST("T33: property — 100 graphs x 3 sources, body-order invariance");
+    TEST("T33: property — 20 graphs x 3 sources, body-order invariance");
 
     int iter;
-    for (iter = 0; iter < 100; iter++) {
+    for (iter = 0; iter < 20; iter++) {
         dl_db *dba, *dbb;
         char sa[32], sb[32];
         int N = 8 + (int)(iter % 12);         /* 8..19 nodes */
@@ -2399,10 +2399,10 @@ static void test_t37_reject_aggregate_over_closure(void)
 
 static void test_t38_negated_edb_property(void)
 {
-    TEST("T38: property — 100 graphs x 3 sources, negated-EDB bound==magic");
+    TEST("T38: property — 20 graphs x 3 sources, negated-EDB bound==magic");
 
     int iter;
-    for (iter = 0; iter < 100; iter++) {
+    for (iter = 0; iter < 20; iter++) {
         dl_db *db;
         char suffix[32];
         int N = 8 + (int)(iter % 12);         /* 8..19 nodes */

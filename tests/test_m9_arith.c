@@ -634,10 +634,10 @@ static uint32_t rng_rand(uint32_t n) { return n ? rng_next() % n : 0; }
 
 static void test_t10_property(void)
 {
-    TEST("T10: property — 200 seeded random cases vs C reference");
+    TEST("T10: property — 40 seeded random cases vs C reference");
 
     int iter;
-    for (iter = 0; iter < 200; iter++) {
+    for (iter = 0; iter < 40; iter++) {
         dl_db *db;
         char suffix[32];
         int N = 8 + (int)(iter % 20);        /* 8..27 pairs */

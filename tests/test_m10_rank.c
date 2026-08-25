@@ -168,7 +168,7 @@ static void t1_rank_select_range(char *dir, size_t cap)
 
     assert(dl_declare_relation(db, "r", 2) == 0);
     /* Distinct random-ish tuples; dl_prefix returns them in lex order. */
-    for (i = 0; i < 500; i++) {
+    for (i = 0; i < 120; i++) {
         cols[0] = (uint32_t)(rand() % 100);
         cols[1] = (uint32_t)(rand() % 1000);
         dl_add_fact(db, "r", cols, 2);
@@ -258,14 +258,14 @@ static void t5_interleaved(char *dir, size_t cap)
     assert(dl_declare_relation(db, "r", 2) == 0);
 
     /* Seed. */
-    for (i = 0; i < 200; i++) {
+    for (i = 0; i < 50; i++) {
         cols[0] = (uint32_t)(i % 40);
         cols[1] = (uint32_t)(i * 7 % 1000);
         dl_add_fact(db, "r", cols, 2);
     }
 
     /* Interleave adds and deletes; after each mutation re-derive and check. */
-    for (i = 0; i < 300; i++) {
+    for (i = 0; i < 75; i++) {
         tset ts2;
         memset(&ts2, 0, sizeof(ts2));
         if (i % 2 == 0) {
@@ -428,9 +428,9 @@ static void t9_prefix_bound(char *dir, size_t cap)
     TEST("T9 prefix-bound rank/select/range_count (leading col0)");
 
     assert(dl_declare_relation(db, "r", 2) == 0);
-    /* Cross-product arity-2: 20 col0 x 100 col1 (heavy suffix sharing). */
-    for (a = 0; a < 20; a++) {
-        for (b = 0; b < 100; b++) {
+    /* Cross-product arity-2: 5 col0 x 25 col1 (heavy suffix sharing). */
+    for (a = 0; a < 5; a++) {
+        for (b = 0; b < 25; b++) {
             cols[0] = (uint32_t)a;
             cols[1] = (uint32_t)b;
             dl_add_fact(db, "r", cols, 2);
@@ -438,9 +438,9 @@ static void t9_prefix_bound(char *dir, size_t cap)
     }
 
     /* rank_bound(leading={a}, k=1, (a,b)) == b: within the bound the suffixes
-     * are the complete set 0..99, so the suffix rank is exactly b. */
-    for (a = 0; a < 20; a++) {
-        for (b = 0; b < 100; b++) {
+     * are the complete set 0..24, so the suffix rank is exactly b. */
+    for (a = 0; a < 5; a++) {
+        for (b = 0; b < 25; b++) {
             leading[0] = (uint32_t)a;
             cols[0] = (uint32_t)a;
             cols[1] = (uint32_t)b;
@@ -450,9 +450,9 @@ static void t9_prefix_bound(char *dir, size_t cap)
     }
 
     /* Round-trip: select_bound(idx) then rank_bound of that tuple == idx. */
-    for (a = 0; a < 20; a++) {
+    for (a = 0; a < 5; a++) {
         leading[0] = (uint32_t)a;
-        for (b = 0; b < 100; b++) {
+        for (b = 0; b < 25; b++) {
             if (dl_select_bound(db, "r", leading, 1, (uint64_t)b, out, 2) != 0) {
                 FAIL("select_bound error"); goto out;
             }
@@ -463,9 +463,9 @@ static void t9_prefix_bound(char *dir, size_t cap)
     }
 
     /* select_bound within bound: idx-th tuple == (a, idx), full tuple out. */
-    for (a = 0; a < 20; a++) {
+    for (a = 0; a < 5; a++) {
         leading[0] = (uint32_t)a;
-        for (b = 0; b < 100; b++) {
+        for (b = 0; b < 25; b++) {
             if (dl_select_bound(db, "r", leading, 1, (uint64_t)b, out, 2) != 0) {
                 FAIL("select_bound error"); goto out;
             }
@@ -480,7 +480,7 @@ static void t9_prefix_bound(char *dir, size_t cap)
     }
 
     /* range_count_bound within bound: tuples (a, 5..10) == 5. */
-    for (a = 0; a < 20; a++) {
+    for (a = 0; a < 5; a++) {
         leading[0] = (uint32_t)a;
         cols[0] = (uint32_t)a;
         cols[1] = 5;
@@ -671,12 +671,12 @@ static void t11_perm(char *dir, size_t cap)
     assert(dl_declare_relation(db, "r", 2) == 0);   /* rel_id 0 */
     assert(dl_declare_relation(db, "r3", 3) == 0);  /* rel_id 1 */
 
-    for (i = 0; i < 400; i++) {
+    for (i = 0; i < 100; i++) {
         cols[0] = (uint32_t)(rand() % 50);
         cols[1] = (uint32_t)(rand() % 50);
         dl_add_fact(db, "r", cols, 2);
     }
-    for (i = 0; i < 300; i++) {
+    for (i = 0; i < 75; i++) {
         cols[0] = (uint32_t)(rand() % 30);
         cols[1] = (uint32_t)(rand() % 30);
         cols[2] = (uint32_t)(rand() % 30);

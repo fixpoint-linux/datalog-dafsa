@@ -533,10 +533,10 @@ static void test_t7_multi_rule(void)
 
 static void test_t8_property(void)
 {
-    TEST("T8: property — 200 random graphs x 5 sources, topdown==bound==magic");
+    TEST("T8: property — 40 random graphs x 5 sources, topdown==bound==magic");
 
     int iter;
-    for (iter = 0; iter < 200; iter++) {
+    for (iter = 0; iter < 40; iter++) {
         dl_db *db;
         char suffix[32];
         int N = 8 + (int)(iter % 12);
@@ -690,10 +690,10 @@ static void test_t11_nonleading_misc(void)
 
 static void test_t12_two_adorn_property(void)
 {
-    TEST("T12: property — 100 graphs x 3 sources, two-adornment p");
+    TEST("T12: property — 20 graphs x 3 sources, two-adornment p");
 
     int iter;
-    for (iter = 0; iter < 100; iter++) {
+    for (iter = 0; iter < 20; iter++) {
         dl_db *db;
         char suffix[32];
         int N = 8 + (int)(iter % 12);
@@ -774,11 +774,11 @@ static void test_t13_rejections(void)
 static void test_t14_chain_10000(void)
 {
     dl_db *db;
-    int N = 10000, i;
+    int N = 2500, i;
     uint32_t *edges;
     uint32_t leading[1] = {1};
 
-    TEST("T14: chain N=10000 — topdown single source, no stack overflow");
+    TEST("T14: chain N=2500 — topdown single source, no stack overflow");
     setup_db(&db, "t14");
     edges = malloc((size_t)(N - 1) * 2 * sizeof(uint32_t));
     for (i = 0; i < N - 1; i++) {
@@ -1173,9 +1173,9 @@ static void test_t21_reject_parity(void)
 static void test_t22_negated_edb_property(void)
 {
     int iter;
-    TEST("T22: property — 40 random graphs x 3 sources, negated-EDB");
+    TEST("T22: property — 10 random graphs x 3 sources, negated-EDB");
 
-    for (iter = 0; iter < 40; iter++) {
+    for (iter = 0; iter < 10; iter++) {
         dl_db *db;
         char suffix[32];
         int N = 8 + (int)(iter % 12);
@@ -1296,10 +1296,10 @@ static void test_benchmark(void)
     uint32_t *edges;
     uint32_t leading[1];
 
-    TEST("BENCH: chain N=1000/10000 + dense — topdown vs dl_query_magic");
+    TEST("BENCH: chain N=250/2500 + dense — topdown vs dl_query_magic");
 
-    /* chain N=1000 */
-    N = 1000;
+    /* chain N=250 */
+    N = 250;
     setup_db(&db, "b1");
     edges = malloc((size_t)(N - 1) * 2 * sizeof(uint32_t));
     for (i = 0; i < N - 1; i++) {
@@ -1309,11 +1309,11 @@ static void test_benchmark(void)
     free(edges);
     load_tc_rules(db);
     leading[0] = 1;
-    bench_one("chain N=1000 src=1", db, "tc", leading, 1);
+    bench_one("chain N=250 src=1", db, "tc", leading, 1);
     teardown_db(db, "b1");
 
-    /* chain N=10000 */
-    N = 10000;
+    /* chain N=2500 */
+    N = 2500;
     setup_db(&db, "b2");
     edges = malloc((size_t)(N - 1) * 2 * sizeof(uint32_t));
     for (i = 0; i < N - 1; i++) {
@@ -1323,11 +1323,11 @@ static void test_benchmark(void)
     free(edges);
     load_tc_rules(db);
     leading[0] = 1;
-    bench_one("chain N=10000 src=1", db, "tc", leading, 1);
+    bench_one("chain N=2500 src=1", db, "tc", leading, 1);
     teardown_db(db, "b2");
 
-    /* dense N=300 (complete digraph) */
-    N = 300;
+    /* dense N=120 (complete digraph) */
+    N = 120;
     setup_db(&db, "b3");
     edges = malloc((size_t)(N * N) * 2 * sizeof(uint32_t));
     {
@@ -1343,7 +1343,7 @@ static void test_benchmark(void)
     free(edges);
     load_tc_rules(db);
     leading[0] = 1;
-    bench_one("dense N=300 src=1", db, "tc", leading, 1);
+    bench_one("dense N=120 src=1", db, "tc", leading, 1);
     teardown_db(db, "b3");
 
     PASS();

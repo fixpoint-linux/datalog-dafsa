@@ -53,7 +53,7 @@ ALL_OBJS = $(VENDOR_OBJS) $(LIB_OBJS)
 
 # ─── Targets ─────────────────────────────────────────────────────────────
 
-.PHONY: all clean test bench test-m1 test-m2 wasm lsp test-lsp dlp dlp_schema_check dlp-check dlp-golden dl-embed fetch-model embed-test
+.PHONY: all clean test test-parallel bench test-m1 test-m2 wasm lsp test-lsp dlp dlp_schema_check dlp-check dlp-golden dl-embed fetch-model embed-test
 
 all: build-tmp libdatalog.so dl
 
@@ -292,118 +292,10 @@ bench: tests/bench
 	LD_LIBRARY_PATH=. ./tests/bench
 
 test: tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4 tests/test_m4_review tests/test_bulk tests/test_m5 tests/test_m5_review tests/test_m6 tests/test_m6_review tests/test_m6_deep_review tests/test_m7 tests/test_cas tests/test_m8_magic tests/test_topdown tests/test_m9_arith tests/test_m9_str tests/test_ivm tests/test_bushy tests/test_vararity tests/test_lists tests/test_m10_rank tests/test_m11_range tests/test_m12_snap_rank tests/test_m13_iter tests/test_m14_permsel tests/test_m15_vmiter tests/test_m16_travel tests/test_positions tests/test_schema tests/test_typecheck tests/test_traverse tests/test_search tests/test_vector_storage tests/test_vector_cli tests/test_embed_math tests/test_embed dl build-tmp
-	@echo "=== Running M0 unit tests ==="
-	LD_LIBRARY_PATH=. ./tests/test_m0
-	@echo ""
-	@echo "=== Running M1 unit tests ==="
-	LD_LIBRARY_PATH=. ./tests/test_m1
-	@echo ""
-	@echo "=== Running M2 unit tests ==="
-	LD_LIBRARY_PATH=. ./tests/test_m2
-	@echo ""
-	@echo "=== Running M3 unit tests ==="
-	LD_LIBRARY_PATH=. ./tests/test_m3
-	@echo ""
-	@echo "=== Running M4 unit tests ==="
-	LD_LIBRARY_PATH=. ./tests/test_m4
-	@echo ""
-	@echo "=== Running M4 adversarial review tests ==="
-	LD_LIBRARY_PATH=. ./tests/test_m4_review
-	@echo ""
-	@echo "=== Running bulk DAFSA tests ==="
-	LD_LIBRARY_PATH=. ./tests/test_bulk
-	@echo ""
-	@echo "=== Running M5 regex walker tests ==="
-	LD_LIBRARY_PATH=. ./tests/test_m5
-	@echo ""
-	@echo "=== Running M5 adversarial review tests ==="
-	LD_LIBRARY_PATH=. ./tests/test_m5_review
-	@echo ""
-	@echo "=== Running M6 permutation index tests ==="
-	LD_LIBRARY_PATH=. ./tests/test_m6
-	@echo ""
-	@echo "=== Running M6 adversarial tests ==="
-	LD_LIBRARY_PATH=. ./tests/test_m6_review
-	@echo ""
-	@echo "=== Running M6 deep adversarial tests ==="
-	LD_LIBRARY_PATH=. ./tests/test_m6_deep_review
-	@echo ""
-	@echo "=== Running M7 durability tests ==="
-	LD_LIBRARY_PATH=. ./tests/test_m7
-	@echo ""
-	@echo "=== Running CAS/txn tests ==="
-	LD_LIBRARY_PATH=. ./tests/test_cas
-	@echo ""
-	@echo "=== Running M8 magic-sets tests ==="
-	LD_LIBRARY_PATH=. ./tests/test_m8_magic
-	@echo ""
-	@echo "=== Running top-down/QSQ tests ==="
-	LD_LIBRARY_PATH=. ./tests/test_topdown
-	@echo ""
-	@echo "=== Running M9 arithmetic/comparison tests ==="
-	LD_LIBRARY_PATH=. ./tests/test_m9_arith
-	@echo ""
-	@echo "=== Running M9-strings builtin tests ==="
-	LD_LIBRARY_PATH=. ./tests/test_m9_str
-	@echo ""
-	@echo "=== Running IVM Slice 0 deletion-correctness tests ==="
-	LD_LIBRARY_PATH=. ./tests/test_ivm
-	@echo ""
-	@echo "=== Running BUSHY join plan tests ==="
-	LD_LIBRARY_PATH=. ./tests/test_bushy
-	@echo ""
-	@echo "=== Running v2 variable-arity tests ==="
-	LD_LIBRARY_PATH=. ./tests/test_vararity
-	@echo ""
-	@echo "=== Running v2 lists tests ==="
-	LD_LIBRARY_PATH=. ./tests/test_lists
-	@echo ""
-	@echo "=== Running M10 order-statistics (rank/select/range_count) tests ==="
-	LD_LIBRARY_PATH=. ./tests/test_m10_rank
-	@echo ""
-	@echo "=== Running M11 range predicate tests ==="
-	LD_LIBRARY_PATH=. ./tests/test_m11_range
-	@echo ""
-	@echo "=== Running M12 snapshot rank/select/range_count tests ==="
-	LD_LIBRARY_PATH=. ./tests/test_m12_snap_rank
-	@echo ""
-	@echo "=== Running M13 pull-iterator / merge-join tests ==="
-	LD_LIBRARY_PATH=. ./tests/test_m13_iter
-	@echo ""
-	@echo "=== Running M14 perm-index selection tests ==="
-	LD_LIBRARY_PATH=. ./tests/test_m14_permsel
-	@echo ""
-	@echo "=== Running M15 OP_RANGE lazy pull-iterator tests ==="
-	LD_LIBRARY_PATH=. ./tests/test_m15_vmiter
-	@echo ""
-	@echo "=== Running M16 time-travel (as-of) snapshot tests ==="
-	LD_LIBRARY_PATH=. ./tests/test_m16_travel
-	@echo ""
-	@echo "=== Running parser position (line:col) tests ==="
-	LD_LIBRARY_PATH=. ./tests/test_positions
-	@echo ""
-	@echo "=== Running Dhall schema tests ==="
-	LD_LIBRARY_PATH=. ./tests/test_schema
-	@echo ""
-	@echo "=== Running Dhall rule typechecker tests ==="
-	LD_LIBRARY_PATH=. ./tests/test_typecheck
-	@echo ""
-	@echo "=== Running graph traversal tests ==="
-	LD_LIBRARY_PATH=. ./tests/test_traverse
-	@echo ""
-	@echo "=== Running full-text search tests ==="
-	LD_LIBRARY_PATH=. ./tests/test_search
-	@echo ""
-	@echo "=== Running embed math (tokenizer + ITQ vs numpy/LAPACK goldens) tests ==="
-	./tests/test_embed_math
-	@echo ""
-	@echo "=== Running embed byte-identity tests ==="
-	./tests/test_embed
-	@echo ""
-	@if [ -x ./dl-embed ]; then echo "=== Running dl-embed self-test ==="; ./dl-embed self-test || exit 1; else echo "=== dl-embed not built (needs vendor/ggml + model: see make dl-embed) — skipping ==="; fi
-	@echo ""
-	@echo "=== Running CLI smoke test ==="
-	@sh tests/smoke.sh
+	./tests/run_all.sh
+
+test-parallel: tests/run_all.sh
+	./tests/run_all.sh
 
 test-m1: tests/test_m1 dl build-tmp
 	@echo "=== Running M1 unit tests ==="

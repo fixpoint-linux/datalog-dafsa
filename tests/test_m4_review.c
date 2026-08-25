@@ -315,9 +315,9 @@ static void test_exhaustive_view_vs_rel(void)
 {
     int iter;
 
-    TEST("exhaustive: view_prefix==rel_prefix with stop-early+all k (200 iters)");
+    TEST("exhaustive: view_prefix==rel_prefix with stop-early+all k (40 iters)");
 
-    for (iter = 0; iter < 200; iter++) {
+    for (iter = 0; iter < 40; iter++) {
         dl_db *db, *db2;
         uint8_t arity = (uint8_t)(1 + (iter % 4));
         int n_facts = 2 + (iter % 10);

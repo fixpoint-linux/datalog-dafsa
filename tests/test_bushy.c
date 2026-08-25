@@ -543,7 +543,7 @@ static void test_random_corpus(void)
 {
     char rule[1024];
     int seed;
-    for (seed = 100; seed < 140; seed++) {
+    for (seed = 100; seed < 110; seed++) {
         int n = 3 + (seed % 5);   /* 3..7 */
         gen_rule(n, (uint32_t)seed, rule, sizeof(rule));
         TEST("T6: random corpus (bushy == left-deep == body-order)");

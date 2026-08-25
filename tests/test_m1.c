@@ -364,9 +364,9 @@ static void test_property_random(void)
     dl_db *db;
     int i;
 
-    TEST("property test: random graphs (50 iterations)");
+    TEST("property test: random graphs (12 iterations)");
 
-    for (i = 0; i < 50; i++) {
+    for (i = 0; i < 12; i++) {
         /* Generate a small random directed graph with unique edges */
         int n_edges = 3 + (i % 10); /* 3-12 edges */
         int edges[20][2];

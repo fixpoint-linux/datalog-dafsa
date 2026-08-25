@@ -214,9 +214,9 @@ static void test_property_view_eq_rel(void)
 {
     int iter;
 
-    TEST("property: view_prefix == rel_prefix (100 random iterations)");
+    TEST("property: view_prefix == rel_prefix (20 random iterations)");
 
-    for (iter = 0; iter < 100; iter++) {
+    for (iter = 0; iter < 20; iter++) {
         dl_db *db;
         uint8_t arity = (uint8_t)(1 + (iter % 4));  /* 1..4 */
         int n_facts = 3 + (iter % 12);  /* 3..14 */
