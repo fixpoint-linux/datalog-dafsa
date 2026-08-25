@@ -358,6 +358,32 @@ int dl_compile(dl_db *db);
  * If a snapshot has been published, reads from mmap'd snapshot (bypasses VM). */
 long dl_query(dl_db *db, const char *goal_rel, dl_tuple_cb cb, void *user);
 
+/* Read-only arbitrary-rule query: parse + compile + evaluate `dl_source` as a
+ * SELF-CONTAINED rule program against a SHALLOW clone of `db`, stream every
+ * tuple of the goal relation `goal_rel` via `cb`, then discard the clone.
+ *
+ * Leaves `db` 100% untouched: no relation is added to db->rels, no existing
+ * relation's contents are mutated, and nothing is written to disk (the clone
+ * has dir==NULL, so the VM/compile path can never touch the filesystem).
+ *
+ * Semantics mirror dl_query on a hypothetical throwaway copy of the store:
+ *   - body atoms that name an existing relation read its CURRENT (view)
+ *     contents — exactly as dl_query would;
+ *   - rule heads are evaluated on the clone only; a head whose name matches
+ *     an existing relation is deep-copied in the clone so the VM writes into
+ *     the copy, never the borrowed live relation;
+ *   - `goal_rel` may be either a head of `dl_source` (derived) or an existing
+ *     relation.
+ *
+ * Supports the full evaluation class: variadic relations, list/range builtins,
+ * negation, aggregates, recursion.  No adornment or bound arguments required.
+ *
+ * Returns the tuple count streamed, or -1 on error (NULL args, parse/compile
+ * failure, goal_rel not found in the clone after evaluation, OOM).  Errors are
+ * printed to stderr in the engine's fx style. */
+long dl_query_rules_ro(dl_db *db, const char *dl_source,
+                       const char *goal_rel, dl_tuple_cb cb, void *user);
+
 /* Prefix-bind k leading columns and enumerate via cb.
  * Reads from snapshot if published, else falls back to in-memory path. */
 long dl_query_bound(dl_db *db, const char *goal_rel,

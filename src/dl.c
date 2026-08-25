@@ -2893,6 +2893,177 @@ long dl_query_bound(dl_db *db, const char *goal_rel,
     }
 }
 
+/* ─── Read-only arbitrary-rule query (clone-and-evaluate) ─────────────── */
+
+/* Forward decls: the eval-clone helpers live in the M8 magic-sets section. */
+static int eval_db_clone(dl_db *src, dl_db *out);
+static int eval_db_declare_inmem(dl_db *edb, const char *name, uint8_t arity);
+
+/* Deep-copy a relation's VIEW (base ∪ derived) into a fresh in-mem relation
+ * (no WAL, no files).  Used by dl_query_rules_ro to give a colliding head a
+ * private copy in the eval clone so the VM never writes a borrowed rel. */
+static relation *rel_deepcopy_view(const relation *src)
+{
+    relation *dst; tuple_set ts; uint8_t ar;
+    if (!src) return NULL;
+    ar = rel_arity(src);
+    dst = rel_create(ar);
+    if (!dst) return NULL;
+    if (ts_init(&ts, ar) != 0) { rel_free(dst); return NULL; }
+    if (rel_prefix(src, NULL, 0, ts_sink_cb, &ts) < 0) { ts_free(&ts); rel_free(dst); return NULL; }
+    ts_sort(&ts);
+    if (rel_build_from_tupleset(dst, &ts) != 0) { ts_free(&ts); rel_free(dst); return NULL; }
+    ts_free(&ts);
+    return dst;
+}
+
+static vrelation *vrel_deepcopy_view(const vrelation *src)
+{
+    vrelation *dst = vrel_create();
+    uint8_t a;
+    if (!dst) return NULL;
+    for (a = 1; a <= MAX_VAR_ARITY; a++) {
+        relation *v = vrel_variant_or_null(src, a);
+        if (!v) continue;
+        relation *cv = rel_deepcopy_view(v);
+        if (!cv || vrel_attach(dst, a, cv) != 0) { if (cv) rel_free(cv); vrel_free(dst); return NULL; }
+    }
+    return dst;
+}
+
+long dl_query_rules_ro(dl_db *db, const char *dl_source,
+                       const char *goal_rel, dl_tuple_cb cb, void *user)
+{
+    if (!db || !dl_source || !goal_rel || !cb) return -1;
+
+    parser *p = parse_create(dl_source);
+    if (!p) return -1;
+    rule **rules; int n_rules;
+    rules = parse_rules(p, &n_rules);
+    if (!rules) { parse_free(p); return -1; }
+
+    /* "rev"-reservation check (mirror dl_load_rules): the CAS revision
+     * relation is system-reserved and must never become a derived head or
+     * appear in a body. */
+    for (int i = 0; i < n_rules; i++) {
+        rule *r = rules[i];
+        if (r->head && r->head->pred && strcmp(r->head->pred, "rev") == 0) {
+            for (int j = 0; j < n_rules; j++) rule_free(rules[j]);
+            free(rules);
+            parse_free(p);
+            return -1;
+        }
+        for (int j = 0; j < r->nbody; j++) {
+            atom *a = r->body[j];
+            if (a && a->pred && strcmp(a->pred, "rev") == 0) {
+                for (int k = 0; k < n_rules; k++) rule_free(rules[k]);
+                free(rules);
+                parse_free(p);
+                return -1;
+            }
+        }
+    }
+
+    dl_db edb; size_t n_aliased; long result = -1;
+    uint8_t owned[MAX_RELS]; memset(owned, 0, sizeof(owned));
+    eval_db_clone(db, &edb);
+    n_aliased = edb.nrels;
+    compiled_rule **crules = NULL; int n_crules = 0;
+
+    /* Pre-declare / replace head relations in the clone. */
+    for (int i = 0; i < n_rules; i++) {
+        rule *r = rules[i];
+        if (!r->head || !r->head->pred) goto fail_free_rules;
+        const char *name = r->head->pred;
+        int ar = r->head->nargs;
+        int ri = find_rel(&edb, name);
+        if (ri < 0) {
+            /* Non-colliding head: declare FIXED at r->head->nargs. */
+            if (eval_db_declare_inmem(&edb, name, (uint8_t)ar) != 0)
+                goto fail_free_rules;
+        } else if ((size_t)ri < n_aliased) {
+            /* Collision with a BORROWED pre-existing relation: give the clone
+             * a private deep-copy so the VM writes into the copy, never the
+             * borrowed live relation.  (ri >= n_aliased means this head was
+             * already declared fresh by an earlier rule with the same head —
+             * leave it owned and untouched.) */
+            rel_entry *e = &edb.rels[ri];
+            if (e->kind == RELK_VARIADIC) {
+                vrelation *vc = vrel_deepcopy_view(e->vrel);
+                if (!vc) goto fail_free_rules;
+                e->vrel = vc;
+            } else {
+                relation *rc = rel_deepcopy_view(e->rel);
+                if (!rc) goto fail_free_rules;
+                e->rel = rc;
+            }
+            owned[ri] = 1;
+        }
+    }
+
+    if (compile_rules(&edb, rules, n_rules, &crules, &n_crules) != 0) {
+        fprintf(stderr, "dl_query_rules_ro: compile failed\n");
+        goto fail_free_crules;
+    }
+
+    /* Filesystem-trap backstop: the clone must stay dir==NULL so neither the
+     * compiler nor the VM can ever touch the disk. */
+    if (edb.dir != NULL) {
+        fprintf(stderr, "dl_query_rules_ro: internal error: clone grew a dir\n");
+        goto fail_free_crules;
+    }
+
+    /* Evaluate the full fixpoint on the clone. */
+    if (vm_execute(&edb, crules, n_crules) != 0) {
+        fprintf(stderr, "dl_query_rules_ro: evaluation failed\n");
+        goto fail_free_crules;
+    }
+
+    /* Stream the goal relation. */
+    {
+        int gi = find_rel(&edb, goal_rel);
+        if (gi < 0) {
+            fprintf(stderr, "dl_query_rules_ro: goal '%s' not found\n", goal_rel);
+            goto fail_free_crules;
+        }
+        if (edb.rels[gi].kind == RELK_VARIADIC)
+            result = vrel_prefix(edb.rels[gi].vrel, NULL, 0, cb, user);
+        else
+            result = rel_prefix(edb.rels[gi].rel, NULL, 0, cb, user);
+    }
+
+fail_free_crules:
+    if (crules) {
+        for (int i = 0; i < n_crules; i++) compiled_rule_free(crules[i]);
+        free(crules);
+    }
+    /* Free the clone: fresh rels (i >= n_aliased) are owned (rel/vrel+name);
+     * deep-copied collision heads (owned[i]) are owned but their names are
+     * borrowed; everything else is borrowed. */
+    permindex_free_all(&edb);
+    for (size_t i = 0; i < edb.nrels; i++) {
+        if (i >= n_aliased) {
+            if (edb.rels[i].kind == RELK_VARIADIC)
+                vrel_free(edb.rels[i].vrel);
+            else
+                rel_free(edb.rels[i].rel);
+            free(edb.rels[i].name);
+        } else if (owned[i]) {
+            if (edb.rels[i].kind == RELK_VARIADIC)
+                vrel_free(edb.rels[i].vrel);
+            else
+                rel_free(edb.rels[i].rel);
+            /* name borrowed from db — do not free */
+        }
+    }
+
+fail_free_rules:
+    for (int i = 0; i < n_rules; i++) rule_free(rules[i]);
+    free(rules);
+    parse_free(p);
+    return result;
+}
+
 /* ─── M4: time-travel (as-of) queries ──────────────────────────────────── */
 
 /* As-of reads are PURELY from-disk: they take an EXPLICIT version and never
