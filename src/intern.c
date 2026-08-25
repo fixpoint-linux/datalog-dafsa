@@ -191,7 +191,26 @@ int intern_save(interner *ir, const char *fwd_path, const char *rev_path)
     for (i = 1; i < ir->next_id; i++) {
         const char *s = ir->rev[i - 1];
         if (s) {
-            if (fputs(s, f) == EOF || fputc('\n', f) == EOF) {
+            /* Escape '\\' and '\n' so embedded newlines round-trip as one
+             * physical line (see intern_load).  '\n' becomes the two chars
+             * '\\' 'n' (0x5C 0x6E). */
+            for (; *s; s++) {
+                int c = (unsigned char)*s;
+                if (c == '\\' || c == '\n') {
+                    if (fputc('\\', f) == EOF) {
+                        fclose(f);
+                        unlink(tmp_path);
+                        return -1;
+                    }
+                    c = (c == '\\') ? '\\' : 'n';
+                }
+                if (fputc(c, f) == EOF) {
+                    fclose(f);
+                    unlink(tmp_path);
+                    return -1;
+                }
+            }
+            if (fputc('\n', f) == EOF) {
                 fclose(f);
                 unlink(tmp_path);
                 return -1;
@@ -252,6 +271,32 @@ interner *intern_load(const char *fwd_path, const char *rev_path)
                 line[--linelen] = '\0';
             if (linelen > 0 && line[linelen - 1] == '\r')
                 line[--linelen] = '\0';
+
+            /* Decode escapes: '\\' '\\' -> 0x5C, '\\' 'n' -> 0x0A, else
+             * verbatim.  Only sequences intern_save ever produces are
+             * '\\' '\\' and '\\' 'n'. */
+            {
+                char *in = line;
+                char *out = line;
+                while (*in) {
+                    if (*in == '\\') {
+                        in++;
+                        if (*in == 'n') {
+                            *out++ = '\n';
+                            in++;
+                        } else if (*in == '\\') {
+                            *out++ = '\\';
+                            in++;
+                        } else {
+                            /* lone trailing backslash, or unknown escape */
+                            *out++ = '\\';
+                        }
+                    } else {
+                        *out++ = *in++;
+                    }
+                }
+                *out = '\0';
+            }
 
             /* Grow rev array if needed */
             if (ir->next_id > ir->rev_cap) {
