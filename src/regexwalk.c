@@ -1397,51 +1397,126 @@ typedef struct {
     long count;
 } sym_prod_ctx;
 
+/* Explicit-stack frame for the iterative product DFS.  `j` is the next
+ * transition index to consider; `entered` records whether the NUL/sym_id
+ * check and visited-set insert have been performed for this frame.  The
+ * stack is heap-allocated because it can grow to ~MAX_WORD_LEN frames,
+ * which would overflow the C stack under the recursive form. */
+typedef struct {
+    unsigned int dstate;
+    uint32_t     rstate;
+    size_t       depth;
+    unsigned int j;
+    int          entered;
+} sp_frame;
+
 static int sym_prod_dfs(sym_prod_ctx *ctx, unsigned int dstate,
                        uint32_t rstate, size_t depth)
 {
-    const State *s;
-    uint32_t j;
-    int on_stack;
-    uint64_t vkey;
-    int rc;
+    sp_frame *stack;
+    size_t cap = 64;
+    size_t top = 0;
 
-    if (depth >= 4096) return 0;
+    if (depth >= MAX_WORD_LEN) return 0;
 
-    s = &ctx->d->states[dstate];
+    stack = malloc(cap * sizeof(*stack));
+    if (!stack) return -1;
 
-    /* Check for NUL terminator + accepting regex state */
-    for (j = 0; j < s->ntrans; j++) {
-        const Edge *e = &trans_arr_c(s)[j];
-        if (e->sym == 0x00 && ctx->dfa->accept[rstate]) {
-            int bad = 0;
-            uint32_t sym_id = read_sym_id(ctx->d, e->target, &bad);
-            if (!bad) {
-                ctx->count++;
-                if (ctx->cb(sym_id, ctx->user) != 0)
-                    return 1;
+    stack[top].dstate = dstate;
+    stack[top].rstate = rstate;
+    stack[top].depth = depth;
+    stack[top].j = 0;
+    stack[top].entered = 0;
+    top++;
+
+    while (top > 0) {
+        sp_frame *f = &stack[top - 1];
+
+        if (!f->entered) {
+            const State *s;
+            uint32_t j;
+            uint64_t vkey;
+            int on_stack;
+
+            f->entered = 1;
+            s = &ctx->d->states[f->dstate];
+
+            /* Check for NUL terminator + accepting regex state (before the
+             * visited-set insert, exactly as the recursive form did). */
+            for (j = 0; j < s->ntrans; j++) {
+                const Edge *e = &trans_arr_c(s)[j];
+                if (e->sym == 0x00 && ctx->dfa->accept[f->rstate]) {
+                    int bad = 0;
+                    uint32_t sym_id = read_sym_id(ctx->d, e->target, &bad);
+                    if (!bad) {
+                        ctx->count++;
+                        if (ctx->cb(sym_id, ctx->user) != 0) {
+                            free(stack);
+                            return 1;
+                        }
+                    }
+                }
+            }
+
+            vkey = ((uint64_t)f->dstate << 32) | (uint64_t)f->rstate;
+            on_stack = vs_try_insert(&ctx->visited, vkey);
+            if (on_stack < 0) { free(stack); return -1; }
+            if (on_stack == 1) {
+                /* Cycle: pair already on an ancestor's path.  Do not remove
+                 * it here — the ancestor still owns it. */
+                top--;
+                continue;
             }
         }
+
+        /* Descend into one child at a time; each child's subtree is fully
+         * explored before this frame resumes at the next transition. */
+        {
+            const State *s = &ctx->d->states[f->dstate];
+            int pushed = 0;
+
+            while (f->j < s->ntrans) {
+                const Edge *e = &trans_arr_c(s)[f->j];
+                unsigned char sym = e->sym;
+                uint32_t next_rs;
+                unsigned int child_d;
+                size_t child_depth;
+                f->j++;
+                if (sym == 0x00) continue;
+                next_rs = ctx->dfa->trans[(size_t)f->rstate * 256 + sym];
+                if (next_rs == DFA_DEAD) continue;
+                if (f->depth + 1 >= MAX_WORD_LEN) continue;
+                /* Capture child fields before realloc may move `stack`
+                 * (and thus invalidate `f`). */
+                child_d = e->target;
+                child_depth = f->depth + 1;
+                if (top == cap) {
+                    size_t ncap = cap * 2;
+                    sp_frame *ns = realloc(stack, ncap * sizeof(*stack));
+                    if (!ns) { free(stack); return -1; }
+                    stack = ns;
+                    cap = ncap;
+                }
+                stack[top].dstate = child_d;
+                stack[top].rstate = next_rs;
+                stack[top].depth = child_depth;
+                stack[top].j = 0;
+                stack[top].entered = 0;
+                top++;
+                pushed = 1;
+                break;
+            }
+            if (pushed) continue;
+        }
+
+        /* Subtree fully explored: pop and drop this pair from the path set. */
+        vs_remove(&ctx->visited,
+                  ((uint64_t)f->dstate << 32) | (uint64_t)f->rstate);
+        top--;
     }
 
-    vkey = ((uint64_t)dstate << 32) | (uint64_t)rstate;
-    on_stack = vs_try_insert(&ctx->visited, vkey);
-    if (on_stack < 0) return -1;
-    if (on_stack == 1) return 0;
-
-    rc = 0;
-    for (j = 0; j < s->ntrans; j++) {
-        const Edge *e = &trans_arr_c(s)[j];
-        unsigned char sym = e->sym;
-        if (sym == 0x00) continue;
-        uint32_t next_rs = ctx->dfa->trans[(size_t)rstate * 256 + sym];
-        if (next_rs == DFA_DEAD) continue;
-        rc = sym_prod_dfs(ctx, e->target, next_rs, depth + 1);
-        if (rc != 0) break;
-    }
-
-    vs_remove(&ctx->visited, vkey);
-    return rc;
+    free(stack);
+    return 0;
 }
 
 long symbols_dfa_walk(const dafsa *d, const regex_dfa *dfa,
@@ -1471,80 +1546,152 @@ typedef struct {
     long count;
 } sym_prod_view_ctx;
 
+/* Explicit-stack frame for the iterative view product DFS.  `cur` is the
+ * resume cursor into the mmap'd CSR for the next transition; `entered`
+ * records whether the NUL/sym_id check and visited-set insert have run. */
+typedef struct {
+    uint32_t       dstate;
+    uint32_t       rstate;
+    size_t         depth;
+    const uint8_t *cur;
+    int            entered;
+} sp_view_frame;
+
 static int sym_prod_view_dfs(sym_prod_view_ctx *ctx, uint32_t dstate,
                             uint32_t rstate, size_t depth)
 {
-    int on_stack;
-    uint64_t vkey;
-    int rc;
+    sp_view_frame *stack;
+    size_t cap = 64;
+    size_t top = 0;
 
-    if (depth >= 4096) return 0;
+    if (depth >= MAX_WORD_LEN) return 0;
 
-    /* Check for NUL terminator + accepting regex state */
-    {
-        const uint8_t *cur = ctx->v->csr + ctx->v->state_off[dstate];
-        unsigned char sym;
-        uint32_t tgt;
-        while (view_edge_next(ctx->v, dstate, &cur, &sym, &tgt) == 0) {
-            if (sym == 0x00 && ctx->dfa->accept[rstate]) {
-                /* Reconstruct the 4-byte u32BE payload following the NUL.
-                 * Mirrors read_sym_id: each of the 4 payload nodes must have
-                 * exactly one outgoing edge (the next payload byte). */
-                int bad = 0;
-                uint32_t sym_id = 0;
-                uint32_t cur2 = tgt;
-                for (int i = 0; i < 4; i++) {
-                    const uint8_t *cur_p = ctx->v->csr + ctx->v->state_off[cur2];
-                    unsigned char sym_p;
-                    uint32_t tgt_p;
-                    /* First edge must exist (the payload byte). */
-                    if (view_edge_next(ctx->v, cur2, &cur_p, &sym_p, &tgt_p) != 0) {
-                        bad = 1;
-                        break;
-                    }
-                    /* A second edge on the same node means malformed payload. */
-                    {
-                        const uint8_t *cur_p2 = cur_p;
-                        unsigned char sym_p2;
-                        uint32_t tgt_p2;
-                        if (view_edge_next(ctx->v, cur2, &cur_p2, &sym_p2, &tgt_p2) == 0) {
-                            bad = 1;
-                            break;
+    stack = malloc(cap * sizeof(*stack));
+    if (!stack) return -1;
+
+    stack[top].dstate = dstate;
+    stack[top].rstate = rstate;
+    stack[top].depth = depth;
+    stack[top].cur = NULL;
+    stack[top].entered = 0;
+    top++;
+
+    while (top > 0) {
+        sp_view_frame *f = &stack[top - 1];
+
+        if (!f->entered) {
+            uint64_t vkey;
+            int on_stack;
+
+            f->entered = 1;
+
+            /* Check for NUL terminator + accepting regex state (before the
+             * visited-set insert, exactly as the recursive form did). */
+            {
+                const uint8_t *cur = ctx->v->csr + ctx->v->state_off[f->dstate];
+                unsigned char sym;
+                uint32_t tgt;
+                while (view_edge_next(ctx->v, f->dstate, &cur, &sym, &tgt) == 0) {
+                    if (sym == 0x00 && ctx->dfa->accept[f->rstate]) {
+                        /* Reconstruct the 4-byte u32BE payload following the
+                         * NUL.  Mirrors read_sym_id: each of the 4 payload
+                         * nodes must have exactly one outgoing edge (the next
+                         * payload byte). */
+                        int bad = 0;
+                        uint32_t sym_id = 0;
+                        uint32_t cur2 = tgt;
+                        for (int i = 0; i < 4; i++) {
+                            const uint8_t *cur_p = ctx->v->csr + ctx->v->state_off[cur2];
+                            unsigned char sym_p;
+                            uint32_t tgt_p;
+                            /* First edge must exist (the payload byte). */
+                            if (view_edge_next(ctx->v, cur2, &cur_p, &sym_p, &tgt_p) != 0) {
+                                bad = 1;
+                                break;
+                            }
+                            /* A second edge on the same node means malformed
+                             * payload. */
+                            {
+                                const uint8_t *cur_p2 = cur_p;
+                                unsigned char sym_p2;
+                                uint32_t tgt_p2;
+                                if (view_edge_next(ctx->v, cur2, &cur_p2, &sym_p2, &tgt_p2) == 0) {
+                                    bad = 1;
+                                    break;
+                                }
+                            }
+                            sym_id = (sym_id << 8) | sym_p;
+                            cur2 = tgt_p;
+                        }
+                        if (!bad) {
+                            ctx->count++;
+                            if (ctx->cb(sym_id, ctx->user) != 0) {
+                                free(stack);
+                                return 1;
+                            }
                         }
                     }
-                    sym_id = (sym_id << 8) | sym_p;
-                    cur2 = tgt_p;
-                }
-                if (!bad) {
-                    ctx->count++;
-                    if (ctx->cb(sym_id, ctx->user) != 0)
-                        return 1;
                 }
             }
+
+            vkey = ((uint64_t)f->dstate << 32) | (uint64_t)f->rstate;
+            on_stack = vs_try_insert(&ctx->visited, vkey);
+            if (on_stack < 0) { free(stack); return -1; }
+            if (on_stack == 1) {
+                /* Cycle: pair already on an ancestor's path. */
+                top--;
+                continue;
+            }
+
+            /* Initialize the resume cursor for the child-iteration loop. */
+            f->cur = ctx->v->csr + ctx->v->state_off[f->dstate];
         }
+
+        /* Descend into one child at a time; each child's subtree is fully
+         * explored before this frame resumes at the next transition. */
+        {
+            unsigned char sym;
+            uint32_t tgt;
+            int pushed = 0;
+
+            while (view_edge_next(ctx->v, f->dstate, &f->cur, &sym, &tgt) == 0) {
+                uint32_t next_rs;
+                uint32_t child_d;
+                size_t child_depth;
+                if (sym == 0x00) continue;
+                next_rs = ctx->dfa->trans[(size_t)f->rstate * 256 + sym];
+                if (next_rs == DFA_DEAD) continue;
+                if (f->depth + 1 >= MAX_WORD_LEN) continue;
+                /* Capture child fields before realloc may move `stack`. */
+                child_d = tgt;
+                child_depth = f->depth + 1;
+                if (top == cap) {
+                    size_t ncap = cap * 2;
+                    sp_view_frame *ns = realloc(stack, ncap * sizeof(*stack));
+                    if (!ns) { free(stack); return -1; }
+                    stack = ns;
+                    cap = ncap;
+                }
+                stack[top].dstate = child_d;
+                stack[top].rstate = next_rs;
+                stack[top].depth = child_depth;
+                stack[top].cur = NULL;
+                stack[top].entered = 0;
+                top++;
+                pushed = 1;
+                break;
+            }
+            if (pushed) continue;
+        }
+
+        /* Subtree fully explored: pop and drop this pair from the path set. */
+        vs_remove(&ctx->visited,
+                  ((uint64_t)f->dstate << 32) | (uint64_t)f->rstate);
+        top--;
     }
 
-    vkey = ((uint64_t)dstate << 32) | (uint64_t)rstate;
-    on_stack = vs_try_insert(&ctx->visited, vkey);
-    if (on_stack < 0) return -1;
-    if (on_stack == 1) return 0;
-
-    rc = 0;
-    {
-        const uint8_t *cur = ctx->v->csr + ctx->v->state_off[dstate];
-        unsigned char sym;
-        uint32_t tgt;
-        while (view_edge_next(ctx->v, dstate, &cur, &sym, &tgt) == 0) {
-            if (sym == 0x00) continue;
-            uint32_t next_rs = ctx->dfa->trans[(size_t)rstate * 256 + sym];
-            if (next_rs == DFA_DEAD) continue;
-            rc = sym_prod_view_dfs(ctx, tgt, next_rs, depth + 1);
-            if (rc != 0) break;
-        }
-    }
-
-    vs_remove(&ctx->visited, vkey);
-    return rc;
+    free(stack);
+    return 0;
 }
 
 long symbols_dfa_walk_view(const dafsa_view *v, const regex_dfa *dfa,

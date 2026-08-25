@@ -564,8 +564,8 @@ static void test_embedded_nul(void)
 static void test_max_word_len(void)
 {
     TEST("E2 key > MAX_WORD_LEN rejected");
-    /* Build a key longer than MAX_WORD_LEN (4096) */
-    size_t longlen = 5000;
+    /* Build a key longer than MAX_WORD_LEN (65536) */
+    size_t longlen = 65537;
     unsigned char *longkey = calloc(1, longlen + 1);
     assert(longkey);
     memset(longkey, 'A', longlen);

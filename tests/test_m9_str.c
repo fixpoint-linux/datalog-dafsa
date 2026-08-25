@@ -20,6 +20,7 @@
  */
 #include "dl.h"
 #include "dl_internal.h"
+#include "regexwalk.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -475,21 +476,25 @@ static void test_t6_edge_cases(void)
         teardown_db(db, "t6a");
     }
 
-    /* 6b: concat result > 4096 bytes -> backtrack (no tuple) */
+    /* 6b: concat result exceeding the symbol cap -> backtrack (no tuple).
+     * Two 33KB operands (which now intern fine at the raised 64K cap) join to
+     * a 66KB result that is too long, so the producing builtin backtracks. */
     {
-        char *big = malloc(3001);
+        char *big = malloc(33001);
         const char *cells[1];
         assert(big);
-        memset(big, 'a', 3000);
-        big[3000] = '\0';
+        memset(big, 'a', 33000);
+        big[33000] = '\0';
         cells[0] = big;
         setup_db(&db, "t6b");
-        load_str_rows(db, "str", 1, cells, 1, "t6b");
+        /* The 33KB operand must actually intern/load (non-vacuous: with the
+         * old 4096 cap this load silently failed and `str` stayed empty). */
+        assert(load_str_rows(db, "str", 1, cells, 1, "t6b") == 1);
         assert(dl_load_rules(db, "r(C):-str(A),str(B),C=concat(A,B).\n") == 0);
         assert(dl_compile(db) == 0);
         {
             if (!check_query(db, "r", NULL, 0, 1)) {
-                FAIL(">4096 concat should backtrack to empty");
+                FAIL("over-long concat should backtrack to empty");
                 free(big); teardown_db(db, "t6b"); return;
             }
         }
@@ -796,6 +801,107 @@ static void test_t9_lower_upper(void)
     teardown_db(db, "t9");
 }
 
+/* ─── T10: long-symbol interning (raised 64K cap) ──────────────────────── */
+
+static int symset_collect_cb(uint32_t sym_id, void *user)
+{
+    sym_set *set = (sym_set *)user;
+    return symset_add(set, sym_id);
+}
+
+static void test_t10_long_symbol(void)
+{
+    TEST("T10: 33311-byte symbol round-trips (intern/save/reload/find/of)");
+
+    const size_t N = 33311;
+    char *long_s = malloc(N + 1);
+    assert(long_s);
+    memset(long_s, 'a', N);
+    long_s[N] = '\0';
+
+    interner *ir = intern_create();
+    assert(ir);
+
+    /* Intern: must succeed (was rejected at the old 4096 cap). */
+    uint32_t id = intern_str(ir, long_s);
+    if (id == 0) {
+        FAIL("33311-byte symbol rejected");
+        free(long_s); intern_free(ir); return;
+    }
+
+    /* find + of agree on the live interner. */
+    if (intern_str_find(ir, long_s) != id) {
+        FAIL("intern_str_find mismatch (live)");
+        free(long_s); intern_free(ir); return;
+    }
+    {
+        const char *back = intern_str_of(ir, id);
+        if (!back || strcmp(back, long_s) != 0) {
+            FAIL("intern_str_of mismatch (live)");
+            free(long_s); intern_free(ir); return;
+        }
+    }
+
+    /* Regex symbol walk over the long symbol (iterative product DFS). */
+    {
+        regex_dfa *dfa = regex_compile(".*");
+        sym_set set;
+        assert(dfa && !dfa->errmsg);
+        assert(symset_init(&set) == 0);
+        long n = symbols_dfa_walk(intern_fwd(ir), dfa, symset_collect_cb, &set);
+        if (n != 1 || !symset_contains(&set, id)) {
+            FAIL("symbol regex walk did not match the long symbol");
+        }
+        symset_free(&set);
+        regex_dfa_free(dfa);
+    }
+
+    /* Persist, free, reload, then verify find/of round-trip. */
+    {
+        const char *fwd = "build-tmp/m9str_t10_symbols.dafsa";
+        const char *rev = "build-tmp/m9str_t10_symbols.array";
+        remove(fwd);
+        remove(rev);
+        if (intern_save(ir, fwd, rev) != 0) {
+            FAIL("intern_save failed");
+            free(long_s); intern_free(ir); return;
+        }
+        intern_free(ir);
+        ir = intern_load(fwd, rev);
+        assert(ir);
+        if (intern_str_find(ir, long_s) != id) {
+            FAIL("intern_str_find mismatch (reloaded)");
+            free(long_s); intern_free(ir); return;
+        }
+        {
+            const char *back = intern_str_of(ir, id);
+            if (!back || strcmp(back, long_s) != 0) {
+                FAIL("intern_str_of mismatch (reloaded)");
+                free(long_s); intern_free(ir); return;
+            }
+        }
+        remove(fwd);
+        remove(rev);
+    }
+
+    /* Rejection above the raised cap is still exercised. */
+    {
+        const size_t over = 65537;
+        char *too = malloc(over + 1);
+        assert(too);
+        memset(too, 'b', over);
+        too[over] = '\0';
+        if (intern_str(ir, too) != 0) {
+            FAIL(">64K symbol should be rejected");
+        }
+        free(too);
+    }
+
+    free(long_s);
+    intern_free(ir);
+    PASS();
+}
+
 int main(void)
 {
     printf("M9-strings Builtin Tests\n");
@@ -810,6 +916,7 @@ int main(void)
     test_t7_property();
     test_t8_empty_string_literals();
     test_t9_lower_upper();
+    test_t10_long_symbol();
 
     printf("\n%d tests run, %d failed\n", tests_run, tests_failed);
     return tests_failed ? 1 : 0;

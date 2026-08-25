@@ -10,6 +10,7 @@
 
 #include "intern.h"
 #include "dafsa.h"
+#include "dafsa_internal.h"   /* MAX_WORD_LEN guard */
 #include "util.h"
 
 #include <stdlib.h>
@@ -119,11 +120,16 @@ uint32_t intern_str(interner *ir, const char *str)
     /* 2. Allocate new sym_id */
     ir->dirty = 1;
     {
-        uint32_t id = ir->next_id++;
-        unsigned char key_buf[4096 + 1 + 4]; /* str + \0 + u32BE */
+        uint32_t id;
         size_t key_len = slen + 1 + 4;
+        unsigned char *key_buf; /* str + \0 + u32BE */
 
-        if (key_len > sizeof(key_buf)) return 0;  /* too long */
+        if (key_len > MAX_WORD_LEN) return 0;  /* too long */
+
+        key_buf = malloc(key_len);
+        if (!key_buf) return 0;  /* OOM */
+
+        id = ir->next_id++;
 
         memcpy(key_buf, str, slen);
         key_buf[slen] = 0x00;
@@ -133,8 +139,11 @@ uint32_t intern_str(interner *ir, const char *str)
         key_buf[slen + 3] = (unsigned char)((id >> 8)  & 0xFF);
         key_buf[slen + 4] = (unsigned char)(id & 0xFF);
 
-        if (dafsa_add_n(ir->fwd, key_buf, key_len) < 0)
+        if (dafsa_add_n(ir->fwd, key_buf, key_len) < 0) {
+            free(key_buf);
             return 0;  /* add failed */
+        }
+        free(key_buf);
 
         /* 3. Grow reverse array if needed */
         if (id > ir->rev_cap) {
