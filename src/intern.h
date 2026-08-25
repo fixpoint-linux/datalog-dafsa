@@ -20,8 +20,9 @@ typedef struct dafsa dafsa;
 /* Opaque handle */
 typedef struct interner interner;
 
-/* Return the forward DAFSA (symbols DAFSA) from an interner. */
-const dafsa *intern_fwd(const interner *ir);
+/* Return the forward DAFSA (symbols DAFSA) from an interner, lazily loading
+ * it (read-only) on first call. */
+const dafsa *intern_fwd(interner *ir);
 
 /* ─── Lifecycle ───────────────────────────────────────────────────────── */
 

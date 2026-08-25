@@ -480,7 +480,7 @@ void dl_close(dl_db *db)
     {
         char *fwd_path = make_path(db, "symbols", ".dafsa");
         char *rev_path = make_path(db, "symbols", ".array");
-        if (fwd_path && rev_path)
+        if (fwd_path && rev_path && intern_is_dirty(db->ir))
             intern_save(db->ir, fwd_path, rev_path);
         free(fwd_path);
         free(rev_path);
