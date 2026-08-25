@@ -182,6 +182,70 @@ static int int_set_add(int_set *s, uint32_t val)
     return 1;
 }
 
+/* Open-addressing hash set of u64 keys (packed (term_sym<<32)|obs_id), used
+ * to dedup postings added within one dl_index_observations run.  The txn path
+ * (dl_txn_add_fact) returns 0 regardless of whether the fact is new, and
+ * buffered ops are invisible to dl_lookup until commit, so a local set is the
+ * only way to count genuinely-new postings. */
+typedef struct {
+    uint64_t *slots;  /* 0 == empty slot (keys are never 0) */
+    size_t   count;
+    size_t   cap;     /* power of two */
+} u64_set;
+
+static void u64_set_free(u64_set *s)
+{
+    free(s->slots);
+    s->slots = NULL;
+    s->count = 0;
+    s->cap = 0;
+}
+
+static uint64_t u64_set_hash(uint64_t k)
+{
+    k ^= k >> 33;
+    k *= 0xff51afd7ed558ccdULL;
+    k ^= k >> 33;
+    return k;
+}
+
+static int u64_set_grow(u64_set *s)
+{
+    size_t ncap = s->cap ? s->cap * 2 : 64;
+    uint64_t *ns = calloc(ncap, sizeof(*ns));
+    size_t i;
+    if (!ns) return -1;
+    for (i = 0; i < s->cap; i++) {
+        if (s->slots[i]) {
+            size_t idx = u64_set_hash(s->slots[i]) & (ncap - 1);
+            while (ns[idx]) idx = (idx + 1) & (ncap - 1);
+            ns[idx] = s->slots[i];
+        }
+    }
+    free(s->slots);
+    s->slots = ns;
+    s->cap = ncap;
+    return 0;
+}
+
+/* Returns 1 if inserted, 0 if already present, -1 on OOM. */
+static int u64_set_add(u64_set *s, uint64_t k)
+{
+    size_t idx;
+    if (k == 0) return 0;
+    if (s->cap == 0 || (s->count + 1) * 4 >= s->cap * 3) {
+        if (u64_set_grow(s) != 0) return -1;
+    }
+    idx = u64_set_hash(k) & (s->cap - 1);
+    while (s->slots[idx]) {
+        if (s->slots[idx] == k) return 0;
+        idx = (idx + 1) & (s->cap - 1);
+    }
+    s->slots[idx] = k;
+    s->count++;
+    return 1;
+}
+
 /* Callback context for collecting obs_ids */
 typedef struct {
     int_set *set;
@@ -597,9 +661,12 @@ typedef struct {
     dl_db *db;
     long postings_added;
     int error;
+    u64_set seen;   /* (term_sym<<32)|obs_id pairs added this run, for dedup */
 } index_obs_ctx;
 
-/* Callback for dl_prefix to process each observation tuple */
+/* Callback for dl_prefix to process each observation tuple.  Runs inside a
+ * dl_txn, so postings go through dl_txn_add_fact (buffered, committed with one
+ * WAL fsync + one interner save) rather than per-posting dl_add_fact. */
 static int index_obs_cb(const uint32_t *cols, uint8_t arity, void *user)
 {
     index_obs_ctx *ctx = (index_obs_ctx *)user;
@@ -628,7 +695,10 @@ static int index_obs_cb(const uint32_t *cols, uint8_t arity, void *user)
         return 0;
     }
 
-    /* For each token, intern and add posting */
+    /* For each token, intern and buffer a posting (dedup in-run via the hash
+     * set; dedup against the persisted base via dl_lookup).  A posting counts
+     * as "added" only when it is genuinely new — dl_txn_add_fact gives no
+     * added-vs-dup signal, so we count it ourselves here. */
     size_t i = 0;
     while (tokens[i]) {
         uint32_t term_sym = dl_intern_str(ctx->db, tokens[i]);
@@ -637,19 +707,62 @@ static int index_obs_cb(const uint32_t *cols, uint8_t arity, void *user)
             token_free(tokens);
             return 1;
         }
-        int rc = aux_index_add_posting(ctx->db, term_sym, cols[1]);
-        if (rc < 0) {
+        uint32_t pc[2] = {term_sym, cols[1]};
+        int is_new = u64_set_add(&ctx->seen,
+                                 ((uint64_t)term_sym << 32) | cols[1]);
+        if (is_new < 0) {
             ctx->error = 1;
             token_free(tokens);
             return 1;
         }
-        if (rc == 1) {
+        if (is_new == 1 && !dl_lookup(ctx->db, POSTINGS_REL_NAME, pc, 2)) {
+            if (dl_txn_add_fact(ctx->db, POSTINGS_REL_NAME, pc, 2) != 0) {
+                ctx->error = 1;
+                token_free(tokens);
+                return 1;
+            }
             ctx->postings_added++;
         }
         i++;
     }
 
     token_free(tokens);
+    return 0;
+}
+
+/* Simple tuple-counting callback (k=0 enumeration). */
+typedef struct {
+    long count;
+} count_ctx;
+
+static int count_cb(const uint32_t *cols, uint8_t arity, void *user)
+{
+    count_ctx *c = (count_ctx *)user;
+    (void)cols;
+    (void)arity;
+    c->count++;
+    return 0;
+}
+
+/* Callback to collect DISTINCT obs_id values (postings column 1) into a
+ * u64_set.  Used by the short-circuit completeness check. */
+typedef struct {
+    u64_set seen;
+    long distinct;
+    int error;
+} distinct_obs_ctx;
+
+static int distinct_obs_cb(const uint32_t *cols, uint8_t arity, void *user)
+{
+    distinct_obs_ctx *c = (distinct_obs_ctx *)user;
+    int r;
+    (void)arity;
+    r = u64_set_add(&c->seen, cols[1]);
+    if (r < 0) {
+        c->error = 1;
+        return 1;  /* stop */
+    }
+    if (r == 1) c->distinct++;
     return 0;
 }
 
@@ -661,19 +774,52 @@ long dl_index_observations(dl_db *db)
     if (aux_index_ensure_postings(db) != 0)
         return -1;
 
-    /* Check if observation relation exists and is arity-2 */
-    /* We use dl_prefix with k=0 to enumerate all observation tuples */
-    index_obs_ctx ctx = {db, 0, 0};
+    /* Short-circuit: if the index already covers every observation content, it
+     * is complete — return 0 without re-tokenizing or re-writing anything.
+     * "Covered" is checked by comparing the number of observation tuples with
+     * the number of DISTINCT obs_id already in __postings__.  Both are cheap
+     * counting passes (no tokenization, no writes), so a second call with no
+     * new observations returns near-instantly. */
+    {
+        count_ctx oc = {0};
+        if (dl_prefix(db, "observation", NULL, 0, count_cb, &oc) < 0)
+            return 0;  /* no observation relation -> nothing to index */
 
-    long n = dl_prefix(db, "observation", NULL, 0, index_obs_cb, &ctx);
-    if (n < 0) {
-        /* Relation doesn't exist (or is variadic and enumerable as empty):
-         * nothing to index.  A variadic relation that holds non-arity-2 facts
-         * is caught by the arity check in index_obs_cb, not here. */
-        return 0;
+        distinct_obs_ctx dc = { {0, 0, 0}, 0, 0 };
+        if (dl_prefix(db, POSTINGS_REL_NAME, NULL, 0, distinct_obs_cb, &dc) < 0) {
+            u64_set_free(&dc.seen);
+            return -1;
+        }
+        if (dc.error) {
+            u64_set_free(&dc.seen);
+            return -1;
+        }
+        if (dc.distinct >= oc.count) {
+            u64_set_free(&dc.seen);
+            return 0;  /* index already complete */
+        }
+        u64_set_free(&dc.seen);
     }
 
-    if (ctx.error)
+    /* Buffer the whole enumeration in one transaction: every posting commit
+     * lands with ONE WAL fsync and ONE interner save (dl_txn_commit does the
+     * M7 interner/term-store ordering internally) instead of one fsync + one
+     * intern_save per posting.  The txn buffer grows dynamically, so there is
+     * no capacity cap to chunk against. */
+    if (dl_txn_begin(db) != 0)
+        return -1;
+
+    index_obs_ctx ctx = {db, 0, 0, {0, 0, 0}};
+    long n = dl_prefix(db, "observation", NULL, 0, index_obs_cb, &ctx);
+    if (n < 0 || ctx.error) {
+        dl_txn_rollback(db);
+        u64_set_free(&ctx.seen);
+        return -1;
+    }
+
+    u64_set_free(&ctx.seen);
+
+    if (dl_txn_commit(db) != 0)
         return -1;
 
     return ctx.postings_added;
