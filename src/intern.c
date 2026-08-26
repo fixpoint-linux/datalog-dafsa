@@ -29,6 +29,7 @@ struct interner {
     int      dirty;        /* M7: 1 if new syms added since last save */
     char    *fwd_path;     /* on-disk path of the forward DAFSA (lazy-load) */
     int      fwd_ro;       /* 1 if fwd is a read-only handle that must NOT be mutated */
+    uint32_t fwd_gen;      /* next_id the in-memory fwd was built from (stale if != next_id) */
 };
 
 /* ─── Callback for dafsa_prefix_enum: capture the first sym_id ──────── */
@@ -104,31 +105,21 @@ static int intern_ensure_fwd(interner *ir, int want_mutable)
     uint32_t i;
 
     if (!ir) return -1;
-    if (ir->fwd && (!want_mutable || !ir->fwd_ro))
+    if (ir->fwd && (!want_mutable || !ir->fwd_ro) &&
+        ir->fwd_gen == ir->next_id)
         return 0;  /* already satisfies the request */
 
-    if (ir->fwd && want_mutable) {
-        /* read-only handle in place; replace it with a mutable rebuild below */
+    if (ir->fwd) {
+        /* stale (gen mismatch) or wrong-mode handle; replace with a rebuild */
         dafsa_free(ir->fwd);
         ir->fwd = NULL;
     }
 
-    if (ir->fwd) {
-        /* satisfied read-only need */
-        return 0;
-    }
-
-    if (!want_mutable) {
-        d = dafsa_load_readonly(ir->fwd_path);
-        if (!d) d = dafsa_create();      /* missing/corrupt file -> empty */
-        if (!d) return -1;
-        ir->fwd = d;
-        ir->fwd_ro = 1;
-        return 0;
-    }
-
-    /* Mutable rebuild from the reverse array: for each rev[i] (sym_id i+1)
-     * build the same key intern_str constructs — str \0 id_u32BE. */
+    /* Rebuild the forward DAFSA from the reverse array (the source of truth).
+     * The on-disk symbols.dafsa is a pure derived cache and is never trusted:
+     * after P1 intern_save writes only symbols.array, so the file may be stale
+     * or absent.  For each rev[i] (sym_id i+1) build the same key intern_str
+     * constructs — str \0 id_u32BE. */
     d = dafsa_create();
     if (!d) return -1;
     for (i = 0; i < ir->next_id - 1 && i < ir->rev_cap; i++) {
@@ -157,75 +148,65 @@ static int intern_ensure_fwd(interner *ir, int want_mutable)
         free(key);
     }
     ir->fwd = d;
-    ir->fwd_ro = 0;
+    ir->fwd_ro = want_mutable ? 0 : 1;
+    ir->fwd_gen = ir->next_id;
     return 0;
 }
 
-/* NON-MUTATING lookup: same forward-DAFSA walk as intern_str, but never
- * allocates / never marks dirty.  Returns 0 if absent (or on NULL input). */
-uint32_t intern_str_find(interner *ir, const char *str)
+/* NON-MUTATING lookup: walk the forward DAFSA if it is materialized and
+ * current (fwd_gen == next_id), else linear-scan the reverse array.  Returns
+ * 0 if absent (or on NULL input).  Never allocates / never marks dirty. */
+static uint32_t intern_lookup(interner *ir, const char *str)
 {
-    size_t slen;
-    struct capture_ctx ctx = {0, 0};
-
     if (!ir || !str) return 0;
 
-    if (intern_ensure_fwd(ir, 0) != 0) return 0;   /* OOM: treat as absent */
+    if (ir->fwd && ir->fwd_gen == ir->next_id) {
+        size_t slen = strlen(str);
+        struct capture_ctx ctx = {0, 0};
+        dafsa_prefix_enum(ir->fwd, (const unsigned char *)str, slen,
+                          capture_cb, &ctx);
+        return ctx.found ? ctx.id : 0;
+    }
 
-    slen = strlen(str);
-    dafsa_prefix_enum(ir->fwd, (const unsigned char *)str, slen,
-                      capture_cb, &ctx);
+    {
+        uint32_t i;
+        for (i = 0; i < ir->next_id - 1 && i < ir->rev_cap; i++)
+            if (ir->rev[i] && strcmp(ir->rev[i], str) == 0)
+                return i + 1;
+    }
+    return 0;
+}
 
-    return ctx.found ? ctx.id : 0;
+uint32_t intern_str_find(interner *ir, const char *str)
+{
+    return ir ? intern_lookup(ir, str) : 0;
 }
 
 uint32_t intern_str(interner *ir, const char *str)
 {
     size_t slen;
-    struct capture_ctx ctx = {0, 0};
+    uint32_t id;
 
     if (!ir || !str) return 0;
 
-    /* Lookup half needs fwd; the add half needs a MUTABLE fwd (it may grow).
-     * Ensuring mutable here rebuilds once and covers both halves. */
-    if (intern_ensure_fwd(ir, 1) != 0) return 0;   /* OOM */
+    /* Lookup half never mutates / never rebuilds: uses the fwd walk when the
+     * cache is current, else the rev[] scan. */
+    id = intern_lookup(ir, str);
+    if (id) return id;
 
     slen = strlen(str);
 
-    /* 1. Check if already interned via prefix enum */
-    dafsa_prefix_enum(ir->fwd, (const unsigned char *)str, slen,
-                      capture_cb, &ctx);
-
-    if (ctx.found)
-        return ctx.id;
-
-    /* 2. Allocate new sym_id */
+    /* Allocate new sym_id: append to rev[] only.  The forward DAFSA is a pure
+     * derived cache — it is NOT grown here (that would make intern_save's full
+     * rebuild pointless); the just-added symbol lives in rev[] and the cache
+     * is invalidated below so lookups fall back to the rev[] scan. */
     ir->dirty = 1;
     {
-        uint32_t id;
         size_t key_len = slen + 1 + 4;
-        unsigned char *key_buf; /* str + \0 + u32BE */
 
         if (key_len > MAX_WORD_LEN) return 0;  /* too long */
 
-        key_buf = malloc(key_len);
-        if (!key_buf) return 0;  /* OOM */
-
         id = ir->next_id++;
-
-        memcpy(key_buf, str, slen);
-        key_buf[slen] = 0x00;
-        /* write id as u32 big-endian */
-        key_buf[slen + 1] = (unsigned char)((id >> 24) & 0xFF);
-        key_buf[slen + 2] = (unsigned char)((id >> 16) & 0xFF);
-        key_buf[slen + 3] = (unsigned char)((id >> 8)  & 0xFF);
-        key_buf[slen + 4] = (unsigned char)(id & 0xFF);
-
-        if (dafsa_add_n(ir->fwd, key_buf, key_len) < 0) {
-            free(key_buf);
-            return 0;  /* add failed */
-        }
-        free(key_buf);
 
         /* 3. Grow reverse array if needed */
         if (id > ir->rev_cap) {
@@ -242,6 +223,13 @@ uint32_t intern_str(interner *ir, const char *str)
         /* 4. Store string in reverse array */
         ir->rev[id - 1] = strdup(str);
         if (!ir->rev[id - 1]) return 0;
+
+        /* Invalidate the stale forward-DAFSA cache: fwd_gen != next_id now,
+         * and the cached handle no longer covers the new symbol. */
+        if (ir->fwd) {
+            dafsa_free(ir->fwd);
+            ir->fwd = NULL;
+        }
 
         return id;
     }
@@ -273,17 +261,12 @@ int intern_save(interner *ir, const char *fwd_path, const char *rev_path)
 
     if (!ir || !fwd_path || !rev_path) return -1;
 
-    /* Save forward DAFSA (already atomic: dafsa_save does tmp+fsync+rename)
-     * ONLY when it isn't already current at this path.  Skip iff clean AND
-     * writing to the interner's own canonical path (the on-disk copy there is
-     * identical).  This avoids rewriting an 89MB DAFSA on every clean close.
-     * A different destination (e.g. a snapshot dir) must always be emitted.
-     * dafsa_save is const, so a read-only handle suffices — no rebuild. */
-    if (ir->dirty || !ir->fwd_path || !fwd_path ||
-        strcmp(fwd_path, ir->fwd_path) != 0) {
-        if (intern_ensure_fwd(ir, 0) != 0) return -1;
-        if (dafsa_save(ir->fwd, fwd_path) != 0) return -1;
-    }
+    /* The forward DAFSA is a pure DERIVED cache of the reverse array; it is
+     * NOT persisted here.  Only symbols.array is the source of truth and the
+     * only thing WAL recovery needs, so a save is just the atomic array write
+     * below.  symbols.dafsa is left stale/absent on disk and rebuilt lazily
+     * from rev[] by intern_ensure_fwd.  fwd_path is kept in the signature for
+     * caller compatibility but is intentionally ignored. */
 
     /* Save reverse array atomically: streaming tmp+fsync+rename+dir-fsync */
     snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", rev_path);

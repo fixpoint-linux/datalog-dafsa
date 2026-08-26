@@ -237,8 +237,9 @@ static void test_t6_ordering_invariant(void)
     /* Load facts with string columns.  dl_load_facts now saves interner
      * BEFORE rel_save, so the sym_ids in the DAFSA are guaranteed to have
      * corresponding entries in symbols.array.  We verify this by checking
-     * that after load, the symbols.array file exists and is non-empty,
-     * and that symbols.dafsa exists. */
+     * that after load, the symbols.array file exists and is non-empty.
+     * symbols.dafsa is a pure derived cache and is no longer written on the
+     * interner save path, so it must NOT be present here. */
     dl_db *db = dl_open("build-tmp/m7t6");
     assert(db != NULL);
     assert(dl_declare_relation(db, "test", 1) == 0);
@@ -247,13 +248,17 @@ static void test_t6_ordering_invariant(void)
     int n = dl_load_facts(db, "test", "build-tmp/m7t6/data.csv");
     assert(n == 2);
 
-    /* Both files should exist and be non-empty */
+    /* The reverse array must exist and be non-empty (source of truth). */
     {
-        struct stat st_fwd, st_rev;
-        assert(stat("build-tmp/m7t6/symbols.dafsa", &st_fwd) == 0);
+        struct stat st_rev;
         assert(stat("build-tmp/m7t6/symbols.array", &st_rev) == 0);
-        assert(st_fwd.st_size > 0);
         assert(st_rev.st_size > 0);
+    }
+    /* The forward DAFSA is a pure cache: absent on disk until a snapshot
+     * persists it.  Its absence must not affect the relation DAFSA below. */
+    {
+        struct stat st_fwd_ignored;
+        assert(stat("build-tmp/m7t6/symbols.dafsa", &st_fwd_ignored) != 0);
     }
 
     /* The relation DAFSA file should also exist */

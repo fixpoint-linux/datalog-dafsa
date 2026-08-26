@@ -4058,6 +4058,12 @@ int dl_publish_snapshot(dl_db *db)
         snprintf(rev, sizeof(rev), "%s/symbols.array", tmp_dir);
         if (intern_save(db->ir, fwd, rev) != 0)
             goto fail;
+        /* intern_save now writes only the reverse array.  The snapshot's
+         * regex-walk path reads symbols.dafsa via dafsa_view_open, so the
+         * forward DAFSA must be materialized from rev[] and persisted here.
+         * Snapshots are rare; the ~1.5s build is acceptable. */
+        if (dafsa_save(intern_fwd(db->ir), fwd) != 0)
+            goto fail;
     }
 
     /* 4a'. Save the list term store (list handles) BEFORE the relations that
