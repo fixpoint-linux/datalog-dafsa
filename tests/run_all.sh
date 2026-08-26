@@ -54,6 +54,7 @@ test_traverse
 test_search
 test_vector_storage
 test_vector_cli
+test_vector_search_content
 test_embed_math
 test_embed
 dl-embed

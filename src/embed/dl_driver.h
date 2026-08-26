@@ -34,6 +34,14 @@ int dld_publish(const char *dl_path, const char *db);
  * Line N (1-based) = interned string, sym_id = N.  Returns count or -1. */
 int dld_symbols_array(const char *db, char ***names_out, uint32_t **ids_out);
 
+/* `dl -d db prefix --raw <rel>` (k=0 full scan): collect every tuple as raw
+ * u32 columns (RAW so content with spaces/unicode never breaks parsing).
+ * On success sets *n_rows_out to the tuple count and *cols_out to a malloc'd
+ * uint32_t[arity * n_rows] row-major buffer (caller frees).  Returns 0, or -1
+ * on any failure (incl. the 16 MiB output-truncation guard). */
+int dld_prefix_raw(const char *dl_path, const char *db, const char *rel,
+                   uint32_t **cols_out, int *n_rows_out, uint8_t *arity_out);
+
 #ifdef __cplusplus
 }
 #endif

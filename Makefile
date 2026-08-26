@@ -184,6 +184,9 @@ tests/test_vector_search: tests/test_vector_search.c $(ALL_OBJS)
 tests/test_vector_cli: tests/test_vector_cli.c $(ALL_OBJS)
 	$(CC) $(CFLAGS) $(INC) -static -o $@ tests/test_vector_cli.c $(ALL_OBJS) -lm
 
+tests/test_vector_search_content: tests/test_vector_search_content.c $(ALL_OBJS)
+	$(CC) $(CFLAGS) $(INC) -static -o $@ tests/test_vector_search_content.c $(ALL_OBJS)
+
 # ─── dl-embed: vector-tier embed tool (ggml C++; OPT-IN) ─────────────────
 # Requires (host, once):  git submodule update --init vendor/ggml   (pinned
 # v0.20.2, commit 8c63e70)  +  cmake on PATH.  ggml builds under its OWN
@@ -198,9 +201,11 @@ GGML_CMAKE := $(GGML_BUILD)/CMakeCache.txt
 GGML_LIBS  := $(GGML_BUILD)/src/libggml.a \
               $(GGML_BUILD)/src/libggml-cpu.a \
               $(GGML_BUILD)/src/libggml-base.a
-EMBED_CXXFLAGS := -O2 -Wall -Wextra -std=c++17 -Ivendor/ggml/include -Isrc
+EMBED_CXXFLAGS := -O2 -Wall -Wextra -fPIC -D_GNU_SOURCE -std=c++17 -Ivendor/ggml/include -Isrc
 EMBED_OBJS := src/embed/itq.o src/embed/tokenizer.o src/embed/bert.o \
               src/embed/csv_emit.o src/embed/dl_driver.o src/embed/dl-embed.o
+LIBEMBED_OBJS := src/embed/itq.o src/embed/tokenizer.o src/embed/bert.o \
+                 src/embed/csv_emit.o src/embed/embed_api.o
 
 # fail fast (before any g++) if the submodule is not materialized
 .PHONY: ggml-check
@@ -209,6 +214,7 @@ ggml-check:
 
 $(GGML_CMAKE): ggml-check $(GGML_SRC)/CMakeLists.txt
 	cmake -S $(GGML_SRC) -B $(GGML_BUILD) -DCMAKE_BUILD_TYPE=Release \
+	      -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
 	      -DGGML_BUILD_EXAMPLES=OFF -DGGML_BUILD_TESTS=OFF \
 	      -DGGML_CUDA=OFF -DGGML_METAL=OFF -DGGML_VULKAN=OFF -DGGML_OPENCL=OFF \
 	      -DBUILD_SHARED_LIBS=OFF -DGGML_OPENMP=OFF
@@ -217,13 +223,21 @@ $(GGML_LIBS): $(GGML_CMAKE)
 	$(MAKE) -C $(GGML_BUILD) ggml ggml-cpu
 
 EMBED_HDRS := src/embed/bert.h src/embed/tokenizer.h src/embed/itq.h \
-              src/embed/csv_emit.h src/embed/dl_driver.h src/embed/vec_bits.h
+              src/embed/csv_emit.h src/embed/dl_driver.h src/embed/embed_api.h \
+              src/embed/vec_bits.h
 
 src/embed/%.o: src/embed/%.cpp $(EMBED_HDRS) | ggml-check
 	g++ $(EMBED_CXXFLAGS) -c -o $@ $<
 
 dl-embed: $(EMBED_OBJS) $(GGML_LIBS)
 	g++ $(EMBED_CXXFLAGS) -o $@ $(EMBED_OBJS) \
+	    -L$(GGML_BUILD)/src \
+	    -lggml -lggml-cpu -lggml-base -lpthread -lm
+
+# libembed.so: the in-process query encoder for external hosts (fx-agent-memory
+# vsearch).  ggml is statically absorbed; only libstdc++.so.6 is a runtime dep.
+libembed.so: $(LIBEMBED_OBJS) $(GGML_LIBS)
+	g++ -shared -fPIC $(EMBED_CXXFLAGS) -o $@ $(LIBEMBED_OBJS) \
 	    -L$(GGML_BUILD)/src \
 	    -lggml -lggml-cpu -lggml-base -lpthread -lm
 
@@ -291,7 +305,7 @@ bench: tests/bench
 	@echo "=== Running demonstration benchmark ==="
 	LD_LIBRARY_PATH=. ./tests/bench
 
-test: tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4 tests/test_m4_review tests/test_bulk tests/test_m5 tests/test_m5_review tests/test_m6 tests/test_m6_review tests/test_m6_deep_review tests/test_m7 tests/test_cas tests/test_m8_magic tests/test_topdown tests/test_m9_arith tests/test_m9_str tests/test_ivm tests/test_bushy tests/test_vararity tests/test_lists tests/test_m10_rank tests/test_m11_range tests/test_m12_snap_rank tests/test_m13_iter tests/test_m14_permsel tests/test_m15_vmiter tests/test_m16_travel tests/test_positions tests/test_schema tests/test_typecheck tests/test_traverse tests/test_search tests/test_vector_storage tests/test_vector_cli tests/test_embed_math tests/test_embed dl build-tmp
+test: tests/test_m0 tests/test_m1 tests/test_m2 tests/test_m3 tests/test_m4 tests/test_m4_review tests/test_bulk tests/test_m5 tests/test_m5_review tests/test_m6 tests/test_m6_review tests/test_m6_deep_review tests/test_m7 tests/test_cas tests/test_m8_magic tests/test_topdown tests/test_m9_arith tests/test_m9_str tests/test_ivm tests/test_bushy tests/test_vararity tests/test_lists tests/test_m10_rank tests/test_m11_range tests/test_m12_snap_rank tests/test_m13_iter tests/test_m14_permsel tests/test_m15_vmiter tests/test_m16_travel tests/test_positions tests/test_schema tests/test_typecheck tests/test_traverse tests/test_search tests/test_vector_storage tests/test_vector_search tests/test_vector_cli tests/test_vector_search_content tests/test_embed_math tests/test_embed dl build-tmp
 	./tests/run_all.sh
 
 test-parallel: tests/run_all.sh
@@ -392,7 +406,7 @@ clean:
 	      tests/test_m6_deep_review tests/test_m7 tests/test_m8_magic tests/test_topdown tests/test_m9_arith \
 	      tests/test_m9_str tests/test_ivm tests/test_bushy tests/test_vararity \
 	      tests/test_lists tests/test_m10_rank tests/test_m11_range tests/test_m12_snap_rank tests/test_m13_iter tests/test_m14_permsel tests/test_m15_vmiter tests/test_m16_travel tests/test_positions tests/test_schema tests/test_typecheck tests/test_traverse tests/test_search tests/test_vector_storage tests/test_vector_search tests/test_vector_cli tests/test_embed_math tests/test_embed tests/test_bert_load tests/bench
-	rm -f dl-embed src/embed/itq.o src/embed/tokenizer.o src/embed/bert.o \
-	      src/embed/csv_emit.o src/embed/dl_driver.o src/embed/dl-embed.o
+	rm -f dl-embed libembed.so src/embed/itq.o src/embed/tokenizer.o src/embed/bert.o \
+	      src/embed/csv_emit.o src/embed/dl_driver.o src/embed/dl-embed.o src/embed/embed_api.o
 	rm -rf build-tmp/ggml
 	rm -rf /tmp/dl-test-db build-tmp/smoke build-tmp/m1 build-tmp/vararity build-tmp/lists build-tmp/rank build-tmp/m12snap build-tmp/m16travel build-tmp/search

@@ -38,7 +38,9 @@ static uint32_t band_slice(const uint32_t *sig, int j) {
     return (sig[j / 2] >> ((1u - (j % 2u)) * 16u)) & 0xFFFFu;
 }
 
-static void sig_rel_name(int j, char *out) { snprintf(out, 16, "__sig%d__", j); }
+static void sig_rel_name(const struct dl_vec_corpus *corpus, int j, char *out) {
+    snprintf(out, 16, corpus->sig_rel_fmt, j);
+}
 
 /* Every VEC_W-bit value within Hamming `budget` of `sub`, streamed via cb.
    Popcount scan (2^16 = 65536 iters) is trivially correct at w=16; a
@@ -92,6 +94,56 @@ static int cand_cmp(const void *pa, const void *pb) {
     return (a->sym < b->sym) ? -1 : (a->sym > b->sym ? 1 : 0);
 }
 
+/* ─── Liveness filter set ──────────────────────────────────────────────────
+ * One scan of the corpus liveness relation collects every live sym into a
+ * growable array (realloc-doubling, mirroring vec_cand_set), then qsort+dedup
+ * so per-candidate membership is a bsearch.  Empty corpus -> empty set -> the
+ * search yields 0 candidates (correct). */
+typedef struct { uint32_t *d; size_t n, cap; int error; uint8_t col; } vec_filter_set;
+
+static void fs_init(vec_filter_set *s, uint8_t col) { s->d = NULL; s->n = s->cap = 0; s->error = 0; s->col = col; }
+static void fs_free(vec_filter_set *s) { free(s->d); s->d = NULL; s->n = s->cap = 0; }
+
+static int collect_filter_cb(const uint32_t *cols, uint8_t arity, void *user) {
+    vec_filter_set *s = user;
+    uint32_t *nd;
+    size_t nc;
+    if ((size_t)s->col >= arity) return 1;      /* malformed row: stop scan */
+    if (s->n >= s->cap) {
+        nc = s->cap ? s->cap * 2 : 64;
+        nd = realloc(s->d, nc * sizeof(*nd));
+        if (!nd) { s->error = 1; return 1; }
+        s->d = nd; s->cap = nc;
+    }
+    s->d[s->n++] = cols[s->col];
+    return 0;
+}
+
+static int fs_u32_cmp(const void *pa, const void *pb) {
+    uint32_t a = *(const uint32_t *)pa, b = *(const uint32_t *)pb;
+    return (a < b) ? -1 : (a > b ? 1 : 0);
+}
+
+/* qsort + linear in-place dedup. */
+static void fs_sort_dedup(vec_filter_set *s) {
+    size_t w = 0, i;
+    qsort(s->d, s->n, sizeof(s->d[0]), fs_u32_cmp);
+    for (i = 0; i < s->n; i++)
+        if (w == 0 || s->d[w - 1] != s->d[i])
+            s->d[w++] = s->d[i];
+    s->n = w;
+}
+
+static int fs_contains(const vec_filter_set *s, uint32_t sym) {
+    size_t lo = 0, hi = s->n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (s->d[mid] == sym) return 1;
+        if (s->d[mid] < sym) lo = mid + 1; else hi = mid;
+    }
+    return 0;
+}
+
 /* ─── Mode dispatch read primitive ──────────────────────────────────────── */
 
 typedef struct {
@@ -132,6 +184,7 @@ static int add_entity_cb(const uint32_t *cols, uint8_t arity, void *user) {
 
 typedef struct {
     const vec_reader *rd;
+    const struct dl_vec_corpus *corpus;
     char rel[16];
     vec_cand_set *per_band;
     int error;
@@ -151,20 +204,23 @@ static int variant_probe_cb(uint32_t variant, void *user) {
 
 /* ─── Shared search body (LIVE / VERSION differ only in the read primitive) */
 
-static long vector_search_impl(const vec_reader *rd, const uint32_t *q_sig,
+static long vector_search_impl(const vec_reader *rd,
+                               const struct dl_vec_corpus *corpus,
+                               const uint32_t *q_sig,
                                int k, int r, dl_vec_cb cb, void *user) {
     int budget, j, err = 0;
     vec_cand_set cand, band;
+    vec_filter_set live;
 
-    if (!rd->db || !q_sig || k <= 0 || !cb) return -1;
+    if (!rd->db || !corpus || !q_sig || k <= 0 || !cb) return -1;
     if (r < 0) r = 0;
 
-    /* VERSION mode up-front gate: the entity relation must be present in the
+    /* VERSION mode up-front gate: the liveness relation must be present in the
        version (relation-absent-from-version -> -1, per the error contract).
        leading=[0] touches no row if the relation exists (even empty). */
     if (rd->use_version) {
         uint32_t probe[1] = { 0 };
-        if (vec_read_prefix(rd, VEC_ENTITY_REL, probe, 1, noop_cb, NULL,
+        if (vec_read_prefix(rd, corpus->filter_rel, probe, 1, noop_cb, NULL,
                             &err) < 0)
             return -1;
     }
@@ -177,8 +233,9 @@ static long vector_search_impl(const vec_reader *rd, const uint32_t *q_sig,
 
     for (j = 0; j < VEC_M && !err; j++) {
         variant_ctx vc;
-        sig_rel_name(j, vc.rel);
+        sig_rel_name(corpus, j, vc.rel);
         vc.rd = rd;
+        vc.corpus = corpus;
         vc.per_band = &band;
         vc.error = 0;
         cs_free(&band);
@@ -198,18 +255,26 @@ static long vector_search_impl(const vec_reader *rd, const uint32_t *q_sig,
     cs_free(&band);
     if (err) { cs_free(&cand); return -1; }
 
-    /* live-entity filter: drop candidates whose entity row is absent. */
+    /* live-entity filter: one scan of the corpus liveness relation collects
+       every live sym (qsort+dedup), then drop candidates not in the set.
+       Empty corpus -> empty set -> 0 candidates (correct). */
+    fs_init(&live, corpus->filter_col);
+    if (vec_read_prefix(rd, corpus->filter_rel, NULL, 0, collect_filter_cb,
+                        &live, &err) < 0 || live.error) {
+        if (!err) err = 1;
+        fs_free(&live);
+        cs_free(&cand);
+        return -1;
+    }
+    fs_sort_dedup(&live);
     {
         size_t w = 0, i;
-        for (i = 0; i < cand.n; i++) {
-            uint32_t leading[1] = { cand.d[i].sym };
-            long n = vec_read_prefix(rd, VEC_ENTITY_REL, leading, 1, noop_cb,
-                                     NULL, &err);
-            if (err) { cs_free(&cand); return -1; }
-            if (n > 0) cand.d[w++] = cand.d[i];
-        }
+        for (i = 0; i < cand.n; i++)
+            if (fs_contains(&live, cand.d[i].sym))
+                cand.d[w++] = cand.d[i];
         cand.n = w;
     }
+    fs_free(&live);
 
     /* coarse relevance: most matched bands first, sym asc as the tiebreak. */
     qsort(cand.d, cand.n, sizeof(cand.d[0]), cand_cmp);
@@ -227,17 +292,32 @@ static long vector_search_impl(const vec_reader *rd, const uint32_t *q_sig,
     }
 }
 
+long dl_vector_search_corpus(dl_db *db, const struct dl_vec_corpus *corpus,
+                             const uint32_t *q_sig, int k, int r,
+                             dl_vec_cb cb, void *user) {
+    vec_reader rd = { db, 0, 0 };
+    return vector_search_impl(&rd, corpus, q_sig, k, r, cb, user);
+}
+
+long dl_vector_search_corpus_version(dl_db *db, uint32_t version,
+                                     const struct dl_vec_corpus *corpus,
+                                     const uint32_t *q_sig, int k, int r,
+                                     dl_vec_cb cb, void *user) {
+    vec_reader rd = { db, version, 1 };
+    if (!db || version == 0) return -1;
+    return vector_search_impl(&rd, corpus, q_sig, k, r, cb, user);
+}
+
 long dl_vector_search(dl_db *db, const uint32_t *q_sig,
                       int k, int r, dl_vec_cb cb, void *user) {
-    vec_reader rd = { db, 0, 0 };
-    return vector_search_impl(&rd, q_sig, k, r, cb, user);
+    struct dl_vec_corpus c = DL_VEC_CORPUS_ENTITY;
+    return dl_vector_search_corpus(db, &c, q_sig, k, r, cb, user);
 }
 
 long dl_vector_search_version(dl_db *db, uint32_t version, const uint32_t *q_sig,
                               int k, int r, dl_vec_cb cb, void *user) {
-    vec_reader rd = { db, version, 1 };
-    if (!db || version == 0) return -1;
-    return vector_search_impl(&rd, q_sig, k, r, cb, user);
+    struct dl_vec_corpus c = DL_VEC_CORPUS_ENTITY;
+    return dl_vector_search_corpus_version(db, version, &c, q_sig, k, r, cb, user);
 }
 
 /* ─── Integer int8 cosine re-rank ───────────────────────────────────────── */
@@ -288,15 +368,16 @@ static int rank_cand_cmp(const void *pa, const void *pb) {
     return (a->sym < b->sym) ? -1 : (a->sym > b->sym ? 1 : 0);
 }
 
-long dl_vector_rerank(dl_db *db, const uint32_t *q_int8,
-                      const uint32_t *cand_syms, int n_cand,
-                      int k, dl_vec_cb cb, void *user) {
+long dl_vector_rerank_corpus(dl_db *db, const struct dl_vec_corpus *corpus,
+                             const uint32_t *q_int8,
+                             const uint32_t *cand_syms, int n_cand,
+                             int k, dl_vec_cb cb, void *user) {
     int32_t q[VEC_D];
     rank_cand *rc;
     int i, err = 0;
     int n_valid = 0;
 
-    if (!db || !q_int8 || !cand_syms || n_cand <= 0 || k <= 0 || !cb)
+    if (!db || !corpus || !q_int8 || !cand_syms || n_cand <= 0 || k <= 0 || !cb)
         return -1;
 
     /* unpack the query int8 vector (96 u32, 4 int8 little-endian packed). */
@@ -315,7 +396,7 @@ long dl_vector_rerank(dl_db *db, const uint32_t *q_int8,
         int64_t dot = 0, norm2 = 0;
 
         memset(&l, 0, sizeof l);
-        n = dl_prefix(db, "__vec_q__", leading, 1, load_vec_cb, &l);
+        n = dl_prefix(db, corpus->vec_rel, leading, 1, load_vec_cb, &l);
         if (n < 0) { err = 1; break; }
         if (!l.present) continue;   /* no vector on record: skip candidate */
 
@@ -344,4 +425,11 @@ long dl_vector_rerank(dl_db *db, const uint32_t *q_int8,
         free(rc);
         return emitted;
     }
+}
+
+long dl_vector_rerank(dl_db *db, const uint32_t *q_int8,
+                      const uint32_t *cand_syms, int n_cand,
+                      int k, dl_vec_cb cb, void *user) {
+    struct dl_vec_corpus c = DL_VEC_CORPUS_ENTITY;
+    return dl_vector_rerank_corpus(db, &c, q_int8, cand_syms, n_cand, k, cb, user);
 }

@@ -45,6 +45,23 @@ extern "C" {
 #define VEC_IVEC_WORDS (VEC_D / 4)   /* 96 u32, 4 int8 packed each          */
 #define VEC_ENTITY_REL "entity"      /* arity-2, name sym-id in col 0       */
 
+/* ─── Corpus descriptor ────────────────────────────────────────────────────
+ * The vector tier is shared by multiple corpora.  Each corpus keeps SEPARATE
+ * liveness / sig / vec relations so entity-name vectors and observation-content
+ * vectors can never collide (the interner is shared across all relations, so
+ * the __sig{j}__/__vec_q__ relations are keyed by sym id regardless of which
+ * corpus produced it).  ENTITY is the historical path (byte-compatible);
+ * OBSERVATION_CONTENT indexes observation CONTENT text (col 1 of `observation`). */
+struct dl_vec_corpus {
+    const char *filter_rel;   /* liveness relation                 */
+    uint8_t     filter_col;   /* which col holds the sym          */
+    const char *sig_rel_fmt;  /* e.g. "__sig%d__" / "__obssig%d__" */
+    const char *vec_rel;      /* e.g. "__vec_q__" / "__vec_obs__"  */
+    const char *basis_suffix; /* "" / "_obs" for npy+metadata     */
+};
+#define DL_VEC_CORPUS_ENTITY              ((struct dl_vec_corpus){"entity",0,"__sig%d__","__vec_q__",""})
+#define DL_VEC_CORPUS_OBSERVATION_CONTENT ((struct dl_vec_corpus){"observation",1,"__obssig%d__","__vec_obs__","_obs"})
+
 /* ─── Callback ──────────────────────────────────────────────────────────── */
 
 /* Callback for dl_vector_search / dl_vector_search_version / dl_vector_rerank.
@@ -78,6 +95,17 @@ long dl_vector_search(dl_db *db, const uint32_t *q_sig,
 long dl_vector_search_version(dl_db *db, uint32_t version, const uint32_t *q_sig,
                               int k, int r, dl_vec_cb cb, void *user);
 
+/* Corpus-parameterized forms.  `corpus` selects the liveness relation/col,
+ * the sig relation-name format, and the vec relation (see the corpus
+ * descriptors above).  Semantics otherwise identical to the entity wrappers. */
+long dl_vector_search_corpus(dl_db *db, const struct dl_vec_corpus *corpus,
+                             const uint32_t *q_sig, int k, int r,
+                             dl_vec_cb cb, void *user);
+long dl_vector_search_corpus_version(dl_db *db, uint32_t version,
+                                     const struct dl_vec_corpus *corpus,
+                                     const uint32_t *q_sig, int k, int r,
+                                     dl_vec_cb cb, void *user);
+
 /* int8 cosine re-rank of a candidate set over the LIVE __vec_q__ relation.
  * q_int8 is the pre-quantized int8 query vector (VEC_IVEC_WORDS u32, 4 int8
  * packed little-endian).  cand_syms[0..n_cand-1] are entity sym-ids (from
@@ -91,6 +119,13 @@ long dl_vector_search_version(dl_db *db, uint32_t version, const uint32_t *q_sig
 long dl_vector_rerank(dl_db *db, const uint32_t *q_int8,
                       const uint32_t *cand_syms, int n_cand,
                       int k, dl_vec_cb cb, void *user);
+
+/* Corpus-parameterized rerank: loads stored vectors from corpus->vec_rel
+ * instead of the hardcoded "__vec_q__".  Identical semantics otherwise. */
+long dl_vector_rerank_corpus(dl_db *db, const struct dl_vec_corpus *corpus,
+                             const uint32_t *q_int8,
+                             const uint32_t *cand_syms, int n_cand,
+                             int k, dl_vec_cb cb, void *user);
 
 #ifdef __cplusplus
 }

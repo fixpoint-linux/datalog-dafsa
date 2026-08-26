@@ -237,7 +237,8 @@ static int fetch_model(void) {
 
 /* ── pipeline ───────────────────────────────────────────────────────────── */
 
-static int cmd_pipeline(const char *db) {
+static int cmd_pipeline(const char *db, const char *rel, int col,
+                        const char *suffix) {
     char err[512];
     if (!file_exists(g_dl_path))
         die("dl binary not found next to dl-embed (expected ./dl in repo root)");
@@ -251,43 +252,58 @@ static int cmd_pipeline(const char *db) {
     if (m.n_embd != VEC_D_)
         die("model n_embd != 384 (not bge-small-en-v1.5?)");
 
-    /* walk entity relation + symbols.array */
-    static char out_buf[16 << 20];            /* 16 MiB of prefix lines */
-    int n_lines = 0;
-    if (dld_prefix(g_dl_path, db, "entity", 0, NULL, out_buf, sizeof out_buf,
-                   &n_lines) != 0)
-        die("dl prefix entity failed (is the DB published?)");
+    /* RAW walk of the corpus liveness relation (spaces/unicode-safe). */
+    uint32_t *rows; int n_rows = 0; uint8_t arity = 0;
+    if (dld_prefix_raw(g_dl_path, db, rel, &rows, &n_rows, &arity) != 0)
+        die("dl prefix raw failed for relation (is the DB published?)");
+    if ((int)arity <= col)
+        die("corpus relation arity too small for --col");
+    if (n_rows <= 0)
+        die("corpus relation is empty (nothing to embed)");
+
+    /* dense sym -> text map over symbols.array (ids are 1-based sym ids). */
     char **names; uint32_t *ids;
     int n_syms = dld_symbols_array(db, &names, &ids);
     if (n_syms <= 0) die("cannot read symbols.array (publish first)");
+    uint32_t max_id = 0;
+    for (int k = 0; k < n_syms; k++) if (ids[k] > max_id) max_id = ids[k];
+    std::vector<const char *> sym_text((size_t)max_id + 1, NULL);
+    for (int k = 0; k < n_syms; k++) sym_text[ids[k]] = names[k];
 
-    /* collect (name, sym) in walk order, resolving sym by name */
-    std::vector<std::string> ent_names;
-    std::vector<uint32_t> ent_syms;
-    for (char *p = out_buf; *p; p += strlen(p) + 1) {
-        char word[512];
-        sscanf(p, "%511s", word);
-        for (int k = 0; k < n_syms; k++) {
-            if (strcmp(names[k], word) == 0) {
-                ent_names.push_back(word);
-                ent_syms.push_back(ids[k]);
-                break;
-            }
+    /* collect (text, sym) for each corpus row, dedup by sym. */
+    std::vector<std::string> corpus_names;
+    std::vector<uint32_t> corpus_syms;
+    std::vector<int> seen((size_t)max_id + 1, 0);
+    for (int r = 0; r < n_rows; r++) {
+        uint32_t s = rows[(size_t)r * arity + (uint32_t)col];
+        if (s > max_id) die("corpus sym out of symbols.array range (rebuild?)");
+        if (seen[s]) continue;
+        seen[s] = 1;
+        const char *txt = sym_text[s];
+        if (!txt || !*txt) {
+            /* dead row: the observation references a sym whose string was
+               removed from symbols.array.  Skip it — it can never be searched
+               (its text is gone), so it must not enter the index. */
+            fprintf(stderr, "  skip dead observation content sym=%u (no interned text)\n", s);
+            continue;
         }
+        corpus_names.push_back(txt);
+        corpus_syms.push_back(s);
     }
     for (int k = 0; k < n_syms; k++) free(names[k]);
     free(names); free(ids);
-    if ((int)ent_names.size() < VEC_C_)
-        die("corpus too small for a rank-256 ITQ basis (need >= 256 entities; "
+    free(rows);
+    if ((int)corpus_names.size() < VEC_C_)
+        die("corpus too small for a rank-256 ITQ basis (need >= 256 entries; "
             "use the S3 synthetic path for smaller corpora)");
-    printf("%zu entities\n", ent_names.size());
+    printf("%zu corpus entries (%s col %d)\n", corpus_names.size(), rel, col);
 
-    /* embed all entity names (L2-normalized) */
-    size_t n_ent = ent_names.size();
+    /* embed all corpus texts (L2-normalized) */
+    size_t n_ent = corpus_names.size();
     float *X = (float *)malloc(sizeof(float) * n_ent * VEC_D_);
     if (!X) die("OOM embeddings");
     for (size_t k = 0; k < n_ent; k++) {
-        if (bert_embed(&m, ent_names[k].c_str(), X + k * VEC_D_, err, sizeof err) != 0)
+        if (bert_embed(&m, corpus_names[k].c_str(), X + k * VEC_D_, err, sizeof err) != 0)
             die(err);
         if ((k + 1) % 50 == 0 || k + 1 == n_ent)
             fprintf(stderr, "\rembedded %zu/%zu", k + 1, n_ent);
@@ -301,14 +317,19 @@ static int cmd_pipeline(const char *db) {
     float gscale = itq_corpus_global_scale(X, (int)n_ent, VEC_D_);
     printf("fitted ITQ basis; global int8 scale = %.9g\n", gscale);
 
-    /* persist basis (.npy for the oracle) + metadata */
+    /* persist basis (.npy for the oracle) + metadata (corpus-namespaced) */
     char path[4096];
-    snprintf(path, sizeof path, "%s/itq_basis.npy", db);
+    snprintf(path, sizeof path, "%s/itq_basis%s.npy", db, suffix);
     if (npy_write_basis(path, B, VEC_D_, VEC_C_) != 0) die("cannot write itq_basis.npy");
-    snprintf(path, sizeof path, "%s/vector_metadata.txt", db);
+    snprintf(path, sizeof path, "%s/vector_metadata%s.txt", db, suffix);
     csv_write_metadata(path, VEC_D_, VEC_C_, VEC_M_, (double)gscale);
 
-    /* encode entities -> sig bands + packed int8 */
+    /* corpus-namespaced relations: __sig{j}__/__vec_q__ (entity, suffix "")
+       or __obssig{j}__/__vec_obs__ (content, suffix "_obs"). */
+    const char *sig_fmt = strcmp(suffix, "_obs") == 0 ? "__obssig%d__" : "__sig%d__";
+    const char *vec_rel = strcmp(suffix, "_obs") == 0 ? "__vec_obs__" : "__vec_q__";
+
+    /* encode corpus -> sig bands + packed int8 */
     size_t n_sig = n_ent, n_vecq = n_ent * VEC_IVEC_WORDS_;
     uint32_t *band_vals[VEC_M_];
     for (int j = 0; j < VEC_M_; j++)
@@ -326,36 +347,36 @@ static int cmd_pipeline(const char *db) {
         for (int j = 0; j < VEC_M_; j++) band_vals[j][k] = vec_band_slice(sig, j);
         itq_quantize_int8_global(v, VEC_D_, gscale, q);
         for (int w = 0; w < VEC_IVEC_WORDS_; w++) {
-            vecq_syms[k * VEC_IVEC_WORDS_ + w] = ent_syms[k];
+            vecq_syms[k * VEC_IVEC_WORDS_ + w] = corpus_syms[k];
             vecq_packed[k * VEC_IVEC_WORDS_ + w] =
                 vec_pack4_le(q[w * 4], q[w * 4 + 1], q[w * 4 + 2], q[w * 4 + 3]);
         }
     }
 
-    /* write + load 18 CSVs */
-    char rel[32];
+    /* write + load CSVs (corpus-namespaced csv names so bases don't clash) */
+    char reln[32];
     for (int j = 0; j < VEC_M_; j++) {
-        snprintf(path, sizeof path, "%s/sig_%d.csv", db, j);
-        if (csv_write_sig(path, band_vals[j], ent_syms.data(), n_sig) != 0) die("csv write failed");
-        snprintf(rel, sizeof rel, "__sig%d__", j);
-        if (dld_load(g_dl_path, db, path, rel) != 0) die("dl load sig failed");
+        snprintf(path, sizeof path, "%s/sig_%d%s.csv", db, j, suffix);
+        if (csv_write_sig(path, band_vals[j], corpus_syms.data(), n_sig) != 0) die("csv write failed");
+        snprintf(reln, sizeof reln, sig_fmt, j);
+        if (dld_load(g_dl_path, db, path, reln) != 0) die("dl load sig failed");
         free(band_vals[j]);
     }
-    snprintf(path, sizeof path, "%s/vec_q.csv", db);
+    snprintf(path, sizeof path, "%s/vec_q%s.csv", db, suffix);
     if (csv_write_vecq(path, vecq_syms, vecq_packed, n_vecq) != 0) die("csv write failed");
-    if (dld_load(g_dl_path, db, path, "__vec_q__") != 0) die("dl load vec_q failed");
-    snprintf(path, sizeof path, "%s/itq_basis.csv", db);
+    if (dld_load(g_dl_path, db, path, vec_rel) != 0) die("dl load vec failed");
+    snprintf(path, sizeof path, "%s/itq_basis%s.csv", db, suffix);
     if (csv_write_basis(path, B, VEC_D_, VEC_C_) != 0) die("csv write failed");
     if (dld_load(g_dl_path, db, path, "__itq_basis__") != 0) die("dl load basis failed");
 
     /* publish + clean up */
     if (dld_publish(g_dl_path, db) != 0) die("dl publish failed");
     for (int j = 0; j < VEC_M_; j++) {
-        snprintf(path, sizeof path, "%s/sig_%d.csv", db, j);
+        snprintf(path, sizeof path, "%s/sig_%d%s.csv", db, j, suffix);
         remove(path);
     }
-    snprintf(path, sizeof path, "%s/vec_q.csv", db); remove(path);
-    snprintf(path, sizeof path, "%s/itq_basis.csv", db); remove(path);
+    snprintf(path, sizeof path, "%s/vec_q%s.csv", db, suffix); remove(path);
+    snprintf(path, sizeof path, "%s/itq_basis%s.csv", db, suffix); remove(path);
 
     free(X); free(B); free(vecq_syms); free(vecq_packed);
     bert_free(&m);
@@ -430,7 +451,8 @@ int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr,
             "usage: dl-embed <command>\n"
-            "  pipeline --db DIR     embed corpus + emit vector relations\n"
+            "  pipeline --db DIR [--rel REL --col N --suffix S]\n"
+            "                      embed corpus + emit vector relations\n"
             "  encode --db DIR QRY   print 'sig_hex ivec_hex' for a query\n"
             "  embed QRY             print the raw 384-float embedding\n"
             "  tokenize QRY          print token ids + strings (debug)\n"
@@ -507,7 +529,19 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--db") == 0) db = argv[i + 1];
     if (!db) die("missing --db DIR");
 
-    if (strcmp(cmd, "pipeline") == 0) return cmd_pipeline(db);
+    if (strcmp(cmd, "pipeline") == 0) {
+        /* --rel <rel> (default "entity"), --col <N> (default 0),
+           --suffix <s> (default "" — the entity corpus). */
+        const char *rel = "entity";
+        int col = 0;
+        const char *suffix = "";
+        for (int i = 2; i < argc - 1; i++) {
+            if (strcmp(argv[i], "--rel") == 0) rel = argv[i + 1];
+            else if (strcmp(argv[i], "--col") == 0) col = atoi(argv[i + 1]);
+            else if (strcmp(argv[i], "--suffix") == 0) suffix = argv[i + 1];
+        }
+        return cmd_pipeline(db, rel, col, suffix);
+    }
     if (strcmp(cmd, "encode") == 0) {
         if (argc < 3) die("encode requires a query string");
         /* query = the non-flag positional after the command */
