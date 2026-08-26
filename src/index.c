@@ -730,17 +730,37 @@ static int index_obs_cb(const uint32_t *cols, uint8_t arity, void *user)
     return 0;
 }
 
-/* Simple tuple-counting callback (k=0 enumeration). */
+/* Callback to count DISTINCT observation content symbols (column 1) that are
+ * tokenizable (contain at least one ASCII alnum byte).  Used by the
+ * short-circuit completeness check: many observations share a content symbol,
+ * so this counts deduped contents, matching what the rebuild would index. */
 typedef struct {
+    dl_db *db;
+    u64_set seen;
     long count;
-} count_ctx;
+    int error;
+} token_obs_ctx;
 
-static int count_cb(const uint32_t *cols, uint8_t arity, void *user)
+static int token_obs_cb(const uint32_t *cols, uint8_t arity, void *user)
 {
-    count_ctx *c = (count_ctx *)user;
-    (void)cols;
+    token_obs_ctx *c = (token_obs_ctx *)user;
+    int r;
     (void)arity;
-    c->count++;
+    r = u64_set_add(&c->seen, cols[1]);
+    if (r < 0) {
+        c->error = 1;
+        return 1;  /* stop */
+    }
+    if (r == 1) {
+        const char *content = dl_intern_str_of(c->db, cols[1]);
+        size_t i = 0;
+        int has_alnum = 0;
+        if (content) {
+            for (; content[i] && !has_alnum; i++)
+                has_alnum = is_alnum_ascii((unsigned char)content[i]);
+        }
+        if (has_alnum) c->count++;
+    }
     return 0;
 }
 
@@ -776,28 +796,38 @@ long dl_index_observations(dl_db *db)
 
     /* Short-circuit: if the index already covers every observation content, it
      * is complete — return 0 without re-tokenizing or re-writing anything.
-     * "Covered" is checked by comparing the number of observation tuples with
-     * the number of DISTINCT obs_id already in __postings__.  Both are cheap
-     * counting passes (no tokenization, no writes), so a second call with no
-     * new observations returns near-instantly. */
+     * "Covered" is checked by comparing the number of DISTINCT obs_id already
+     * in __postings__ with the number of DISTINCT TOKENIZABLE observation
+     * contents (contents deduped by symbol, counted only if they contain at
+     * least one ASCII alnum byte — exactly when tokenize() would yield tokens).
+     * Both are cheap passes (a set-dedup + alnum scan, no tokenization, no
+     * writes), so a second call with no new observations returns near-instantly. */
     {
-        count_ctx oc = {0};
-        if (dl_prefix(db, "observation", NULL, 0, count_cb, &oc) < 0)
+        token_obs_ctx oc = { db, {0, 0, 0}, 0, 0 };
+        if (dl_prefix(db, "observation", NULL, 0, token_obs_cb, &oc) < 0)
             return 0;  /* no observation relation -> nothing to index */
+        if (oc.error) {
+            u64_set_free(&oc.seen);
+            return -1;
+        }
 
         distinct_obs_ctx dc = { {0, 0, 0}, 0, 0 };
         if (dl_prefix(db, POSTINGS_REL_NAME, NULL, 0, distinct_obs_cb, &dc) < 0) {
+            u64_set_free(&oc.seen);
             u64_set_free(&dc.seen);
             return -1;
         }
         if (dc.error) {
+            u64_set_free(&oc.seen);
             u64_set_free(&dc.seen);
             return -1;
         }
         if (dc.distinct >= oc.count) {
+            u64_set_free(&oc.seen);
             u64_set_free(&dc.seen);
             return 0;  /* index already complete */
         }
+        u64_set_free(&oc.seen);
         u64_set_free(&dc.seen);
     }
 
