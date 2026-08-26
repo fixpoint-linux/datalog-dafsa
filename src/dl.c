@@ -2197,6 +2197,12 @@ const char *dl_intern_str_of(dl_db *db, uint32_t sym_id)
     return intern_str_of(db->ir, sym_id);
 }
 
+void *dl_intern_fwd_mutable(dl_db *db)
+{
+    if (!db || !db->ir) return NULL;
+    return (void *)intern_fwd_mutable(db->ir);
+}
+
 /* ─── List term-store access (v2 lists, public wrappers) ─────────────────── */
 
 uint32_t dl_term_cons(dl_db *db, uint32_t head, uint32_t tail)

@@ -549,6 +549,13 @@ uint32_t    dl_intern_str_find(dl_db *db, const char *str);
 /* Look up a sym_id → string.  Returns NULL if id is out of range. */
 const char *dl_intern_str_of(dl_db *db, uint32_t sym_id);
 
+/* Return the interner's forward DAFSA as a MUTABLE handle, lazily materializing
+ * it if absent.  After this, dl_intern_str GROWS the DAFSA in place on new
+ * symbols (instead of freeing it), so interning stays off the linear rev[]
+ * scan.  Returns void* because dl.h does not expose the dafsa type.  NULL on
+ * NULL db / OOM (callers treat NULL as "degrade to the safe linear path"). */
+void *dl_intern_fwd_mutable(dl_db *db);
+
 /* ─── Graph traversal (Tier-2) ───────────────────────────────────────────── */
 
 /* Callback for dl_traverse: receives (node_sym, depth).

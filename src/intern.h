@@ -24,6 +24,10 @@ typedef struct interner interner;
  * it (read-only) on first call. */
 const dafsa *intern_fwd(interner *ir);
 
+/* Return a MUTABLE forward DAFSA (lazily built if absent/stale) that intern_str
+ * can grow in place on new symbols instead of freeing. NULL on OOM. */
+const dafsa *intern_fwd_mutable(interner *ir);
+
 /* ─── Lifecycle ───────────────────────────────────────────────────────── */
 
 interner *intern_create(void);

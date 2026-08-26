@@ -228,6 +228,19 @@ static int u64_set_grow(u64_set *s)
     return 0;
 }
 
+/* Returns 1 if k is present in the set, 0 otherwise.  Read-only probe. */
+static int u64_set_contains(const u64_set *s, uint64_t k)
+{
+    size_t idx;
+    if (!s || s->cap == 0) return 0;
+    idx = u64_set_hash(k) & (s->cap - 1);
+    while (s->slots[idx]) {
+        if (s->slots[idx] == k) return 1;
+        idx = (idx + 1) & (s->cap - 1);
+    }
+    return 0;
+}
+
 /* Returns 1 if inserted, 0 if already present, -1 on OOM. */
 static int u64_set_add(u64_set *s, uint64_t k)
 {
@@ -662,6 +675,7 @@ typedef struct {
     long postings_added;
     int error;
     u64_set seen;   /* (term_sym<<32)|obs_id pairs added this run, for dedup */
+    const u64_set *indexed;  /* distinct content syms already in __postings__ */
 } index_obs_ctx;
 
 /* Callback for dl_prefix to process each observation tuple.  Runs inside a
@@ -682,6 +696,12 @@ static int index_obs_cb(const uint32_t *cols, uint8_t arity, void *user)
     }
 
     /* cols[0] = entity_sym, cols[1] = content_sym */
+    /* Incremental rebuild: skip contents whose sym is ALREADY in __postings__
+     * (threaded in via ctx->indexed, the short-circuit's distinct set).  Only
+     * genuinely-new contents are tokenized + indexed. */
+    if (ctx->indexed && u64_set_contains(ctx->indexed, cols[1]))
+        return 0;
+
     const char *content = dl_intern_str_of(ctx->db, cols[1]);
     if (!content) {
         ctx->error = 1;
@@ -801,7 +821,11 @@ long dl_index_observations(dl_db *db)
      * contents (contents deduped by symbol, counted only if they contain at
      * least one ASCII alnum byte — exactly when tokenize() would yield tokens).
      * Both are cheap passes (a set-dedup + alnum scan, no tokenization, no
-     * writes), so a second call with no new observations returns near-instantly. */
+     * writes), so a second call with no new observations returns near-instantly.
+     * dc.seen (the distinct contents already in __postings__) is kept ALIVE
+     * past this block and threaded into the rebuild so it skips re-tokenizing
+     * already-indexed contents (Fix A incremental rebuild). */
+    distinct_obs_ctx dc = { {0, 0, 0}, 0, 0 };
     {
         token_obs_ctx oc = { db, {0, 0, 0}, 0, 0 };
         if (dl_prefix(db, "observation", NULL, 0, token_obs_cb, &oc) < 0)
@@ -811,7 +835,6 @@ long dl_index_observations(dl_db *db)
             return -1;
         }
 
-        distinct_obs_ctx dc = { {0, 0, 0}, 0, 0 };
         if (dl_prefix(db, POSTINGS_REL_NAME, NULL, 0, distinct_obs_cb, &dc) < 0) {
             u64_set_free(&oc.seen);
             u64_set_free(&dc.seen);
@@ -828,29 +851,40 @@ long dl_index_observations(dl_db *db)
             return 0;  /* index already complete */
         }
         u64_set_free(&oc.seen);
-        u64_set_free(&dc.seen);
+        /* dc.seen survives: it now drives the incremental rebuild below. */
     }
+
+    /* Materialize a MUTABLE forward DAFSA so interning the rebuild's tokens
+     * grows it in place (instead of the ~111µs/sym linear rev[] scan).  On
+     * OOM it degrades safely to the rev[] scan — still correct, just slower. */
+    dl_intern_fwd_mutable(db);
 
     /* Buffer the whole enumeration in one transaction: every posting commit
      * lands with ONE WAL fsync and ONE interner save (dl_txn_commit does the
      * M7 interner/term-store ordering internally) instead of one fsync + one
      * intern_save per posting.  The txn buffer grows dynamically, so there is
      * no capacity cap to chunk against. */
-    if (dl_txn_begin(db) != 0)
+    if (dl_txn_begin(db) != 0) {
+        u64_set_free(&dc.seen);
         return -1;
+    }
 
-    index_obs_ctx ctx = {db, 0, 0, {0, 0, 0}};
+    index_obs_ctx ctx = {db, 0, 0, {0, 0, 0}, &dc.seen};
     long n = dl_prefix(db, "observation", NULL, 0, index_obs_cb, &ctx);
     if (n < 0 || ctx.error) {
         dl_txn_rollback(db);
         u64_set_free(&ctx.seen);
+        u64_set_free(&dc.seen);
         return -1;
     }
 
     u64_set_free(&ctx.seen);
 
-    if (dl_txn_commit(db) != 0)
+    if (dl_txn_commit(db) != 0) {
+        u64_set_free(&dc.seen);
         return -1;
+    }
 
+    u64_set_free(&dc.seen);
     return ctx.postings_added;
 }

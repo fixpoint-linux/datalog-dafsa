@@ -224,11 +224,43 @@ uint32_t intern_str(interner *ir, const char *str)
         ir->rev[id - 1] = strdup(str);
         if (!ir->rev[id - 1]) return 0;
 
-        /* Invalidate the stale forward-DAFSA cache: fwd_gen != next_id now,
-         * and the cached handle no longer covers the new symbol. */
-        if (ir->fwd) {
-            dafsa_free(ir->fwd);
-            ir->fwd = NULL;
+        /* Grow the forward-DAFSA cache instead of freeing it when the handle is
+         * MUTABLE (fwd_ro==0) and CURRENT (fwd_gen == id covers ids 1..id-1,
+         * i.e. every prior sym).  Adding the new symbol in place keeps the
+         * cache usable across a whole rebuild, avoiding the linear rev[] scan.
+         * The key is laid out exactly as intern_ensure_fwd builds it: str \0
+         * id_u32BE.  On any add failure (OOM), fall back to the existing safe
+         * degradation — drop the DAFSA so lookups use the always-correct rev[]
+         * scan (never keep a partially-grown cache claiming to be current). */
+        if (ir->fwd && !ir->fwd_ro && ir->fwd_gen == id) {
+            unsigned char *k = malloc(key_len);
+            if (!k) {
+                dafsa_free(ir->fwd);
+                ir->fwd = NULL;
+            } else {
+                memcpy(k, str, slen);
+                k[slen] = 0x00;
+                k[slen + 1] = (unsigned char)((id >> 24) & 0xFF);
+                k[slen + 2] = (unsigned char)((id >> 16) & 0xFF);
+                k[slen + 3] = (unsigned char)((id >> 8)  & 0xFF);
+                k[slen + 4] = (unsigned char)(id & 0xFF);
+                if (dafsa_add_n(ir->fwd, k, key_len) < 0) {
+                    free(k);
+                    dafsa_free(ir->fwd);
+                    ir->fwd = NULL;
+                } else {
+                    free(k);
+                    ir->fwd_gen = ir->next_id;  /* stay current */
+                }
+            }
+        } else {
+            /* Invalidate the stale/read-only forward-DAFSA cache: fwd_gen !=
+             * next_id now, and the cached handle no longer covers the new
+             * symbol. */
+            if (ir->fwd) {
+                dafsa_free(ir->fwd);
+                ir->fwd = NULL;
+            }
         }
 
         return id;
@@ -248,6 +280,16 @@ const dafsa *intern_fwd(interner *ir)
 {
     if (!ir) return NULL;
     if (intern_ensure_fwd(ir, 0) != 0) return NULL;   /* OOM */
+    return ir->fwd;
+}
+
+/* Return a MUTABLE forward DAFSA (fwd_ro==0), building it if absent/stale so
+ * intern_str can grow it in place instead of freeing it on each new symbol.
+ * Used by the index rebuild to keep interning off the linear rev[] scan. */
+const dafsa *intern_fwd_mutable(interner *ir)
+{
+    if (!ir) return NULL;
+    if (intern_ensure_fwd(ir, 1) != 0) return NULL;   /* OOM */
     return ir->fwd;
 }
 
