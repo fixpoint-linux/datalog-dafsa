@@ -1262,6 +1262,236 @@ static void test_t23_fb_adorn_negation(void)
     teardown_db(db, "t23");
 }
 
+/* ─── T24-T28: fast-path left-recursive TC recognizer (BFS) ────────────── */
+
+static int tset_contains(tuple_set *ts, uint32_t a, uint32_t b)
+{
+    long i;
+    for (i = 0; i < ts->count; i++)
+        if (ts->data[(size_t)i * 2] == a &&
+            ts->data[(size_t)i * 2 + 1] == b) return 1;
+    return 0;
+}
+
+static int query_count(dl_db *db, const char *rel, uint32_t src)
+{
+    tuple_set r;
+    uint32_t leading[1] = { src };
+    long n;
+    memset(&r, 0, sizeof(r));
+    n = dl_query_topdown(db, rel, leading, 1, tset_cb, &r);
+    tset_free(&r);
+    return (int)n;
+}
+
+/* T24: self-loop {1->1} — the seed must be reachable by >=1 edge. */
+static void test_t24_selfloop(void)
+{
+    dl_db *db;
+    uint32_t e[] = {1,1};
+
+    TEST("T24: self-loop tc(1,?) — BFS fast path count+set");
+    setup_db(&db, "t24");
+    load_rows(db, "edge", 2, e, 1, "t24");
+    load_tc_rules(db);
+    assert(dl_compile(db) == 0);
+    {
+        tuple_set rt;
+        uint32_t leading[1] = {1};
+        long nt;
+        memset(&rt, 0, sizeof(rt));
+        nt = dl_query_topdown(db, "tc", leading, 1, tset_cb, &rt);
+        if (nt != 1 || rt.count != 1 || rt.arity != 2 ||
+            rt.data[0] != 1 || rt.data[1] != 1) {
+            printf("  got %ld rows, expected {(1,1)}\n", nt);
+            tset_free(&rt); teardown_db(db, "t24");
+            FAIL("T24 self-loop wrong result"); return;
+        }
+        tset_free(&rt);
+    }
+    if (!cmp_topdown_magic_rel(db, "tc", 1)) {
+        FAIL("T24 self-loop topdown vs magic mismatch");
+        teardown_db(db, "t24"); return;
+    }
+    PASS();
+    teardown_db(db, "t24");
+}
+
+/* T25: cycle {1->2, 2->1, 2->3} — cycles and self-reachability count. */
+static void test_t25_cycle(void)
+{
+    dl_db *db;
+    uint32_t e[] = {1,2, 2,1, 2,3};
+    uint32_t srcs[2] = {1, 2};
+    int i;
+
+    TEST("T25: cycle — BFS fast path, topdown==bound==magic");
+    setup_db(&db, "t25");
+    load_rows(db, "edge", 2, e, 3, "t25");
+    load_tc_rules(db);
+    assert(dl_compile(db) == 0);
+
+    {
+        tuple_set rt;
+        uint32_t leading[1] = {1};
+        memset(&rt, 0, sizeof(rt));
+        if (dl_query_topdown(db, "tc", leading, 1, tset_cb, &rt) != 3 ||
+            rt.count != 3 || rt.arity != 2 ||
+            !tset_contains(&rt,1,1) || !tset_contains(&rt,1,2) ||
+            !tset_contains(&rt,1,3)) {
+            FAIL("T25 cycle src=1 wrong result");
+            tset_free(&rt); teardown_db(db, "t25"); return;
+        }
+        tset_free(&rt);
+    }
+    {
+        tuple_set rt;
+        uint32_t leading[1] = {2};
+        memset(&rt, 0, sizeof(rt));
+        if (dl_query_topdown(db, "tc", leading, 1, tset_cb, &rt) != 3 ||
+            rt.count != 3 || rt.arity != 2 ||
+            !tset_contains(&rt,2,1) || !tset_contains(&rt,2,2) ||
+            !tset_contains(&rt,2,3)) {
+            FAIL("T25 cycle src=2 wrong result");
+            tset_free(&rt); teardown_db(db, "t25"); return;
+        }
+        tset_free(&rt);
+    }
+    for (i = 0; i < 2; i++) {
+        if (!cmp_bound_topdown(db, srcs[i]) ||
+            !cmp_topdown_magic_rel(db, "tc", srcs[i])) {
+            FAIL("T25 cycle bound/magic mismatch");
+            teardown_db(db, "t25"); return;
+        }
+    }
+    PASS();
+    teardown_db(db, "t25");
+}
+
+/* T26: complete DAG N=20 (i->j for i<j); source 20 is a sink -> 0 tuples. */
+static void test_t26_dense_dag(void)
+{
+    dl_db *db;
+    int N = 20, i, j, k = 0;
+    uint32_t *edges;
+    uint32_t srcs[4] = {1, 10, 19, 20};
+    int expect[4] = {19, 10, 1, 0};
+
+    TEST("T26: dense DAG N=20 — BFS fast path, sink count 0");
+    setup_db(&db, "t26");
+    edges = malloc((size_t)(N * N) * 2 * sizeof(uint32_t));
+    for (i = 0; i < N; i++)
+        for (j = i + 1; j < N; j++) {
+            edges[k*2] = (uint32_t)(i + 1);
+            edges[k*2 + 1] = (uint32_t)(j + 1);
+            k++;
+        }
+    load_rows(db, "edge", 2, edges, k, "t26");
+    free(edges);
+    load_tc_rules(db);
+    assert(dl_compile(db) == 0);
+
+    for (i = 0; i < 4; i++) {
+        int cnt = query_count(db, "tc", srcs[i]);
+        if (cnt != expect[i]) {
+            printf("  src %u got %d, expected %d\n", srcs[i], cnt, expect[i]);
+            FAIL("T26 dense count mismatch");
+            teardown_db(db, "t26"); return;
+        }
+        if (!cmp_bound_topdown(db, srcs[i]) ||
+            !cmp_topdown_magic_rel(db, "tc", srcs[i])) {
+            FAIL("T26 dense bound/magic mismatch");
+            teardown_db(db, "t26"); return;
+        }
+    }
+    PASS();
+    teardown_db(db, "t26");
+}
+
+/* T27: multisource chain N=50 — 1->49, 25->25, 50->0, 99->0. */
+static void test_t27_multisource_chain(void)
+{
+    dl_db *db;
+    int N = 50, i;
+    uint32_t *edges;
+    uint32_t srcs[4] = {1, 25, 50, 99};
+    int expect[4] = {49, 25, 0, 0};
+
+    TEST("T27: multisource chain N=50 — BFS fast path");
+    setup_db(&db, "t27");
+    edges = malloc((size_t)(N - 1) * 2 * sizeof(uint32_t));
+    for (i = 0; i < N - 1; i++) {
+        edges[i*2] = (uint32_t)(i + 1);
+        edges[i*2 + 1] = (uint32_t)(i + 2);
+    }
+    load_rows(db, "edge", 2, edges, N - 1, "t27");
+    free(edges);
+    load_tc_rules(db);
+    assert(dl_compile(db) == 0);
+
+    for (i = 0; i < 4; i++) {
+        int cnt = query_count(db, "tc", srcs[i]);
+        if (cnt != expect[i]) {
+            printf("  src %u got %d, expected %d\n", srcs[i], cnt, expect[i]);
+            FAIL("T27 multisource count mismatch");
+            teardown_db(db, "t27"); return;
+        }
+        if (!cmp_bound_topdown(db, srcs[i]) ||
+            !cmp_topdown_magic_rel(db, "tc", srcs[i])) {
+            FAIL("T27 multisource bound/magic mismatch");
+            teardown_db(db, "t27"); return;
+        }
+    }
+    PASS();
+    teardown_db(db, "t27");
+}
+
+/* T28: non-canonical shapes must NOT fire — normal path holds parity. */
+static void test_t28_fallthrough(void)
+{
+    dl_db *db;
+    uint32_t e[] = {1,2, 2,3, 3,4};
+    int i;
+    uint32_t srcs[2] = {1, 2};
+
+    TEST("T28: non-canonical shapes fall through — parity holds");
+
+    /* (a) 3-rule program breaks the 2-rule invariant. */
+    setup_db(&db, "t28a");
+    load_rows(db, "edge", 2, e, 3, "t28a");
+    assert(dl_load_rules(db,
+        "tc(X,Y):-edge(X,Y).\n"
+        "tc(X,Y):-edge(X,Z),tc(Z,Y).\n"
+        "extra(X):-edge(X,1).\n") == 0);
+    assert(dl_compile(db) == 0);
+    for (i = 0; i < 2; i++) {
+        if (!cmp_bound_topdown(db, srcs[i]) ||
+            !cmp_topdown_magic_rel(db, "tc", srcs[i])) {
+            FAIL("T28a 3-rule parity mismatch");
+            teardown_db(db, "t28a"); return;
+        }
+    }
+    teardown_db(db, "t28a");
+
+    /* (b) filtered recursive rule tc(X,Y):-edge(X,Z),tc(Z,Y),Y!=1. */
+    setup_db(&db, "t28b");
+    load_rows(db, "edge", 2, e, 3, "t28b");
+    assert(dl_load_rules(db,
+        "tc(X,Y):-edge(X,Y).\n"
+        "tc(X,Y):-edge(X,Z),tc(Z,Y),Y!=1.\n") == 0);
+    assert(dl_compile(db) == 0);
+    for (i = 0; i < 2; i++) {
+        if (!cmp_bound_topdown(db, srcs[i]) ||
+            !cmp_topdown_magic_rel(db, "tc", srcs[i])) {
+            FAIL("T28b filtered parity mismatch");
+            teardown_db(db, "t28b"); return;
+        }
+    }
+    teardown_db(db, "t28b");
+
+    PASS();
+}
+
 /* ─── Benchmark: topdown vs dl_query_magic_adorn ───────────────────────── */
 
 static double now_sec(void)
@@ -1379,6 +1609,12 @@ int main(void)
     test_t21_reject_parity();
     test_t22_negated_edb_property();
     test_t23_fb_adorn_negation();
+
+    test_t24_selfloop();
+    test_t25_cycle();
+    test_t26_dense_dag();
+    test_t27_multisource_chain();
+    test_t28_fallthrough();
 
     /* Honest benchmark (topdown vs dl_query_magic) is OPT-IN to keep the
      * default `make test` fast (~3min if it runs: chain N=10000 twice ≈ 90s).

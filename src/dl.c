@@ -3564,6 +3564,201 @@ long dl_query_topdown(dl_db *db, const char *goal_rel,
     return dl_query_topdown_adorn(db, goal_rel, adorn, leading, k, cb, user);
 }
 
+/* ─── Fast path: canonical left-recursive TC recognizer ────────────────── */
+
+/* BFS state for the O(edges) single-source reachability walk. */
+typedef struct {
+    dl_db      *db;
+    int         edge_idx;  /* index (in db->rels) of the pure-EDB edge rel */
+    uint32_t    seed;      /* bound col-0 value (the "b" of the bf adorn) */
+    dl_tuple_cb cb;
+    void       *user;
+    tuple_set  *visited;   /* arity-1: nodes already reached */
+    uint32_t   *queue;     /* FIFO of nodes to expand (grows via realloc) */
+    long        qcap, qtail;
+    long        count;     /* tuples emitted */
+    int         stop;      /* nonzero: cb asked to stop, or a fatal error */
+} tc_bfs_ctx;
+
+/* rel_enum_cb for the edge relation: for each (u,w) edge, emit (seed,w) when
+ * w is newly reached, mark it visited, and enqueue it for expansion. */
+static int tc_bfs_edge_cb(const uint32_t *cols, uint8_t arity, void *user)
+{
+    tc_bfs_ctx *ctx = (tc_bfs_ctx *)user;
+    uint32_t w = cols[1];
+    uint32_t emit[2];
+    (void)arity;
+
+    if (ts_contains(ctx->visited, &w)) return 0;   /* already reached */
+
+    emit[0] = ctx->seed;
+    emit[1] = w;
+    ctx->count++;
+    if (ctx->cb(emit, 2, ctx->user) != 0) { ctx->stop = 1; return 1; }
+
+    if (ts_add(ctx->visited, &w) != 1) { ctx->stop = 1; return 1; }
+    if (ctx->qtail >= ctx->qcap) {
+        long nc = ctx->qcap ? ctx->qcap * 2 : 64;
+        uint32_t *nq = realloc(ctx->queue, (size_t)nc * sizeof(uint32_t));
+        if (!nq) { ctx->stop = 1; return 1; }
+        ctx->queue = nq;
+        ctx->qcap = nc;
+    }
+    ctx->queue[ctx->qtail++] = w;
+    return 0;
+}
+
+/* Detect the exact canonical left-recursive transitive-closure shape
+ *
+ *   tc(X,Y) :- edge(X,Y).
+ *   tc(X,Y) :- edge(X,Z), tc(Z,Y).
+ *
+ * queried as tc(seed, ?) (bf adorn, seed bound).  When it fires, answer
+ * tc(seed, ?) = { (seed,w) : w reachable from seed by >=1 edge } in O(edges)
+ * with an iterative BFS, instead of the O(N^2) magic/topdown evaluation.
+ *
+ * On ANY disqualifier sets *matched=0 and returns 0 (caller falls through to
+ * the existing path byte-identically).  On a match sets *matched=1 and
+ * returns the tuple count (or -1 on an internal error). */
+static long tc_recognize_bf(dl_db *db, const char *goal_rel, const char *adorn,
+                            const uint32_t *vals, uint8_t nvals,
+                            dl_tuple_cb cb, void *user, int *matched)
+{
+    const rule *B = NULL, *R = NULL;
+    const atom *h;
+    const char *X, *Y, *Z;
+    const char *edge_pred;
+    int edge_idx, i;
+
+    *matched = 0;
+
+    /* A. Exactly 2 rules, both well-formed. */
+    if (!db || db->n_ast_rules != 2) return 0;
+    for (i = 0; i < 2; i++) {
+        const rule *r = db->ast_rules[i];
+        if (!r || !r->head || !r->head->pred) return 0;
+    }
+
+    /* B. Both heads equal to goal_rel; arity-2, all-variable. */
+    h = db->ast_rules[0]->head;
+    for (i = 0; i < 2; i++) {
+        const rule *r = db->ast_rules[i];
+        if (strcmp(r->head->pred, goal_rel) != 0) return 0;
+        if (r->head->nargs != 2) return 0;
+        if (r->head->args[0]->kind != TOK_VAR ||
+            r->head->args[1]->kind != TOK_VAR) return 0;
+    }
+
+    /* C. Adornment exactly "bf", exactly 1 bound value. */
+    if (!adorn || adorn[0] != 'b' || adorn[1] != 'f' ||
+        adorn[2] != '\0' || nvals != 1 || !vals) return 0;
+
+    /* D. No negation/aggregate; exactly one base (nbody==1) and exactly one
+     *    recursive (nbody==2) rule. */
+    for (i = 0; i < 2; i++) {
+        const rule *r = db->ast_rules[i];
+        if (r->has_negation || r->has_aggregate) return 0;
+        if (r->nbody == 1 && !B) B = r;
+        else if (r->nbody == 2 && !R) R = r;
+        else return 0;
+    }
+    if (!B || !R) return 0;
+
+    X = h->args[0]->text;
+    Y = h->args[1]->text;
+    if (!X || !Y) return 0;
+
+    /* E. Base rule: single pure-EDB edge atom edge(X,Y). */
+    {
+        const atom *a = B->body[0];
+        if (!a->pred || strcmp(a->pred, h->pred) == 0) return 0;
+        if (a->nargs != 2) return 0;
+        if (a->args[0]->kind != TOK_VAR || a->args[1]->kind != TOK_VAR) return 0;
+        if (a->negated || a->aggregate || a->arith || a->pattern) return 0;
+        if (!a->args[0]->text || !a->args[1]->text) return 0;
+        if (strcmp(a->args[0]->text, X) != 0) return 0;
+        if (strcmp(a->args[1]->text, Y) != 0) return 0;
+        edge_pred = a->pred;
+        edge_idx = find_rel(db, edge_pred);
+        if (edge_idx < 0) return 0;
+        if (db->rels[edge_idx].kind != RELK_FIXED) return 0;
+        if (rel_arity(db->rels[edge_idx].rel) != 2) return 0;
+        if (ast_has_head(db, edge_pred)) return 0;  /* edge must be pure EDB */
+    }
+
+    /* F. Recursive rule: edge(X,Z), tc(Z,Y) with Z fresh, tc the LAST atom. */
+    {
+        const atom *a0 = R->body[0];
+        const atom *a1 = R->body[1];
+
+        if (strcmp(a0->pred, edge_pred) != 0) return 0;
+        if (a0->nargs != 2) return 0;
+        if (a0->args[0]->kind != TOK_VAR || a0->args[1]->kind != TOK_VAR) return 0;
+        if (a0->negated || a0->aggregate || a0->arith || a0->pattern) return 0;
+        if (!a0->args[0]->text || !a0->args[1]->text) return 0;
+        if (strcmp(a0->args[0]->text, X) != 0) return 0;
+        Z = a0->args[1]->text;
+        if (strcmp(Z, X) == 0 || strcmp(Z, Y) == 0) return 0;  /* Z fresh */
+
+        if (!a1->pred || strcmp(a1->pred, h->pred) != 0) return 0;
+        if (a1->nargs != 2) return 0;
+        if (a1->args[0]->kind != TOK_VAR || a1->args[1]->kind != TOK_VAR) return 0;
+        if (a1->negated || a1->aggregate || a1->arith || a1->pattern) return 0;
+        if (!a1->args[0]->text || !a1->args[1]->text) return 0;
+        if (strcmp(a1->args[0]->text, Z) != 0) return 0;
+        if (strcmp(a1->args[1]->text, Y) != 0) return 0;
+    }
+
+    /* G. Every argument token in every atom of both rules is TOK_VAR. */
+    {
+        const rule *rules[2] = { B, R };
+        int ri, ai;
+        for (ri = 0; ri < 2; ri++) {
+            const rule *r = rules[ri];
+            for (ai = 0; ai < r->nbody; ai++) {
+                const atom *a = r->body[ai];
+                int k;
+                for (k = 0; k < a->nargs; k++)
+                    if (a->args[k]->kind != TOK_VAR) return 0;
+            }
+        }
+    }
+
+    /* Fires: single-source BFS reachability from seed. */
+    *matched = 1;
+    {
+        tc_bfs_ctx ctx;
+        long qhead = 0;
+        tuple_set visited;
+
+        if (ts_init(&visited, 1) != 0) return -1;
+        memset(&ctx, 0, sizeof(ctx));
+        ctx.db = db;
+        ctx.edge_idx = edge_idx;
+        ctx.seed = vals[0];
+        ctx.cb = cb;
+        ctx.user = user;
+        ctx.visited = &visited;
+        ctx.qcap = 64;
+        ctx.queue = malloc((size_t)ctx.qcap * sizeof(uint32_t));
+        if (!ctx.queue) { ts_free(&visited); return -1; }
+
+        ctx.queue[ctx.qtail++] = ctx.seed;   /* NOT pre-visited: self-loops/cycles count */
+
+        while (qhead < ctx.qtail) {
+            uint32_t u = ctx.queue[qhead++];
+            long n;
+            if (ctx.stop) break;
+            n = rel_prefix(db->rels[edge_idx].rel, &u, 1,
+                           tc_bfs_edge_cb, &ctx);
+            if (n < 0) { free(ctx.queue); ts_free(&visited); return -1; }
+        }
+        free(ctx.queue);
+        ts_free(&visited);
+        return ctx.count;
+    }
+}
+
 long dl_query_topdown_adorn(dl_db *db, const char *goal_rel,
                             const char *adorn, const uint32_t *vals, uint8_t nvals,
                             dl_tuple_cb cb, void *user)
@@ -3643,6 +3838,16 @@ long dl_query_topdown_adorn(dl_db *db, const char *goal_rel,
     }
 
     if (db->n_ast_rules <= 0) return -1;
+
+    /* Fast path: the canonical left-recursive TC shape (bf adorn) is answered
+     * in O(edges) by BFS.  Anything else falls through byte-identically. */
+    {
+        long rc;
+        int matched = 0;
+        rc = tc_recognize_bf(db, goal_rel, adorn, vals, nvals, cb, user, &matched);
+        if (matched)
+            return rc;
+    }
 
     /* Negation/aggregate soundness (mirrors dl_query_magic_adorn). */
     if (db->fixpoint_dirty) {
