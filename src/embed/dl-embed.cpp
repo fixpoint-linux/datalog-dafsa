@@ -24,6 +24,7 @@
 #include "csv_emit.h"
 #include "dl_driver.h"
 #include "itq.h"
+#include "remote_embed.h"
 #include "tokenizer.h"
 #include "vec_bits.h"
 
@@ -242,15 +243,20 @@ static int cmd_pipeline(const char *db, const char *rel, int col,
     char err[512];
     if (!file_exists(g_dl_path))
         die("dl binary not found next to dl-embed (expected ./dl in repo root)");
-    if (!file_exists(g_model_path)) {
-        fprintf(stderr, "model missing: %s\n  run: make fetch-model (or dl-embed fetch-model)\n",
-                g_model_path);
-        return 1;
-    }
+    const int remote = remote_embed_configured();
     bert_model m;
-    if (bert_load(g_model_path, &m, err, sizeof err) != 0) die(err);
-    if (m.n_embd != VEC_D_)
-        die("model n_embd != 384 (not bge-small-en-v1.5?)");
+    if (!remote) {
+        if (!file_exists(g_model_path)) {
+            fprintf(stderr, "model missing: %s\n  run: make fetch-model (or dl-embed fetch-model)\n",
+                    g_model_path);
+            return 1;
+        }
+        if (bert_load(g_model_path, &m, err, sizeof err) != 0) die(err);
+        if (m.n_embd != VEC_D_)
+            die("model n_embd != 384 (not bge-small-en-v1.5?)");
+    } else {
+        fprintf(stderr, "remote embed: DL_EMBED_API_URL=%s\n", getenv("DL_EMBED_API_URL"));
+    }
 
     /* RAW walk of the corpus liveness relation (spaces/unicode-safe). */
     uint32_t *rows; int n_rows = 0; uint8_t arity = 0;
@@ -302,13 +308,27 @@ static int cmd_pipeline(const char *db, const char *rel, int col,
     size_t n_ent = corpus_names.size();
     float *X = (float *)malloc(sizeof(float) * n_ent * VEC_D_);
     if (!X) die("OOM embeddings");
-    for (size_t k = 0; k < n_ent; k++) {
-        if (bert_embed(&m, corpus_names[k].c_str(), X + k * VEC_D_, err, sizeof err) != 0)
-            die(err);
-        if ((k + 1) % 50 == 0 || k + 1 == n_ent)
-            fprintf(stderr, "\rembedded %zu/%zu", k + 1, n_ent);
+    std::vector<const char *> corpus_cstrs;
+    if (remote) {
+        corpus_cstrs.reserve(n_ent);
+        for (size_t k = 0; k < n_ent; k++) corpus_cstrs.push_back(corpus_names[k].c_str());
     }
-    fprintf(stderr, "\n");
+    if (remote) {
+        /* single call: remote_embed batches + runs the worker pool internally,
+         * so batches go out concurrently and keep the P40 saturated. */
+        if (remote_embed(corpus_cstrs.data(), (int)n_ent, X, err, sizeof err) != 0)
+            die(err);
+        fprintf(stderr, "embedded %zu/%zu\n", n_ent, n_ent);
+    } else {
+        for (size_t k = 0; k < n_ent; ) {
+            if (bert_embed(&m, corpus_names[k].c_str(), X + k * VEC_D_, err, sizeof err) != 0)
+                die(err);
+            k++;
+            if ((k + 1) % 50 == 0 || k == n_ent)
+                fprintf(stderr, "\rembedded %zu/%zu", k, n_ent);
+        }
+        fprintf(stderr, "\n");
+    }
 
     /* fit basis + global scale */
     float *B = (float *)malloc(sizeof(float) * VEC_D_ * VEC_C_);
@@ -379,8 +399,202 @@ static int cmd_pipeline(const char *db, const char *rel, int col,
     snprintf(path, sizeof path, "%s/itq_basis%s.csv", db, suffix); remove(path);
 
     free(X); free(B); free(vecq_syms); free(vecq_packed);
-    bert_free(&m);
+    if (!remote) bert_free(&m);
     printf("published vector snapshot\n");
+    return 0;
+}
+
+/* ── incremental ──────────────────────────────────────────────────────────
+ * Frozen-basis append (Option A): reuse the existing ITQ basis + global
+ * int8 scale, embed only corpus syms NOT already indexed, and append their
+ * __obssig{0..15}/__vec_obs__ rows. Queries hash under the same frozen
+ * basis, so recall stays consistent across incremental runs.
+ */
+static int cmd_incremental(const char *db, const char *rel, int col,
+                           const char *suffix) {
+    char err[512];
+    const int remote = remote_embed_configured();
+    bert_model m;
+    if (!remote) {
+        if (!file_exists(g_model_path)) {
+            fprintf(stderr, "model missing: %s\n  run: make fetch-model (or dl-embed fetch-model)\n",
+                    g_model_path);
+            return 1;
+        }
+        if (bert_load(g_model_path, &m, err, sizeof err) != 0) die(err);
+        if (m.n_embd != VEC_D_)
+            die("model n_embd != 384 (not bge-small-en-v1.5?)");
+    } else {
+        fprintf(stderr, "remote embed: DL_EMBED_API_URL=%s\n", getenv("DL_EMBED_API_URL"));
+    }
+
+    /* Load the FROZEN basis + global scale (from a prior full pipeline run).
+       Reuse cmd_encode's loader by factoring it: we need B + gscale. */
+    float *B = (float *)malloc(sizeof(float) * VEC_D_ * VEC_C_);
+    if (!B) die("OOM basis");
+    double gscale = 0;
+    static char out_buf[16 << 20];
+    int n_lines = 0;
+    int got = 0;
+    if (dld_prefix(g_dl_path, db, "__itq_basis__", 1, NULL,
+                   out_buf, sizeof out_buf, &n_lines) == 0 &&
+        n_lines == VEC_D_ * VEC_C_) {
+        int n = 0;
+        for (char *p = out_buf; *p && n < VEC_D_ * VEC_C_; p += strlen(p) + 1) {
+            unsigned i, j, bits;
+            if (sscanf(p, "%u %u %u", &i, &j, &bits) == 3 &&
+                i < (unsigned)VEC_D_ && j < (unsigned)VEC_C_) {
+                B[i * VEC_C_ + j] = vec_bits_float32(bits);
+                n++;
+            }
+        }
+        got = (n == VEC_D_ * VEC_C_);
+    }
+    if (!got) {
+        char bpath[4096];
+        snprintf(bpath, sizeof bpath, "%s/itq_basis%s.npy", db, suffix);
+        got = npy_read_basis(bpath, B, VEC_D_, VEC_C_) == 0;
+    }
+    if (!got)
+        die("no existing basis — run 'dl-embed pipeline --db' once first");
+    char mpath[4096];
+    snprintf(mpath, sizeof mpath, "%s/vector_metadata%s.txt", db, suffix);
+    if (meta_read_qscale(mpath, &gscale) != 0)
+        die("no qscale — run 'dl-embed pipeline --db' once first");
+    printf("loaded frozen basis + scale=%.9g\n", gscale);
+
+    /* RAW walk of the corpus liveness relation (same as pipeline). */
+    uint32_t *rows; int n_rows = 0; uint8_t arity = 0;
+    if (dld_prefix_raw(g_dl_path, db, rel, &rows, &n_rows, &arity) != 0)
+        die("dl prefix raw failed for relation (is the DB published?)");
+    if ((int)arity <= col)
+        die("corpus relation arity too small for --col");
+
+    /* dense sym -> text map over symbols.array. */
+    char **names; uint32_t *ids;
+    int n_syms = dld_symbols_array(db, &names, &ids);
+    if (n_syms <= 0) die("cannot read symbols.array (publish first)");
+    uint32_t max_id = 0;
+    for (int k = 0; k < n_syms; k++) if (ids[k] > max_id) max_id = ids[k];
+    std::vector<const char *> sym_text((size_t)max_id + 1, NULL);
+    for (int k = 0; k < n_syms; k++) sym_text[ids[k]] = names[k];
+
+    /* collect (text, sym) for each corpus row, dedup by sym. */
+    std::vector<std::string> corpus_names;
+    std::vector<uint32_t> corpus_syms;
+    std::vector<int> seen((size_t)max_id + 1, 0);
+    for (int r = 0; r < n_rows; r++) {
+        uint32_t s = rows[(size_t)r * arity + (uint32_t)col];
+        if (s > max_id) die("corpus sym out of symbols.array range (rebuild?)");
+        if (seen[s]) continue;
+        seen[s] = 1;
+        const char *txt = sym_text[s];
+        if (!txt || !*txt) continue;   /* dead row: text gone */
+        corpus_names.push_back(txt);
+        corpus_syms.push_back(s);
+    }
+    for (int k = 0; k < n_syms; k++) free(names[k]);
+    free(names); free(ids);
+    free(rows);
+
+    /* Which syms are ALREADY indexed? Read __obssig0__ col1 (content_sym).
+       Corpus-namespaced: __obssig0__ (_obs) or __sig0__ (""). */
+    const char *sig0_rel = strcmp(suffix, "_obs") == 0 ? "__obssig0__" : "__sig0__";
+    uint32_t *sigrows = NULL; int n_sigrows = 0; uint8_t s_arity = 0;
+    std::vector<int> indexed((size_t)max_id + 1, 0);
+    if (dld_prefix_raw(g_dl_path, db, sig0_rel, &sigrows, &n_sigrows, &s_arity) == 0 &&
+        (int)s_arity >= 2) {
+        for (int r = 0; r < n_sigrows; r++) {
+            uint32_t s = sigrows[(size_t)r * s_arity + 1];
+            if (s <= max_id) indexed[s] = 1;
+        }
+    }
+    free(sigrows);
+
+    /* Filter to NEW syms only. */
+    std::vector<std::string> new_names;
+    std::vector<uint32_t> new_syms;
+    for (size_t k = 0; k < corpus_syms.size(); k++) {
+        if (!indexed[corpus_syms[k]]) {
+            new_names.push_back(corpus_names[k]);
+            new_syms.push_back(corpus_syms[k]);
+        }
+    }
+    printf("corpus %zu, already indexed %zu, new %zu\n",
+           corpus_syms.size(), corpus_syms.size() - new_syms.size(), new_syms.size());
+    if (new_syms.empty()) {
+        printf("nothing to index — index is up to date\n");
+        if (!remote) bert_free(&m);
+        free(B);
+        return 0;
+    }
+
+    /* Embed only the new texts. */
+    size_t n_ent = new_syms.size();
+    float *X = (float *)malloc(sizeof(float) * n_ent * VEC_D_);
+    if (!X) die("OOM embeddings");
+    std::vector<const char *> new_cstrs;
+    if (remote) {
+        new_cstrs.reserve(n_ent);
+        for (size_t k = 0; k < n_ent; k++) new_cstrs.push_back(new_names[k].c_str());
+        if (remote_embed(new_cstrs.data(), (int)n_ent, X, err, sizeof err) != 0)
+            die(err);
+        fprintf(stderr, "embedded %zu/%zu\n", n_ent, n_ent);
+    } else {
+        for (size_t k = 0; k < n_ent; ) {
+            if (bert_embed(&m, new_names[k].c_str(), X + k * VEC_D_, err, sizeof err) != 0)
+                die(err);
+            k++;
+            if ((k + 1) % 50 == 0 || k == n_ent)
+                fprintf(stderr, "\rembedded %zu/%zu", k, n_ent);
+        }
+        fprintf(stderr, "\n");
+    }
+
+    /* Encode with the frozen basis + global scale; build ONLY new rows. */
+    const char *sig_fmt = strcmp(suffix, "_obs") == 0 ? "__obssig%d__" : "__sig%d__";
+    const char *vec_rel = strcmp(suffix, "_obs") == 0 ? "__vec_obs__" : "__vec_q__";
+    size_t n_sig = n_ent, n_vecq = n_ent * VEC_IVEC_WORDS_;
+    uint32_t *band_vals[VEC_M_];
+    for (int j = 0; j < VEC_M_; j++)
+        band_vals[j] = (uint32_t *)malloc(sizeof(uint32_t) * n_sig);
+    uint32_t *vecq_syms = (uint32_t *)malloc(sizeof(uint32_t) * n_vecq);
+    uint32_t *vecq_packed = (uint32_t *)malloc(sizeof(uint32_t) * n_vecq);
+    int8_t q[VEC_D_];
+    uint32_t sig[VEC_SIG_WORDS_];
+    for (size_t k = 0; k < n_ent; k++) {
+        const float *v = X + k * VEC_D_;
+        itq_encode(v, B, VEC_D_, VEC_C_, sig);
+        for (int j = 0; j < VEC_M_; j++) band_vals[j][k] = vec_band_slice(sig, j);
+        itq_quantize_int8_global(v, VEC_D_, (float)gscale, q);
+        for (int w = 0; w < VEC_IVEC_WORDS_; w++) {
+            vecq_syms[k * VEC_IVEC_WORDS_ + w] = new_syms[k];
+            vecq_packed[k * VEC_IVEC_WORDS_ + w] =
+                vec_pack4_le(q[w * 4], q[w * 4 + 1], q[w * 4 + 2], q[w * 4 + 3]);
+        }
+    }
+
+    /* Append-only load of the new rows (existing rows stay put). */
+    char path[4096];
+    char reln[32];
+    for (int j = 0; j < VEC_M_; j++) {
+        snprintf(path, sizeof path, "%s/sig_%d%s.csv", db, j, suffix);
+        if (csv_write_sig(path, band_vals[j], new_syms.data(), n_sig) != 0) die("csv write failed");
+        snprintf(reln, sizeof reln, sig_fmt, j);
+        if (dld_load(g_dl_path, db, path, reln) != 0) die("dl load sig failed");
+        free(band_vals[j]);
+        remove(path);
+    }
+    snprintf(path, sizeof path, "%s/vec_q%s.csv", db, suffix);
+    if (csv_write_vecq(path, vecq_syms, vecq_packed, n_vecq) != 0) die("csv write failed");
+    if (dld_load(g_dl_path, db, path, vec_rel) != 0) die("dl load vec failed");
+    remove(path);
+
+    if (dld_publish(g_dl_path, db) != 0) die("dl publish failed");
+
+    free(X); free(B); free(vecq_syms); free(vecq_packed);
+    if (!remote) bert_free(&m);
+    printf("incrementally indexed %zu new entries; published\n", n_ent);
     return 0;
 }
 
@@ -422,14 +636,20 @@ static int cmd_encode(const char *db, const char *query) {
     if (meta_read_qscale(path, &gscale) != 0)
         die("no qscale in vector_metadata.txt (run pipeline first)");
 
-    if (!file_exists(g_model_path)) {
-        fprintf(stderr, "model missing: %s\n", g_model_path);
-        return 1;
-    }
-    bert_model m;
-    if (bert_load(g_model_path, &m, err, sizeof err) != 0) die(err);
     float v[VEC_D_];
-    if (bert_embed(&m, query, v, err, sizeof err) != 0) die(err);
+    if (remote_embed_configured()) {
+        const char *q = query;
+        if (remote_embed(&q, 1, v, err, sizeof err) != 0) die(err);
+    } else {
+        if (!file_exists(g_model_path)) {
+            fprintf(stderr, "model missing: %s\n", g_model_path);
+            return 1;
+        }
+        bert_model m;
+        if (bert_load(g_model_path, &m, err, sizeof err) != 0) die(err);
+        if (bert_embed(&m, query, v, err, sizeof err) != 0) die(err);
+        bert_free(&m);
+    }
 
     uint32_t sig[VEC_SIG_WORDS_];
     itq_encode(v, B, VEC_D_, VEC_C_, sig);
@@ -441,7 +661,6 @@ static int cmd_encode(const char *db, const char *query) {
     for (int w = 0; w < VEC_IVEC_WORDS_; w++)
         printf("%08x", vec_pack4_le(q[w * 4], q[w * 4 + 1], q[w * 4 + 2], q[w * 4 + 3]));
     printf("\n");
-    bert_free(&m);
     return 0;
 }
 
@@ -452,7 +671,9 @@ int main(int argc, char **argv) {
         fprintf(stderr,
             "usage: dl-embed <command>\n"
             "  pipeline --db DIR [--rel REL --col N --suffix S]\n"
-            "                      embed corpus + emit vector relations\n"
+            "                      full rebuild: embed corpus + fit basis + emit\n"
+            "  incremental --db DIR [--rel REL --col N --suffix S]\n"
+            "                      frozen-basis append: index only NEW corpus syms\n"
             "  encode --db DIR QRY   print 'sig_hex ivec_hex' for a query\n"
             "  embed QRY             print the raw 384-float embedding\n"
             "  tokenize QRY          print token ids + strings (debug)\n"
@@ -509,17 +730,22 @@ int main(int argc, char **argv) {
     if (strcmp(cmd, "embed") == 0) {
         if (argc < 3) die("embed requires a query string");
         char err[512];
-        if (!file_exists(g_model_path)) {
-            fprintf(stderr, "model missing: %s\n", g_model_path);
-            return 1;
-        }
-        bert_model m;
-        if (bert_load(g_model_path, &m, err, sizeof err) != 0) die(err);
         float v[VEC_D_];
-        if (bert_embed(&m, argv[2], v, err, sizeof err) != 0) die(err);
+        if (remote_embed_configured()) {
+            const char *q = argv[2];
+            if (remote_embed(&q, 1, v, err, sizeof err) != 0) die(err);
+        } else {
+            if (!file_exists(g_model_path)) {
+                fprintf(stderr, "model missing: %s\n", g_model_path);
+                return 1;
+            }
+            bert_model m;
+            if (bert_load(g_model_path, &m, err, sizeof err) != 0) die(err);
+            if (bert_embed(&m, argv[2], v, err, sizeof err) != 0) die(err);
+            bert_free(&m);
+        }
         for (int i = 0; i < VEC_D_; i++)
             printf("%.9g%c", v[i], i + 1 == VEC_D_ ? '\n' : ' ');
-        bert_free(&m);
         return 0;
     }
 
@@ -529,7 +755,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--db") == 0) db = argv[i + 1];
     if (!db) die("missing --db DIR");
 
-    if (strcmp(cmd, "pipeline") == 0) {
+    if (strcmp(cmd, "pipeline") == 0 || strcmp(cmd, "incremental") == 0) {
         /* --rel <rel> (default "entity"), --col <N> (default 0),
            --suffix <s> (default "" — the entity corpus). */
         const char *rel = "entity";
@@ -540,6 +766,8 @@ int main(int argc, char **argv) {
             else if (strcmp(argv[i], "--col") == 0) col = atoi(argv[i + 1]);
             else if (strcmp(argv[i], "--suffix") == 0) suffix = argv[i + 1];
         }
+        if (strcmp(cmd, "incremental") == 0)
+            return cmd_incremental(db, rel, col, suffix);
         return cmd_pipeline(db, rel, col, suffix);
     }
     if (strcmp(cmd, "encode") == 0) {

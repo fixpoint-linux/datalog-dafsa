@@ -4,7 +4,7 @@
 
 CC       = gcc
 CFLAGS   = -O2 -Wall -Wextra -Werror -std=c11 -fPIC -D_POSIX_C_SOURCE=200809L
-LDFLAGS  = -shared -fPIC
+LDFLAGS  = -shared -fPIC -Wl,-soname,libdatalog.so
 TMPDIR   = $(CURDIR)/build-tmp
 export TMPDIR
 
@@ -201,11 +201,15 @@ GGML_CMAKE := $(GGML_BUILD)/CMakeCache.txt
 GGML_LIBS  := $(GGML_BUILD)/src/libggml.a \
               $(GGML_BUILD)/src/libggml-cpu.a \
               $(GGML_BUILD)/src/libggml-base.a
-EMBED_CXXFLAGS := -O2 -Wall -Wextra -fPIC -D_GNU_SOURCE -std=c++17 -Ivendor/ggml/include -Isrc
+EMBED_CXXFLAGS := -O2 -Wall -Wextra -fPIC -D_GNU_SOURCE -std=c++17 \
+                  -Ivendor/ggml/include -Ivendor/http_client -Ivendor/yyjson -Isrc
+VENDOR_EMBED_OBJS := vendor/http_client/http_client.o vendor/yyjson/yyjson.o
 EMBED_OBJS := src/embed/itq.o src/embed/tokenizer.o src/embed/bert.o \
-              src/embed/csv_emit.o src/embed/dl_driver.o src/embed/dl-embed.o
+              src/embed/csv_emit.o src/embed/dl_driver.o src/embed/dl-embed.o \
+              src/embed/remote_embed.o $(VENDOR_EMBED_OBJS)
 LIBEMBED_OBJS := src/embed/itq.o src/embed/tokenizer.o src/embed/bert.o \
-                 src/embed/csv_emit.o src/embed/embed_api.o
+                 src/embed/csv_emit.o src/embed/embed_api.o \
+                 src/embed/remote_embed.o $(VENDOR_EMBED_OBJS)
 
 # fail fast (before any g++) if the submodule is not materialized
 .PHONY: ggml-check
@@ -224,10 +228,16 @@ $(GGML_LIBS): $(GGML_CMAKE)
 
 EMBED_HDRS := src/embed/bert.h src/embed/tokenizer.h src/embed/itq.h \
               src/embed/csv_emit.h src/embed/dl_driver.h src/embed/embed_api.h \
-              src/embed/vec_bits.h
+              src/embed/vec_bits.h src/embed/remote_embed.h
 
 src/embed/%.o: src/embed/%.cpp $(EMBED_HDRS) | ggml-check
 	g++ $(EMBED_CXXFLAGS) -c -o $@ $<
+
+# vendored C (http client + yyjson) — plain gcc, self-contained, no libcurl.
+vendor/http_client/http_client.o: vendor/http_client/http_client.c vendor/http_client/http_client.h
+	gcc -O2 -Wall -Wextra -fPIC -std=c11 -c -o $@ $<
+vendor/yyjson/yyjson.o: vendor/yyjson/yyjson.c vendor/yyjson/yyjson.h
+	gcc -O2 -Wall -Wextra -fPIC -std=c11 -c -o $@ $<
 
 dl-embed: $(EMBED_OBJS) $(GGML_LIBS)
 	g++ $(EMBED_CXXFLAGS) -o $@ $(EMBED_OBJS) \
