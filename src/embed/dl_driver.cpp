@@ -181,13 +181,19 @@ int dld_prefix_raw(const char *dl_path, const char *db, const char *rel,
     return 0;
 }
 
-int dld_publish(const char *dl_path, const char *db) {
+int dld_publish(const char *dl_path, const char *db, unsigned keep) {
     char *argv[16];
     int i = 0;
     argv[i++] = (char *)"dl";
     argv[i++] = (char *)"-d";
     argv[i++] = (char *)db;
     argv[i++] = (char *)"publish";
+    if (keep > 0) {
+        char kbuf[16];
+        snprintf(kbuf, sizeof kbuf, "%u", keep);
+        argv[i++] = (char *)"--keep";
+        argv[i++] = kbuf;
+    }
     argv[i] = NULL;
     char sink[256];
     return dld_run(dl_path, argv, sink, sizeof sink) == 0 ? 0 : -1;

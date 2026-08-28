@@ -359,7 +359,7 @@ static void usage(const char *prog)
         "  %s [-d <dir>] prefix <rel> [<val> ...]\n"
         "  %s [-d <dir>] query '<rule>' | <file.dl> <goal-rel>\n"
         "  %s [-d <dir>] qmagic '<rule>' | <file.dl> <goal-rel> [-a <adorn>] <val> [<val> ...]\n"
-        "  %s [-d <dir>] publish\n"
+        "  %s [-d <dir>] publish [--keep N]\n"
         "  %s [-d <dir>] bound <rel> <val> [<val> ...]\n"
         "  %s [-d <dir>] pattern <rel> [<col>] '<regex>'\n"
         "  %s [-d <dir>] rev <entity>\n"
@@ -671,6 +671,18 @@ int main(int argc, char **argv)
             printf("(no results)\n");
 
     } else if (strcmp(cmd, "publish") == 0) {
+        /* Optional --keep N: retain only the N most-recent snapshots, pruning
+         * older ones after this publish (opt-in; 0 disables retention). */
+        unsigned keep = 0;
+        if (argp < argc) {
+            if (argc - argp == 2 && strcmp(argv[argp], "--keep") == 0) {
+                keep = (unsigned)strtoul(argv[argp + 1], NULL, 10);
+                argp += 2;
+            } else {
+                usage(argv[0]);
+            }
+        }
+        dl_set_snapshot_retain(db, keep);
         if (dl_publish_snapshot(db) != 0) {
             fprintf(stderr, "dl: publish failed\n");
             dl_close(db);

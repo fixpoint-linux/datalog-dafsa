@@ -28,7 +28,7 @@ int dld_load(const char *dl_path, const char *db, const char *csv,
              const char *rel);
 
 /* `dl -d db publish`. */
-int dld_publish(const char *dl_path, const char *db);
+int dld_publish(const char *dl_path, const char *db, unsigned keep);
 
 /* Parse <db>/symbols.array into parallel arrays (malloc'd; caller frees).
  * Line N (1-based) = interned string, sym_id = N.  Returns count or -1. */

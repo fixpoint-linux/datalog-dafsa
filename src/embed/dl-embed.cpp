@@ -50,6 +50,7 @@
 static char g_repo_dir[4096];       /* dir of this binary (repo root)  */
 static char g_dl_path[4096];        /* repo-root/dl                    */
 static char g_model_path[4096];
+static unsigned g_keep = 0;         /* snapshot retention (DL_PUBLISH_KEEP) */
 
 static void die(const char *msg) { fprintf(stderr, "dl-embed: %s\n", msg); exit(1); }
 
@@ -70,6 +71,9 @@ static void resolve_paths(const char *argv0) {
     if (slash) *slash = '\0';
     else snprintf(g_repo_dir, sizeof g_repo_dir, ".");
     pathf(g_dl_path, sizeof g_dl_path, "%s/dl", g_repo_dir);
+
+    const char *keep = getenv("DL_PUBLISH_KEEP");
+    if (keep && *keep) g_keep = (unsigned)strtoul(keep, NULL, 10);
 
     const char *env = getenv("DL_EMBED_MODEL");
     if (env && *env) {
@@ -390,7 +394,7 @@ static int cmd_pipeline(const char *db, const char *rel, int col,
     if (dld_load(g_dl_path, db, path, "__itq_basis__") != 0) die("dl load basis failed");
 
     /* publish + clean up */
-    if (dld_publish(g_dl_path, db) != 0) die("dl publish failed");
+    if (dld_publish(g_dl_path, db, g_keep) != 0) die("dl publish failed");
     for (int j = 0; j < VEC_M_; j++) {
         snprintf(path, sizeof path, "%s/sig_%d%s.csv", db, j, suffix);
         remove(path);
@@ -590,7 +594,7 @@ static int cmd_incremental(const char *db, const char *rel, int col,
     if (dld_load(g_dl_path, db, path, vec_rel) != 0) die("dl load vec failed");
     remove(path);
 
-    if (dld_publish(g_dl_path, db) != 0) die("dl publish failed");
+    if (dld_publish(g_dl_path, db, g_keep) != 0) die("dl publish failed");
 
     free(X); free(B); free(vecq_syms); free(vecq_packed);
     if (!remote) bert_free(&m);
