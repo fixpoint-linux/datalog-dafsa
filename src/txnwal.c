@@ -287,6 +287,62 @@ txnwal *txnwal_open_rw(const char *db_dir)
     return w;
 }
 
+/* Reader-side open: O_RDONLY, no O_CREAT, never mutates the file.  A missing
+ * file is NOT an error for the caller's purposes — it returns NULL, which
+ * replay_txn_wal treats as "nothing to replay".  Same for a header-only
+ * (< 16 B after validation) or corrupt-header file. */
+txnwal *txnwal_open_ro(const char *db_dir)
+{
+    char *path;
+    txnwal *w;
+    int fd;
+    struct stat st;
+    size_t dlen;
+
+    if (!db_dir) return NULL;
+
+    dlen = strlen(db_dir);
+    path = malloc(dlen + 8 + 1);          /* "/txn.wal" = 8 chars + NUL */
+    if (!path) return NULL;
+    memcpy(path, db_dir, dlen);
+    memcpy(path + dlen, "/txn.wal", 9);   /* 8 chars + trailing NUL */
+
+    fd = open(path, O_RDONLY);
+    free(path);
+    if (fd < 0) return NULL;
+    if (fstat(fd, &st) != 0) { close(fd); return NULL; }
+    if (st.st_size < 16) { close(fd); return NULL; }   /* header-only/empty */
+
+    w = calloc(1, sizeof(*w));
+    if (!w) { close(fd); return NULL; }
+    w->fd = fd;
+
+    {
+        uint8_t *map;
+        size_t committed_end;
+
+        map = (uint8_t *)mmap(NULL, (size_t)st.st_size, PROT_READ,
+                              MAP_PRIVATE, fd, 0);
+        if (map == MAP_FAILED) { close(fd); free(w); return NULL; }
+
+        if (txnwal_validate_header(map, (size_t)st.st_size) != 0) {
+            munmap(map, (size_t)st.st_size);
+            close(fd); free(w); return NULL;
+        }
+
+        /* Scan (not truncate) the committed boundary: replay stops there. */
+        if (txnwal_committed_end(map, (size_t)st.st_size,
+                                 &committed_end) != 0) {
+            munmap(map, (size_t)st.st_size);
+            close(fd); free(w); return NULL;
+        }
+
+        munmap(map, (size_t)st.st_size);
+        w->size = (uint64_t)committed_end;
+    }
+    return w;
+}
+
 /* ─── Append ────────────────────────────────────────────────────────────── */
 
 int txnwal_append_record(txnwal *w, const char *rel, uint16_t rel_len,

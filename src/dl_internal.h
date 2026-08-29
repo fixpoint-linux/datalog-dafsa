@@ -90,6 +90,10 @@ struct dl_db {
     rel_entry  rels[MAX_RELS];
     size_t     nrels;
     int        lock_fd;    /* M7: fcntl lock file descriptor, or -1 */
+    int        read_only;  /* 1 if opened via dl_open_ro (shared F_RDLCK):
+                              every write API rejects, close never saves */
+    int        meta_dirty; /* 1 if rels.txt needs rewriting (new relation
+                              declared); guards the close-time write */
     int        rev_rel_id; /* CAS: cached index of the internal "rev" relation
                               (arity-2 entity→revision), or -1 if unknown */
     txn       *txn;        /* CAS Slice 2: active transaction buffer, or NULL

@@ -32,6 +32,7 @@ test_m6_review
 test_m6_deep_review
 test_m7
 test_cas
+test_concurrency
 test_m8_magic
 test_topdown
 test_m9_arith

@@ -25,6 +25,7 @@ build-tmp/
 /tests/test_m6_deep_review
 /tests/test_m7
 /tests/test_cas
+/tests/test_concurrency
 /tests/test_m8_magic
 /tests/test_topdown
 /tests/test_m9_arith

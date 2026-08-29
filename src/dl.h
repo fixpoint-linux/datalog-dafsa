@@ -44,6 +44,40 @@ void    dl_close(dl_db *db);
  * err_out may be NULL (behaviour identical to dl_open). */
 dl_db  *dl_open2(const char *dir, int *err_out);
 
+/* Open an EXISTING database READ-ONLY under a SHARED fcntl lock (F_RDLCK on
+ * <dir>/LOCK): multiple read-only handles coexist; a handle fails with
+ * DL_E_LOCKED while a writer (dl_open/dl_open2) holds the lock, and a
+ * writer fails while any read-only handle is open — the single-writer
+ * invariant is unchanged.
+ *
+ * The directory must already be a database (it is NEVER created): *err_out
+ * is -1 unless <dir> exists and contains rels.txt or symbols.dafsa AND the
+ * <dir>/LOCK file exists (dl_open_ro never creates files, LOCK included;
+ * every database directory created by dl_open/dl_open2 has one).
+ *
+ * SAME-PROCESS LOCKING CAVEAT: fcntl locks are per (process, file), so
+ * never hold a read-write handle (dl_open/dl_open2) and a read-only handle
+ * (dl_open_ro) of the SAME database directory in one process at the same
+ * time — the RO open's F_RDLCK silently replaces that process's own F_WRLCK
+ * (the F_SETLK succeeds against the process's own lock), admitting a second
+ * writer in another process while the RW handle is live.  One handle per
+ * directory per process; use dl_open_ro from other PROCESSES alongside an
+ * active writer.
+ *
+ * A read-only handle never writes: no mkdir, no LOCK creation, per-relation
+ * and txn WALs are replayed IN MEMORY only (no compaction, no truncation,
+ * torn tails tolerated), and dl_close performs no saves — every db file is
+ * byte-identical before/after (dirty flags are never applied).  All write
+ * APIs return -1 (dl_term_cons/dl_term_append and dl_intern_str return 0);
+ * every query/lookup/traversal/intern-lookup API works and reads the live
+ * state (committed WAL records included).
+ *
+ * CAVEAT (pre-existing routing, unchanged): when a snapshot has been
+ * published (dl_publish_snapshot), the dl_query/dl_rank/dl_select family
+ * prefers that snapshot, while dl_prefix reads the live WAL-replayed state.
+ */
+dl_db  *dl_open_ro(const char *dir, int *err_out);
+
 /* ─── Schema ──────────────────────────────────────────────────────────── */
 
 /* Declare a relation with a fixed arity (1-8).  Creates an empty DAFSA

@@ -58,6 +58,14 @@ typedef int (*txnwal_replay_cb)(const char *rel, uint16_t rel_len,
  * appends start at a clean committed boundary.  Returns NULL on error. */
 txnwal *txnwal_open_rw(const char *db_dir);
 
+/* Open <db_dir>/txn.wal READ-ONLY (concurrency-ro-open): O_RDONLY, no
+ * O_CREAT, never writes/ftruncates.  The header is validated like
+ * txnwal_open_rw; a missing file, a header-only/short file, or a corrupt
+ * header returns NULL (the caller treats NULL as "nothing to replay").
+ * Replay (txnwal_replay) only ever delivers the committed prefix, so a torn
+ * tail is harmless without truncation. */
+txnwal *txnwal_open_ro(const char *db_dir);
+
 /* Append one ADD/DEL record for relation `rel` (rel_len bytes, may be any
  * non-zero length; the caller keeps it alive only for the duration of this
  * call).  `op` must be TXNWAL_OP_ADD or TXNWAL_OP_DEL.  Not fsync'd until

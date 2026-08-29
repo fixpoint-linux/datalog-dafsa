@@ -48,6 +48,21 @@ relation *rel_open_writable(const char *dafsa_path, const char *wal_path,
 relation *rel_open_writable_idb(const char *base_path, const char *dafsa_path,
                                 const char *wal_path, uint8_t arity);
 
+/* READ-ONLY open under a shared lock (concurrency-ro-open): loads the base
+ * DAFSA, opens the WAL with dafsa_wal_open_ro (O_RDONLY, never mutates) and
+ * replays it IN MEMORY only — no compaction, no file is created or written.
+ * A missing (or header-only/corrupt) WAL is tolerated (wal handle stays
+ * NULL).  The dirty flag is never set here, so dl_close skips every save. */
+relation *rel_open_readonly(const char *dafsa_path, const char *wal_path,
+                            uint8_t arity);
+
+/* READ-ONLY open of a rule-head (IDB) relation: loads base + view, replays
+ * the WAL into base IN MEMORY only (no compaction).  As with
+ * rel_open_writable_idb the view is NOT re-derived here — a query path that
+ * needs derived facts re-derives via the VM (in memory). */
+relation *rel_open_readonly_idb(const char *base_path, const char *dafsa_path,
+                                const char *wal_path, uint8_t arity);
+
 /* Save the relation DAFSA to path. Returns 0 on success, -1 on error. */
 int rel_save(const relation *rel, const char *path);
 
@@ -159,6 +174,13 @@ int rel_build_base_from_tupleset(relation *rel, const struct tuple_set *ts);
 
 /* 1 if this relation is a rule head (base is split from view), else 0. */
 int rel_is_idb(const relation *rel);
+
+/* 1 if the relation was mutated since open (or since the last reset of the
+ * flag): a fact was added/deleted (base or view), the view was rebuilt from
+ * a tuple_set, or the view was reset for re-derivation.  Open-time WAL
+ * replay does NOT set it.  dl_close skips rel_compact/rel_save on a clean
+ * relation. */
+int rel_is_dirty(const relation *rel);
 
 /* Prepare the view for (re-)evaluation: on the first call for a rule-head
  * relation, SPLIT base off from the view (base = copy of view, which at that

@@ -49,7 +49,8 @@ extern tuple_set *vm_export_ts;
 
 /* Forward decls (defined in the Schema section below). */
 static int  dl_declare_relation_kind(dl_db *db, const char *name,
-                                     uint8_t arity, int is_idb);
+                                     uint8_t arity, int is_idb,
+                                     int from_meta);
 static void write_rels_txt(dl_db *db);
 
 /* IVM Slice 5: forward decls for the batched-delta capture in dl_load_facts
@@ -252,8 +253,11 @@ static relation *variadic_open_variant(dl_db *db, rel_entry *e, uint8_t a)
         return NULL;
     }
 
-    r = is_idb ? rel_open_writable_idb(base, dafsa, wal, a)
-               : rel_open_writable(dafsa, wal, a);
+    r = is_idb
+        ? (db->read_only ? rel_open_readonly_idb(base, dafsa, wal, a)
+                         : rel_open_writable_idb(base, dafsa, wal, a))
+        : (db->read_only ? rel_open_readonly(dafsa, wal, a)
+                         : rel_open_writable(dafsa, wal, a));
 
     free(dafsa);
     free(wal);
@@ -282,7 +286,24 @@ dl_db *dl_open(const char *dir)
     return dl_open2(dir, NULL);
 }
 
-dl_db *dl_open2(const char *dir, int *err_out)
+/* RO existence probe: 1 if <dir>/<name> exists, 0 if it does not, -1 if
+ * the path cannot be formed (over-long dir) — the caller must fail the
+ * open rather than stat a silently truncated path. */
+static int ro_probe_exists(const char *dir, const char *name)
+{
+    char path[4096];
+    struct stat st;
+    int n = snprintf(path, sizeof(path), "%s/%s", dir, name);
+    if (n < 0 || n >= (int)sizeof(path)) return -1;
+    return stat(path, &st) == 0;
+}
+
+/* Shared body of dl_open2 (read-write) and dl_open_ro.  ro==1 opens the
+ * database read-only: the directory is never created, the LOCK file is
+ * opened O_RDONLY (never created) and locked F_RDLCK (shared), and every
+ * downstream path (relation opens, txn WAL replay, declare, close) routes
+ * to its non-mutating variant via db->read_only. */
+static dl_db *dl_open_common(const char *dir, int *err_out, int ro)
 {
     dl_db *db;
     char *rels_path;
@@ -295,12 +316,33 @@ dl_db *dl_open2(const char *dir, int *err_out)
         return NULL;
     }
 
-    /* Create directory if needed */
-    mkdir(dir, 0755);
+    if (ro) {
+        /* A read-only open never creates anything: require an existing
+         * database directory (rels.txt or symbols.dafsa present) plus the
+         * LOCK file the shared lock below opens O_RDONLY. */
+        struct stat st;
+        int have_meta;
 
-    /* M7: acquire fcntl single-writer lock */
+        if (stat(dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
+            if (err_out) *err_out = -1;
+            return NULL;
+        }
+        have_meta = ro_probe_exists(dir, "rels.txt");
+        if (have_meta == 0)
+            have_meta = ro_probe_exists(dir, "symbols.dafsa");
+        if (have_meta != 1) {
+            if (err_out) *err_out = -1;
+            return NULL;
+        }
+    } else {
+        /* Create directory if needed */
+        mkdir(dir, 0755);
+    }
+
+    /* M7: acquire fcntl single-writer lock (F_RDLCK shared for ro) */
     snprintf(lock_path, sizeof(lock_path), "%s/LOCK", dir);
-    lfd = open(lock_path, O_CREAT | O_RDWR, 0644);
+    lfd = ro ? open(lock_path, O_RDONLY)
+             : open(lock_path, O_CREAT | O_RDWR, 0644);
     if (lfd < 0) {
         if (err_out) *err_out = -1;
         return NULL;
@@ -308,14 +350,15 @@ dl_db *dl_open2(const char *dir, int *err_out)
 
     {
         struct flock fl;
-        fl.l_type   = F_WRLCK;
+        fl.l_type   = ro ? F_RDLCK : F_WRLCK;
         fl.l_whence = SEEK_SET;
         fl.l_start  = 0;
         fl.l_len    = 0;  /* whole file */
         fl.l_pid    = 0;
 
         if (fcntl(lfd, F_SETLK, &fl) != 0) {
-            /* Contention: another writer holds the lock */
+            /* Contention: another writer holds the lock (or, for ro, a
+             * writer holds it so no shared lock can be taken). */
             close(lfd);
             if (err_out) *err_out = DL_E_LOCKED;
             return NULL;
@@ -325,6 +368,7 @@ dl_db *dl_open2(const char *dir, int *err_out)
     db = calloc(1, sizeof(*db));
     if (!db) { close(lfd); if (err_out) *err_out = -1; return NULL; }
     db->lock_fd = lfd;
+    db->read_only = ro;
     db->rev_rel_id = -1;  /* CAS: cached rev relation index (unknown yet) */
 
     db->dir = strdup(dir);
@@ -433,7 +477,8 @@ dl_db *dl_open2(const char *dir, int *err_out)
 
             for (size_t mi = 0; mi < n_meta; mi++) {
                 dl_declare_relation_kind(db, rel_names[mi],
-                                         rel_arities[mi], rel_idb[mi]);
+                                         rel_arities[mi], rel_idb[mi],
+                                         1 /* from_meta */);
             }
         }
         free(rels_path);
@@ -441,7 +486,8 @@ dl_db *dl_open2(const char *dir, int *err_out)
 
     /* CAS Slice 2: replay any committed txn WAL prefix (facts written by a
      * transaction commit that were not yet compacted) into the base
-     * relations, BEFORE any publish, so a crash cannot lose them. */
+     * relations, BEFORE any publish, so a crash cannot lose them.
+     * Read-only: in-memory replay only (no compaction, no truncation). */
     replay_txn_wal(db);
 
     /* M4: detect existing snapshot and fixpoint state */
@@ -450,6 +496,16 @@ dl_db *dl_open2(const char *dir, int *err_out)
 
     if (err_out) *err_out = 0;
     return db;
+}
+
+dl_db *dl_open2(const char *dir, int *err_out)
+{
+    return dl_open_common(dir, err_out, 0);
+}
+
+dl_db *dl_open_ro(const char *dir, int *err_out)
+{
+    return dl_open_common(dir, err_out, 1);
 }
 
 void dl_close(dl_db *db)
@@ -476,11 +532,14 @@ void dl_close(dl_db *db)
     vm_clear_deltas(db);
     vm_clear_deletes(db);
 
-    /* Save interner */
+    /* Save interner (skipped entirely on read-only handles: dl_query_rules_ro
+     * may intern constants into the shared in-memory interner, which must
+     * never leak to disk). */
     {
         char *fwd_path = make_path(db, "symbols", ".dafsa");
         char *rev_path = make_path(db, "symbols", ".array");
-        if (fwd_path && rev_path && intern_is_dirty(db->ir))
+        if (fwd_path && rev_path && !db->read_only &&
+            intern_is_dirty(db->ir))
             intern_save(db->ir, fwd_path, rev_path);
         free(fwd_path);
         free(rev_path);
@@ -488,11 +547,13 @@ void dl_close(dl_db *db)
 
     /* v2-lists: save the term store AFTER the interner and BEFORE any
      * relation DAFSA that references list handles (the same ordering
-     * invariant as the interner-before-relation rule). */
+     * invariant as the interner-before-relation rule).  Dirty-tracked:
+     * a clean store (nothing interned this session) is not rewritten. */
     {
         char *tpath = make_path(db, "terms", ".bin");
         if (tpath) {
-            term_save(db->terms, tpath);
+            if (!db->read_only && term_is_dirty(db->terms))
+                term_save(db->terms, tpath);
             free(tpath);
         }
     }
@@ -501,7 +562,10 @@ void dl_close(dl_db *db)
      * (IDB) relations additionally persist their VIEW to <name>.dafsa>.
      * v2: a VARIADIC relation does the same PER VARIANT under
      * <name>.<a>.dafsa — an idb variant's base file doubles as the durable
-     * per-variant edb|idb marker consulted at reopen. */
+     * per-variant edb|idb marker consulted at reopen.
+     * Dirty-tracked (concurrency-ro-open): a relation with no in-session
+     * mutation is skipped entirely, and read-only handles (whose dirty flags
+     * may have been set by in-memory txn replay) never save. */
     for (i = 0; i < db->nrels; i++) {
         char *path;
         if (db->rels[i].kind == RELK_VARIADIC) {
@@ -509,6 +573,7 @@ void dl_close(dl_db *db)
             for (a = 1; a <= MAX_VAR_ARITY; a++) {
                 relation *vr = vrel_variant_or_null(db->rels[i].vrel, a);
                 if (!vr) continue;
+                if (db->read_only || !rel_is_dirty(vr)) continue;
                 if (rel_is_idb(vr)) {
                     path = make_vpath(db, db->rels[i].name, a, ".base.dafsa");
                     if (path) {
@@ -528,6 +593,8 @@ void dl_close(dl_db *db)
                     }
                 }
             }
+        } else if (db->read_only || !rel_is_dirty(db->rels[i].rel)) {
+            continue;
         } else if (rel_is_idb(db->rels[i].rel)) {
             path = make_path(db, db->rels[i].name, ".base.dafsa");
             if (path) {
@@ -548,8 +615,12 @@ void dl_close(dl_db *db)
         }
     }
 
-    /* Save relation metadata (name:arity:edb|idb) while names/rels are alive */
-    write_rels_txt(db);
+    /* Save relation metadata (name:arity:edb|idb) while names/rels are alive.
+     * Read-only handles never rewrite; a read-write handle only rewrites
+     * when a relation was declared this session (meta_dirty) — rels.txt is
+     * already written immediately at declare time. */
+    if (!db->read_only && db->meta_dirty)
+        write_rels_txt(db);
 
     /* Now free relations and their names */
     for (i = 0; i < db->nrels; i++) {
@@ -679,9 +750,13 @@ static int is_variant_stem(const char *name, char stem[256])
 }
 
 /* Declare a relation, optionally as a rule head (is_idb).  arity == 0
- * declares a VARIADIC relation (dl_declare_relation_variadic). */
+ * declares a VARIADIC relation (dl_declare_relation_variadic).
+ * from_meta marks a declaration replayed from rels.txt during open: it is
+ * already on disk, so it must not set meta_dirty nor rewrite rels.txt —
+ * otherwise every RW session would look dirty and the close-time
+ * write_rels_txt guard could never suppress the rewrite. */
 static int dl_declare_relation_kind(dl_db *db, const char *name,
-                                    uint8_t arity, int is_idb)
+                                    uint8_t arity, int is_idb, int from_meta)
 {
     int idx;
     char *path;
@@ -796,10 +871,16 @@ static int dl_declare_relation_kind(dl_db *db, const char *name,
             return -1;
         }
 
+        /* Route to the read-only openers under a shared lock: the WAL is
+         * replayed in memory only and nothing is compacted/created. */
         if (is_idb)
-            rel = rel_open_writable_idb(base_path, path, wal_path, arity);
+            rel = db->read_only
+                ? rel_open_readonly_idb(base_path, path, wal_path, arity)
+                : rel_open_writable_idb(base_path, path, wal_path, arity);
         else
-            rel = rel_open_writable(path, wal_path, arity);
+            rel = db->read_only
+                ? rel_open_readonly(path, wal_path, arity)
+                : rel_open_writable(path, wal_path, arity);
         free(path);
         free(wal_path);
         free(base_path);
@@ -824,20 +905,31 @@ static int dl_declare_relation_kind(dl_db *db, const char *name,
 
     /* M7: persist relation metadata immediately so crash-recovery works.
      * Without this, a process that declares a relation and adds facts
-     * before crashing would lose the relation declaration on reopen. */
-    write_rels_txt(db);
+     * before crashing would lose the relation declaration on reopen.
+     * Read-only handles never rewrite rels.txt (a shared-lock reader must
+     * not mutate the db): they only record the declaration in memory via
+     * meta_dirty, which dl_close applies to write-side handles only.
+     * from_meta declarations are already recorded in rels.txt — neither
+     * flag nor write. */
+    if (!from_meta) {
+        db->meta_dirty = 1;
+        if (!db->read_only)
+            write_rels_txt(db);
+    }
 
     return 0;
 }
 
 int dl_declare_relation(dl_db *db, const char *name, uint8_t arity)
 {
-    return dl_declare_relation_kind(db, name, arity, 0);
+    if (db && db->read_only) return -1;   /* write API on a read-only handle */
+    return dl_declare_relation_kind(db, name, arity, 0, 0);
 }
 
 int dl_declare_relation_variadic(dl_db *db, const char *name)
 {
-    return dl_declare_relation_kind(db, name, 0, 0);
+    if (db && db->read_only) return -1;   /* write API on a read-only handle */
+    return dl_declare_relation_kind(db, name, 0, 0, 0);
 }
 
 /* ─── CSV parser ──────────────────────────────────────────────────────── */
@@ -1068,6 +1160,7 @@ int dl_load_facts(dl_db *db, const char *rel_name, const char *csv_path)
     tuple_set delta;
 
     if (!db || !rel_name || !csv_path) return -1;
+    if (db->read_only) return -1;   /* write API on a read-only handle */
 
     /* CAS Slice 2: bulk load while a transaction is open would bypass the txn
      * buffer and break atomicity — reject. */
@@ -1531,6 +1624,7 @@ int dl_add_fact(dl_db *db, const char *rel_name,
     size_t key_len;
 
     if (!db || !rel_name || !cols) return -1;
+    if (db->read_only) return -1;   /* write API on a read-only handle */
 
     /* CAS Slice 2: a direct write while a transaction is open would mix
      * buffered and direct WAL writes — reject. */
@@ -1640,6 +1734,7 @@ int dl_delete_fact(dl_db *db, const char *rel_name,
     size_t key_len;
 
     if (!db || !rel_name || !cols) return -1;
+    if (db->read_only) return -1;   /* write API on a read-only handle */
 
     /* CAS Slice 2: reject a direct write while a transaction is open. */
     if (db->txn) return -1;
@@ -1731,6 +1826,7 @@ int dl_cas_revision(dl_db *db, const char *entity,
     uint32_t old_cols[2], new_cols[2];
 
     if (!db || !entity) return -1;
+    if (db->read_only) return -1;   /* write API on a read-only handle */
 
     /* CAS Slice 2: mixing a direct CAS with an open transaction's buffered
      * writes would break atomicity — reject. */
@@ -1818,6 +1914,22 @@ int dl_rev_get(dl_db *db, const char *entity, uint32_t *out)
 {
     uint32_t entity_sym;
     if (!db || !entity || !out) return -1;
+    if (db->read_only) {
+        /* Read-only lookup: never declare the rev relation (a write) and
+         * never intern a new sym.  A missing rev relation or an unknown
+         * entity reads as revision 0, matching the empty-row contract. */
+        int rel_id = find_rel(db, "rev");
+        relation *rel;
+        long n;
+        if (rel_id < 0) { *out = 0; return 0; }
+        rel = db->rels[rel_id].rel;
+        if (!rel) return -1;
+        entity_sym = intern_str_find(db->ir, entity);
+        if (entity_sym == 0) { *out = 0; return 0; }
+        *out = 0;
+        n = rel_prefix(rel, &entity_sym, 1, rev_sink_cb, out);
+        return (n < 0) ? -1 : 0;
+    }
     if (ensure_rev_rel(db) < 0) return -1;
     entity_sym = intern_str(db->ir, entity);
     if (entity_sym == 0) return -1;
@@ -1855,6 +1967,7 @@ static int txn_buf_op(dl_db *db, const txn_op *op)
 int dl_txn_begin(dl_db *db)
 {
     if (!db) return -1;
+    if (db->read_only) return -1;   /* write API on a read-only handle */
     if (db->txn) return -1;   /* reject nested transactions */
     db->txn = calloc(1, sizeof(*db->txn));
     return db->txn ? 0 : -1;
@@ -2124,10 +2237,12 @@ static int txn_replay_cb(const char *rel, uint16_t rel_len, uint8_t op,
 }
 
 /* Replay the committed prefix of the txn WAL into the base relations at
- * reopen, compact every touched relation (durable base), then reset the WAL
- * so the committed records are consumed.  Mirrors the per-relation WAL
- * replay+compact done by rel_open_writable.  Must run after the rels.txt
- * load (all relations exist) and before any publish. */
+ * reopen.  Read-write: compact every touched relation (durable base), then
+ * reset the WAL so the committed records are consumed.  Read-only: replay
+ * IN MEMORY only via txnwal_open_ro — no compaction, no truncation, nothing
+ * on disk changes (a later read-write open compacts).  Mirrors the
+ * per-relation WAL replay done by the relation openers.  Must run after the
+ * rels.txt load (all relations exist) and before any publish. */
 static void replay_txn_wal(dl_db *db)
 {
     txnwal *w;
@@ -2137,7 +2252,7 @@ static void replay_txn_wal(dl_db *db)
     int compact_failed = 0;
 
     if (!db || !db->dir) return;
-    w = txnwal_open_rw(db->dir);
+    w = db->read_only ? txnwal_open_ro(db->dir) : txnwal_open_rw(db->dir);
     if (!w) return;   /* no txn.wal / open failed: nothing to replay */
 
     memset(&ctx, 0, sizeof(ctx));
@@ -2146,6 +2261,13 @@ static void replay_txn_wal(dl_db *db)
     if (txnwal_replay(w, txn_replay_cb, &ctx, &good_bytes) != 0) {
         /* Replay error: leave the committed records in txn.wal for a later
          * open to retry (never drop them on an I/O error). */
+        txnwal_close(w);
+        return;
+    }
+
+    /* Read-only: the replayed facts live in memory only; the next
+     * read-write open replays + compacts + consumes them. */
+    if (db->read_only) {
         txnwal_close(w);
         return;
     }
@@ -2182,6 +2304,7 @@ static void replay_txn_wal(dl_db *db)
 uint32_t dl_intern_str(dl_db *db, const char *str)
 {
     if (!db || !db->ir) return 0;
+    if (db->read_only) return 0;   /* interning mutates: reject on RO */
     return intern_str(db->ir, str);
 }
 
@@ -2208,12 +2331,14 @@ void *dl_intern_fwd_mutable(dl_db *db)
 uint32_t dl_term_cons(dl_db *db, uint32_t head, uint32_t tail)
 {
     if (!db || !db->terms) return 0;
+    if (db->read_only) return 0;   /* interning mutates: reject on RO */
     return term_cons(db->terms, head, tail);
 }
 
 uint32_t dl_term_append(dl_db *db, uint32_t a, uint32_t b)
 {
     if (!db || !db->terms) return 0;
+    if (db->read_only) return 0;   /* interning mutates: reject on RO */
     return term_append(db->terms, a, b);
 }
 
@@ -2675,6 +2800,7 @@ int dl_load_rules(dl_db *db, const char *dl_source)
     compiled_rule **new_crules;
 
     if (!db || !dl_source) return -1;
+    if (db->read_only) return -1;   /* write API on a read-only handle */
 
     p = parse_create(dl_source);
     if (!p) return -1;
@@ -2829,6 +2955,7 @@ int dl_load_rules(dl_db *db, const char *dl_source)
 int dl_compile(dl_db *db)
 {
     if (!db) return -1;
+    if (db->read_only) return -1;   /* materializes views: write-side only */
     if (db->n_crules == 0) return 0; /* nothing to compile */
 
     if (vm_execute(db, db->crules, db->n_crules) != 0)
@@ -4144,6 +4271,10 @@ int dl_publish_snapshot(dl_db *db)
 #pragma GCC diagnostic ignored "-Wformat-truncation"
 
     if (!db) return -1;
+
+    /* Read-only handles never publish (a publish writes a snapshot dir and
+     * flips CURRENT). */
+    if (db->read_only) return -1;
 
     /* CAS Slice 2: publishing while a transaction is open would capture a
      * half-applied state — reject. */

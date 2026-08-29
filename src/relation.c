@@ -37,6 +37,9 @@ struct relation {
     uint8_t    arity;
     dafsa_wal *wal;       /* M7: per-relation WAL handle, or NULL */
     char      *wal_path;  /* M7: path to WAL file (owned) */
+    int        dirty;     /* 1 if mutated since open (rel_is_dirty); open-time
+                           WAL replay does NOT set it — dl_close skips
+                           rel_compact/rel_save on a clean relation */
 };
 
 /* ─── Key encoding helpers ────────────────────────────────────────────── */
@@ -322,12 +325,16 @@ static int rel_add_d(relation *rel, dafsa *d, const uint32_t *cols)
 
 int rel_add(relation *rel, const uint32_t *cols)
 {
-    return rel_add_d(rel, rel ? rel->d : NULL, cols);
+    int rc = rel_add_d(rel, rel ? rel->d : NULL, cols);
+    if (rc > 0) rel->dirty = 1;
+    return rc;
 }
 
 int rel_add_base(relation *rel, const uint32_t *cols)
 {
-    return rel_add_d(rel, rel ? rel->base : NULL, cols);
+    int rc = rel_add_d(rel, rel ? rel->base : NULL, cols);
+    if (rc > 0) rel->dirty = 1;
+    return rc;
 }
 
 static int rel_exact_d(const relation *rel, const dafsa *d, const uint32_t *cols)
@@ -364,12 +371,16 @@ static int rel_delete_d(relation *rel, dafsa *d, const uint32_t *cols)
 
 int rel_delete(relation *rel, const uint32_t *cols)
 {
-    return rel_delete_d(rel, rel ? rel->d : NULL, cols);
+    int rc = rel_delete_d(rel, rel ? rel->d : NULL, cols);
+    if (rc > 0) rel->dirty = 1;
+    return rc;
 }
 
 int rel_delete_base(relation *rel, const uint32_t *cols)
 {
-    return rel_delete_d(rel, rel ? rel->base : NULL, cols);
+    int rc = rel_delete_d(rel, rel ? rel->base : NULL, cols);
+    if (rc > 0) rel->dirty = 1;
+    return rc;
 }
 
 /* ─── Prefix enumeration ──────────────────────────────────────────────── */
@@ -605,6 +616,7 @@ int rel_build_from_tupleset(relation *rel, const struct tuple_set *ts)
     dafsa_free(rel->d);
     rel->d = new_d;
     if (aliased) rel->base = rel->d;   /* keep base aliased for EDB rels */
+    rel->dirty = 1;
     return 0;
 }
 
@@ -623,6 +635,7 @@ int rel_build_base_from_tupleset(relation *rel, const struct tuple_set *ts)
     dafsa_free(rel->base);
     rel->base = new_b;
     if (aliased) rel->d = rel->base;   /* keep view aliased for EDB rels */
+    rel->dirty = 1;
     return 0;
 }
 
@@ -652,6 +665,11 @@ int rel_is_idb(const relation *rel)
     return rel ? (rel->base != rel->d) : 0;
 }
 
+int rel_is_dirty(const relation *rel)
+{
+    return rel ? rel->dirty : 0;
+}
+
 int rel_reset_view(relation *rel)
 {
     if (!rel) return -1;
@@ -663,6 +681,7 @@ int rel_reset_view(relation *rel)
         dafsa *nb = dafsa_copy_from(rel, rel->d);
         if (!nb) return -1;
         rel->base = nb;
+        rel->dirty = 1;   /* view is about to be re-derived by the VM */
         return 0;
     }
 
@@ -673,6 +692,7 @@ int rel_reset_view(relation *rel)
         dafsa_free(rel->d);
         rel->d = nv;
     }
+    rel->dirty = 1;   /* view reset for re-derivation */
     return 0;
 }
 
@@ -899,6 +919,78 @@ relation *rel_open_writable_idb(const char *base_path, const char *dafsa_path,
             return NULL;
         }
         if (rel_compact(rel, base_path) != 0) {
+            rel_free(rel);
+            return NULL;
+        }
+    }
+
+    return rel;
+}
+
+/* READ-ONLY open: load the DAFSA, replay the WAL in memory only.  Uses the
+ * vendor's dafsa_wal_open_ro (O_RDONLY, no O_CREAT, never mutates), so a
+ * missing WAL is simply an empty replay (wal stays NULL).  No compaction,
+ * no file writes — the dirty flag stays clear. */
+relation *rel_open_readonly(const char *dafsa_path, const char *wal_path,
+                            uint8_t arity)
+{
+    relation *rel;
+
+    if (arity == 0 || arity > MAX_ARITY) return NULL;
+
+    rel = calloc(1, sizeof(*rel));
+    if (!rel) return NULL;
+
+    rel->d = dafsa_load(dafsa_path);
+    if (!rel->d) {
+        rel->d = dafsa_create();
+        if (!rel->d) { free(rel); return NULL; }
+    }
+    rel->base = rel->d;   /* EDB-only: base aliases view */
+    rel->arity = arity;
+
+    if (wal_path) {
+        rel->wal = dafsa_wal_open_ro(wal_path);
+        if (rel->wal && rel_wal_replay_into(rel) != 0) {
+            rel_free(rel);
+            return NULL;
+        }
+        /* wal_path stays NULL: only rel_compact reads it and RO never
+         * compacts. */
+    }
+
+    return rel;
+}
+
+/* READ-ONLY open of a rule-head (IDB) relation: base and view are SEPARATE
+ * DAFSAs; the WAL replays into BASE in memory only.  The view is left as
+ * loaded (re-derived in memory by a query path that needs it). */
+relation *rel_open_readonly_idb(const char *base_path, const char *dafsa_path,
+                                const char *wal_path, uint8_t arity)
+{
+    relation *rel;
+
+    if (arity == 0 || arity > MAX_ARITY) return NULL;
+
+    rel = calloc(1, sizeof(*rel));
+    if (!rel) return NULL;
+
+    rel->base = dafsa_load(base_path);
+    if (!rel->base) {
+        rel->base = dafsa_create();
+        if (!rel->base) { free(rel); return NULL; }
+    }
+
+    rel->d = dafsa_load(dafsa_path);
+    if (!rel->d) {
+        rel->d = dafsa_create();
+        if (!rel->d) { dafsa_free(rel->base); free(rel); return NULL; }
+    }
+    rel->arity = arity;
+
+    if (wal_path) {
+        rel->wal = dafsa_wal_open_ro(wal_path);
+        if (rel->wal && rel_wal_replay_into(rel) != 0) {
             rel_free(rel);
             return NULL;
         }
