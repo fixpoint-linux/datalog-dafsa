@@ -18,21 +18,15 @@ const std = @import("std");
 // zig/src/{relation,vrelation,txnwal}.zig the same way.
 // U5: parser.c and typecheck.c are ported to
 // zig/src/{parser,typecheck}.zig the same way.
-// The rest of LIB_OBJS is still C.
-const lib_srcs = [_][]const u8{
-    "src/compiler.c",
-    "src/vm.c",
-    "src/snapshot.c",
-    "src/regexwalk.c",
-    "src/permindex.c",
-    "src/dl.c",
-    "src/iter.c",
-    "src/magic.c",
-    "src/topdown.c",
-    "src/analyze.c",
-    "src/index.c",
-    "src/vector.c",
-};
+// U6: regexwalk.c is ported to zig/src/regexwalk.zig the same way.
+// U7: snapshot.c, permindex.c and iter.c are ported to
+// zig/src/{snapshot,permindex,iter}.zig the same way.
+// U8: compiler.c is ported to zig/src/compiler.zig the same way.
+// U11: dl.c is ported to zig/src/dl.zig the same way.
+// U14: index.c, vector.c and analyze.c are ported to
+// zig/src/{index,vector,analyze}.zig — lib_srcs is now EMPTY and the .so is
+// 100% Zig (the migration completes; the C files stay in-tree as oracles).
+const lib_srcs = [_][]const u8{};
 
 // Vendored DAFSA engine — mirrors Makefile VENDOR_OBJS.
 const vendor_srcs = [_][]const u8{
@@ -104,35 +98,37 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(lib);
 
-    // ─── dl CLI, dynamically linked against the hybrid .so ───────────────
+    // ─── dl CLI, dynamically linked against the 100%-Zig .so ─────────────
     // (test_m4_review popen()s ./dl and test_vector_cli execv()s it; the
     // smoke suite drives it too — all relinked/pointed at the Zig build.)
+    // U12: the exe is the ported zig/src/dl_cli.zig (src/dl_cli.c stays in
+    // the repo as the untouched byte-diff ORACLE).  It resolves every engine
+    // symbol from the .so exports at link time — dl_*/regex_*/intern_* from
+    // the ported Zig modules and, since U14, tokenize/dl_search_top/
+    // dl_vector_* from the ported index.zig/vector.zig.
     const exe = b.addExecutable(.{
         .name = "dl",
         .root_module = b.createModule(.{
             .target = target,
             .optimize = optimize,
             .link_libc = true,
+            .root_source_file = b.path("src/dl_cli.zig"),
         }),
     });
     const emod = exe.root_module;
     emod.addIncludePath(b.path("../src"));
     emod.addIncludePath(b.path("../vendor/dafsa"));
-    emod.addCSourceFiles(.{
-        .root = b.path(".."),
-        .files = &.{"src/dl_cli.c"},
-        .flags = &c_flags,
-    });
     emod.linkLibrary(lib);
     emod.addRPathSpecial("$ORIGIN/../lib");
     b.installArtifact(exe);
 
     // ─── Unit tests for the ported Zig modules (`zig build test`) ─────────
     // Runs every inline `test` decl of the ported modules (zig/src/tests.zig
-    // imports them all).  Those tests exercise C symbols (dafsa_*, crc32,
-    // regex_dfa_walk/symset_contains from regexwalk.c), so the test binary
-    // links the same C the modules import: the vendored DAFSA engine plus
-    // src/regexwalk.c.  No other engine C is reachable from the tests.
+    // imports them all).  Those tests exercise C symbols (dafsa_*, crc32;
+    // the vendored DAFSA engine stays C), so the binary links the vendored
+    // DAFSA engine.  Since U14 the engine itself is 100% Zig — lib_srcs is
+    // EMPTY and only vendor_srcs is compiled as C for the test link (all
+    // dl_*/index/vector/analyze symbols now come from the ported modules).
     const unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .target = target,
@@ -146,7 +142,7 @@ pub fn build(b: *std.Build) void {
     tmod.addIncludePath(b.path("../vendor/dafsa"));
     tmod.addCSourceFiles(.{
         .root = b.path(".."),
-        .files = &(vendor_srcs ++ .{"src/regexwalk.c"}),
+        .files = &(lib_srcs ++ vendor_srcs),
         .flags = &c_flags,
     });
     const run_unit_tests = b.addRunArtifact(unit_tests);

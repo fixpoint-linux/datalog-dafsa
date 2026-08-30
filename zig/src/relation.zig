@@ -12,8 +12,8 @@
 //! @cImport("dafsa_internal.h") — this port REACHES INTO dafsa internals
 //! (struct dafsa states/initial/subtree_valid, State/Edge, trans_find) exactly
 //! like the C oracle does; it does NOT reimplement them.  regex_dfa_walk and
-//! symset_contains come from src/regexwalk.h (still C) via the same @cImport.
-//! crc32_compute comes from dafsa_internal.h.
+//! symset_contains come from the ported zig/src/regexwalk.zig (U6) — imported
+//! directly.  crc32_compute comes from dafsa_internal.h.
 //!
 //! Oracle: src/relation.c (never modified).
 
@@ -27,13 +27,14 @@ extern "c" fn ts_free(ts: ?*tupleset.tuple_set) void;
 extern "c" fn ts_add(ts: ?*tupleset.tuple_set, cols: ?[*]const u32) c_int;
 extern "c" fn ts_sort(ts: ?*tupleset.tuple_set) void;
 
-// dafsa_internal.h (struct dafsa/State/Edge/dafsa_wal, trans_find, crc32_compute,
-// dafsa_* externs) + regexwalk.h (regex_dfa, sym_set, regex_dfa_walk,
-// symset_contains).  Both include paths are set on the module by build.zig.
+// dafsa_internal.h (struct dafsa/State/Edge/dafsa_wal, trans_find,
+// crc32_compute, dafsa_* externs).  Include path set by build.zig.
 const dc = @cImport({
     @cInclude("dafsa_internal.h");
-    @cInclude("regexwalk.h");
 });
+
+// regexwalk.zig (U6): regex_dfa, sym_set, regex_dfa_walk, symset_contains.
+const regexwalk = @import("regexwalk.zig");
 
 const MAX_ARITY: usize = 8;
 const MAX_KEY_LEN: usize = MAX_ARITY * 4 + 1; // 33
@@ -51,10 +52,10 @@ pub const Relation = struct {
 /// typedef int (*rel_enum_cb)(const uint32_t *cols, uint8_t arity, void *user)
 pub const RelEnumCb = ?*const fn (cols: ?[*]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_int;
 
-/// regexwalk.h types, re-exported for vrelation.zig (single @cImport source of
-/// truth so the two modules share the exact same struct identity).
-pub const regex_dfa = dc.regex_dfa;
-pub const sym_set = dc.sym_set;
+/// regexwalk.h types, re-exported for vrelation.zig (single source of truth so
+/// the two modules share the exact same struct identity).
+pub const regex_dfa = regexwalk.regex_dfa;
+pub const sym_set = regexwalk.sym_set;
 
 // ─── Key encoding helpers ─────────────────────────────────────────────────
 
@@ -1011,7 +1012,7 @@ fn patCb(key_bytes: [*c]const u8, key_len: usize, user: ?*anyopaque) callconv(.c
 
 /// long rel_pattern(const relation *rel, const struct regex_dfa *dfa,
 ///                  rel_enum_cb cb, void *user)
-pub export fn rel_pattern(rel: ?*const Relation, dfa: [*c]const dc.regex_dfa, cb: RelEnumCb, user: ?*anyopaque) c_long {
+pub export fn rel_pattern(rel: ?*const Relation, dfa: [*c]const regexwalk.regex_dfa, cb: RelEnumCb, user: ?*anyopaque) c_long {
     const r = rel orelse return -1;
     if (dfa == null or cb == null) return -1;
 
@@ -1022,7 +1023,9 @@ pub export fn rel_pattern(rel: ?*const Relation, dfa: [*c]const dc.regex_dfa, cb
         .count = 0,
     };
 
-    const n = dc.regex_dfa_walk(r.d, dfa, patCb, &ctx);
+    // r.d is a [*c]dc.dafsa (this module's @cImport); regexwalk's dc is a
+    // separate @cImport, so cast the opaque struct pointer across.
+    const n = regexwalk.regex_dfa_walk(@ptrCast(r.d), dfa, patCb, &ctx);
     if (n < 0) return -1;
     return ctx.count;
 }
@@ -1031,7 +1034,7 @@ pub export fn rel_pattern(rel: ?*const Relation, dfa: [*c]const dc.regex_dfa, cb
 
 const FilterCtx = struct {
     col: u8,
-    set: [*c]const dc.sym_set,
+    set: [*c]const regexwalk.sym_set,
     cb: RelEnumCb,
     user: ?*anyopaque,
     count: c_long,
@@ -1040,7 +1043,7 @@ const FilterCtx = struct {
 fn filterCb(cols: ?[*]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_int {
     const ctx: *FilterCtx = @ptrCast(@alignCast(user orelse return 0));
     const cols_p = cols orelse return 0;
-    if (ctx.col < arity and dc.symset_contains(ctx.set, cols_p[ctx.col]) != 0) {
+    if (ctx.col < arity and regexwalk.symset_contains(ctx.set, cols_p[ctx.col]) != 0) {
         ctx.count +%= 1;
         return ctx.cb.?(cols, arity, ctx.user);
     }
@@ -1049,7 +1052,7 @@ fn filterCb(cols: ?[*]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_in
 
 /// long rel_filter_col(const relation *rel, uint8_t col, const struct sym_set *set,
 ///                     rel_enum_cb cb, void *user)
-pub export fn rel_filter_col(rel: ?*const Relation, col: u8, set: [*c]const dc.sym_set, cb: RelEnumCb, user: ?*anyopaque) c_long {
+pub export fn rel_filter_col(rel: ?*const Relation, col: u8, set: [*c]const regexwalk.sym_set, cb: RelEnumCb, user: ?*anyopaque) c_long {
     const r = rel orelse return -1;
     if (set == null or cb == null) return -1;
     if (col >= r.arity) return 0; // out of range: no matches
