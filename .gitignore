@@ -75,3 +75,8 @@ node_modules/
 elm-stuff/
 dist/
 /vendor/@mfe/
+
+# zig strangler-hybrid harness build artifacts
+zig-out/
+zig/.zig-cache/
+/tests/test_vector_search_content
