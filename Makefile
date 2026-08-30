@@ -53,7 +53,7 @@ ALL_OBJS = $(VENDOR_OBJS) $(LIB_OBJS)
 
 # ─── Targets ─────────────────────────────────────────────────────────────
 
-.PHONY: all clean test test-parallel bench test-m1 test-m2 wasm lsp test-lsp dlp dlp_schema_check dlp-check dlp-golden dl-embed fetch-model embed-test
+.PHONY: all clean test test-parallel bench test-m1 test-m2 lsp test-lsp dlp dlp_schema_check dlp-check dlp-golden dl-embed fetch-model embed-test
 
 all: build-tmp libdatalog.so dl
 
@@ -357,7 +357,7 @@ CORE_SRCS = $(DHALLC)/src/arena.c $(DHALLC)/src/lexer.c \
 
 # Engine sources for dlp: the LIB_OBJS source set + vendored dafsa*.c,
 # EXCLUDING the TUs that carry their own entry points (dl_cli.c main,
-# lsp.c main, playground-wasm.c wasm entry).  We compile from source again
+# lsp.c main).  We compile from source again
 # with cosmocc (the gcc-built .o files are not cosmo-safe to reuse).
 DLP_ENGINE_SRCS = src/intern.c src/termstore.c src/relation.c \
                   src/vrelation.c src/tupleset.c src/parser.c src/compiler.c \
@@ -393,18 +393,6 @@ dlp-check: dlp dlp_schema_check
 dlp-golden: dlp
 	@tests/dlp_golden.sh ./dlp/dlp
 
-
-# ─── WebAssembly playground ─────────────────────────────────────────────
-# Builds the in-browser language playground (docs/playground.js + .wasm)
-# from src/playground-wasm.c + the full engine core, then runs the headless
-# node smoke test against the freshly-built bundle.  Requires emscripten +
-# node on the HOST (see scripts/build-wasm.sh); the emitted artifacts are
-# committed to docs/ so the Pages site needs no build step.
-
-wasm:
-	./scripts/build-wasm.sh
-	@node tests/wasm-smoke.js
-	@node tests/lsp-wasm-smoke.js
 
 # ─── Clean ───────────────────────────────────────────────────────────────
 
