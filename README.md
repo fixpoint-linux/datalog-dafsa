@@ -7,10 +7,12 @@ serve reads from an mmap'd snapshot. M0–M9 + v2 IVM complete (306 test cases g
 ## Quickstart
 
 ```sh
-make                 # build libdatalog.so, dl CLI, test binaries
-make test            # run the full test suite
-make bench           # run the demonstration benchmark
+zig build -Drelease -p zig-out --build-file zig/build.zig   # build libdatalog.so + dl CLI
+bash zig/run_zig_suites.sh                                   # run the 42 C test suites (oracle)
 ```
+
+(The deferred C++ embed/ggml opt-in targets are `make dl-embed` / `make libembed.so` /
+`make fetch-model` — see `make help`.)
 
 Use the `dl` CLI to load facts and query them:
 
