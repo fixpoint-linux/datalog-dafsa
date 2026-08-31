@@ -1,0 +1,5 @@
+--raw doc1
+--raw red fox jumps over the lazy dog
+doc1 red fox jumps over the lazy dog
+red fox jumps over the lazy dog doc2
+doc2 --raw

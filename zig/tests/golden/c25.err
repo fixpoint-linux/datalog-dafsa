@@ -1,0 +1,21 @@
+Usage:
+  @PROG@ [-d <dir>] load <csv> --rel <name>
+  @PROG@ [-d <dir>] lookup <rel> <val> [<val> ...]
+  @PROG@ [-d <dir>] prefix <rel> [<val> ...]
+  @PROG@ [-d <dir>] query '<rule>' | <file.dl> <goal-rel>
+  @PROG@ [-d <dir>] qmagic '<rule>' | <file.dl> <goal-rel> [-a <adorn>] <val> [<val> ...]
+  @PROG@ [-d <dir>] publish [--keep N]
+  @PROG@ [-d <dir>] bound <rel> <val> [<val> ...]
+  @PROG@ [-d <dir>] pattern <rel> [<col>] '<regex>'
+  @PROG@ [-d <dir>] rev <entity>
+  @PROG@ [-d <dir>] cas <entity> <expected> <new>
+  @PROG@ [-d <dir>] txn
+  @PROG@ [-d <dir>] traverse <start> [depth] [--max-nodes N]
+  @PROG@ [-d <dir>] obs <node> [--max-obs N]
+  @PROG@ [-d <dir>] index
+  @PROG@ [-d <dir>] search '<terms>' [--top N] [--version N] (--version 0 = current)
+  @PROG@ [-d <dir>] vsearch '<query>' [--k N] [--radius R] [--version V] [--sig <hex64>] [--ivec <hex768>]
+  @PROG@ [-d <dir>] vhybrid '<terms>' '<query>' [--k N] [--radius R] [--version V]
+  @PROG@ [-d <dir>] versions
+Values: bare integer -> raw u32; anything else -> interned string
+Hex args: concatenated hex digits (no spaces, no 0x prefix)

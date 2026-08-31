@@ -1,6 +1,6 @@
 # datalog-dafsa
 
-A DAFSA-backed Datalog engine in C: load facts into an on-disk minimal-acyclic-DAFSA
+A DAFSA-backed Datalog engine in Zig: load facts into an on-disk minimal-acyclic-DAFSA
 fact store, compile Datalog rules to a small VM, materialize derived relations, and
 serve reads from an mmap'd snapshot. M0–M9 + v2 IVM complete (306 test cases green).
 
@@ -181,9 +181,8 @@ JSON is strict (array of objects, keys = column names). Coercion is per-type:
 IDB, so loading data into a rule-defined relation is an error, and undeclared
 relations are rejected.
 
-**Build.** `dlp` is a cosmocc binary linking the engine + dhall-c (a sibling repo);
-build it with `make dlp DHALLC=../dhall-c`. The default gcc `make` / `make test`
-(306 tests) are unaffected.
+**Build.** `dlp` is a deferred cosmocc tool (its C dependencies — the engine and the
+dhall-c core — are both removed; it is not built by the canonical Zig build).
 
 ## API Summary
 
@@ -245,18 +244,19 @@ see [`docs/README.md`](docs/README.md) for how to enable Pages.
 
 ## Building from Source
 
-Requires `gcc`, `make`, and POSIX headers (`-D_POSIX_C_SOURCE=200809L`), targeting
-`c11`. No third-party dependencies for the engine itself — the DAFSA engine is
-vendored under `vendor/`.
+The engine is built with Zig (canonical; see [zig/build.zig](zig/build.zig)):
 
-- `make` builds `libdatalog.so`, the `dl` CLI, and all test binaries.
-- Test and CLI binaries are **statically linked** for portability.
-- The build sets `TMPDIR` to `./build-tmp`; the CLI's default database directory is
-  `dl-test-db` unless `-d <dir>` is given.
-- The **semantic tier** (`dl-embed`, `dl vsearch`/`vhybrid`) is opt-in and adds a
-  vendored [ggml](https://github.com/ggml-org/ggml) submodule (v0.20.2) + `cmake`:
-  `git submodule update --init vendor/ggml && make dl-embed`. It is not built by
-  the default `make`/`make test`. The model is git-lfs-tracked under `models/`.
+```sh
+zig build -Drelease -p zig-out --build-file zig/build.zig   # libdatalog.so + dl CLI
+```
+
+The deferred C++ embed/ggml machinery is the only remaining `make` target set
+(`make dl-embed` / `make libembed.so` / `make fetch-model`; needs `gcc`/`g++` +
+`cmake` + the vendored `ggml` submodule, v0.20.2) — see `make help`. The C test
+suites (the behavioral oracle) re-link against the Zig-built `libdatalog.so`
+via `bash zig/run_zig_suites.sh` (needs `gcc` and POSIX headers,
+`-D_POSIX_C_SOURCE=200809L`, targeting `c11`). No third-party dependencies for
+the engine itself — the DAFSA engine is vendored under `vendor/`.
 
 ## License
 

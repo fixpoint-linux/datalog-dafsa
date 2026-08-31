@@ -1,9 +1,10 @@
-// U1 strangler-hybrid skeleton: build libdatalog.so + dl CLI from 100% C.
+// Build libdatalog.so + dl CLI from 100% Zig.
 //
-// This is the migration harness, not a port: every source file below is the
-// UNMODIFIED C from the Makefile build (LIB_OBJS + VENDOR_OBJS, 1:1).  Later
-// units swap individual C files for Zig exports in this one build; the 41
-// test suites re-linked against the resulting .so are the oracle.
+// The pre-migration C engine (src/*.c + vendor/dafsa/*.c) is REMOVED; every
+// source below is a Zig port (zig/src/*.zig) or the vendored dafsa Zig engine
+// (abi.zig).  The 42 C test suites re-linked against the resulting .so are
+// the oracle (their re-link is the ABI-completeness check; their asserts are
+// the behavioral oracle).
 //
 //   zig build -p zig-out --build-file zig/build.zig
 //     -> zig-out/lib/libdatalog.so   (SONAME libdatalog.so)
@@ -25,7 +26,7 @@ const std = @import("std");
 // U11: dl.c is ported to zig/src/dl.zig the same way.
 // U14: index.c, vector.c and analyze.c are ported to
 // zig/src/{index,vector,analyze}.zig — the datalog engine is now 100% Zig
-// (the migration completes; the C files stay in-tree as oracles).
+// (the migration completes; the C oracle sources are removed).
 
 // The vendored DAFSA engine is no longer compiled from C (vendor/dafsa/*.c).
 // Since U15 it comes from the dafsa ZIG engine (vendor/dafsa/zig/src/*.zig),
@@ -34,14 +35,13 @@ const std = @import("std");
 // trans_find/view_trans_find/view_edge_next/view_enum_dfs) plus the C-layout
 // CFacade/CViewFacade handles, so the ported modules' @cImport'd extern decls
 // and struct-field derefs (d->states/initial, v->csr/state_off/final_bits)
-// resolve against the Zig engine unchanged.  The vendor C files stay in-tree
-// as the C oracle (dafsa_diff.sh in the dafsa repo, cli_diff.sh here).  No C
-// is compiled into the .so anymore.
+// resolve against the Zig engine unchanged.  The vendor C files are gone
+// (removed with the C oracle).  No C is compiled into the .so anymore.
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    // ReleaseFast: the C oracle builds with -O2; Debug would be needlessly
-    // slow for the suite matrix (and asserts nothing extra for plain C).
+    // ReleaseFast: the C test suites (the behavioral oracle) build with -O2;
+    // Debug would be needlessly slow for the suite matrix.
     const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseFast });
 
     // ─── dafsa Zig engine (the C-ABI export layer, replacing vendor/dafsa/*.c)
@@ -76,8 +76,8 @@ pub fn build(b: *std.Build) void {
     // ─── dl CLI, dynamically linked against the 100%-Zig .so ─────────────
     // (test_m4_review popen()s ./dl and test_vector_cli execv()s it; the
     // smoke suite drives it too — all relinked/pointed at the Zig build.)
-    // U12: the exe is the ported zig/src/dl_cli.zig (src/dl_cli.c stays in
-    // the repo as the untouched byte-diff ORACLE).  It resolves every engine
+    // U12: the exe is the ported zig/src/dl_cli.zig (src/dl_cli.c is removed
+    // with the C oracle).  It resolves every engine
     // symbol from the .so exports at link time — dl_*/regex_*/intern_* from
     // the ported Zig modules and, since U14, tokenize/dl_search_top/
     // dl_vector_* from the ported index.zig/vector.zig.
