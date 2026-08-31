@@ -24,56 +24,34 @@ const std = @import("std");
 // U8: compiler.c is ported to zig/src/compiler.zig the same way.
 // U11: dl.c is ported to zig/src/dl.zig the same way.
 // U14: index.c, vector.c and analyze.c are ported to
-// zig/src/{index,vector,analyze}.zig — lib_srcs is now EMPTY and the .so is
-// 100% Zig (the migration completes; the C files stay in-tree as oracles).
-const lib_srcs = [_][]const u8{};
+// zig/src/{index,vector,analyze}.zig — the datalog engine is now 100% Zig
+// (the migration completes; the C files stay in-tree as oracles).
 
-// Vendored DAFSA engine — mirrors Makefile VENDOR_OBJS.
-const vendor_srcs = [_][]const u8{
-    "vendor/dafsa/dafsa.c",
-    "vendor/dafsa/dafsa_state.c",
-    "vendor/dafsa/dafsa_core.c",
-    "vendor/dafsa/dafsa_persist.c",
-    "vendor/dafsa/dafsa_view.c",
-    "vendor/dafsa/dafsa_crc32.c",
-    "vendor/dafsa/dafsa_wal.c",
-    "vendor/dafsa/dafsa_build.c",
-    "vendor/dafsa/dafsa_rank.c",
-    "vendor/dafsa/dafsa_view_rank.c",
-};
-
-const all_srcs = lib_srcs ++ vendor_srcs;
-
-// CFLAGS mirror the Makefile's CFLAGS, with three deliberate differences:
-//   - no -Werror: zig cc is clang and warns differently than gcc; warning
-//     drift is expected and engine C is never edited to appease it.
-//   - -fvisibility=default is explicit: every non-static symbol must stay
-//     exported for the tests/consumers (the ABI audit checks this).
-//   - -fno-sanitize=undefined: zig cc injects UBSan checks (in Debug) that
-//     abort on glibc-tolerated UB the engine relies on, e.g.
-//     qsort(NULL, 0, ...) on an empty vector (src/vector.c:130).  The oracle
-//     is the gcc -O2 build; the harness must not introduce new aborts.
-//   - -ftrivial-auto-var-init=zero: the engine C has latent uninitialized-
-//     stack UB the gcc build passes by layout luck — e.g. regexwalk.c
-//     regex_compile()'s fail path calls dsm_free(&dsm) before dsm_init on
-//     parse errors (tests/test_m5_review G03).  Zero-init makes the clang
-//     build deterministic and oracle-faithful without editing engine C.
-const c_flags = [_][]const u8{
-    "-std=c11",
-    "-D_POSIX_C_SOURCE=200809L",
-    "-fPIC",
-    "-fvisibility=default",
-    "-fno-sanitize=undefined",
-    "-ftrivial-auto-var-init=zero",
-    "-Wall",
-    "-Wextra",
-};
+// The vendored DAFSA engine is no longer compiled from C (vendor/dafsa/*.c).
+// Since U15 it comes from the dafsa ZIG engine (vendor/dafsa/zig/src/*.zig),
+// imported below as the `dafsa_abi` module: abi.zig exports the full dafsa.h /
+// dafsa_internal.h C ABI (dafsa_*/view_*/wal_*/rank/select/range_count +
+// trans_find/view_trans_find/view_edge_next/view_enum_dfs) plus the C-layout
+// CFacade/CViewFacade handles, so the ported modules' @cImport'd extern decls
+// and struct-field derefs (d->states/initial, v->csr/state_off/final_bits)
+// resolve against the Zig engine unchanged.  The vendor C files stay in-tree
+// as the C oracle (dafsa_diff.sh in the dafsa repo, cli_diff.sh here).  No C
+// is compiled into the .so anymore.
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     // ReleaseFast: the C oracle builds with -O2; Debug would be needlessly
     // slow for the suite matrix (and asserts nothing extra for plain C).
     const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseFast });
+
+    // ─── dafsa Zig engine (the C-ABI export layer, replacing vendor/dafsa/*.c)
+    // abi.zig links libc (c_allocator facades + fprintf in dafsa_dot).
+    const dafsa_abi = b.createModule(.{
+        .root_source_file = b.path("../vendor/dafsa/zig/src/abi.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
 
     // ─── libdatalog.so (the strangler hybrid) ────────────────────────────
     const lib = b.addLibrary(.{
@@ -87,15 +65,12 @@ pub fn build(b: *std.Build) void {
     });
     const lmod = lib.root_module;
     // Zig side of the hybrid: the root references the ported modules whose
-    // `export fn`s carry the exact C ABI names the retained C expects.
+    // `export fn`s carry the exact C ABI names the retained C expects, plus
+    // the dafsa Zig engine (abi.zig) which supplies the dafsa_* surface.
     lmod.root_source_file = b.path("src/hybrid.zig");
+    lmod.addImport("dafsa_abi", dafsa_abi);
     lmod.addIncludePath(b.path("../src"));
     lmod.addIncludePath(b.path("../vendor/dafsa"));
-    lmod.addCSourceFiles(.{
-        .root = b.path(".."),
-        .files = &all_srcs,
-        .flags = &c_flags,
-    });
     b.installArtifact(lib);
 
     // ─── dl CLI, dynamically linked against the 100%-Zig .so ─────────────
@@ -129,6 +104,8 @@ pub fn build(b: *std.Build) void {
     // DAFSA engine.  Since U14 the engine itself is 100% Zig — lib_srcs is
     // EMPTY and only vendor_srcs is compiled as C for the test link (all
     // dl_*/index/vector/analyze symbols now come from the ported modules).
+    // Since U15 the dafsa engine is also Zig: tests.zig references dafsa_abi
+    // so the dafsa_*/crc32_*/trans_find symbols come from abi.zig's exports.
     const unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .target = target,
@@ -138,13 +115,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const tmod = unit_tests.root_module;
+    tmod.addImport("dafsa_abi", dafsa_abi);
     tmod.addIncludePath(b.path("../src"));
     tmod.addIncludePath(b.path("../vendor/dafsa"));
-    tmod.addCSourceFiles(.{
-        .root = b.path(".."),
-        .files = &(lib_srcs ++ vendor_srcs),
-        .flags = &c_flags,
-    });
     const run_unit_tests = b.addRunArtifact(unit_tests);
     // The gate IS the exit code: addRunArtifact marks this step failed when
     // the test binary reports any failure/crash/timeout/leak over the

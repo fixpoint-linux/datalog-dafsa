@@ -52,6 +52,33 @@ vendor/dafsa/dafsa_internal.h
 # static in the vendor C — absent from the gcc-built .so too (pre-existing).
 ALLOWED_MISSING="dafsa_check_invariants reg_lookup_no_count"
 
+# U15: the dafsa engine is now the Zig engine (abi.zig) instead of the
+# vendored vendor/dafsa/*.c.  The C engine happened to leak these internal
+# helpers as dynamic exports (they were non-static), but they are NOT part of
+# the public dafsa.h surface and are referenced by NO datalog consumer (tests,
+# dl_cli, dl-lsp, dlp, index/vector — final_audit.sh proves that).  abi.zig
+# deliberately encapsulates them, so they are absent from the Zig .so by
+# design — not a migration regression.  (The dafsa_internal.h helpers datalog
+# DOES use — trans_find, view_trans_find, view_edge_next, view_enum_dfs,
+# dafsa_ensure_subtree, dafsa_view_subtree_counts, the rank/select/range_count
+# family — are all exported by abi.zig.)
+DAFSA_INTERNAL="clone_state confluence_path dafsa_ensure_scratch dafsa_load_impl \
+enum_dfs fsync_dir_of incoming_add incoming_redirect incoming_redirect_one \
+inode_alloc is_prime mb_skipvarint mb_u16 mb_u32 mb_u8 mb_uvarint next_prime \
+put_u16_le put_u32_le put_u8 put_uvarint reg_grow reg_insert reg_lookup \
+replace_or_register sig_compute state_detach_from_children state_free state_new \
+trans_add trans_reserve"
+
+# is_whitelisted <name> — true if the symbol is intentionally absent from the
+# Zig .so (ALLOWED_MISSING or the dafsa-internal set above).
+is_whitelisted() {
+    local n=$1 a
+    for a in $ALLOWED_MISSING $DAFSA_INTERNAL; do
+        [ "$n" = "$a" ] && return 0
+    done
+    return 1
+}
+
 [ -f "$SO" ] || { echo "abi_audit: $SO missing — run zig build first"; exit 1; }
 
 mkdir -p build-tmp
@@ -137,9 +164,11 @@ echo "abi_audit: zig .so exports $NEXP symbols; headers declare $TOTAL functions
 
 fail=0
 
-# (a) ABI regression: every reference export must exist in the Zig .so.
+# (a) ABI regression: every reference export must exist in the Zig .so —
+# unless it is a whitelisted dafsa-internal leak (U15, see DAFSA_INTERNAL).
 REGRESSED=$(comm -13 build-tmp/.abi_exported build-tmp/.abi_ref)
 for s in $REGRESSED; do
+    if is_whitelisted "$s"; then continue; fi
     echo "REGRESSION vs C .so: missing export $s"
     fail=1
 done
@@ -147,21 +176,14 @@ done
 # (b) header completeness.
 for fn in $(cat build-tmp/.abi_expected); do
     grep -q -x "$fn" build-tmp/.abi_exported && continue
+    if is_whitelisted "$fn"; then continue; fi
     if [ -s build-tmp/.abi_ref ] && grep -q -x "$fn" build-tmp/.abi_ref; then
         echo "MISSING EXPORT: $fn"
         fail=1
         continue
     fi
-    # C reference lacks it too: pre-existing declared-but-static — only OK
-    # if acknowledged.
-    ok=0
-    for allowed in $ALLOWED_MISSING; do
-        [ "$fn" = "$allowed" ] && ok=1
-    done
-    if [ "$ok" -eq 0 ]; then
-        echo "MISSING EXPORT: $fn (also absent from C reference .so; add to ALLOWED_MISSING with a reason or investigate)"
-        fail=1
-    fi
+    echo "MISSING EXPORT: $fn (also absent from C reference .so; add to ALLOWED_MISSING with a reason or investigate)"
+    fail=1
 done
 
 if [ "$fail" -ne 0 ]; then

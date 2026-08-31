@@ -28,4 +28,8 @@ comptime {
     _ = @import("index.zig"); // U14: src/index.c
     _ = @import("vector.zig"); // U14: src/vector.c
     _ = @import("analyze.zig"); // U14: src/analyze.c
+    // U15: dafsa Zig engine — abi.zig supplies the dafsa_*/view_*/wal_*/
+    // rank/select/range_count + trans_find/view_trans_find/view_edge_next/
+    // view_enum_dfs C-ABI exports (replacing the vendored vendor/dafsa/*.c).
+    _ = @import("dafsa_abi");
 }

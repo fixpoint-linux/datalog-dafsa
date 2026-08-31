@@ -9,7 +9,6 @@
 #include "dl.h"
 #include "relation.h"
 #include "dafsa.h"
-#include "dafsa_internal.h"
 #include "regexwalk.h"
 #include "snapshot.h"
 #include "tupleset.h"
