@@ -345,6 +345,166 @@ pub export fn manifest_find_rel(sdir: [*c]const u8, rel_name: [*c]const u8, arit
     return manifest_find_rel_ex(sdir, rel_name, arity_out, null);
 }
 
+// ─── manifest_enumerate_rels ──────────────────────────────────────────────
+
+/// Strip a trailing \n / \r (in place, NUL-terminating) — the getline chomp
+/// every manifest walker above does inline.
+fn chompLine(buf: [*c]u8, len: usize) usize {
+    var l = len;
+    if (l > 0 and buf[l - 1] == '\n') {
+        l -= 1;
+        buf[l] = 0;
+    }
+    if (l > 0 and buf[l - 1] == '\r') {
+        l -= 1;
+        buf[l] = 0;
+    }
+    return l;
+}
+
+/// One parsed manifest entry.  `name` (NUL-terminated in place) and the
+/// arity/idb fields are slices of the getline line buffer — valid only until
+/// the next getline.  arity == 0 marks the variadic star base 'name:*'.
+const ManifestEntry = struct {
+    name: [:0]const u8,
+    arity: u8,
+    idb: bool,
+};
+
+fn strContains(hay: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (hay.len < needle.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= hay.len) : (i += 1) {
+        if (std.mem.eql(u8, hay[i .. i + needle.len], needle)) return true;
+    }
+    return false;
+}
+
+/// Parse one manifest line into a strict 'name:arity:edb|idb' entry (or a
+/// 'name:*' variadic star base).  Returns null for everything the enumerator
+/// must skip: comments ('#'), directives ('D'), reserved __PI perm-index
+/// names (also recognizable by their trailing ' # perm index' comment), and
+/// malformed lines (no flag field, arity outside 1..8).
+fn manifestParseLine(buf: [*c]u8, l: usize) ?ManifestEntry {
+    if (l == 0 or buf[0] == '#' or buf[0] == 'D') return null;
+
+    var ci: usize = 0;
+    while (ci < l) : (ci += 1) {
+        if (buf[ci] == ':') break;
+    }
+    if (ci == 0 or ci == l) return null; // empty name / no arity field
+    buf[ci] = 0;
+    const name: [:0]const u8 = buf[0..ci :0];
+
+    // reserved perm-index names: '<rel>__PI<hex>__'
+    if (strContains(name, "__PI")) return null;
+
+    const rest: [*c]u8 = buf + ci + 1;
+    var cj: usize = 0;
+    while (rest[cj] != 0 and rest[cj] != ':') cj += 1;
+    if (rest[cj] == 0) return null; // no flag field: not the strict shape
+    rest[cj] = 0;
+    const flag: [*c]const u8 = rest + cj + 1;
+
+    var idb = false;
+    if (strEq(flag, "idb")) {
+        idb = true;
+    } else if (!strEq(flag, "edb")) {
+        return null;
+    }
+
+    if (rest[0] == '*' and rest[1] == 0)
+        return .{ .name = name, .arity = 0, .idb = idb };
+
+    const a = atoiC(rest);
+    if (a < 1 or a > MAX_ARITY) return null;
+    return .{ .name = name, .arity = @intCast(a), .idb = idb };
+}
+
+/// Star-base capacity: db->rels is bounded by MAX_RELS (dl_internal.h), so a
+/// manifest can never carry more variadic star bases than this.
+const MAX_STAR_BASES: usize = dx.MAX_RELS;
+
+/// Star-base name cap: names longer than this cannot be recorded for
+/// variant-line matching, so the walk fails loudly (-1) rather than
+/// emitting a variadic's variant lines as fixed relations.  (Relation names
+/// are unbounded in principle; every real one is far shorter.)
+const MAX_STAR_NAME: usize = 255;
+
+/// Is `name` a per-variant 'base.<d>' line of a collected star base
+/// (d a single digit 1..8)?  Same shape manifest_find_variants matches.
+fn isVariantOf(name: []const u8, bases: []const [MAX_STAR_NAME + 1]u8, base_lens: []const usize) bool {
+    for (bases, base_lens) |*base, bl| {
+        if (name.len == bl + 2 and
+            std.mem.eql(u8, name[0..bl], base[0..bl]) and
+            name[bl] == '.' and
+            name[bl + 1] >= '1' and name[bl + 1] <= '8')
+            return true;
+    }
+    return false;
+}
+
+/// long manifest_enumerate_rels(const char *sdir, dl_relation_cb cb,
+///                              void *user)
+///
+/// Stream every fixed-arity 'name:arity:edb|idb' entry of `<sdir>/manifest.txt`
+/// through `cb` (dl.h dl_relation_cb).  Two passes: the first collects the
+/// variadic star-base names ('name:*'), the second emits every fixed entry
+/// while skipping the star markers themselves and their per-variant
+/// 'name.<d>' lines.  Returns the emitted count, or -1 when the manifest is
+/// unreadable or carries a star base this walk cannot represent.
+pub export fn manifest_enumerate_rels(sdir: [*c]const u8, cb: dx.dl_relation_cb, user: ?*anyopaque) c_long {
+    if (sdir == null or cb == null) return -1;
+
+    var path: [8192:0]u8 = undefined;
+    _ = snprintf(&path, 8192, "%s/manifest.txt", sdir);
+
+    // Pass 1: collect star-base names for the pass-2 variant skip.
+    var bases: [MAX_STAR_BASES][MAX_STAR_NAME + 1]u8 = undefined;
+    var base_lens: [MAX_STAR_BASES]usize = undefined;
+    var n_bases: usize = 0;
+    {
+        const f = c.fopen(&path, "r") orelse return -1;
+        defer _ = c.fclose(f);
+
+        var line: ?[*]u8 = null;
+        var cap: usize = 0;
+        defer if (line) |lp| c.free(@ptrCast(lp));
+
+        var len: isize = getline(&line, &cap, f);
+        while (len > 0) : (len = getline(&line, &cap, f)) {
+            const ent = manifestParseLine(line.?, chompLine(line.?, @intCast(len))) orelse continue;
+            if (ent.arity != 0) continue; // fixed relation: not a base
+            if (n_bases >= MAX_STAR_BASES or ent.name.len > MAX_STAR_NAME)
+                return -1; // unrepresentable: refuse rather than mis-emit
+            @memcpy(bases[n_bases][0..ent.name.len], ent.name);
+            base_lens[n_bases] = ent.name.len;
+            n_bases += 1;
+        }
+    }
+
+    // Pass 2: emit every fixed entry, skipping star markers + variants.
+    const f = c.fopen(&path, "r") orelse return -1;
+    defer _ = c.fclose(f);
+
+    var line: ?[*]u8 = null;
+    var cap: usize = 0;
+    defer if (line) |lp| c.free(@ptrCast(lp));
+
+    var count: c_long = 0;
+    var len: isize = getline(&line, &cap, f);
+    while (len > 0) : (len = getline(&line, &cap, f)) {
+        const ent = manifestParseLine(line.?, chompLine(line.?, @intCast(len))) orelse continue;
+        if (ent.arity == 0) continue; // the star marker itself
+        if (isVariantOf(ent.name, bases[0..n_bases], base_lens[0..n_bases])) continue;
+        count += 1;
+        if (cb.?(ent.name.ptr, ent.arity, if (ent.idb) @as(c_int, 1) else 0, user) != 0)
+            return count; // stop early (dl_tuple_cb contract)
+    }
+    return count;
+}
+
 /// void manifest_find_variants(const char *sdir, const char *rel_name,
 ///                             uint8_t present[9]) — v2: scan the manifest
 /// for per-variant lines 'name.<a>:<a>:...' of the variadic relation.
@@ -692,6 +852,93 @@ test "manifest_find_rel_ex fixed/variadic/absent + variants" {
     // sanity check must reject a variant line whose arity field disagrees
     manifest_find_variants(dir, "path", &present);
     try testing.expectEqual(@as(u8, 0), present[0]);
+}
+
+test "manifest_enumerate_rels strict shape + star/variant/__PI skips" {
+    const dir = "/tmp/datalog_zig_snap_enum";
+    _ = std.c.mkdir(dir, 0o755); // EEXIST on rerun is fine
+    const mfpath = dir ++ "/manifest.txt";
+    {
+        const f = c.fopen(mfpath, "w") orelse return error.TestUnexpectedResult;
+        _ = fputs("# header\n" ++
+            "D:some-directive\n" ++
+            "edge:3:edb\n" ++
+            "path:*:edb\n" ++
+            "path.2:2:edb\n" ++
+            "path.5:5:idb\n" ++
+            "edge.2:2:edb\n" ++ // NOT a star base's variant (edge is fixed): emitted
+            "closure:1:idb\n" ++
+            "edge__PI0__:2 # perm index of edge\n" ++
+            "weird:9:edb\n" ++ // arity out of range: skipped
+            "zero:0:edb\n" ++ // arity out of range: skipped
+            "noflag:2\n" ++ // missing flag field: skipped
+            "badflag:2:xyz\n" ++ // unknown flag: skipped
+            "garbage\n", f); // no colon: skipped
+        _ = c.fclose(f);
+    }
+    defer _ = c.unlink(mfpath);
+    defer _ = c.rmdir(dir);
+
+    const Ent = struct { name: [64]u8 = undefined, name_len: usize = 0, arity: u8 = 0, idb: c_int = 0 };
+    const Ctx = struct {
+        rows: [16]Ent = undefined,
+        n: usize = 0,
+        stop_at: usize = 0, // 0: never stop (early-stop arm)
+
+        fn cb(name: [*c]const u8, arity: u8, idb: c_int, user: ?*anyopaque) callconv(.c) c_int {
+            const self: *@This() = @ptrCast(@alignCast(user.?));
+            if (self.n >= self.rows.len) return 1;
+            const nm = std.mem.span(@as([*:0]const u8, @ptrCast(name)));
+            @memcpy(self.rows[self.n].name[0..nm.len], nm);
+            self.rows[self.n].name_len = nm.len;
+            self.rows[self.n].arity = arity;
+            self.rows[self.n].idb = idb;
+            self.n += 1;
+            if (self.stop_at != 0 and self.n >= self.stop_at) return 1;
+            return 0;
+        }
+
+        fn nameOf(self: *const @This(), i: usize) []const u8 {
+            return self.rows[i].name[0..self.rows[i].name_len];
+        }
+    };
+
+    // full enumeration: fixed rels only, in manifest order
+    var got = Ctx{};
+    try testing.expectEqual(@as(c_long, 3), manifest_enumerate_rels(dir, Ctx.cb, &got));
+    try testing.expectEqual(@as(usize, 3), got.n);
+    try testing.expectEqualStrings("edge", got.nameOf(0));
+    try testing.expectEqual(@as(u8, 3), got.rows[0].arity);
+    try testing.expectEqual(@as(c_int, 0), got.rows[0].idb);
+    try testing.expectEqualStrings("edge.2", got.nameOf(1)); // fixed rel named like a variant
+    try testing.expectEqual(@as(u8, 2), got.rows[1].arity);
+    try testing.expectEqualStrings("closure", got.nameOf(2));
+    try testing.expectEqual(@as(u8, 1), got.rows[2].arity);
+    try testing.expectEqual(@as(c_int, 1), got.rows[2].idb);
+
+    // every skipped shape is absent from the emitted set
+    var i: usize = 0;
+    while (i < got.n) : (i += 1) {
+        const nm = got.nameOf(i);
+        try testing.expect(!std.mem.eql(u8, nm, "badflag"));
+        try testing.expect(!std.mem.eql(u8, nm, "weird"));
+        try testing.expect(!std.mem.eql(u8, nm, "zero"));
+        try testing.expect(!std.mem.eql(u8, nm, "noflag"));
+        try testing.expect(!std.mem.eql(u8, nm, "garbage"));
+        try testing.expect(!std.mem.eql(u8, nm, "path")); // star base itself
+        try testing.expect(!std.mem.eql(u8, nm, "path.2")); // its variants
+        try testing.expect(!std.mem.eql(u8, nm, "path.5"));
+        try testing.expect(std.mem.indexOf(u8, nm, "__PI") == null);
+    }
+
+    // early stop: cb returns non-zero at the 2nd entry
+    var stopped = Ctx{ .stop_at = 2 };
+    try testing.expectEqual(@as(c_long, 2), manifest_enumerate_rels(dir, Ctx.cb, &stopped));
+    try testing.expectEqual(@as(usize, 2), stopped.n);
+
+    // unreadable/nonexistent dir + null cb
+    try testing.expectEqual(@as(c_long, -1), manifest_enumerate_rels("/tmp/datalog_zig_snap_enum_no_zz", Ctx.cb, &got));
+    try testing.expectEqual(@as(c_long, -1), manifest_enumerate_rels(dir, null, &got));
 }
 
 test "snapshot_read_current parse + overflow + missing" {

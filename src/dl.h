@@ -552,6 +552,25 @@ long dl_query_bound_version(dl_db *db, uint32_t version, const char *goal_rel,
                             const uint32_t *leading, uint8_t k,
                             dl_tuple_cb cb, void *user);
 
+/* Manifest-relation callback for dl_snapshot_relations.  `name` is
+ * NUL-terminated and valid only for the duration of the call; `idb` is 1
+ * when the manifest records the relation as derived.  Return non-zero to
+ * stop the enumeration early. */
+typedef int (*dl_relation_cb)(const char *name, uint8_t arity, int idb,
+                              void *user);
+
+/* Enumerate the FIXED-ARITY relations recorded in snapshot `version`'s
+ * manifest.txt ('name:arity:edb|idb' lines), streaming each via `cb`.
+ * Skips comment/directive lines, variadic '*' star markers and their
+ * per-variant 'name.<d>' lines (a variadic relation has no single fixed
+ * arity), and the reserved '<rel>__PI<hex>__' perm-index names.  Malformed
+ * lines are skipped, not fatal.
+ * Returns the number of relations emitted, or -1 on error: NULL db/cb,
+ * version == 0, a nonexistent/unreadable snapshot version, or a manifest
+ * entry this walker cannot represent. */
+long dl_snapshot_relations(dl_db *db, uint32_t version,
+                           dl_relation_cb cb, void *user);
+
 /* Opt-in snapshot retention: keep at most `n` most-recent versions, pruning
  * older ones at the end of each successful publish.  n == 0 (the default)
  * keeps every version.  Returns 0 on success, -1 on a NULL db. */

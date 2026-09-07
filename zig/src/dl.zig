@@ -122,6 +122,7 @@ const ZERO_OWNED = [_]u8{0} ** MAX_RELS;
 /// dl_tuple_cb == rel_enum_cb — identical C signature, shared type identity
 /// with relation.zig so rel_prefix/vrel_prefix calls need no cast.
 const DlTupleCb = relation.RelEnumCb;
+const DlRelationCb = ?*const fn (name: [*c]const u8, arity: u8, idb: c_int, user: ?*anyopaque) callconv(.c) c_int;
 const DlTraverseCb = ?*const fn (node_sym: u32, depth: u8, user: ?*anyopaque) callconv(.c) c_int;
 const DlStrCb = ?*const fn (s: [*c]const u8, user: ?*anyopaque) callconv(.c) c_int;
 const FaultHook = ?*const fn (fp: c_int, user: ?*anyopaque) callconv(.c) c_int;
@@ -293,6 +294,7 @@ extern "c" fn vcache_invalidate(vcache: [*c]ViewCacheSlot) void;
 extern "c" fn view_open_cached(vcache: [*c]ViewCacheSlot, rel_name: [*c]const u8, sdir: [*c]const u8) ?*anyopaque;
 extern "c" fn manifest_find_rel_ex(sdir: [*c]const u8, rel_name: [*c]const u8, arity_out: [*c]u8, variadic_out: [*c]c_int) c_int;
 extern "c" fn manifest_find_variants(sdir: [*c]const u8, rel_name: [*c]const u8, present: [*]u8) void;
+extern "c" fn manifest_enumerate_rels(sdir: [*c]const u8, cb: dx.dl_relation_cb, user: ?*anyopaque) c_long;
 extern "c" fn snapshot_query_scan(db_dir: [*c]const u8, snap_version: c_uint, vcache: [*c]ViewCacheSlot, goal_rel: [*c]const u8, leading: ?[*]const u32, k: u8, cb: DlTupleCb, user: ?*anyopaque) c_long;
 extern "c" fn view_filter_col(view_handle: ?*anyopaque, arity: u8, col: u8, set: ?*const regexwalk.sym_set, cb: DlTupleCb, user: ?*anyopaque) c_long;
 extern "c" fn view_rank(view_handle: ?*anyopaque, arity: u8, cols: ?[*]const u32) u64;
@@ -3144,6 +3146,20 @@ pub export fn dl_query_bound_version(db: ?*DlDb, version: u32, goal_rel: [*c]con
     return r;
 }
 
+/// long dl_snapshot_relations(dl_db *db, uint32_t version,
+///                             dl_relation_cb cb, void *user)
+/// Manifest enumeration (dl.h): stream every fixed-arity relation recorded
+/// in snapshot `version`'s manifest.  Errors are the manifest walker's
+/// (-1: NULL args, version == 0, no db dir, unreadable/nonexistent version).
+pub export fn dl_snapshot_relations(db: ?*DlDb, version: u32, cb: DlRelationCb, user: ?*anyopaque) c_long {
+    const d = db orelse return -1;
+    if (version == 0 or cb == null) return -1;
+    if (d.dir == null) return -1;
+    var sdir: [8192:0]u8 = undefined;
+    _ = snprintf(&sdir, 8192, "%s/snapshots/%u", d.dir.?, version);
+    return manifest_enumerate_rels(&sdir, cb, user);
+}
+
 // ─── M8: magic-sets bound query (scoped re-eval, clone-and-scope) ───────────
 
 /// Clone-and-scope: build an eval-only dl_db that shallow-aliases EDB rels.
@@ -4795,6 +4811,71 @@ test "dl txn commit + rollback" {
     var rev: u32 = 0;
     try testing.expectEqual(@as(c_int, 0), dl_rev_get(db, "ent", &rev));
     try testing.expectEqual(@as(u32, 5), rev);
+}
+
+test "dl_snapshot_relations enumerates a published manifest" {
+    const dir = "/tmp/datalog_zig_u11_snaprels";
+    rmrfTestDir(dir);
+    defer rmrfTestDir(dir);
+
+    const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+    defer dl_close(db);
+
+    try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "edge", 2));
+    const e1 = [2]u32{ 1, 2 };
+    const e2 = [2]u32{ 2, 3 };
+    try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "edge", &e1, 2));
+    try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "edge", &e2, 2));
+
+    // a variadic relation: its '*' marker + per-variant lines must NOT emit
+    try testing.expectEqual(@as(c_int, 0), dl_declare_relation_variadic(db, "svc"));
+    const s1 = [1]u32{7};
+    const s2 = [2]u32{ 7, 8 };
+    try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "svc", &s1, 1));
+    try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "svc", &s2, 2));
+
+    // a derived (IDB) head relation, materialized by compile
+    try testing.expectEqual(@as(c_int, 0), dl_load_rules(db, "path(X,Y) :- edge(X,Y)."));
+    try testing.expectEqual(@as(c_int, 0), dl_compile(db));
+
+    try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db));
+
+    const Rel = struct { name: [64]u8 = undefined, len: usize = 0, arity: u8 = 0, idb: c_int = 0 };
+    const Ctx = struct {
+        rels: [16]Rel = undefined,
+        n: usize = 0,
+
+        fn cb(name: [*c]const u8, arity: u8, idb: c_int, user: ?*anyopaque) callconv(.c) c_int {
+            const self: *@This() = @ptrCast(@alignCast(user.?));
+            const nm = std.mem.span(@as([*:0]const u8, @ptrCast(name)));
+            @memcpy(self.rels[self.n].name[0..nm.len], nm);
+            self.rels[self.n].len = nm.len;
+            self.rels[self.n].arity = arity;
+            self.rels[self.n].idb = idb;
+            self.n += 1;
+            return 0;
+        }
+
+        fn has(self: *const @This(), want: []const u8, arity: u8, idb: c_int) bool {
+            for (self.rels[0..self.n]) |r| {
+                if (std.mem.eql(u8, r.name[0..r.len], want) and r.arity == arity and r.idb == idb)
+                    return true;
+            }
+            return false;
+        }
+    };
+
+    var got = Ctx{};
+    // edge + path only: 'svc' is variadic (star marker + svc.1/svc.2 skipped)
+    try testing.expectEqual(@as(c_long, 2), dl_snapshot_relations(db, 1, Ctx.cb, &got));
+    try testing.expectEqual(@as(usize, 2), got.n);
+    try testing.expect(got.has("edge", 2, 0));
+    try testing.expect(got.has("path", 2, 1));
+
+    // error arms: version 0 / nonexistent version / null cb
+    try testing.expectEqual(@as(c_long, -1), dl_snapshot_relations(db, 0, Ctx.cb, &got));
+    try testing.expectEqual(@as(c_long, -1), dl_snapshot_relations(db, 99, Ctx.cb, &got));
+    try testing.expectEqual(@as(c_long, -1), dl_snapshot_relations(db, 1, null, &got));
 }
 
 test "dl_open_ro never writes" {
