@@ -43,22 +43,24 @@ src/txnwal.h
 src/index.h
 src/vector.h
 vendor/dafsa/dafsa.h
-vendor/dafsa/dafsa_internal.h
 "
 
 # Declared in a header but intentionally not exported (must carry a reason).
-# dafsa_check_invariants (dafsa_internal.h:171) and reg_lookup_no_count
-# (dafsa_internal.h:196) are declared in the vendor header but defined
-# static in the vendor C — absent from the gcc-built .so too (pre-existing).
+# dafsa_check_invariants / reg_lookup_no_count were declared in the dropped
+# vendor internal header (dafsa_internal.h:171/196) but defined static in the
+# vendor C — absent from the gcc-built .so too (pre-existing).  Kept for the
+# C reference-vs-Zig check should a build resurrect them.
 ALLOWED_MISSING="dafsa_check_invariants reg_lookup_no_count"
 
 # U15: the dafsa engine is now the Zig engine (abi.zig) instead of the
-# vendored vendor/dafsa/*.c.  The C engine happened to leak these internal
+# vendored vendor/dafsa/*.c.  The vendor submodule is pinned at a commit
+# keeping only the public dafsa.h (dafsa_internal.h was dropped upstream), so
+# only dafsa.h is audited above.  The C engine happened to leak these internal
 # helpers as dynamic exports (they were non-static), but they are NOT part of
 # the public dafsa.h surface and are referenced by NO datalog consumer (tests,
 # dl_cli, dl-lsp, dlp, index/vector — final_audit.sh proves that).  abi.zig
 # deliberately encapsulates them, so they are absent from the Zig .so by
-# design — not a migration regression.  (The dafsa_internal.h helpers datalog
+# design — not a migration regression.  (The internal helpers datalog
 # DOES use — trans_find, view_trans_find, view_edge_next, view_enum_dfs,
 # dafsa_ensure_subtree, dafsa_view_subtree_counts, the rank/select/range_count
 # family — are all exported by abi.zig.)
