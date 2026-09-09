@@ -11,20 +11,32 @@
 //! Strangler-hybrid ABI: `struct txnwal` is OPAQUE in txnwal.h; the
 //! implementation is a native Zig {fd, size} struct (no heap pointers), and
 //! every non-static C function is an `export fn` with the exact C name,
-//! signature and return semantics.  crc32_compute comes from dafsa_internal.h
-//! (@cImport); raw libc syscalls via std.c (typed O_* flags) and @cImport
-//! (fstat/mmap/munmap) so framing bytes and EINTR/partial-write handling
-//! match the C oracle exactly.
+//! signature and return semantics.  crc32_compute comes from the dafsa Zig
+//! engine's exported C ABI (dafsa_c.zig); file sizing / mmap use the same
+//! std.posix + statx idioms as the engine's wal.zig, so framing bytes and
+//! EINTR/partial-write handling match the C oracle exactly.
 //!
 //! Oracle: src/txnwal.c (never modified).
 
 const std = @import("std");
 const c = std.c;
+const linux = std.os.linux;
+const dafsa_c = @import("dafsa_c.zig"); // crc32_compute (Zig engine export)
 
-const dc = @cImport({
-    @cInclude("dafsa_internal.h"); // crc32_compute, fstat/struct_stat, mmap/munmap
-    @cInclude("errno.h"); // EINTR, EIO, __errno_location
-});
+// libc errno plumbing (dl_cli.zig declares the same extern).  EINTR/EIO are
+// Linux glibc errno values; the engine targets Linux only.
+extern "c" fn __errno_location() *c_int;
+const EINTR: c_int = 4;
+const EIO: c_int = 5;
+
+/// File size of an open fd via statx on the empty path (same idiom as the
+/// Zig dafsa engine's wal.zig fstatSize).
+fn txnwalFdSize(fd: c_int) ?u64 {
+    var sb: linux.Statx = undefined;
+    const rc = linux.statx(fd, "", linux.AT.EMPTY_PATH, .BASIC_STATS, &sb);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    return sb.size;
+}
 
 const TXNWAL_OP_ADD: u8 = 1;
 const TXNWAL_OP_DEL: u8 = 2;
@@ -111,7 +123,7 @@ fn txnwalValidateRecord(
         const body: usize = 2 + @as(usize, rlen) + 1 + 4 + @as(usize, klen);
         var stored_crc: u32 = 0;
         if (txnwalReadU32(crc_at, head + rem, &stored_crc) != 0) return -2;
-        const calc_crc = dc.crc32_compute(head, body);
+        const calc_crc = dafsa_c.crc32_compute(head, body);
         if (calc_crc != stored_crc) return -1;
     }
 
@@ -144,7 +156,7 @@ fn txnwalWriteHeader(fd: c_int) c_int {
     hdr[10] = 0;
     hdr[11] = 0; // flags 0
 
-    const crc = dc.crc32_compute(&hdr, 12);
+    const crc = dafsa_c.crc32_compute(&hdr, 12);
     hdr[12] = @truncate(crc);
     hdr[13] = @truncate(crc >> 8);
     hdr[14] = @truncate(crc >> 16);
@@ -169,7 +181,7 @@ fn txnwalValidateHeader(map: [*c]const u8, size: usize) c_int {
     if (version != 1) return -1;
     if (txnwalReadU32(map + 8, map + 16, &flags) != 0) return -1;
     // flags validated for framing; value unused (as in C's `(void)flags`)
-    const calc_crc = dc.crc32_compute(map, 12);
+    const calc_crc = dafsa_c.crc32_compute(map, 12);
     if (txnwalReadU32(map + 12, map + 16, &stored_crc) != 0) return -1;
     if (calc_crc != stored_crc) return -1;
     return 0;
@@ -211,11 +223,11 @@ fn txnwalWriteAll(fd: c_int, buf: [*]const u8, len: usize) c_int {
     while (left > 0) {
         const wr = c.write(fd, p, left);
         if (wr < 0) {
-            if (dc.__errno_location().* == dc.EINTR) continue;
+            if (__errno_location().* == EINTR) continue;
             return -1;
         }
         if (wr == 0) {
-            dc.__errno_location().* = dc.EIO;
+            __errno_location().* = EIO;
             return -1;
         }
         p += @as(usize, @intCast(wr));
@@ -246,11 +258,10 @@ pub export fn txnwal_open_rw(db_dir: [*c]const u8) ?*Txnwal {
     c.free(path);
     if (fd < 0) return null;
 
-    var st: dc.struct_stat = undefined;
-    if (dc.fstat(fd, &st) != 0) {
+    const fsize = txnwalFdSize(fd) orelse {
         _ = c.close(fd);
         return null;
-    }
+    };
 
     const mem = c.calloc(1, @sizeOf(Txnwal)) orelse {
         _ = c.close(fd);
@@ -260,7 +271,7 @@ pub export fn txnwal_open_rw(db_dir: [*c]const u8) ?*Txnwal {
     w.* = std.mem.zeroes(Txnwal);
     w.fd = fd;
 
-    if (st.st_size == 0) {
+    if (fsize == 0) {
         if (txnwalWriteHeader(fd) != 0) {
             _ = c.close(fd);
             c.free(mem);
@@ -273,19 +284,18 @@ pub export fn txnwal_open_rw(db_dir: [*c]const u8) ?*Txnwal {
     // Existing file: validate header, truncate any torn tail (bytes after the
     // last valid COMMIT marker).
     {
-        const map_size: usize = @intCast(st.st_size);
-        const map = dc.mmap(null, map_size, dc.PROT_READ, dc.MAP_PRIVATE, fd, 0);
-        if (map == dc.MAP_FAILED) {
+        const map_size: usize = @intCast(fsize);
+        const map = std.posix.mmap(null, map_size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0) catch {
             _ = c.close(fd);
             c.free(mem);
             return null;
-        }
-        const mapu: [*c]const u8 = @ptrCast(map);
+        };
+        const mapu: [*c]const u8 = map.ptr;
 
         if (txnwalValidateHeader(mapu, map_size) != 0) {
             // Header-only file (16 B) with a corrupt header: reinitialize.
-            if (st.st_size == 16) {
-                _ = dc.munmap(map, map_size);
+            if (fsize == 16) {
+                std.posix.munmap(map);
                 if (c.ftruncate(fd, 0) != 0 or txnwalWriteHeader(fd) != 0) {
                     _ = c.close(fd);
                     c.free(mem);
@@ -294,7 +304,7 @@ pub export fn txnwal_open_rw(db_dir: [*c]const u8) ?*Txnwal {
                 w.size = 16;
                 return w;
             }
-            _ = dc.munmap(map, map_size);
+            std.posix.munmap(map);
             _ = c.close(fd);
             c.free(mem);
             return null; // non-empty corrupt header
@@ -302,7 +312,7 @@ pub export fn txnwal_open_rw(db_dir: [*c]const u8) ?*Txnwal {
 
         var committed_end: usize = 0;
         if (txnwalCommittedEnd(mapu, map_size, &committed_end) != 0) {
-            _ = dc.munmap(map, map_size);
+            std.posix.munmap(map);
             _ = c.close(fd);
             c.free(mem);
             return null;
@@ -310,14 +320,14 @@ pub export fn txnwal_open_rw(db_dir: [*c]const u8) ?*Txnwal {
 
         if (committed_end < map_size) {
             if (c.ftruncate(fd, @intCast(committed_end)) != 0) {
-                _ = dc.munmap(map, map_size);
+                std.posix.munmap(map);
                 _ = c.close(fd);
                 c.free(mem);
                 return null;
             }
         }
 
-        _ = dc.munmap(map, map_size);
+        std.posix.munmap(map);
         w.size = @intCast(committed_end);
     }
     return w;
@@ -332,12 +342,11 @@ pub export fn txnwal_open_ro(db_dir: [*c]const u8) ?*Txnwal {
     c.free(path);
     if (fd < 0) return null;
 
-    var st: dc.struct_stat = undefined;
-    if (dc.fstat(fd, &st) != 0) {
+    const fsize = txnwalFdSize(fd) orelse {
         _ = c.close(fd);
         return null;
-    }
-    if (st.st_size < 16) {
+    };
+    if (fsize < 16) {
         _ = c.close(fd);
         return null; // header-only/empty
     }
@@ -351,17 +360,16 @@ pub export fn txnwal_open_ro(db_dir: [*c]const u8) ?*Txnwal {
     w.fd = fd;
 
     {
-        const map_size: usize = @intCast(st.st_size);
-        const map = dc.mmap(null, map_size, dc.PROT_READ, dc.MAP_PRIVATE, fd, 0);
-        if (map == dc.MAP_FAILED) {
+        const map_size: usize = @intCast(fsize);
+        const map = std.posix.mmap(null, map_size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0) catch {
             _ = c.close(fd);
             c.free(mem);
             return null;
-        }
-        const mapu: [*c]const u8 = @ptrCast(map);
+        };
+        const mapu: [*c]const u8 = map.ptr;
 
         if (txnwalValidateHeader(mapu, map_size) != 0) {
-            _ = dc.munmap(map, map_size);
+            std.posix.munmap(map);
             _ = c.close(fd);
             c.free(mem);
             return null;
@@ -370,13 +378,13 @@ pub export fn txnwal_open_ro(db_dir: [*c]const u8) ?*Txnwal {
         // Scan (not truncate) the committed boundary: replay stops there.
         var committed_end: usize = 0;
         if (txnwalCommittedEnd(mapu, map_size, &committed_end) != 0) {
-            _ = dc.munmap(map, map_size);
+            std.posix.munmap(map);
             _ = c.close(fd);
             c.free(mem);
             return null;
         }
 
-        _ = dc.munmap(map, map_size);
+        std.posix.munmap(map);
         w.size = @intCast(committed_end);
     }
     return w;
@@ -408,7 +416,7 @@ pub export fn txnwal_append_record(w: ?*Txnwal, rel: [*c]const u8, rel_len: u16,
     buf[2 + @as(usize, rel_len) + 4] = @truncate(key_len >> 24);
     @memcpy(buf[2 + @as(usize, rel_len) + 1 + 4 ..][0..@as(usize, key_len)], key[0..@as(usize, key_len)]);
 
-    const crc = dc.crc32_compute(buf, body);
+    const crc = dafsa_c.crc32_compute(buf, body);
     buf[body] = @truncate(crc);
     buf[body + 1] = @truncate(crc >> 8);
     buf[body + 2] = @truncate(crc >> 16);
@@ -435,7 +443,7 @@ pub export fn txnwal_append_commit(w: ?*Txnwal) c_int {
     buf[5] = 0;
     buf[6] = 0; // key_len = 0
 
-    const crc = dc.crc32_compute(&buf, 7); // body = rel_len||op||key_len
+    const crc = dafsa_c.crc32_compute(&buf, 7); // body = rel_len||op||key_len
     buf[7] = @truncate(crc);
     buf[8] = @truncate(crc >> 8);
     buf[9] = @truncate(crc >> 16);
@@ -480,18 +488,16 @@ pub export fn txnwal_replay(w: ?*Txnwal, cb: TxnwalReplayCb, user: ?*anyopaque, 
     const ww = w orelse return -1;
     if (cb == null) return -1;
 
-    var st: dc.struct_stat = undefined;
-    if (dc.fstat(ww.fd, &st) != 0) return -1;
-    const map_size: usize = @intCast(st.st_size);
+    const fsize = txnwalFdSize(ww.fd) orelse return -1;
+    const map_size: usize = @intCast(fsize);
     if (map_size < 16) return -1;
 
-    const map = dc.mmap(null, map_size, dc.PROT_READ, dc.MAP_PRIVATE, ww.fd, 0);
-    if (map == dc.MAP_FAILED) return -1;
-    const mapu: [*c]const u8 = @ptrCast(map);
+    const map = std.posix.mmap(null, map_size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, ww.fd, 0) catch return -1;
+    const mapu: [*c]const u8 = map.ptr;
 
     var committed_end: usize = 0;
     if (txnwalCommittedEnd(mapu, map_size, &committed_end) != 0) {
-        _ = dc.munmap(map, map_size);
+        std.posix.munmap(map);
         return -1;
     }
     if (good_bytes_out) |out| out[0] = @intCast(committed_end);
@@ -520,7 +526,7 @@ pub export fn txnwal_replay(w: ?*Txnwal, cb: TxnwalReplayCb, user: ?*anyopaque, 
         }
     }
 
-    _ = dc.munmap(map, map_size);
+    std.posix.munmap(map);
     return rc;
 }
 

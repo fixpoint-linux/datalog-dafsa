@@ -46,15 +46,16 @@ const magic = @import("magic.zig");
 // permindex.h/termstore.h/compiler.h/parser.h/regexwalk.h — the reference
 // layout of dl_db/rel_entry/txn/txn_op/view_cache_slot/perm_index_entry and
 // the opaque relation/vrelation/interner/termstore/tuple_set types.
-const dx = @cImport({
-    @cInclude("dl_internal.h");
-});
+// dl_internal.h: dl_db/rel_entry/txn/perm_index_entry/view_cache_slot layout,
+// verified here against our native DlDb/RelEntry/... at comptime below.
+// The datalog engine is now Zig; dl_internal.zig hand-declares the C-layout
+// structs in place of the removed @cImport("dl_internal.h").
+const dx = @import("dl_internal.zig");
 
 // dafsa_internal.h: struct dafsa/dafsa_view + dafsa_save/dafsa_view_open/
-// dafsa_view_close (the vendored DAFSA engine stays C in the hybrid .so).
-const dc = @cImport({
-    @cInclude("dafsa_internal.h");
-});
+// dafsa_view_close.  The engine is now Zig; dafsa_c.zig hand-declares the
+// C-layout types + extern ABI in place of the removed header.
+const dc = @import("dafsa_c.zig");
 
 // POSIX filesystem/lock primitives (stat/lstat/fstatat/mkdir/open/fcntl/
 // flock/opendir/readdir/dirfd/rename/unlink/rmdir) with _GNU_SOURCE so

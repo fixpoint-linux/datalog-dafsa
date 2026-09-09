@@ -18,9 +18,11 @@ const relation = @import("relation.zig");
 const tupleset = @import("tupleset.zig");
 
 // dl_internal.h: dl_db, perm_index_entry (via permindex.h), db_rel_at_arity_ro.
-const dx = @cImport({
-    @cInclude("dl_internal.h");
-});
+// dl_internal.h: dl_db, perm_index_entry, RELK_FIXED.  The datalog engine is
+// now Zig; dl_internal.zig hand-declares the C-layout structs + extern ABI
+// (db_rel_at_arity_ro is dl.zig's export, reached via extern "c") in place of
+// the removed @cImport("dl_internal.h").
+const dx = @import("dl_internal.zig");
 
 // ts_* are `export fn`s in tupleset.zig (C ABI); link against them directly.
 extern "c" fn ts_init(ts: ?*tupleset.tuple_set, arity: u8) c_int;

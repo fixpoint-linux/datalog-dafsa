@@ -33,9 +33,10 @@ const regexwalk = @import("regexwalk.zig");
 // extern decls for dl_declare_relation / dl_ensure_variant /
 // dl_db_declare_perm / dl_db_find_perm / rel_* / vrel_count / intern_str /
 // term_cons.
-const dx = @cImport({
-    @cInclude("dl_internal.h");
-});
+// dl_internal.h: dl_db + rel_entry + dl_*/rel_*/intern_*/term_* externs.
+// The datalog engine is now Zig; dl_internal.zig hand-declares the C-layout
+// structs + extern ABI in place of the removed @cImport("dl_internal.h").
+const dx = @import("dl_internal.zig");
 
 // glibc strdup (not re-exported by std.c; parser.zig declares its own too).
 extern "c" fn strdup(s: [*c]const u8) ?[*:0]u8;

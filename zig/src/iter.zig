@@ -19,16 +19,15 @@ const c = std.c;
 const relation = @import("relation.zig");
 const snapshot = @import("snapshot.zig");
 
-// dl_internal.h: dl_db, rel_entry, RELK_VARIADIC.
-const dx = @cImport({
-    @cInclude("dl_internal.h");
-});
+// dl_internal.h: dl_db, rel_entry, RELK_VARIADIC.  The datalog engine is now
+// Zig; dl_internal.zig hand-declares the C-layout structs + extern ABI in
+// place of the removed @cImport("dl_internal.h").
+const dx = @import("dl_internal.zig");
 
 // dafsa_internal.h: struct dafsa/State/Edge, trans_find, dafsa_view,
-// view_trans_find, view_edge_next, dafsa_view_open/close.
-const dc = @cImport({
-    @cInclude("dafsa_internal.h");
-});
+// view_trans_find, view_edge_next, dafsa_view_open/close.  The engine is now
+// Zig; dafsa_c.zig hand-declares these C-layout types + extern ABI.
+const dc = @import("dafsa_c.zig");
 
 extern "c" fn snprintf(buf: [*c]u8, size: usize, fmt: [*c]const u8, ...) c_int;
 

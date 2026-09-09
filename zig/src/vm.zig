@@ -41,9 +41,10 @@ const var_info = compiler.var_info;
 // permindex.h/termstore.h/compiler.h/regexwalk.h — supplying dl_db, rel_entry,
 // perm_index_entry, RELK_FIXED/RELK_VARIADIC, dl_tuple_cb/rel_enum_cb, and the
 // extern decls for every still-C / already-ported function the VM calls.
-const dx = @cImport({
-    @cInclude("dl_internal.h");
-});
+// dl_internal.h: dl_db/rel_entry/relation/dl_iter + db_*/dl_*/rel_* externs.
+// The datalog engine is now Zig; dl_internal.zig hand-declares the C-layout
+// structs + extern ABI in place of the removed @cImport("dl_internal.h").
+const dx = @import("dl_internal.zig");
 
 // std.c does not re-export the C string functions the M9 string ops need.
 extern "c" fn strcmp(a: [*c]const u8, b: [*c]const u8) c_int;

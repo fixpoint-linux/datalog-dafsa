@@ -27,11 +27,15 @@ extern "c" fn ts_free(ts: ?*tupleset.tuple_set) void;
 extern "c" fn ts_add(ts: ?*tupleset.tuple_set, cols: ?[*]const u32) c_int;
 extern "c" fn ts_sort(ts: ?*tupleset.tuple_set) void;
 
-// dafsa_internal.h (struct dafsa/State/Edge/dafsa_wal, trans_find,
-// crc32_compute, dafsa_* externs).  Include path set by build.zig.
-const dc = @cImport({
-    @cInclude("dafsa_internal.h");
-});
+// The dafsa engine is now Zig; dafsa_c.zig hand-declares its C-layout
+// structs (struct dafsa/State/Edge/dafsa_wal) and exported ABI
+// (dafsa_*/trans_find/dafsa_wal_*/rank/select/crc32) in place of the removed
+// @cImport("dafsa_internal.h").
+const dc = @import("dafsa_c.zig");
+
+// libc strdup/strrchr/strndup helpers the old translate-c pulled in via
+// dafsa_internal.h's transitive <string.h> include.
+extern "c" fn strdup(s: [*c]const u8) [*c]u8;
 
 // regexwalk.zig (U6): regex_dfa, sym_set, regex_dfa_walk, symset_contains.
 const regexwalk = @import("regexwalk.zig");
@@ -717,11 +721,14 @@ pub export fn rel_wal_append_del(rel: ?*Relation, key: [*c]const u8, key_len: u3
 /// NOTE: this replicates relation.c's own fsync_parent_dir (takes a path,
 /// fsyncs its containing directory) — distinct from util.fsync_dir_of_path.
 fn fsyncParentDir(path: [*c]const u8) c_int {
-    const slash = dc.strrchr(path, '/');
+    // Find the last '/' (strrchr).  -1/none or index 0 => the dir is "/".
+    var last_slash: isize = -1;
+    var i: isize = 0;
+    while (path[@intCast(i)] != 0) : (i += 1) {
+        if (path[@intCast(i)] == '/') last_slash = i;
+    }
     var ret: c_int = -1;
-    const path_addr = @intFromPtr(path);
-
-    if (slash == null or @intFromPtr(slash) == path_addr) {
+    if (last_slash <= 0) {
         const fd = c.open("/", .{ .ACCMODE = .RDONLY, .DIRECTORY = true });
         if (fd >= 0) {
             ret = c.fsync(fd);
@@ -730,14 +737,17 @@ fn fsyncParentDir(path: [*c]const u8) c_int {
         return ret;
     }
 
-    const dir = dc.strndup(path, @intFromPtr(slash) - path_addr);
-    if (dir == null) return -1;
-    const fd = c.open(dir, .{ .ACCMODE = .RDONLY, .DIRECTORY = true });
+    const dir_len: usize = @intCast(last_slash);
+    const mem = c.malloc(dir_len + 1) orelse return -1;
+    const buf: [*]u8 = @ptrCast(mem);
+    @memcpy(buf[0..dir_len], @as([*]const u8, @ptrCast(path))[0..dir_len]);
+    buf[dir_len] = 0;
+    defer c.free(mem);
+    const fd = c.open(@ptrCast(buf), .{ .ACCMODE = .RDONLY, .DIRECTORY = true });
     if (fd >= 0) {
         ret = c.fsync(fd);
         _ = c.close(fd);
     }
-    c.free(dir);
     return ret;
 }
 
@@ -803,12 +813,6 @@ pub export fn rel_open_writable(dafsa_path: [*c]const u8, wal_path: [*c]const u8
     rel.arity = arity;
 
     // Open WAL (rw) — auto-repairs torn tail
-    var wal_exists: c_int = 0;
-    {
-        var st: dc.struct_stat = undefined;
-        wal_exists = if (dc.stat(wal_path, &st) == 0 and st.st_size > 16) 1 else 0;
-    }
-
     rel.wal = dc.dafsa_wal_open_rw(wal_path);
     if (rel.wal == null) {
         dc.dafsa_free(rel.d);
@@ -816,7 +820,7 @@ pub export fn rel_open_writable(dafsa_path: [*c]const u8, wal_path: [*c]const u8
         return null;
     }
 
-    rel.wal_path = dc.strdup(wal_path);
+    rel.wal_path = strdup(wal_path);
     if (rel.wal_path == null) {
         dc.dafsa_wal_close(rel.wal);
         dc.dafsa_free(rel.d);
@@ -825,7 +829,9 @@ pub export fn rel_open_writable(dafsa_path: [*c]const u8, wal_path: [*c]const u8
     }
 
     // If WAL had records > header, replay them into in-memory DAFSA
-    if (wal_exists != 0) {
+    // A WAL with committed records (> 16-B header) needs replay into the
+    // in-memory DAFSA; dafsa_wal_open_rw already truncated any torn tail.
+    if (rel.wal.*.size > 16) {
         if (rel_wal_replay_into(rel) != 0) {
             rel_free(rel);
             return null;
@@ -872,12 +878,6 @@ pub export fn rel_open_writable_idb(base_path: [*c]const u8, dafsa_path: [*c]con
     rel.arity = arity;
 
     // Open WAL (rw) — auto-repairs torn tail
-    var wal_exists: c_int = 0;
-    {
-        var st: dc.struct_stat = undefined;
-        wal_exists = if (dc.stat(wal_path, &st) == 0 and st.st_size > 16) 1 else 0;
-    }
-
     rel.wal = dc.dafsa_wal_open_rw(wal_path);
     if (rel.wal == null) {
         dc.dafsa_free(rel.d);
@@ -886,7 +886,7 @@ pub export fn rel_open_writable_idb(base_path: [*c]const u8, dafsa_path: [*c]con
         return null;
     }
 
-    rel.wal_path = dc.strdup(wal_path);
+    rel.wal_path = strdup(wal_path);
     if (rel.wal_path == null) {
         dc.dafsa_wal_close(rel.wal);
         dc.dafsa_free(rel.d);
@@ -896,7 +896,9 @@ pub export fn rel_open_writable_idb(base_path: [*c]const u8, dafsa_path: [*c]con
     }
 
     // Replay WAL into BASE and compact immediately.
-    if (wal_exists != 0) {
+    // A WAL with committed records (> 16-B header) needs replay into the
+    // in-memory DAFSA; dafsa_wal_open_rw already truncated any torn tail.
+    if (rel.wal.*.size > 16) {
         if (rel_wal_replay_into(rel) != 0) {
             rel_free(rel);
             return null;

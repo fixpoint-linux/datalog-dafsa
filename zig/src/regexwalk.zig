@@ -38,11 +38,14 @@
 const std = @import("std");
 const c = std.c;
 
-// dafsa_internal.h: struct dafsa/State/Edge/TransHeap, dafsa_view,
-// view_edge_next/trans_find, strdup, crc32 etc.  Include path set by build.zig.
-const dc = @cImport({
-    @cInclude("dafsa_internal.h");
-});
+// The dafsa engine is now Zig; dafsa_c.zig hand-declares its C-layout
+// structs (struct dafsa/State/Edge/dafsa_view) and exported ABI
+// (dafsa_create/dafsa_free/dafsa_add_n/view_edge_next) in place of the
+// removed @cImport("dafsa_internal.h").
+const dc = @import("dafsa_c.zig");
+
+// libc strdup (intern.zig declares the same extern; std.c does not re-export).
+extern "c" fn strdup(s: [*c]const u8) ?[*:0]u8;
 
 // ─── Constants (mirror regexwalk.h / dafsa_internal.h) ─────────────────────
 
@@ -210,7 +213,7 @@ const RxParser = struct {
 };
 
 fn rxError(p: *RxParser, msg: [*c]const u8) void {
-    if (p.errmsg == null) p.errmsg = dc.strdup(msg);
+    if (p.errmsg == null) p.errmsg = strdup(msg);
 }
 
 fn rxIsOctalDigit(ch: u8) bool {
@@ -900,7 +903,7 @@ fn dsmFindOrAdd(m: *DfaStateMap, bs: *const Bitset, hash: u64, dfa_id: c_int, fo
 fn makeErrDfa(msg: [*c]const u8) ?*regex_dfa {
     const mem = c.calloc(1, @sizeOf(regex_dfa)) orelse return null;
     const dfa: *regex_dfa = @ptrCast(@alignCast(mem));
-    dfa.errmsg = dc.strdup(msg);
+    dfa.errmsg = strdup(msg);
     return dfa;
 }
 

@@ -35,9 +35,10 @@ const magic = @import("magic.zig");
 // dl_internal.h pulls in dl.h/intern.h/relation.h/.../compiler.h/regexwalk.h —
 // supplying dl_db, dl_tuple_cb, dl_db_get_perm (permindex.h), and the extern
 // decls for every still-C function this unit calls.
-const dx = @cImport({
-    @cInclude("dl_internal.h");
-});
+// dl_internal.h: dl_db + dl_* externs.  The datalog engine is now Zig;
+// dl_internal.zig hand-declares the C-layout structs + extern ABI in place of
+// the removed @cImport("dl_internal.h").
+const dx = @import("dl_internal.zig");
 
 const vm_instr = compiler.vm_instr;
 const compiled_rule = compiler.compiled_rule;

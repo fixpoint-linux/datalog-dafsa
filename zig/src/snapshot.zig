@@ -25,15 +25,16 @@ const relation = @import("relation.zig");
 
 // dl_internal.h: dl_db, rel_entry, view_cache_slot, DL_VIEW_CACHE_SZ,
 // RELK_VARIADIC/MAX_RELS, dl_tuple_cb/dl_join_cb, db_rel_at_arity_ro (dl.c).
-const dx = @cImport({
-    @cInclude("dl_internal.h");
-});
+// dl_internal.h: dl_db, rel_entry, view_cache_slot, DL_VIEW_CACHE_SZ,
+// RELK_VARIADIC/MAX_RELS, dl_tuple_cb/dl_relation_cb, db_rel_at_arity_ro.
+// The datalog engine is now Zig; dl_internal.zig hand-declares these
+// C-layout structs + extern ABI in place of the removed @cImport.
+const dx = @import("dl_internal.zig");
 
 // dafsa_internal.h: dafsa_view, view_trans_find/view_enum_dfs/view_edge_next,
 // dafsa_view_{open,close,rank_n,select_n,range_count_n,subtree_counts}.
-const dc = @cImport({
-    @cInclude("dafsa_internal.h");
-});
+// The engine is now Zig; dafsa_c.zig hand-declares these types + extern ABI.
+const dc = @import("dafsa_c.zig");
 
 // libc decls not in std.c (precedent: intern.zig).
 extern "c" fn snprintf(buf: [*c]u8, size: usize, fmt: [*c]const u8, ...) c_int;

@@ -17,22 +17,18 @@
 //! dl_index_observations/dl_search_top*/dl_vector_* still come from the C
 //! index.c/vector.c in the .so (deferred to U14).
 //!
-//! The dl_db layout is reached through the shared internal header
-//! (@cImport of dl_internal.h) exactly like the C CLI — db->ir and db->terms
+//! The dl_db layout is reached through the shared internal module
+//! (@import of dl_internal.zig) exactly like the C CLI — db->ir and db->terms
 //! for CLI value parsing / list printing.  Layout drift is impossible: dl.zig
-//! comptime-gates its authoritative mirror against the same header.
+//! comptime-gates its authoritative mirror against the same module.
 
 const std = @import("std");
 
-// Umbrella cImport: dl_internal.h pulls in dl.h (which pulls vector.h) plus
-// the intern/termstore/relation/snapshot/regexwalk headers — the dl_db layout
-// and every engine typedef/callback; index.h adds the still-C tokenizer,
-// postings and full-text search API (all in the same translate-c unit, so
-// dl_db type identity is shared).
-const c = @cImport({
-    @cInclude("dl_internal.h");
-    @cInclude("index.h");
-});
+// The datalog engine is now Zig.  dl_internal.zig hand-declares the C-layout
+// dl_db struct and the whole engine extern ABI (dl_*/intern_*/term_*/regex_*/
+// index.zig's tokenize/dl_search_top/dl_index_observations/aux_index_*), so
+// dl_db type identity is shared with libdatalog's own modules.
+const c = @import("dl_internal.zig");
 
 // ─── libc decls — byte fidelity to the C oracle means using libc itself ────
 extern "c" fn printf(fmt: [*:0]const u8, ...) c_int;
