@@ -26,6 +26,8 @@ extern "c" fn ts_init(ts: ?*tupleset.tuple_set, arity: u8) c_int;
 extern "c" fn ts_free(ts: ?*tupleset.tuple_set) void;
 extern "c" fn ts_add(ts: ?*tupleset.tuple_set, cols: ?[*]const u32) c_int;
 extern "c" fn ts_sort(ts: ?*tupleset.tuple_set) void;
+extern "c" fn ts_contains(ts: ?*const tupleset.tuple_set, cols: ?[*]const u32) c_int;
+extern "c" fn ts_reset(ts: ?*tupleset.tuple_set) void;
 
 // The dafsa engine is now Zig; dafsa_c.zig hand-declares its C-layout
 // structs (struct dafsa/State/Edge/dafsa_wal) and exported ABI
@@ -43,7 +45,23 @@ const regexwalk = @import("regexwalk.zig");
 const MAX_ARITY: usize = 8;
 const MAX_KEY_LEN: usize = MAX_ARITY * 4 + 1; // 33
 
+/// Overlay materialization threshold: adds are accumulated in the hot-set
+/// (sorted-array) overlay and folded into the DAFSA at consolidation
+/// (publish/compact).  Below this count the overlay IS cheaper than a
+/// DAFSA rebuild even at consolidation time; above it we materialize
+/// eagerly so a single huge batch does not pay sorted-array insert on a
+/// set that is about to be rebuilt anyway.  NOT a correctness knob.
+const REL_OVERLAY_FLUSH_AT: usize = 1 << 20;
+
 /// struct relation — opaque to C; native Zig layout.
+///
+/// selfreg-dl-storage (C19): the agent-level store is APPEND-ONLY — a wrong
+/// fact is corrected by SUPERSESSION (re-assert with a newer version;
+/// latest-wins at read time via the set semantics of the key), never by
+/// deletion.  `ov` is the hot-write overlay: a sorted-array tupleset of
+/// facts added since the last consolidation.  Reads see `d` UNION `ov`
+/// (pure set union — no masking, no resurrect risk, because there are no
+/// tombstones).  `ov_dirty` counts unconsolidated adds.
 pub const Relation = struct {
     d: [*c]dc.dafsa, // VIEW = base ∪ derived; all reads enumerate this
     base: [*c]dc.dafsa, // BASE = durable EDB facts; base == d for EDB-only
@@ -51,6 +69,10 @@ pub const Relation = struct {
     wal: [*c]dc.dafsa_wal, // per-relation WAL handle, or NULL
     wal_path: [*c]u8, // path to WAL file (owned, strdup'd)
     dirty: c_int, // 1 if mutated since open (rel_is_dirty)
+    // ─── selfreg-dl-storage overlay (beyond C's sizeof(struct relation)) ───
+    ov: ?*tupleset.tuple_set = null, // hot-write overlay (append-only union)
+    ov_dirty: u64 = 0, // adds since last consolidation (decay/sizing signal)
+    ov_epoch: u32 = 0, // access epoch of the newest overlay fact (C20)
 };
 
 /// typedef int (*rel_enum_cb)(const uint32_t *cols, uint8_t arity, void *user)
@@ -150,6 +172,167 @@ pub export fn rel_open(path: [*c]const u8, arity: u8) ?*Relation {
     return rel;
 }
 
+// ─── Hot-write overlay (selfreg-dl-storage, C19 append-only) ───────────────
+
+/// Lazily create the overlay tupleset.  Returns null on OOM.
+fn ovEnsure(rel: *Relation) ?*tupleset.tuple_set {
+    if (rel.ov == null) {
+        const m = c.malloc(@sizeOf(tupleset.tuple_set)) orelse return null;
+        const ts: *tupleset.tuple_set = @ptrCast(@alignCast(m));
+        if (ts_init(ts, rel.arity) != 0) {
+            c.free(m);
+            return null;
+        }
+        rel.ov = ts;
+    }
+    return rel.ov;
+}
+
+/// Append a fact to the overlay WITHOUT touching the DAFSA (O(1) amortized
+/// hash insert).  Returns 1 added / 0 duplicate (already in DAFSA or
+/// overlay) / -1 error.  This is the hot-write path: the fact is durable
+/// via the caller's WAL append; reads see it through rel_exact/rel_prefix
+/// union; consolidation (rel_overlay_flush) folds it into the DAFSA.
+pub export fn rel_overlay_add(rel: ?*Relation, cols: [*c]const u32) c_int {
+    const r = rel orelse return -1;
+    if (cols == null) return -1;
+
+    // duplicate against the DAFSA view: overlay adds nothing
+    if (relExactD(r, r.d, cols) != 0) return 0;
+
+    const ov = ovEnsure(r) orelse return -1;
+    const rc = ts_add(ov, cols);
+    if (rc < 0) return -1;
+    if (rc == 1) {
+        r.ov_dirty += 1;
+        r.dirty = 1; // close-time compaction contract (same as rel_add_base)
+    }
+    return rc;
+}
+
+/// Record the access epoch on the overlay (C20 decay bookkeeping; epoch
+/// granularity, never a per-access write).
+pub export fn rel_overlay_touch(rel: ?*Relation, epoch: u32) void {
+    const r = rel orelse return;
+    if (epoch > r.ov_epoch) r.ov_epoch = epoch;
+}
+
+/// Current overlay occupancy (facts pending consolidation).
+pub export fn rel_overlay_count(rel: ?*const Relation) u64 {
+    const r = rel orelse return 0;
+    const ov = r.ov orelse return 0;
+    return @intCast(ov.count);
+}
+
+/// Fold the overlay into the VIEW DAFSA and drop it (consolidation step).
+/// Pure set union merge: enumerate d ∪ ov into one sorted tupleset and bulk
+/// rebuild via dafsa_build_sorted (the Daciuk sorted-insert construction),
+/// then swap.  The whole relation is materialized at most once per
+/// consolidation cycle, never per add.  Returns 0 ok / -1 error.
+pub export fn rel_overlay_flush(rel: ?*Relation) c_int {
+    const r = rel orelse return -1;
+    const ov = r.ov orelse return 0;
+    if (ov.count == 0) {
+        ts_reset(ov);
+        return 0;
+    }
+
+    // d ∪ ov, sorted + dedup'd, -> fresh minimal DAFSA
+    var ts: tupleset.tuple_set = undefined;
+    if (ts_init(&ts, r.arity) != 0) return -1;
+    if (relPrefixD(r, r.d, null, 0, ts_sink_cb, &ts) < 0) {
+        ts_free(&ts);
+        return -1;
+    }
+    var i: c_long = 0;
+    while (i < ov.count) : (i += 1) {
+        if (ts_add(&ts, ov.data.? + @as(usize, @intCast(i)) * r.arity) < 0) {
+            ts_free(&ts);
+            return -1;
+        }
+    }
+    ts_sort(&ts);
+    const nd = dafsaBuildFromTs(&ts, r.arity);
+    ts_free(&ts);
+    if (nd == null) return -1;
+
+    const aliased = (r.base == r.d);
+    // Preserve the split if base != d (IDB): rebuild the VIEW only, and
+    // fold the overlay into the BASE too (overlay facts are EDB premises —
+    // they must survive a view reset).  For aliased EDB relations the
+    // single DAFSA is both.
+    if (aliased) {
+        dc.dafsa_free(r.d);
+        r.d = nd;
+        r.base = r.d;
+    } else {
+        // IDB: union overlay into base via the same tupleset, keep view.
+        var bts: tupleset.tuple_set = undefined;
+        if (ts_init(&bts, r.arity) != 0) {
+            dc.dafsa_free(nd);
+            return -1;
+        }
+        var ok: c_int = 0;
+        if (relPrefixD(r, r.base, null, 0, ts_sink_cb, &bts) == 0) {
+            var j: c_long = 0;
+            ok = 1;
+            while (j < ov.count) : (j += 1) {
+                if (ts_add(&bts, ov.data.? + @as(usize, @intCast(j)) * r.arity) < 0) {
+                    ok = 0;
+                    break;
+                }
+            }
+        }
+        if (ok == 0) {
+            ts_free(&bts);
+            dc.dafsa_free(nd);
+            return -1;
+        }
+        ts_sort(&bts);
+        const nb = dafsaBuildFromTs(&bts, r.arity);
+        ts_free(&bts);
+        if (nb == null) {
+            dc.dafsa_free(nd);
+            return -1;
+        }
+        dc.dafsa_free(r.base);
+        dc.dafsa_free(r.d);
+        r.base = nb;
+        r.d = nd; // view already includes base via the union above
+    }
+    r.dirty = 1;
+
+    ts_reset(ov); // capacity kept; hash cleared
+    r.ov_dirty = 0;
+    return 0;
+}
+
+/// Read-side consolidation gate (selfreg-dl-storage C18): enumeration and
+/// order-statistics reads walk the DAFSA, so they must see d ∪ ov.  Rather
+/// than merging two unsorted sources per read, a read through a non-empty
+/// overlay folds it into the DAFSA once — the same consolidation step
+/// publish performs, pulled forward to the first reader.  No-op when the
+/// overlay is empty or already materialized; a flush failure leaves the
+/// relation unchanged (readers then see the pre-overlay state, never a
+/// torn one).
+fn ovConsolidateForRead(r: *const Relation) void {
+    const ov = r.ov orelse return;
+    if (ov.count == 0) return;
+    _ = rel_overlay_flush(@constCast(r));
+}
+
+/// Free the overlay (relation teardown).  Non-consolidated facts MUST have
+/// been flushed (or are still durable in the WAL) by the caller.
+fn ovFree(rel: *Relation) void {
+    if (rel.ov) |ov| {
+        ts_free(ov);
+        c.free(ov);
+        rel.ov = null;
+    }
+    rel.ov_dirty = 0;
+}
+
+
 /// int rel_save(const relation *rel, const char *path)
 pub export fn rel_save(rel: ?*const Relation, path: [*c]const u8) c_int {
     const r = rel orelse return -1;
@@ -167,6 +350,7 @@ pub export fn rel_save_base(rel: ?*const Relation, path: [*c]const u8) c_int {
 /// void rel_free(relation *rel)
 pub export fn rel_free(rel: ?*Relation) void {
     const r = rel orelse return;
+    ovFree(r);
     if (r.base != r.d) dc.dafsa_free(r.base);
     dc.dafsa_free(r.d);
     if (r.wal != null) dc.dafsa_wal_close(r.wal);
@@ -181,17 +365,27 @@ pub export fn rel_arity(rel: ?*const Relation) u8 {
 }
 
 /// uint64_t rel_count(const relation *rel)
+/// Word count = DAFSA words + overlay tuples (C19 union; no double count —
+/// rel_overlay_add rejects DAFSA duplicates).
 pub export fn rel_count(rel: ?*const Relation) u64 {
     const r = rel orelse return 0;
-    if (r.d == null) return 0;
-    var st: dc.dafsa_stats_out = std.mem.zeroes(dc.dafsa_stats_out);
-    dc.dafsa_stats(r.d, &st);
-    return @as(u64, st.n_final);
+    var n: u64 = 0;
+    if (r.d != null) {
+        var st: dc.dafsa_stats_out = std.mem.zeroes(dc.dafsa_stats_out);
+        dc.dafsa_stats(r.d, &st);
+        n = @as(u64, st.n_final);
+    }
+    if (r.ov) |ov| n +%= @as(u64, @intCast(ov.count));
+    return n;
 }
 
 /// const dafsa *rel_dafsa(const relation *rel)
+/// Read-side consolidation gate: iterator opens (dl_iter_open,
+/// dl_iter_open_live -> OP_RANGE, merge-join) borrow rel->d and DFS it, so
+/// the overlay must be folded in before the pointer escapes.
 pub export fn rel_dafsa(rel: ?*const Relation) [*c]const dc.dafsa {
     const r = rel orelse return null;
+    ovConsolidateForRead(r);
     return r.d;
 }
 
@@ -201,6 +395,7 @@ pub export fn rel_dafsa(rel: ?*const Relation) [*c]const dc.dafsa {
 pub export fn rel_rank(rel: ?*const Relation, cols: ?[*]const u32) u64 {
     const r = rel orelse return std.math.maxInt(u64);
     if (r.d == null or cols == null) return std.math.maxInt(u64);
+    ovConsolidateForRead(r);
     var key: [MAX_KEY_LEN]u8 = undefined;
     const key_len = encodeKey(&key, cols.?, r.arity);
     return dc.dafsa_rank_n(r.d, &key, key_len);
@@ -210,6 +405,7 @@ pub export fn rel_rank(rel: ?*const Relation, cols: ?[*]const u32) u64 {
 pub export fn rel_select(rel: ?*const Relation, k: u64, cols_out: ?[*]u32) c_int {
     const r = rel orelse return -1;
     if (r.d == null or cols_out == null) return -1;
+    ovConsolidateForRead(r);
     var key: [MAX_KEY_LEN]u8 = undefined;
     const key_len = dc.dafsa_select_n(r.d, k, &key, MAX_KEY_LEN);
     if (key_len < 0) return -1;
@@ -222,6 +418,7 @@ pub export fn rel_select(rel: ?*const Relation, k: u64, cols_out: ?[*]u32) c_int
 pub export fn rel_range_count(rel: ?*const Relation, lo: ?[*]const u32, hi: ?[*]const u32) u64 {
     const r = rel orelse return std.math.maxInt(u64);
     if (r.d == null or lo == null or hi == null) return std.math.maxInt(u64);
+    ovConsolidateForRead(r);
     var lo_key: [MAX_KEY_LEN]u8 = undefined;
     var hi_key: [MAX_KEY_LEN]u8 = undefined;
     const lo_len = encodeKey(&lo_key, lo.?, r.arity);
@@ -230,11 +427,15 @@ pub export fn rel_range_count(rel: ?*const Relation, lo: ?[*]const u32, hi: ?[*]
 }
 
 /// uint64_t rel_count_subtree(const relation *rel)
+/// Word count via subtree counts + overlay occupancy (C19 union).
 pub export fn rel_count_subtree(rel: ?*const Relation) u64 {
     const r = rel orelse return 0;
-    if (r.d == null) return 0;
-    const n = dc.dafsa_ensure_subtree(r.d);
-    if (r.d.*.subtree_valid == 0) return 0; // OOM during build: degrade to 0
+    var n: u64 = 0;
+    if (r.d != null) {
+        n = dc.dafsa_ensure_subtree(r.d);
+        if (r.d.*.subtree_valid == 0) n = 0; // OOM during build: degrade to 0
+    }
+    if (r.ov) |ov| n +%= @as(u64, @intCast(ov.count));
     return n;
 }
 
@@ -249,6 +450,7 @@ pub export fn rel_prefix_state(rel: ?*const Relation, leading: ?[*]const u32, k:
     const r = rel orelse return -1;
     if (r.d == null) return -1;
     if (r.arity == 0) return -1;
+    ovConsolidateForRead(r);
     var current: c_uint = r.d.*.initial;
     var i: u8 = 0;
     while (i < k) : (i += 1) {
@@ -351,9 +553,14 @@ fn relExactD(rel: *const Relation, d: [*c]const dc.dafsa, cols: ?[*]const u32) c
 }
 
 /// int rel_exact(const relation *rel, const uint32_t *cols)
+/// VIEW = DAFSA ∪ overlay (C19: append-only set union).
 pub export fn rel_exact(rel: ?*const Relation, cols: ?[*]const u32) c_int {
     const r = rel orelse return 0;
-    return relExactD(r, r.d, cols);
+    if (relExactD(r, r.d, cols) != 0) return 1;
+    if (r.ov) |ov| {
+        if (ov.count > 0 and ts_contains(ov, cols) != 0) return 1;
+    }
+    return 0;
 }
 
 /// int rel_exact_base(const relation *rel, const uint32_t *cols)
@@ -473,11 +680,65 @@ fn relPrefixD(rel: *const Relation, d: [*c]const dc.dafsa, leading: ?[*]const u3
     return ctx.count;
 }
 
+/// Overlay prefix scan: emit overlay tuples matching the k-column leading
+/// bound through the same cb contract as relPrefixD.  The tupleset is
+/// unsorted between flushes, so this filters by linear scan — acceptable
+/// because the overlay is bounded (flushed at consolidation) and point
+/// reads (rel_exact) take the O(1) hash path.
+const OvScanCtx = struct {
+    leading: ?[*]const u32,
+    k: u8,
+    arity: u8,
+    cb: RelEnumCb,
+    user: ?*anyopaque,
+    count: c_long,
+};
+
+fn ovScanCb(cols: ?[*]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_int {
+    _ = arity;
+    const ctx: *OvScanCtx = @ptrCast(@alignCast(user orelse return 0));
+    const p = cols.?;
+    var i: u8 = 0;
+    while (i < ctx.k) : (i += 1) {
+        if (p[i] != ctx.leading.?[i]) return 0;
+    }
+    ctx.count += 1;
+    return ctx.cb.?(p, ctx.arity, ctx.user);
+}
+
+fn ovPrefixScan(r: *const Relation, ov: *tupleset.tuple_set, leading: ?[*]const u32, k: u8, cb: RelEnumCb, user: ?*anyopaque) c_long {
+    if (ov.count == 0) return 0;
+    var ctx = OvScanCtx{
+        .leading = leading,
+        .k = k,
+        .arity = r.arity,
+        .cb = cb,
+        .user = user,
+        .count = 0,
+    };
+    var i: c_long = 0;
+    while (i < ov.count) : (i += 1) {
+        _ = ovScanCb(ov.data.? + @as(usize, @intCast(i)) * r.arity, r.arity, &ctx);
+    }
+    return ctx.count;
+}
+
 /// long rel_prefix(const relation *rel, const uint32_t *leading, uint8_t k,
 ///                 rel_enum_cb cb, void *user)
+/// VIEW = DAFSA ∪ overlay (C19).  NOTE: emission order is DAFSA (lex-sorted)
+/// then overlay (insertion order); consumers needing global sort must sort.
 pub export fn rel_prefix(rel: ?*const Relation, leading: ?[*]const u32, k: u8, cb: RelEnumCb, user: ?*anyopaque) c_long {
     const r = rel orelse return -1;
-    return relPrefixD(r, r.d, leading, k, cb, user);
+    ovConsolidateForRead(r);
+    const n = relPrefixD(r, r.d, leading, k, cb, user);
+    if (n < 0) return -1;
+    var total: c_long = n;
+    if (r.ov) |ov| {
+        const m = ovPrefixScan(r, ov, leading, k, cb, user);
+        if (m < 0) return -1;
+        total += m;
+    }
+    return total;
 }
 
 /// long rel_prefix_base(const relation *rel, const uint32_t *leading, uint8_t k,
@@ -756,6 +1017,12 @@ pub export fn rel_compact(rel: ?*Relation, dafsa_path: [*c]const u8) c_int {
     const r = rel orelse return -1;
     if (r.wal == null or dafsa_path == null) return -1;
 
+    // Fold the hot-write overlay into the DAFSA BEFORE truncating the WAL:
+    // un-flushed overlay facts are durable only through the WAL, so a
+    // compact-without-flush would silently destroy them (selfreg-dl-storage
+    // C18/C19).  On flush error the WAL is left intact, so nothing is lost.
+    if (rel_overlay_flush(r) != 0) return -1;
+
     // 1. Save the BASE DAFSA atomically.
     if (dc.dafsa_save(r.base, dafsa_path) != 0) return -1;
 
@@ -1018,6 +1285,7 @@ pub export fn rel_pattern(rel: ?*const Relation, dfa: [*c]const regexwalk.regex_
     const r = rel orelse return -1;
     if (dfa == null or cb == null) return -1;
 
+    ovConsolidateForRead(r);
     var ctx = PatCtx{
         .arity = r.arity,
         .cb = cb,
@@ -1059,6 +1327,7 @@ pub export fn rel_filter_col(rel: ?*const Relation, col: u8, set: [*c]const rege
     if (set == null or cb == null) return -1;
     if (col >= r.arity) return 0; // out of range: no matches
 
+    ovConsolidateForRead(r);
     var ctx = FilterCtx{
         .col = col,
         .set = set,

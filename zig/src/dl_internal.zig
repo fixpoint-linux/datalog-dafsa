@@ -141,6 +141,9 @@ pub const struct_dl_db = extern struct {
     delta_pending: [64]?*struct_tuple_set = @import("std").mem.zeroes([64]?*struct_tuple_set),
     del_pending: [64]?*struct_tuple_set = @import("std").mem.zeroes([64]?*struct_tuple_set),
 };
+// selfreg-dl-storage: dl.zig's DlDb appends Zig-only fields (compact_checks,
+// access_epoch) PAST this sizeof; dl.zig's comptime gate asserts the tail
+// lands at/after @sizeOf(struct_dl_db).  This mirror must NOT grow.
 pub const dl_db = struct_dl_db;
 pub const dl_schema = struct_dl_schema;
 pub extern fn dl_open(dir: [*c]const u8) [*c]dl_db;

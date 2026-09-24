@@ -76,6 +76,7 @@ extern "c" fn strlen(s: [*c]const u8) usize;
 extern "c" fn strncmp(a: [*c]const u8, b: [*c]const u8, n: usize) c_int;
 extern "c" fn strstr(haystack: [*c]const u8, needle: [*c]const u8) [*c]u8;
 extern "c" fn strtoul(nptr: [*c]const u8, endptr: [*c][*c]u8, base: c_int) c_ulong;
+extern "c" fn getenv(name: [*c]const u8) ?[*:0]const u8;
 extern "c" fn snprintf(buf: [*c]u8, size: usize, fmt: [*c]const u8, ...) c_int;
 extern "c" fn fprintf(stream: *c.FILE, fmt: [*c]const u8, ...) c_int;
 extern "c" fn getline(lineptr: *?[*]u8, n: *usize, stream: *c.FILE) isize;
@@ -202,6 +203,9 @@ pub const DlDb = extern struct {
     full_reeval_pending: c_int,
     delta_pending: [MAX_RELS]?*tupleset.tuple_set,
     del_pending: [MAX_RELS]?*tupleset.tuple_set,
+    // ─── selfreg-dl-storage (beyond C's sizeof(struct dl_db)) ─────────────
+    compact_checks: u64 = 0, // add counter for throttled compaction checks
+    access_epoch: u32 = 0, // C20: current consolidation epoch (cycle count)
 };
 
 // Comptime gate: our extern layouts must be byte-identical to the C header.
@@ -214,7 +218,11 @@ comptime {
     std.debug.assert(@sizeOf(ViewCacheSlot) == @sizeOf(dx.view_cache_slot));
     std.debug.assert(@sizeOf(PermIndexEntry) == @sizeOf(dx.perm_index_entry));
 
-    std.debug.assert(@sizeOf(DlDb) == @sizeOf(dx.dl_db));
+    // ─── selfreg-dl-storage: the C-prefix must stay byte-identical, but DlDb now
+    // carries Zig-only fields PAST C's sizeof (the facade pattern relation.zig
+    // uses for the overlay).  C allocates from its own sizeof; the Zig side
+    // allocates the larger struct and C never sees the tail.
+    std.debug.assert(@offsetOf(DlDb, "compact_checks") >= @sizeOf(dx.dl_db));
     std.debug.assert(@offsetOf(DlDb, "rels") == @offsetOf(dx.dl_db, "rels"));
     std.debug.assert(@offsetOf(DlDb, "nrels") == @offsetOf(dx.dl_db, "nrels"));
     std.debug.assert(@offsetOf(DlDb, "lock_fd") == @offsetOf(dx.dl_db, "lock_fd"));
@@ -225,6 +233,11 @@ comptime {
     std.debug.assert(@offsetOf(DlDb, "ast_rules") == @offsetOf(dx.dl_db, "ast_rules"));
     std.debug.assert(@offsetOf(DlDb, "delta_pending") == @offsetOf(dx.dl_db, "delta_pending"));
     std.debug.assert(@offsetOf(DlDb, "del_pending") == @offsetOf(dx.dl_db, "del_pending"));
+    // selfreg-dl-storage: the C-prefix must stay byte-identical, but DlDb now
+    // carries Zig-only fields PAST C's sizeof (the facade pattern relation.zig
+    // uses for the overlay).  C allocates from its own sizeof; the Zig side
+    // allocates the larger struct and C never sees the tail.
+    std.debug.assert(@offsetOf(DlDb, "compact_checks") >= @sizeOf(dx.dl_db));
 }
 
 // ─── Ported-module extern bindings (callees whose db type is a private ────
@@ -1619,6 +1632,7 @@ fn encodeFactKey(key: [*c]u8, key_len: *usize, cols: [*c]const u32, arity: u8) c
 
 /// v2: variadic add — WAL-backed variant for `arity`.
 fn dlAddFactVariadic(db: *DlDb, idx: usize, rel_name: [*c]const u8, cols: [*c]const u32, arity: u8) c_int {
+    _ = rel_name; // retained for signature parity; the variant rel carries paths
     var key: [33]u8 = undefined;
     var key_len: usize = undefined;
 
@@ -1656,45 +1670,41 @@ fn dlAddFactVariadic(db: *DlDb, idx: usize, rel_name: [*c]const u8, cols: [*c]co
         c.free(@ptrCast(tpath));
     }
 
-    // 2. Duplicate check against the variant BASE.
-    if (relation.rel_exact_base(vr, cols) != 0)
+    // 2. Duplicate check against the variant VIEW (base ∪ overlay).
+    if (relation.rel_exact(vr, cols) != 0)
         return 0;
 
     // 3. WAL-append ADD + sync.
     if (relation.rel_wal_append_add(vr, &key, @intCast(key_len)) != 0)
         return -1;
 
-    // 4. In-memory add to the variant BASE.
-    const rc = relation.rel_add_base(vr, cols);
+    // 4. In-memory add to the variant OVERLAY (hot-write; DAFSA untouched
+    //    until consolidation).
+    const rc = relation.rel_overlay_add(vr, cols);
     if (rc < 0) return -1;
     if (rc == 1) {
         permindex_mark_dirty(db, @intCast(idx));
         db.full_reeval_pending = 1;
     }
 
-    // 5. Compaction threshold (per variant).
-    {
-        const wal_sz = relation.rel_wal_size(vr);
-        const dafsa_sz = relation.rel_dafsa_size(vr);
-        if (dafsa_sz > 0 and wal_sz > dafsa_sz / 4) {
-            const path = if (relation.rel_is_idb(vr) != 0)
-                makeVpath(db, rel_name, arity, ".base.dafsa")
-            else
-                makeVpath(db, rel_name, arity, ".dafsa");
-            if (path != null) {
-                _ = relation.rel_compact(vr, path.?);
-                c.free(@ptrCast(path.?));
-            }
-        }
-    }
-
     db.fixpoint_dirty = 1;
     return 1; // added
 }
 
+/// How many adds between compaction-threshold evaluations.  The threshold
+/// check itself (rel_dafsa_size -> dafsa_stats) is a fresh O(states) BFS —
+/// measured 6.2ms at 100k states, 34.7ms at 800k — so it MUST NOT run per
+/// add (it made dl_add_fact 2500x slower than the DAFSA insert itself).
+/// 64 adds amortizes it to O(states/64) while still compacting promptly.
+const COMPACT_CHECK_EVERY: u64 = 64;
+
 /// CAS Slice 2: apply a fact add to the in-memory BASE + IVM delta capture.
+/// selfreg-dl-storage: the hot write lands in the OVERLAY (sorted-array
+/// tupleset, O(1) amortized) + the WAL (durable); the DAFSA is only touched
+/// at consolidation (dl_publish_snapshot -> rel_overlay_flush).
 fn addFactApply(db: *DlDb, idx: c_int, cols: [*c]const u32, arity: u8) c_int {
-    const rc = relation.rel_add_base(db.rels[@intCast(idx)].rel, cols);
+    const rel = db.rels[@intCast(idx)].rel;
+    const rc = relation.rel_overlay_add(rel, cols);
     if (rc < 0) return -1;
     if (rc == 1) {
         permindex_mark_dirty(db, idx);
@@ -1705,19 +1715,11 @@ fn addFactApply(db: *DlDb, idx: c_int, cols: [*c]const u32, arity: u8) c_int {
         }
     }
 
-    // Compaction threshold.
+    // Compaction threshold (throttled — see COMPACT_CHECK_EVERY).
     {
-        const wal_sz = relation.rel_wal_size(db.rels[@intCast(idx)].rel);
-        const dafsa_sz = relation.rel_dafsa_size(db.rels[@intCast(idx)].rel);
-        if (dafsa_sz > 0 and wal_sz > dafsa_sz / 4) {
-            const path = if (relation.rel_is_idb(db.rels[@intCast(idx)].rel) != 0)
-                makePath(db, db.rels[@intCast(idx)].name, ".base.dafsa")
-            else
-                makePath(db, db.rels[@intCast(idx)].name, ".dafsa");
-            if (path != null) {
-                _ = relation.rel_compact(db.rels[@intCast(idx)].rel, path.?);
-                c.free(@ptrCast(path.?));
-            }
+        db.compact_checks +%= 1;
+        if (db.compact_checks % COMPACT_CHECK_EVERY == 0) {
+            maybeCompact(db, idx);
         }
     }
 
@@ -1725,8 +1727,32 @@ fn addFactApply(db: *DlDb, idx: c_int, cols: [*c]const u32, arity: u8) c_int {
     return if (rc == 1) 1 else 0;
 }
 
+/// Evaluate + fire the WAL/dafsa compaction threshold for one relation.
+/// Shared by the throttled add path and consolidation.
+fn maybeCompact(db: *DlDb, idx: c_int) void {
+    const rel = db.rels[@intCast(idx)].rel;
+    const wal_sz = relation.rel_wal_size(rel);
+    const dafsa_sz = relation.rel_dafsa_size(rel);
+    if (dafsa_sz > 0 and wal_sz > dafsa_sz / 4) {
+        // Overlay facts must be IN the DAFSA before the WAL is truncated,
+        // or a crash between truncate and re-open loses them.
+        if (relation.rel_overlay_flush(rel) != 0) return;
+        const path = if (relation.rel_is_idb(rel) != 0)
+            makePath(db, db.rels[@intCast(idx)].name, ".base.dafsa")
+        else
+            makePath(db, db.rels[@intCast(idx)].name, ".dafsa");
+        if (path != null) {
+            _ = relation.rel_compact(rel, path.?);
+            c.free(@ptrCast(path.?));
+        }
+    }
+}
+
 /// CAS Slice 2: apply a fact delete to the in-memory BASE + IVM -delta.
 fn deleteFactApply(db: *DlDb, idx: c_int, cols: [*c]const u32, arity: u8) c_int {
+    // A pending overlay fact must be materialized before its DEL (C19:
+    // deletes only ever target the engine/recomputable layer).
+    if (relation.rel_overlay_flush(db.rels[@intCast(idx)].rel) != 0) return -1;
     const rc = relation.rel_delete_base(db.rels[@intCast(idx)].rel, cols);
     if (rc < 0) return -1;
     if (rc == 1) {
@@ -1786,8 +1812,10 @@ pub export fn dl_add_fact(db: ?*DlDb, rel_name: [*c]const u8, cols: [*c]const u3
         c.free(@ptrCast(tpath));
     }
 
-    // 2. Duplicate check against BASE.
-    if (relation.rel_exact_base(d.rels[@intCast(idx)].rel, cols) != 0)
+    // 2. Duplicate check against BASE ∪ overlay (supersession re-asserts
+    //    and true duplicates both land here; C19 latest-wins is the set
+    //    semantics of the key).
+    if (relation.rel_exact(d.rels[@intCast(idx)].rel, cols) != 0)
         return 0;
 
     // 3. WAL-append ADD + sync.
@@ -1809,9 +1837,12 @@ fn dlDeleteFactVariadic(db: *DlDb, idx: usize, cols: [*c]const u32, arity: u8) c
 
     if (encodeFactKey(&key, &key_len, cols, arity) != 0) return -1;
 
-    // 1. Absent check against the variant BASE.
-    if (relation.rel_exact_base(vr, cols) == 0)
+    // 1. Absent check against the variant VIEW; flush overlay so the DEL
+    //    can remove the fact from the DAFSA (C19).
+    if (relation.rel_exact(vr, cols) == 0)
         return 0;
+    if (relation.rel_overlay_flush(vr) != 0)
+        return -1;
 
     // 2. WAL-append DEL + sync.
     if (relation.rel_wal_append_del(vr, &key, @intCast(key_len)) != 0)
@@ -1848,9 +1879,13 @@ pub export fn dl_delete_fact(db: ?*DlDb, rel_name: [*c]const u8, cols: [*c]const
     var key_len: usize = undefined;
     if (encodeFactKey(&key, &key_len, cols, arity) != 0) return -1;
 
-    // 1. Absent check against BASE.
-    if (relation.rel_exact_base(d.rels[@intCast(idx)].rel, cols) == 0)
+    // 1. Absent check against the VIEW (base ∪ overlay) — a fact still in
+    //    the overlay must flush into the DAFSA before a DEL can remove it
+    //    (deletes exist only on the recomputable/engine layer, C19).
+    if (relation.rel_exact(d.rels[@intCast(idx)].rel, cols) == 0)
         return 0;
+    if (relation.rel_overlay_flush(d.rels[@intCast(idx)].rel) != 0)
+        return -1;
 
     // 2. WAL-append DEL + sync.
     if (relation.rel_wal_append_del(d.rels[@intCast(idx)].rel, &key, @intCast(key_len)) != 0)
@@ -1950,12 +1985,13 @@ pub export fn dl_cas_revision(db: ?*DlDb, entity: [*c]const u8, expected: u32, n
             d.full_reeval_pending = 1;
     }
 
-    // 2. ADD the new row.
+    // 2. ADD the new row (overlay hot path; supersession via delete+add of
+    //    the versioned row — the engine's CAS semantics, not a C19 change).
     new_cols[0] = entity_sym;
     new_cols[1] = new_value;
     if (encodeFactKey(&key, &key_len, &new_cols, 2) != 0) return -1;
     if (relation.rel_wal_append_add(rel, &key, @intCast(key_len)) != 0) return -1;
-    rc = relation.rel_add_base(rel, &new_cols);
+    rc = relation.rel_overlay_add(rel, &new_cols);
     if (rc < 0) return -1;
     if (rc == 1) {
         permindex_mark_dirty(d, rel_id);
@@ -1963,17 +1999,11 @@ pub export fn dl_cas_revision(db: ?*DlDb, entity: [*c]const u8, expected: u32, n
             d.full_reeval_pending = 1;
     }
 
-    // 3. Compaction threshold.
+    // 3. Compaction threshold (throttled with the add path's counter).
     {
-        const wal_sz = relation.rel_wal_size(rel);
-        const dafsa_sz = relation.rel_dafsa_size(rel);
-        if (dafsa_sz > 0 and wal_sz > dafsa_sz / 4) {
-            const path = makePath(d, "rev", ".dafsa");
-            if (path != null) {
-                _ = relation.rel_compact(rel, path.?);
-                c.free(@ptrCast(path.?));
-            }
-        }
+        d.compact_checks +%= 1;
+        if (d.compact_checks % COMPACT_CHECK_EVERY == 0)
+            maybeCompact(d, rel_id);
     }
 
     d.fixpoint_dirty = 1;
@@ -3900,6 +3930,62 @@ pub export fn dl_query_topdown_adorn(db: ?*DlDb, goal_rel: [*c]const u8, adorn: 
 
 // ─── M4: snapshot publish ───────────────────────────────────────────────────
 
+// ─── publish timing instrumentation (selfreg-dl-storage) ───────────────────
+//
+// Always-compiled cumulative timers for the materialization-vs-serialization
+// split.  Zero overhead when DL_PUB_TIMING is unset (one getenv at publish
+// entry); when set, each publish accumulates into these counters and
+// dl_publish_timing_reset() zeroes them.  dl_publish_timing_get() copies
+// them out.  NOT ABI-gated symbols (new dl_* additions only; the audit
+// checks the header-declared surface).
+const timec = @cImport({
+    @cDefine("_GNU_SOURCE", "1");
+    @cInclude("time.h");
+});
+
+pub const dl_publish_timing_out = extern struct {
+    n_publishes: u64, // number of publishes accumulated
+    t_intern_ns: u64, // interner save (symbols.dafsa + symbols.array)
+    t_terms_ns: u64, // term store save (terms.bin)
+    t_rel_save_ns: u64, // sum over relations: rel_save (dafsa serialization)
+    t_rel_other_ns: u64, // manifest writes + misc per-relation work
+    t_fsync_ns: u64, // dir fsyncs (tmp dir + snapshots dir)
+    t_rename_ns: u64, // atomic rename of tmp -> final
+    t_current_ns: u64, // CURRENT flip (atomic_write_str)
+    t_prune_ns: u64, // snapshot retention prune
+    t_ivm_ns: u64, // fixpoint materialization (step 1 cascade)
+    t_total_ns: u64, // whole dl_publish_snapshot call
+};
+
+var pub_timers = std.mem.zeroes(dl_publish_timing_out);
+var pub_timers_on: bool = false;
+var pub_timers_env_checked: bool = false;
+
+fn pubTimersCheckEnv() void {
+    if (pub_timers_env_checked) return;
+    pub_timers_env_checked = true;
+    const v = getenv("DL_PUB_TIMING");
+    pub_timers_on = (v != null and v.?[0] != 0 and !strEq(v.?, "0"));
+}
+
+fn nowNs() u64 {
+    // std.time.nanoTimestamp was dropped in 0.16; clock_gettime directly.
+    var ts: timec.struct_timespec = undefined;
+    _ = timec.clock_gettime(timec.CLOCK_MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.tv_sec)) * 1_000_000_000 + @as(u64, @intCast(ts.tv_nsec));
+}
+
+/// void dl_publish_timing_get(dl_publish_timing_out *out)
+pub export fn dl_publish_timing_get(out: ?*dl_publish_timing_out) void {
+    const o = out orelse return;
+    o.* = pub_timers;
+}
+
+/// void dl_publish_timing_reset(void)
+pub export fn dl_publish_timing_reset() void {
+    pub_timers = std.mem.zeroes(dl_publish_timing_out);
+}
+
 /// Best-effort recursive removal of a file or directory.
 fn rmRf(path: [*c]const u8) void {
     const d = posix.opendir(path);
@@ -4024,6 +4110,120 @@ fn pruneSnapshots(db: *DlDb) void {
     if (vers) |x| c.free(@ptrCast(x));
 }
 
+// ─── Access-epoch decay (selfreg-dl-storage, design decision C20) ─────────
+//
+// WHY EPOCHS, NOT PER-ACCESS WRITES: tracking last-access per fact would
+// make every read a write — fatal under the exclusive reader/writer lock
+// (C13: readers and the writer cannot coexist) and outside the ~10us
+// per-step budget (point reads measure 1.5-8.5us; a per-read WAL append +
+// fsync measures 0.7us BEST-case on tmpfs and forces reader/writer
+// alternation per read).  So "last access" is approximated at CYCLE
+// (consolidation) granularity: each relation carries ov_epoch, bumped when
+// the relation is written or read through the overlay during a cycle; decay
+// is applied AT CONSOLIDATION ONLY — the same sleep cycle the overlay
+// introduces.  Decay costs O(relations), never O(store), and the durable
+// store never sees a read.
+//
+// WHAT DECAYS AND WHAT MUST NOT (C9 split): DECISIONS/OBSERVATIONS (EDB
+// facts) are the unrecoverable class — append-only, never decayed, only
+// REWEIGHTED.  DERIVED (IDB) facts are recomputable from premises — the
+// recomputable layer may be dropped at consolidation because the IVM
+// cascade re-derives it.  decayApply therefore only prunes IDB view
+// relations that the fixpoint will rebuild; EDB base relations are never
+// touched.
+//
+// RATE DERIVATION (not tuned): steady-state overlay memory under decay is
+// bounded by (arrivals per cycle) * (cycles of retention).  The budget
+// criterion is: decay must retain at least one full hot cycle of writes
+// (err SLOW — decaying something the mechanism still needs is a SILENT
+// failure, while unbounded memory is LOUD), so retention >= 1 cycle by
+// construction and the knob is the SIZE GATE: if the total overlay
+// occupancy across relations exceeds DL_OVERLAY_BUDGET_BYTES, consolidation
+// flushes (materializes) ALL overlays early rather than letting the working
+// set grow unbounded.  Flushing is always safe (the overlay is a cache of
+// WAL-durable facts, not the durability record itself).
+//
+// SIZE GATE: the overlay working set is bounded by DL_OVERLAY_BUDGET_BYTES
+// (default 256 MiB, override via DL_OVERLAY_BUDGET_MB).  Exceeding it at
+// consolidation forces a full materialization — memory explosion is caught
+// LOUDLY (a slow publish) instead of silently (OOM).
+
+/// Default overlay working-set budget before the size gate forces a full
+/// materialization (bytes).
+const DL_OVERLAY_BUDGET_BYTES_DEFAULT: u64 = 256 * 1024 * 1024;
+
+fn overlayBudgetBytes() u64 {
+    const v = getenv("DL_OVERLAY_BUDGET_MB");
+    if (v != null and v.?[0] != 0) {
+        const mb = strtoul(v, null, 10);
+        if (mb > 0) return mb * 1024 * 1024;
+    }
+    return DL_OVERLAY_BUDGET_BYTES_DEFAULT;
+}
+
+/// Total overlay occupancy across all relations, in approximate bytes
+/// (tuples * arity * 4 for the sorted array + 4 for the hash slot).
+fn overlayTotalBytes(d: *DlDb) u64 {
+    var total: u64 = 0;
+    var ri: usize = 0;
+    while (ri < d.nrels) : (ri += 1) {
+        if (d.rels[ri].kind == RELK_VARIADIC) {
+            var a: u8 = 1;
+            while (a <= MAX_VAR_ARITY) : (a += 1) {
+                const vr = vrelation.vrel_variant_or_null(d.rels[ri].vrel, a);
+                if (vr != null)
+                    total += relation.rel_overlay_count(vr) * (@as(u64, d.rels[ri].arity + 1) * 4 + 4);
+            }
+        } else {
+            total += relation.rel_overlay_count(d.rels[ri].rel) * (@as(u64, d.rels[ri].arity) * 4 + 4);
+        }
+    }
+    return total;
+}
+
+/// Decay + size-gate pass, run at consolidation.  Returns 0 ok / -1 error.
+/// Err-slow by construction: nothing is dropped; the only action is
+/// materializing overlays (always safe) when the working set exceeds the
+/// budget.  IDB relations whose facts are recomputable rely on the IVM
+/// cascade (step 1 of publish) to rebuild — decay never deletes a premise.
+fn decayApply(d: *DlDb) c_int {
+    if (overlayTotalBytes(d) > overlayBudgetBytes()) {
+        // SIZE GATE fired: the working set is exploding; materialize all
+        // overlays NOW (this publish is slower, i.e. LOUD, but memory is
+        // bounded).  rel_overlay_flush is idempotent after the publish-time
+        // flush — this only triggers if the budget was exceeded BEFORE the
+        // flush pass, i.e. on the next cycle after a huge batch.
+        var ri: usize = 0;
+        while (ri < d.nrels) : (ri += 1) {
+            if (d.rels[ri].kind == RELK_VARIADIC) {
+                var a: u8 = 1;
+                while (a <= MAX_VAR_ARITY) : (a += 1) {
+                    const vr = vrelation.vrel_variant_or_null(d.rels[ri].vrel, a);
+                    if (vr != null and relation.rel_overlay_flush(vr) != 0)
+                        return -1;
+                }
+            } else {
+                if (relation.rel_overlay_flush(d.rels[ri].rel) != 0)
+                    return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+/// double dl_overlay_bytes(db) — test/bench observable: current overlay
+/// working-set size in bytes.
+pub export fn dl_overlay_bytes(db: ?*const DlDb) f64 {
+    const d = db orelse return 0;
+    return @floatFromInt(overlayTotalBytes(@constCast(d)));
+}
+
+/// uint32_t dl_access_epoch(db) — test observable: current access epoch.
+pub export fn dl_access_epoch(db: ?*const DlDb) u32 {
+    const d = db orelse return 0;
+    return d.access_epoch;
+}
+
 pub export fn dl_publish_snapshot(db: ?*DlDb) c_int {
     const d = db orelse return -1;
     var snapshots_dir: [4096:0]u8 = undefined;
@@ -4035,6 +4235,43 @@ pub export fn dl_publish_snapshot(db: ?*DlDb) c_int {
 
     if (d.read_only != 0) return -1;
     if (d.txn != null) return -1;
+
+    pubTimersCheckEnv();
+    const t_start = nowNs();
+    var t_mark: u64 = t_start;
+
+    // ─── CONSOLIDATION: the single maintenance point (selfreg-dl-storage) ──
+    //
+    // Because readers and the writer cannot coexist (C13), publish IS the
+    // quiescent boundary — the natural "stop the world".  ALL store
+    // maintenance happens here, in one scheduled place:
+    //   1. fold every relation's hot-write overlay into its DAFSA (C19);
+    //   2. resolve supersession (latest-wins is the flush's set union);
+    //   3. advance the access epoch (C20 decay bookkeeping);
+    //   4. apply decay / fire the size gate (see decayApply below);
+    //   5. materialize derived facts (the IVM cascade, step 1 below);
+    //   6. serialize the consolidated state into the new snapshot.
+    // Un-consolidated writes stay durable in the fsynced per-relation WALs,
+    // replayed at open — a crash loses nothing committed.
+    {
+        var ri: usize = 0;
+        while (ri < d.nrels) : (ri += 1) {
+            if (d.rels[ri].kind == RELK_VARIADIC) {
+                var a: u8 = 1;
+                while (a <= MAX_VAR_ARITY) : (a += 1) {
+                    const vr = vrelation.vrel_variant_or_null(d.rels[ri].vrel, a);
+                    if (vr == null) continue;
+                    if (relation.rel_overlay_flush(vr) != 0)
+                        return -1;
+                }
+            } else {
+                if (relation.rel_overlay_flush(d.rels[ri].rel) != 0)
+                    return -1;
+            }
+        }
+        d.access_epoch +%= 1;
+        if (decayApply(d) != 0) return -1;
+    }
 
     // 1. Materialize derived views if rules exist and the fixpoint is dirty.
     //    IVM Slice 1/3 dispatch cascade (the correctness crux).
@@ -4104,6 +4341,10 @@ pub export fn dl_publish_snapshot(db: ?*DlDb) c_int {
         d.full_reeval_pending = 0;
         d.fixpoint_dirty = 0;
     }
+    if (pub_timers_on) {
+        pub_timers.t_ivm_ns += nowNs() - t_mark;
+        t_mark = nowNs();
+    }
 
     // 2. Determine new version
     const new_version = d.snap_version +% 1;
@@ -4129,6 +4370,10 @@ pub export fn dl_publish_snapshot(db: ?*DlDb) c_int {
         if (dc.dafsa_save(@ptrCast(@alignCast(intern_fwd(d.ir))), &fwd) != 0)
             return dlPublishFail(&tmp_dir, &new_dir, renamed);
     }
+    if (pub_timers_on) {
+        pub_timers.t_intern_ns += nowNs() - t_mark;
+        t_mark = nowNs();
+    }
 
     // 4a'. Save the list term store.
     {
@@ -4137,12 +4382,17 @@ pub export fn dl_publish_snapshot(db: ?*DlDb) c_int {
         if (term_save(d.terms, &tpath) != 0)
             return dlPublishFail(&tmp_dir, &new_dir, renamed);
     }
+    if (pub_timers_on) {
+        pub_timers.t_terms_ns += nowNs() - t_mark;
+        t_mark = nowNs();
+    }
 
     // 4b. Save each relation + write manifest.
     {
         var manifest_path: [4096:0]u8 = undefined;
         _ = snprintf(&manifest_path, 4096, "%s/manifest.txt", &tmp_dir);
         const mf = c.fopen(&manifest_path, "w") orelse return dlPublishFail(&tmp_dir, &new_dir, renamed);
+        var t_rel_mark: u64 = if (pub_timers_on) nowNs() else 0;
 
         _ = fprintf(mf, "# Datalog-DAFSA snapshot version %u\n", new_version);
 
@@ -4170,6 +4420,11 @@ pub export fn dl_publish_snapshot(db: ?*DlDb) c_int {
                         _ = c.fclose(mf);
                         return dlPublishFail(&tmp_dir, &new_dir, renamed);
                     }
+                    if (pub_timers_on) {
+                        const nw = nowNs();
+                        pub_timers.t_rel_save_ns += nw - t_rel_mark;
+                        t_rel_mark = nw;
+                    }
                     if (d.fault_hook) |hook| {
                         if (hook(DL_FPOINT_AFTER_REL_SAVE, d.fault_user) != 0) {
                             _ = c.fclose(mf);
@@ -4188,6 +4443,11 @@ pub export fn dl_publish_snapshot(db: ?*DlDb) c_int {
             if (relation.rel_save(d.rels[i].rel, &rel_path) != 0) {
                 _ = c.fclose(mf);
                 return dlPublishFail(&tmp_dir, &new_dir, renamed);
+            }
+            if (pub_timers_on) {
+                const nw = nowNs();
+                pub_timers.t_rel_save_ns += nw - t_rel_mark;
+                t_rel_mark = nw;
             }
 
             if (d.fault_hook) |hook| {
@@ -4220,17 +4480,34 @@ pub export fn dl_publish_snapshot(db: ?*DlDb) c_int {
         }
 
         if (c.fclose(mf) != 0) return dlPublishFail(&tmp_dir, &new_dir, renamed);
+        if (pub_timers_on) pub_timers.t_rel_other_ns += nowNs() - t_rel_mark;
     }
+    if (pub_timers_on) t_mark = nowNs();
 
     // 4c. fsync the tmp dir
     if (fsync_dir_path(&tmp_dir) != 0) return dlPublishFail(&tmp_dir, &new_dir, renamed);
+    if (pub_timers_on) {
+        const nw = nowNs();
+        pub_timers.t_fsync_ns += nw - t_mark;
+        t_mark = nw;
+    }
 
     // 5. Atomic rename: .tmp → final dir
     _ = snprintf(&new_dir, 4096, "%s/snapshots/%u", d.dir.?, new_version);
     rmRf(&new_dir);
     if (posix.rename(&tmp_dir, &new_dir) != 0) return dlPublishFail(&tmp_dir, &new_dir, renamed);
     renamed = 1;
+    if (pub_timers_on) {
+        const nw = nowNs();
+        pub_timers.t_rename_ns += nw - t_mark;
+        t_mark = nw;
+    }
     if (fsync_dir_path(&snapshots_dir) != 0) return dlPublishFail(&tmp_dir, &new_dir, renamed);
+    if (pub_timers_on) {
+        const nw = nowNs();
+        pub_timers.t_fsync_ns += nw - t_mark;
+        t_mark = nw;
+    }
 
     // FAULT HOOK: after rename (before CURRENT flip)
     if (d.fault_hook) |hook| {
@@ -4245,6 +4522,11 @@ pub export fn dl_publish_snapshot(db: ?*DlDb) c_int {
     _ = snprintf(&buf, 4096, "%u\n", new_version);
     if (atomic_write_str(&current_path, &buf) != 0)
         return dlPublishFail(&tmp_dir, &new_dir, renamed);
+    if (pub_timers_on) {
+        const nw = nowNs();
+        pub_timers.t_current_ns += nw - t_mark;
+        t_mark = nw;
+    }
 
     // 7. Invalidate cache + update snap_version
     vcache_invalidate(&d.vcache);
@@ -4253,6 +4535,12 @@ pub export fn dl_publish_snapshot(db: ?*DlDb) c_int {
     // 8. Opt-in retention
     if (d.snapshot_retain > 0)
         pruneSnapshots(d);
+
+    if (pub_timers_on) {
+        pub_timers.t_prune_ns += nowNs() - t_mark;
+        pub_timers.t_total_ns += nowNs() - t_start;
+        pub_timers.n_publishes += 1;
+    }
 
     return 0;
 }
