@@ -224,11 +224,26 @@ pub export fn rel_overlay_count(rel: ?*const Relation) u64 {
     return @intCast(ov.count);
 }
 
-/// Fold the overlay into the VIEW DAFSA and drop it (consolidation step).
-/// Pure set union merge: enumerate d ∪ ov into one sorted tupleset and bulk
-/// rebuild via dafsa_build_sorted (the Daciuk sorted-insert construction),
-/// then swap.  The whole relation is materialized at most once per
-/// consolidation cycle, never per add.  Returns 0 ok / -1 error.
+/// Incrementally insert one fact into a DAFSA (4*arity+1-byte key).  The
+/// engine is the Carrasco & Forcada incremental construction: dafsa_add_n
+/// maintains minimality in place at O(key) — the same per-fact path rel_add
+/// (above) and WAL replay (below) already drive on live DAFSAs, so a DAFSA
+/// built by dafsa_build_sorted and one grown by dafsa_add_n are the same
+/// object.  Returns 1 added / 0 already present / -1 error.
+fn ovFoldInto(d: [*c]dc.dafsa, key: [*]const u8, key_len: usize) c_int {
+    return dc.dafsa_add_n(d, key, key_len);
+}
+
+/// Fold the overlay into the DAFSA and drop it (consolidation step).
+/// The overlay is a PURE SET UNION over d (C19 append-only), so folding is
+/// dafsa_add_n per overlay fact — O(overlay), in place, minimality kept —
+/// instead of the enumerate d ∪ ov + ts_sort + dafsa_build_sorted full
+/// rebuild, which paid O(store) on EVERY consolidation regardless of delta
+/// size.  On error the DAFSAs are left with a PREFIX of the overlay folded
+/// in: the union read is unaffected (every fact is still in d ∪ ov, no
+/// masking), the fold is idempotent (already-present keys return 0), and
+/// `ov` is only cleared after the fold fully succeeds so a retry re-folds
+/// exactly the remaining facts.  Returns 0 ok / -1 error.
 pub export fn rel_overlay_flush(rel: ?*Relation) c_int {
     const r = rel orelse return -1;
     const ov = r.ov orelse return 0;
@@ -237,71 +252,26 @@ pub export fn rel_overlay_flush(rel: ?*Relation) c_int {
         return 0;
     }
 
-    // d ∪ ov, sorted + dedup'd, -> fresh minimal DAFSA
-    var ts: tupleset.tuple_set = undefined;
-    if (ts_init(&ts, r.arity) != 0) return -1;
-    if (relPrefixD(r, r.d, null, 0, ts_sink_cb, &ts) < 0) {
-        ts_free(&ts);
-        return -1;
-    }
     var i: c_long = 0;
+    var rc: c_int = 0;
     while (i < ov.count) : (i += 1) {
-        if (ts_add(&ts, ov.data.? + @as(usize, @intCast(i)) * r.arity) < 0) {
-            ts_free(&ts);
-            return -1;
+        var key: [MAX_KEY_LEN]u8 = undefined;
+        const key_len = encodeKey(&key, ov.data.? + @as(usize, @intCast(i)) * r.arity, r.arity);
+        rc = ovFoldInto(r.d, &key, key_len);
+        if (rc < 0) break;
+        // Overlay facts are EDB premises — they must survive a view reset —
+        // so a split (IDB) relation folds them into the BASE too.  The view
+        // already contains them; the base fold failing leaves d complete and
+        // the overlay intact (retry below at the next consolidation).
+        if (r.base != r.d and ovFoldInto(r.base, &key, key_len) < 0) {
+            rc = -1;
+            break;
         }
     }
-    ts_sort(&ts);
-    const nd = dafsaBuildFromTs(&ts, r.arity);
-    ts_free(&ts);
-    if (nd == null) return -1;
 
-    const aliased = (r.base == r.d);
-    // Preserve the split if base != d (IDB): rebuild the VIEW only, and
-    // fold the overlay into the BASE too (overlay facts are EDB premises —
-    // they must survive a view reset).  For aliased EDB relations the
-    // single DAFSA is both.
-    if (aliased) {
-        dc.dafsa_free(r.d);
-        r.d = nd;
-        r.base = r.d;
-    } else {
-        // IDB: union overlay into base via the same tupleset, keep view.
-        var bts: tupleset.tuple_set = undefined;
-        if (ts_init(&bts, r.arity) != 0) {
-            dc.dafsa_free(nd);
-            return -1;
-        }
-        var ok: c_int = 0;
-        if (relPrefixD(r, r.base, null, 0, ts_sink_cb, &bts) == 0) {
-            var j: c_long = 0;
-            ok = 1;
-            while (j < ov.count) : (j += 1) {
-                if (ts_add(&bts, ov.data.? + @as(usize, @intCast(j)) * r.arity) < 0) {
-                    ok = 0;
-                    break;
-                }
-            }
-        }
-        if (ok == 0) {
-            ts_free(&bts);
-            dc.dafsa_free(nd);
-            return -1;
-        }
-        ts_sort(&bts);
-        const nb = dafsaBuildFromTs(&bts, r.arity);
-        ts_free(&bts);
-        if (nb == null) {
-            dc.dafsa_free(nd);
-            return -1;
-        }
-        dc.dafsa_free(r.base);
-        dc.dafsa_free(r.d);
-        r.base = nb;
-        r.d = nd; // view already includes base via the union above
-    }
+    if (rc < 0) return -1; // partial fold: overlay kept, reads still complete
+
     r.dirty = 1;
-
     ts_reset(ov); // capacity kept; hash cleared
     r.ov_dirty = 0;
     return 0;
