@@ -2436,7 +2436,17 @@ pub export fn vm_ivm_eligible(db: ?*dx.dl_db) c_int {
             const op: u8 = cr.instrs.?[@intCast(k)].op;
             if (op == OP_NEG_CHECK) return 0;
             if (op == OP_WALK) return 0;
-            if (op == OP_LOOKUP_PERM) return 0;
+            // OP_LOOKUP_PERM is IVM-safe only over a same-stratum recursive
+            // head: the fixpoint loop substitutes a perm shadow there
+            // (rebuildPermShadows).  Any other perm atom (EDB or lower-
+            // stratum IDB) is invisible to the seed/propagate firing loops,
+            // which only match OP_SCAN/OP_LOOKUP, so it must stay rejected.
+            if (op == OP_LOOKUP_PERM) {
+                const R: c_int = @intCast(cr.instrs.?[@intCast(k)].a);
+                if (R < 0 or R >= MAX_RELS) return 0;
+                if (is_rec_head[@intCast(R)] == 0 or rec_stratum[@intCast(R)] != cr.stratum) return 0;
+                continue;
+            }
             if (op == OP_HASH_JOIN) return 0;
             if (op == OP_MAT_BEGIN) return 0;
             if (op == OP_MAT_JOIN) return 0;
