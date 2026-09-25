@@ -528,6 +528,32 @@ long dl_pattern(dl_db *db, const char *rel_name, uint8_t col, const struct regex
  * After publish, dl_query reads from mmap instead of the VM. */
 int dl_publish_snapshot(dl_db *db);
 
+/* ─── Periodic consolidation (selfreg periodic snapshot) ───────────────── */
+
+/* Consolidate without necessarily snapshotting: fsync every per-relation WAL
+ * (the cycle-boundary durability barrier), fold each relation's hot-write
+ * overlay into its DAFSA, advance the access epoch, apply decay, and
+ * materialize derived facts (the IVM cascade).  This is the cheap O(delta)
+ * per-turn maintenance point.
+ *
+ * It materializes a NEW versioned snapshot when the total WAL-append bytes
+ * since the last materialization meet or exceed the snapshot budget (the
+ * default 64 MiB, override DL_SNAPSHOT_BUDGET_MB, or dl_set_snapshot_budget).
+ * With a budget of 0 it never snapshots (the pure "in-memory with sync"
+ * mode).  So the snapshot is PERIODIC (budget-triggered at consolidation-
+ * time) instead of per-publish; dl_publish_snapshot remains the explicit
+ * every-call checkpoint.
+ *
+ * Returns 0 on success, -1 on error (NULL db, read-only handle, open txn,
+ * or a consolidation/materialization failure). */
+int dl_consolidate(dl_db *db);
+
+/* Set the WAL-append byte budget that triggers a snapshot materialization
+ * inside dl_consolidate.  bytes == 0 disables auto-snapshot: dl_consolidate
+ * then only consolidates and never materializes.  The default is 64 MiB
+ * (DL_SNAPSHOT_BUDGET_MB).  Returns 0 on success, -1 on a NULL db. */
+int dl_set_snapshot_budget(dl_db *db, uint64_t bytes);
+
 /* ─── Time-travel / as-of queries ──────────────────────────────────────── */
 
 /* Enumerate every published snapshot version in ascending order.  Returns the

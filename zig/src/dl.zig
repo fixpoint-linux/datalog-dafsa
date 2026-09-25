@@ -223,6 +223,14 @@ pub const DlDb = extern struct {
     // detects the restart; rev alone suffices for fixed relations and
     // variadic variants (created once per process, never re-created).
     saved_perm_rel: [MAX_PERMS]?*anyopaque = @splat(null),
+    // ─── selfreg periodic snapshot (beyond C's sizeof) ────────────────────
+    // snapshot_budget_bytes: WAL-append byte budget for dl_consolidate's
+    // auto-materialization (0 = never auto-snapshot; set via
+    // dl_set_snapshot_budget).  wal_appended_at_snapshot is the sum of
+    // rel_wal_appended() across relations at the last materialization; the
+    // trigger fires when sum(rel_wal_appended) - watermark >= budget.
+    snapshot_budget_bytes: u64 = 0,
+    wal_appended_at_snapshot: u64 = 0,
 };
 
 /// Marker for "not yet serialized by any publish of this process".
@@ -708,6 +716,9 @@ fn dlOpenCommon(dir: ?[*:0]const u8, err_out: ?*c_int, ro: c_int) ?*DlDb {
     db.fixpoint_dirty = 0;
     db.snap_version = 0;
     db.snapshot_retain = 0;
+    // Periodic snapshot: default budget from env (64 MiB); 0 would mean
+    // "never auto-snapshot" — the default keeps dl_consolidate periodic.
+    db.snapshot_budget_bytes = snapshotBudgetBytes();
     // Publish gate: mem.zeroes above clears the default-field sentinels;
     // re-arm them so the first publish of this process serializes
     // everything (open-time WAL replay does not bump rev).
@@ -4214,6 +4225,19 @@ fn overlayBudgetBytes() u64 {
     return DL_OVERLAY_BUDGET_BYTES_DEFAULT;
 }
 
+/// Default WAL-append byte budget before dl_consolidate materializes a
+/// snapshot (selfreg periodic snapshot).  Env override DL_SNAPSHOT_BUDGET_MB.
+const DL_SNAPSHOT_BUDGET_BYTES_DEFAULT: u64 = 64 * 1024 * 1024;
+
+fn snapshotBudgetBytes() u64 {
+    const v = getenv("DL_SNAPSHOT_BUDGET_MB");
+    if (v != null and v.?[0] != 0) {
+        const mb = strtoul(v, null, 10);
+        if (mb > 0) return mb * 1024 * 1024;
+    }
+    return DL_SNAPSHOT_BUDGET_BYTES_DEFAULT;
+}
+
 /// Total overlay occupancy across all relations, in approximate bytes
 /// (tuples * arity * 4 for the sorted array + 4 for the hash slot).
 fn overlayTotalBytes(d: *DlDb) u64 {
@@ -4303,54 +4327,48 @@ fn syncAllWals(d: *DlDb) void {
     }
 }
 
-pub export fn dl_publish_snapshot(db: ?*DlDb) c_int {
-    const d = db orelse return -1;
-    var snapshots_dir: [4096:0]u8 = undefined;
-    var tmp_dir: [4096:0]u8 = undefined;
-    var new_dir: [4096:0]u8 = undefined;
-    var current_path: [4096:0]u8 = undefined;
-    var buf: [4096:0]u8 = undefined;
-    var renamed: c_int = 0;
-    // Publish-gate staging (defect: watermark committed before durability).
-    // relSaveGated writes the NEW rev here instead of into d.saved_rev*;
-    // the staged values are COMMITTED into the live watermarks only at the
-    // successful end of this publish (step 7).  Until then the live
-    // watermarks keep describing the LAST durable snapshot, so a publish
-    // that fails after a gated save (fclose, fsync, CURRENT flip) leaves
-    // them untouched — the invariant "a watermark never claims content is
-    // in the previous snapshot unless it is actually durable in it" holds
-    // even on the failure path, and a mutation-free retry re-serializes
-    // instead of hardlinking bytes that were never published.
-    var stage_rev: [MAX_RELS]u64 = @splat(SAVED_REV_NONE);
-    var stage_rev_var: [MAX_RELS][MAX_VAR_ARITY + 1]u64 = @splat(@splat(SAVED_REV_NONE));
-    var stage_rev_perm: [MAX_PERMS]u64 = @splat(SAVED_REV_NONE);
-    var stage_perm_rel: [MAX_PERMS]?*anyopaque = @splat(null);
+/// Sum of rel_wal_appended() over every relation that carries a WAL
+/// (fixed relations + variadic variants).  This is the monotonic append
+/// traffic since open, immune to rel_compact's ftruncate — the signal the
+/// periodic-snapshot trigger compares against wal_appended_at_snapshot.
+fn sumRelWalAppended(d: *DlDb) u64 {
+    var total: u64 = 0;
+    var ri: usize = 0;
+    while (ri < d.nrels) : (ri += 1) {
+        if (d.rels[ri].kind == RELK_VARIADIC) {
+            var a: u8 = 1;
+            while (a <= MAX_VAR_ARITY) : (a += 1) {
+                const vr = vrelation.vrel_variant_or_null(d.rels[ri].vrel, a);
+                if (vr != null) total += relation.rel_wal_appended(vr);
+            }
+        } else {
+            total += relation.rel_wal_appended(d.rels[ri].rel);
+        }
+    }
+    return total;
+}
 
-    if (d.read_only != 0) return -1;
-    if (d.txn != null) return -1;
-
-    pubTimersCheckEnv();
-    const t_start = nowNs();
-    var t_mark: u64 = t_start;
-
-    // ─── CONSOLIDATION: the single maintenance point (selfreg-dl-storage) ──
-    //
-    // Because readers and the writer cannot coexist (C13), publish IS the
-    // quiescent boundary — the natural "stop the world".  ALL store
-    // maintenance happens here, in one scheduled place:
-    //   0. fsync every per-relation WAL (the cycle-boundary durability
-    //      barrier — selfreg-batched-fsync);
-    //   1. fold every relation's hot-write overlay into its DAFSA (C19);
-    //   2. resolve supersession (latest-wins is the flush's set union);
-    //   3. advance the access epoch (C20 decay bookkeeping);
-    //   4. apply decay / fire the size gate (see decayApply below);
-    //   5. materialize derived facts (the IVM cascade, step 1 below);
-    //   6. serialize the consolidated state into the new snapshot.
-    // Durability contract (selfreg-batched-fsync): the per-relation WALs are
-    // fsync'd HERE and at dl_close — NOT per append.  Un-consolidated EDB
-    // writes are durable only from this barrier onward; a crash before the
-    // next barrier loses exactly the current cycle's writes (a bounded,
-    // stated exposure), while everything before it replays at open.
+/// Consolidation (selfreg-dl-storage): the single maintenance point shared by
+/// dl_publish_snapshot and dl_consolidate.  Because readers and the writer
+/// cannot coexist (C13), this is the quiescent boundary — the natural
+/// "stop the world".  ALL non-materializing store maintenance happens here:
+///   0. fsync every per-relation WAL (the cycle-boundary durability
+///      barrier — selfreg-batched-fsync);
+///   1. fold every relation's hot-write overlay into its DAFSA (C19);
+///   2. resolve supersession (latest-wins is the flush's set union);
+///   3. advance the access epoch (C20 decay bookkeeping);
+///   4. apply decay / fire the size gate (see decayApply below);
+///   5. materialize derived facts (the IVM cascade, step 1 below).
+/// Durability contract (selfreg-batched-fsync): the per-relation WALs are
+/// fsync'd HERE and at dl_close — NOT per append.  Un-consolidated EDB
+/// writes are durable only from this barrier onward; a crash before the
+/// next barrier loses exactly the current cycle's writes (a bounded,
+/// stated exposure), while everything before it replays at open.
+/// This is the CHEAP half: it does NOT serialize the store into a snapshot
+/// (that is materializeSnapshot, gated by the budget trigger in
+/// dl_consolidate and unconditional in dl_publish_snapshot).
+fn consolidate(d: *DlDb) c_int {
+    const t_mark: u64 = if (pub_timers_on) nowNs() else 0;
     {
         syncAllWals(d);
         var ri: usize = 0;
@@ -4442,8 +4460,39 @@ pub export fn dl_publish_snapshot(db: ?*DlDb) c_int {
     }
     if (pub_timers_on) {
         pub_timers.t_ivm_ns += nowNs() - t_mark;
-        t_mark = nowNs();
     }
+    return 0;
+}
+
+/// Snapshot materialization: serialize the consolidated state into a NEW
+/// versioned snapshot dir and flip CURRENT (steps 2-8 of the publish
+/// contract).  This is the EXPENSIVE half — O(store) serialize + the tmp/
+/// snapshots dir fsyncs — and is what the periodic-snapshot trigger gates.
+/// Also resets the WAL-append watermark so the next budget window counts
+/// only traffic since THIS materialization.
+fn materializeSnapshot(d: *DlDb) c_int {
+    var snapshots_dir: [4096:0]u8 = undefined;
+    var tmp_dir: [4096:0]u8 = undefined;
+    var new_dir: [4096:0]u8 = undefined;
+    var current_path: [4096:0]u8 = undefined;
+    var buf: [4096:0]u8 = undefined;
+    var renamed: c_int = 0;
+    // Publish-gate staging (defect: watermark committed before durability).
+    // relSaveGated writes the NEW rev here instead of into d.saved_rev*;
+    // the staged values are COMMITTED into the live watermarks only at the
+    // successful end of this publish (step 7).  Until then the live
+    // watermarks keep describing the LAST durable snapshot, so a publish
+    // that fails after a gated save (fclose, fsync, CURRENT flip) leaves
+    // them untouched — the invariant "a watermark never claims content is
+    // in the previous snapshot unless it is actually durable in it" holds
+    // even on the failure path, and a mutation-free retry re-serializes
+    // instead of hardlinking bytes that were never published.
+    var stage_rev: [MAX_RELS]u64 = @splat(SAVED_REV_NONE);
+    var stage_rev_var: [MAX_RELS][MAX_VAR_ARITY + 1]u64 = @splat(@splat(SAVED_REV_NONE));
+    var stage_rev_perm: [MAX_PERMS]u64 = @splat(SAVED_REV_NONE);
+    var stage_perm_rel: [MAX_PERMS]?*anyopaque = @splat(null);
+
+    var t_mark: u64 = if (pub_timers_on) nowNs() else 0;
 
     // 2. Determine new version
     const new_version = d.snap_version +% 1;
@@ -4662,10 +4711,71 @@ pub export fn dl_publish_snapshot(db: ?*DlDb) c_int {
 
     if (pub_timers_on) {
         pub_timers.t_prune_ns += nowNs() - t_mark;
+    }
+
+    // Reset the WAL-append watermark: the snapshot just materialized
+    // includes everything appended up to this consolidation, so the next
+    // budget window counts only traffic since THIS materialization.
+    d.wal_appended_at_snapshot = sumRelWalAppended(d);
+
+    return 0;
+}
+
+/// Atomic publish (M4): consolidate + ALWAYS materialize a new versioned
+/// snapshot (the explicit checkpoint).  This is the unchanged per-call
+/// semantic that tests and the binding rely on; dl_consolidate is the
+/// cheaper periodic path that gates the materialization on the WAL budget.
+pub export fn dl_publish_snapshot(db: ?*DlDb) c_int {
+    const d = db orelse return -1;
+    if (d.read_only != 0) return -1;
+    if (d.txn != null) return -1;
+
+    pubTimersCheckEnv();
+    const t_start = nowNs();
+
+    if (consolidate(d) != 0) return -1;
+    if (materializeSnapshot(d) != 0) return -1;
+
+    if (pub_timers_on) {
         pub_timers.t_total_ns += nowNs() - t_start;
         pub_timers.n_publishes += 1;
     }
+    return 0;
+}
 
+/// Periodic consolidation (selfreg periodic snapshot): the per-turn
+/// maintenance point.  Consolidates (sync WAL + flush overlay + decay + IVM)
+/// every call, and materializes a NEW snapshot only when the accumulated
+/// WAL-append bytes since the last materialization exceed the budget
+/// (default 64 MiB via DL_SNAPSHOT_BUDGET_MB, or dl_set_snapshot_budget;
+/// 0 disables auto-materialization entirely).  This makes the snapshot
+/// PERIODIC (budget-triggered at consolidation-time) instead of per-publish:
+/// the expensive O(store) serialize + fsyncs are paid once per W-byte
+/// budget, while every turn pays only the O(delta) consolidation.
+pub export fn dl_consolidate(db: ?*DlDb) c_int {
+    const d = db orelse return -1;
+    if (d.read_only != 0) return -1;
+    if (d.txn != null) return -1;
+
+    if (consolidate(d) != 0) return -1;
+
+    if (d.snapshot_budget_bytes > 0) {
+        const pending = sumRelWalAppended(d) -| d.wal_appended_at_snapshot;
+        if (pending >= d.snapshot_budget_bytes) {
+            if (materializeSnapshot(d) != 0) return -1;
+        }
+    }
+    return 0;
+}
+
+/// Set the WAL-append byte budget that triggers a snapshot materialization
+/// inside dl_consolidate.  0 disables auto-materialization — dl_consolidate
+/// then only consolidates and never snapshots (the pure "in-memory with
+/// sync" mode).  The default (set at open) is 64 MiB / DL_SNAPSHOT_BUDGET_MB.
+/// Returns 0 on success, -1 on a NULL db.
+pub export fn dl_set_snapshot_budget(db: ?*DlDb, bytes: u64) c_int {
+    const d = db orelse return -1;
+    d.snapshot_budget_bytes = bytes;
     return 0;
 }
 

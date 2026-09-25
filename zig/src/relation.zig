@@ -79,6 +79,11 @@ pub const Relation = struct {
     // "mutated at least once this process", not "changed since the last
     // snapshot".  rev==0 means "never mutated" (calloc-initialized).
     rev: u64 = 0,
+    // Monotonic bytes appended to this relation's WAL since open (selfreg
+    // periodic snapshot).  Never reset by rel_compact (which truncates the
+    // WAL FILE but not this counter), so it measures total append traffic
+    // independent of compaction — the signal for the snapshot-budget trigger.
+    wal_appended_bytes: u64 = 0,
 };
 
 /// Bump the content revision (every mutation site that sets dirty=1 calls
@@ -93,6 +98,14 @@ pub export fn rel_touch(rel: ?*Relation) void {
 pub export fn rel_rev(rel: ?*const Relation) u64 {
     const r = rel orelse return 0;
     return r.rev;
+}
+
+/// Monotonic WAL-append byte count since open (snapshot-budget signal).
+/// Survives rel_compact's ftruncate (which resets the WAL FILE size) so the
+/// snapshot trigger sees total append traffic, not the current file length.
+pub export fn rel_wal_appended(rel: ?*const Relation) u64 {
+    const r = rel orelse return 0;
+    return r.wal_appended_bytes;
 }
 
 /// typedef int (*rel_enum_cb)(const uint32_t *cols, uint8_t arity, void *user)
@@ -1045,7 +1058,9 @@ pub export fn rel_wal_replay_into(rel: ?*Relation) c_int {
 pub export fn rel_wal_append_add(rel: ?*Relation, key: [*c]const u8, key_len: u32) c_int {
     const r = rel orelse return -1;
     if (r.wal == null or key == null) return -1;
+    const before = dc.dafsa_wal_size(r.wal);
     if (dc.dafsa_wal_append_add(r.wal, key, key_len) != 0) return -1;
+    r.wal_appended_bytes +%= dc.dafsa_wal_size(r.wal) - before;
     return 0;
 }
 
@@ -1055,7 +1070,9 @@ pub export fn rel_wal_append_add(rel: ?*Relation, key: [*c]const u8, key_len: u3
 pub export fn rel_wal_append_del(rel: ?*Relation, key: [*c]const u8, key_len: u32) c_int {
     const r = rel orelse return -1;
     if (r.wal == null or key == null) return -1;
+    const before = dc.dafsa_wal_size(r.wal);
     if (dc.dafsa_wal_append_del(r.wal, key, key_len) != 0) return -1;
+    r.wal_appended_bytes +%= dc.dafsa_wal_size(r.wal) - before;
     return 0;
 }
 
