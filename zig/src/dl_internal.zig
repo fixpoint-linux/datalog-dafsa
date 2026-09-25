@@ -426,6 +426,7 @@ pub extern fn rel_exact_base(rel: ?*const relation, cols: [*c]const u32) c_int;
 pub extern fn rel_delete(rel: ?*relation, cols: [*c]const u32) c_int;
 pub extern fn rel_delete_base(rel: ?*relation, cols: [*c]const u32) c_int;
 pub extern fn rel_build_from_tupleset(rel: ?*relation, ts: ?*const struct_tuple_set) c_int;
+pub extern fn rel_add_tupleset(rel: ?*relation, ts: ?*const struct_tuple_set) c_int;
 pub extern fn rel_build_base_from_tupleset(rel: ?*relation, ts: ?*const struct_tuple_set) c_int;
 pub extern fn rel_is_idb(rel: ?*const relation) c_int;
 pub extern fn rel_is_dirty(rel: ?*const relation) c_int;

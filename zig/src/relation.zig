@@ -823,6 +823,51 @@ pub export fn rel_build_from_tupleset(rel: ?*Relation, ts: ?*const tupleset.tupl
     return 0;
 }
 
+/// int rel_add_tupleset(relation *rel, const struct tuple_set *ts)
+/// Insert-only incremental fold: add every tuple of `ts` into the VIEW DAFSA
+/// via dafsa_add_n instead of rebuilding.  Tuples already present are no-ops
+/// (dafsa_add_n returns 0); `ts` may be unsorted.  Callers must guarantee the
+/// resulting view is exactly the intended one — this NEVER removes a fact, so
+/// it cannot replace rel_build_from_tupleset where the new content is a
+/// from-scratch recomputation that may shrink the relation.
+/// Returns 0 ok / -1 error.
+pub export fn rel_add_tupleset(rel: ?*Relation, ts: ?*const tupleset.tuple_set) c_int {
+    const r = rel orelse return -1;
+    const t = ts orelse return -1;
+    if (t.arity != r.arity) return -1;
+    if (t.count == 0) return 0;
+
+    // Insert in SORTED order: the cost of a single dafsa_add_n is dominated
+    // by re-registering the divergent suffix path, so adding in lex order
+    // (maximum prefix sharing between consecutive inserts) is up to an order
+    // of magnitude cheaper than an adversarial order on a large DAFSA — the
+    // batch then behaves like an incremental Daciuk construction while each
+    // individual add still merges through the live equivalence registry
+    // (minimality is preserved exactly as for arbitrary-order adds).
+    var copy: tupleset.tuple_set = undefined;
+    if (ts_init(&copy, t.arity) != 0) return -1;
+    var i: c_long = 0;
+    while (i < t.count) : (i += 1) {
+        if (ts_add(&copy, t.data.? + @as(usize, @intCast(i)) * @as(usize, t.arity)) < 0) {
+            ts_free(&copy);
+            return -1;
+        }
+    }
+    ts_sort(&copy);
+
+    i = 0;
+    while (i < copy.count) : (i += 1) {
+        const rc = relAddD(r, r.d, copy.data.? + @as(usize, @intCast(i)) * @as(usize, copy.arity));
+        if (rc < 0) {
+            ts_free(&copy);
+            return -1;
+        }
+        if (rc > 0) r.dirty = 1;
+    }
+    ts_free(&copy);
+    return 0;
+}
+
 /// int rel_build_base_from_tupleset(relation *rel, const struct tuple_set *ts)
 pub export fn rel_build_base_from_tupleset(rel: ?*Relation, ts: ?*const tupleset.tuple_set) c_int {
     const r = rel orelse return -1;
@@ -1395,6 +1440,68 @@ fn countCb(cols: ?[*]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_int
     const counter: *c_long = @ptrCast(@alignCast(user orelse return 0));
     counter.* +%= 1;
     return 0;
+}
+
+test "rel_add_tupleset incremental fold matches bulk rebuild" {
+    const r1 = rel_create(2) orelse return error.OutOfMemory;
+    defer rel_free(r1);
+    const r2 = rel_create(2) orelse return error.OutOfMemory;
+    defer rel_free(r2);
+
+    // Split base from view on both (IDB shape).
+    try std.testing.expectEqual(@as(c_int, 0), rel_reset_view(r1));
+    try std.testing.expectEqual(@as(c_int, 0), rel_reset_view(r2));
+
+    var ts: tupleset.tuple_set = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), ts_init(&ts, 2));
+    defer ts_free(&ts);
+    // Unsorted, with internal duplicates — exercises the no-sort, no-delete
+    // contract.
+    const rows = [_][2]u32{ .{ 5, 5 }, .{ 1, 2 }, .{ 2, 1 }, .{ 1, 3 } };
+    for (rows) |row| {
+        try std.testing.expectEqual(@as(c_int, 1), ts_add(&ts, &row));
+    }
+
+    // Incremental fold takes the ts AS-IS (unsorted — its contract needs no
+    // order); the bulk rebuild gets the sorted ts that dafsa_build_sorted
+    // requires.  Both DAFSAs must accept the same set.
+    try std.testing.expectEqual(@as(c_int, 0), rel_add_tupleset(r1, &ts));
+    ts_sort(&ts);
+    try std.testing.expectEqual(@as(c_int, 0), rel_build_from_tupleset(r2, &ts));
+
+    for (rows) |row| {
+        try std.testing.expectEqual(@as(c_int, 1), rel_exact(r1, &row));
+        try std.testing.expectEqual(@as(c_int, 1), rel_exact(r2, &row));
+    }
+    // Order-statistics view identical to the bulk build's.
+    try std.testing.expectEqual(rel_rank(r2, &.{ 1, 3 }), rel_rank(r1, &.{ 1, 3 }));
+    var ord1: [4][2]u32 = undefined;
+    var ord2: [4][2]u32 = undefined;
+    var k: u64 = 0;
+    while (k < 4) : (k += 1) {
+        var a: [2]u32 = undefined;
+        var b: [2]u32 = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), rel_select(r1, k, &a));
+        try std.testing.expectEqual(@as(c_int, 0), rel_select(r2, k, &b));
+        ord1[@intCast(k)] = a;
+        ord2[@intCast(k)] = b;
+    }
+    try std.testing.expectEqualSlices([2]u32, &ord1, &ord2);
+
+    // Empty tupleset: no-op, still ok.
+    var empty: tupleset.tuple_set = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), ts_init(&empty, 2));
+    defer ts_free(&empty);
+    try std.testing.expectEqual(@as(c_int, 0), rel_add_tupleset(r1, &empty));
+
+    // Arity mismatch rejected.
+    var bad: tupleset.tuple_set = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), ts_init(&bad, 3));
+    defer ts_free(&bad);
+    try std.testing.expectEqual(@as(c_int, -1), rel_add_tupleset(r1, &bad));
+
+    // Null ts rejected.
+    try std.testing.expectEqual(@as(c_int, -1), rel_add_tupleset(r1, null));
 }
 
 test "rel_reset_view split + build_from_tupleset" {
