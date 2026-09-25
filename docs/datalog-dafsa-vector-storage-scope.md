@@ -10,7 +10,7 @@
 - Arity cap: **1–8** fixed, 1–8 variadic (`rel_arity`, `dl_declare_relation`).
 - **`MAX_RELS = 64`** (`dl_internal.h:39`) — this is the load-bearing constraint for the `sig_j` naming decision.
 - Baseline relations in a memory-graph DB: `entity`, `edge`, `observation`, `__postings__`, plus any user relations. `m=16` `sig_j` + `vec_q` + `itq_basis` ≈ 19 more slots — comfortably inside 64 for a search DB, but worth documenting.
-- `dl_publish_snapshot` saves **all** relations + interner + permutation indices atomically → time-travel/version search is free.
+- `dl_publish_snapshot` saves relations + interner + permutation indices atomically → time-travel/version search is free. (Since the 6e publish gate, a relation whose content revision is unchanged since the previous snapshot is **hardlinked** from that snapshot instead of re-serialized — atomicity and byte-identity are unchanged, only unchanged work is skipped.)
 - `dl_iter` exists (iterate a relation); `dl_entity_names` does **not** exist yet — the embed step needs a way to walk `entity(name, type)`; `dl_iter` over `entity` suffices (no new iterator strictly required).
 - `dl_prefix`, `dl_declare_relation`, `dl_add_fact` all exist — the storage layer needs **zero new C engine code**.
 
@@ -81,7 +81,7 @@ embed.py (new):
   dl_publish_snapshot()                   # ONE atomic publish → all auxiliaries consistent
 ```
 
-- **Bulk path (F6):** `dl_add_fact` WAL-appends + fsyncs **per fact** (`dl.c:1588`) — the "one fsync on rebuild" property requires **`dl_load_facts` (CSV → single rebuild+save per relation, `dl.c:1231`)**, then one publish. Never per-fact `dl_add_fact` for the bulk load. **CSV parser accepts full u32 `[0, 2³²−1]`** (`dl.c:1135-1136`) — packed int8 u32 values exceed INT32_MAX, verified OK.
+- **Bulk path (F6, re-derived after 6f):** `dl_add_fact` WAL-appends per fact but no longer fsyncs per fact — the WAL is fsync'd at cycle boundaries (publish / close / WAL compaction), so the old "one fsync per fact" penalty is gone. `dl_load_facts` (CSV → single rebuild+save per relation) is still the right bulk primitive on throughput grounds: per-add cost is a WAL append + overlay insert per row versus one sorted rebuild per relation, and the bulk path pays the atomic-commit syscall dance (tmp-write → fsync → rename → dir-fsync) once per relation instead of amortizing per-fact WAL traffic. Never per-fact `dl_add_fact` for the bulk load. **CSV parser accepts full u32 `[0, 2³²−1]`** — packed int8 u32 values exceed INT32_MAX, verified OK.
 - **Re-embed is wholesale** (ITQ basis re-fit), so all aux facts are written then **one `dl_publish_snapshot`** — crash before publish discards the partial write, previous snapshot stays consistent.
 - `__itq_basis__` + `__vec_q__` + `sig_j` publish atomically with `entity` → time-travel (`dl_vector_search_version`) gets a consistent vector index + basis for free.
 

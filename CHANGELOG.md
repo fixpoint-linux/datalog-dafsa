@@ -3,6 +3,51 @@
 All notable changes to this project are documented in this file.
 
 ## [Unreleased]
+- **6e/6f/6g — publish cost, WAL durability, periodic snapshots** (three
+  changes, one corrected attribution):
+  - **6e publish gate** (`64564c5`): `dl_publish_snapshot` was saving EVERY
+    relation unconditionally; the existing `dirty` flag could never gate it
+    (nothing clears it). Fixed with a per-relation monotonic content revision
+    + a `saved_rev` watermark + a HARDLINK of the previous snapshot's file
+    for unchanged relations (perm indices additionally check object identity
+    — a rebuilt index restarts its rev at 0 and could alias a stale
+    watermark). **Corrected attribution:** the cost was first blamed on the
+    IVM/`rel_reset_view` cascade — REFUTED; the bench (`tests/bench_publish.c`)
+    declares no rules so `n_crules==0` and the `t_ivm_ns` bucket is ~1.1 ms at
+    640k. Note the bucket NAME is misleading: `t_ivm_ns` measures the whole
+    consolidation block (WAL sync + overlay flush + decay + IVM dispatch),
+    not rule IVM alone. Measured (re-run on this tree vs the d2caa1b .so,
+    640k/8-rel/100-delta): pub2 `rel_save` 296.7 → 40.0 ms.
+  - **6f batched WAL fsync** (`f326052`): `rel_wal_append_add/del` no longer
+    fsync per fact; durability is at cycle boundaries via a new
+    `rel_wal_sync` barrier, called by `syncAllWals` at `dl_publish_snapshot`
+    consolidation step 0 and at `dl_close`. `rel_compact` (via `maybeCompact`,
+    throttled to every 64 adds, WAL > DAFSA/4) also ftruncate+fsyncs, so it is
+    a second barrier. Exposure = the current cycle, bounded by
+    min(publish, close, maybeCompact). C9 split preserved: only EDB reaches
+    this WAL (`dl_add_fact`/`dl_delete_fact`/`dl_cas_revision`); IDB is
+    recomputable and never WAL-appended. Measured (re-run, 300 adds on ZFS):
+    9.99 → 0.087 ms/add (115x), essentially all of it ZFS fsync latency
+    (dirty fsync on this host: ZFS 8.3–8.9 ms vs tmpfs ~0.0002–0.0004 ms).
+  - **6g periodic snapshot** (`a56268e`): `dl_publish_snapshot` keeps its
+    explicit every-call checkpoint semantics (the read-only `dlb` binding
+    gate requires per-call versioning); new `dl_consolidate(db)` is the
+    per-turn maintenance point, materializing a snapshot only every W
+    WAL-append bytes (`dl_set_snapshot_budget`, default 64 MiB, 0 = pure
+    in-memory+sync). BETWEEN materializations `dl_query`/`dl_rank`/
+    `dl_select`/`dl_pattern` serve the LAST snapshot while `dl_lookup`/
+    `dl_prefix` are LIVE (mirrors `src/dl.h`). Measured (re-run, 100-fact
+    delta): consolidate flat 7.7–19.2 ms across 10k–640k vs publish
+    108–174 ms and growing. **Corrected premise:** the snapshot does NOT
+    bound replay at open — `dl_open` reads the root-level base `.dafsa` +
+    WAL replay and never reads `snapshots/<v>/`; replay is bounded by
+    `maybeCompact` + `dl_close`. The snapshot's only real job is the
+    versioned mmap view, so W trades mmap-view STALENESS, not replay cost.
+  - Full cost decomposition (serialization compute / VFS atomic-commit /
+    storage medium) recorded in
+    `design/datalog-dafsa-architecture.md` §10.2; the three stale durability
+    claims in `docs/datalog-dafsa-cas.md` and
+    `docs/datalog-dafsa-vector-storage-scope.md` corrected.
 - **GGML C-embedding migration**: the semantic-tier embed pipeline moved from
   Python (`scripts/embed.py`, removed) to a C++ `dl-embed` tool backed by a
   vendored ggml submodule (v0.20.2). bge-small-en-v1.5 runs as a real GGUF

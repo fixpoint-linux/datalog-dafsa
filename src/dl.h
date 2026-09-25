@@ -123,13 +123,23 @@ int dl_load_facts(dl_db *db, const char *rel, const char *csv_path);
 
 /* Add a single fact to a relation.  cols has `arity` u32 values.
  * Returns 1 if added, 0 if duplicate, -1 on error.
- * Durable: WAL-appended + fsync'd before in-memory commit. */
+ * Durability is cycle-granularity: the fact is WAL-appended and visible
+ * in memory on return, but no fsync happens here — every WAL is fsync'd
+ * at the next cycle boundary (dl_publish_snapshot, dl_close, or a
+ * consolidation-time WAL compaction).  An unclean stop before that
+ * boundary loses the current cycle's appends; everything before the last
+ * boundary replays at open. */
 int dl_add_fact(dl_db *db, const char *rel,
                 const uint32_t *cols, uint8_t arity);
 
 /* Delete a single fact from a relation.  cols has `arity` u32 values.
  * Returns 1 if deleted, 0 if absent, -1 on error.
- * Durable: WAL-appended + fsync'd before in-memory commit. */
+ * Durability is cycle-granularity: the delete is WAL-appended and takes
+ * effect in memory on return, but no fsync happens here — every WAL is
+ * fsync'd at the next cycle boundary (dl_publish_snapshot, dl_close, or a
+ * consolidation-time WAL compaction).  An unclean stop before that
+ * boundary loses the current cycle's appends; everything before the last
+ * boundary replays at open. */
 int dl_delete_fact(dl_db *db, const char *rel,
                    const uint32_t *cols, uint8_t arity);
 
@@ -137,8 +147,9 @@ int dl_delete_fact(dl_db *db, const char *rel,
 
 /* Compare-and-swap the revision counter for `entity`.  If the entity's
  * CURRENT stored revision equals `expected`, replace it with `new_value`
- * (DELETE + ADD of the rev row, each WAL-appended + fsync'd, with IVM delta
- * capture) and return 0.  If the current revision differs, returns
+ * (DELETE + ADD of the rev row, each WAL-appended only — durability is
+ * cycle-granularity as for dl_add_fact — with IVM delta capture) and
+ * return 0.  If the current revision differs, returns
  * DL_E_CONFLICT and makes NO change.  If expected == new_value it is an
  * idempotent no-op returning 0.  Returns -1 on error (NULL db/entity, or the
  * internal "rev" relation could not be ensured).  The first successful CAS on

@@ -96,8 +96,10 @@ publish a versioned snapshot (`dl_publish_snapshot`: save interner + relations, 
 `CURRENT` pointer). After publish, `dl_query`/`dl_query_bound`/`dl_pattern` read from mmap'd
 read-only views instead of running the VM. Single writer, multiple readers (mmap RO).
 
-**Durability.** `dl_add_fact`/`dl_delete_fact` append to a per-relation WAL and fsync before
-committing in memory; a `fcntl` single-writer lock guards the database; the interner is
+**Durability.** `dl_add_fact`/`dl_delete_fact` append to a per-relation WAL; the WAL is fsync'd at
+cycle boundaries (`dl_publish_snapshot` / `dl_close` / WAL compaction), not per fact — an unclean
+stop loses the current cycle's appends, everything before the last boundary replays at open. A
+`fcntl` single-writer lock guards the database; the interner is
 saved durably (and ordered *before* WAL records so crash recovery can decode symbol ids).
 WAL compaction triggers at 25% of the relation size.
 

@@ -16,7 +16,7 @@ Add optimistic-concurrency (CAS) writes to datalog-dafsa so the graph write path
 
 datalog-dafsa today (`src/dl.h`) has **no** CAS primitive:
 - `DL_E_LOCKED` (1) = database locked by another *writer* (single-writer file lock).
-- `dl_add_fact` / `dl_delete_fact` are WAL-appended + fsync'd, durable single ops — but they are **unconditional** (no expected-revision check) and **per-fact** (not atomic across a multi-fact mutation).
+- `dl_add_fact` / `dl_delete_fact` are WAL-appended (fsync deferred to the next cycle boundary — `dl_publish_snapshot` / `dl_close` / WAL compaction — so a single op is *not* durable on return; an unclean stop loses the current cycle's appends) — but they are **unconditional** (no expected-revision check) and **per-fact** (not atomic across a multi-fact mutation).
 
 So the write path that the graph needs — "bump revision + add observation + add relation, all-or-nothing, reject if stale" — is impossible today.
 

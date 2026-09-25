@@ -359,6 +359,84 @@ Each milestone is independently testable. The first vertical slice (M0+M1) is on
 
 10. **Composite-key width (u32)** -- Limits arity <= 8 (32 B key) and symbol space to 4 G. **Mitigation:** documented limit; u64 args would double key width and roughly halve DAFSA density (the perf measurement assumes ~5.8 B/key at the current width) -- u32 is the right default. **Watch:** a workload needing u64 ids (e.g., 128-bit hashes) needs a different encoding; out of v1 scope.
 
+### 10.2 Where publish/fact-write cost actually goes (measured 2026-09-25)
+
+Every durable write in this engine pays three separable layers; attributing
+cost to the wrong one sent the 6e fix to the wrong place first (see the
+corrected attribution below).
+
+1. **Serialization compute** -- constructing the bytes: the BFS renumbering
+   traversal plus the O(nstates) allocations in `dafsa_save`
+   (`vendor/dafsa/zig/src/persist.zig`). Proportional to relation size;
+   this is the layer the 6e publish gate removes for *unchanged* relations
+   (per-relation content revision + `saved_rev` watermark + hardlink of the
+   previous snapshot's file). Note the interner (`symbols.dafsa`) and term
+   store (`terms.bin`) saves are NOT revision-gated -- they re-save on every
+   publish (~33 ms + ~17 ms per publish at every store size measured).
+2. **VFS / atomic-commit syscall dance** -- per saved file:
+   `open(tmp)` -> `writeAll` -> `fsync(fd)` -> `close` -> `renameat` ->
+   `fsyncDirOf` (`persist.zig`). This is the price of crash-atomicity and is
+   paid per file, not per byte; it is NOT eliminated by putting the store on
+   tmpfs (tmpfs is still the VFS stack).
+3. **Storage medium** -- the fsync latency of the filesystem the store lives
+   on. **The store is on ZFS, not tmpfs** (`df -T` on the store dir ->
+   `data/workspace zfs`; only `/tmp` is tmpfs). Measured on this host with a
+   dirty-page fsync probe (3 runs of 50 fsyncs, 2026-09-25): **ZFS
+   8.3-8.9 ms vs tmpfs ~0.0002-0.0004 ms** -- roughly four orders of
+   magnitude, so layer 3 is LARGE for this store, not
+   negligible. This corrected an earlier note that had reasoned "/tmp is
+   tmpfs, therefore the medium is ruled out" -- the datum was valid, the
+   scope was wrong (measured on `/tmp`, applied to the store).
+
+**Proof that layer 3 dominated the fact path:** `dl_add_fact` at 300 adds
+measured 9.99 ms/add on the pre-6f build (d2caa1b, per-fact WAL fsync) and
+0.087 ms/add after 6f (`f326052`, append-only + cycle-boundary fsync) -- a
+115x drop from removing one fsync per fact, i.e. essentially the entire
+9.9 ms was ZFS fsync latency, not serialization or VFS work.
+
+**Corrected attribution of the 6e publish defect.** The first diagnosis
+blamed the IVM/`rel_reset_view` cascade. REFUTED: `tests/bench_publish.c`
+declares no rules, so `n_crules==0`, the IVM dispatch never fires, and the
+`ivm` timing bucket measures ~1.1 ms at 640k facts. The bucket NAME invited
+the wrong inference -- `t_ivm_ns` actually accumulates the *entire
+consolidation block* (WAL sync + overlay flush + decay + the IVM dispatch
+that never fires), because `t_mark` is set at the top of `consolidate()`.
+The real defect was that `dl_publish_snapshot` saved every relation
+unconditionally and the `dirty` flag could never gate it (nothing clears
+it, so relations stayed permanently dirty from the build phase). After the
+rev+watermark+hardlink gate: pub2 `rel_save` 296.7 -> 40.0 ms at 640k
+(8 relations, 100-fact delta), re-measured 2026-09-25 on this tree against
+the d2caa1b `.so`.
+
+**The 6f durability contract** (so the layers above are read with the right
+guarantee): `rel_wal_append_add/del` APPEND only. `rel_wal_sync`
+(`relation.zig`) is the barrier; `syncAllWals` calls it at
+`dl_publish_snapshot` consolidation step 0 and at `dl_close`. `rel_compact`
+-- via `maybeCompact` (`dl.zig`, checked every 64 adds, WAL > DAFSA/4) --
+also ftruncate+fsyncs the WAL and is therefore a second barrier. An EDB
+fact is durable only from the next barrier onward; an unclean stop loses
+exactly the current cycle's writes, so the exposure window is
+**min(publish, close, maybeCompact)**. Only EDB reaches this WAL
+(`dl_add_fact`/`dl_delete_fact`/`dl_cas_revision`); IDB is recomputable and
+never WAL-appended (the C9 split, preserved by construction).
+
+**The 6g snapshot-rate trade.** `dl_publish_snapshot` is the explicit
+every-call checkpoint (unchanged; versioned/as-of reads and the read-only
+binding gate require it). `dl_consolidate` is the per-turn maintenance
+point: consolidate (the cheap half -- WAL sync + overlay flush + decay +
+IVM) every call, materialize a snapshot only every W WAL-append bytes
+(`dl_set_snapshot_budget`, default 64 MiB, 0 = pure in-memory + sync).
+Measured on ZFS, 100-fact delta, 8 relations: consolidate 7.7-19.2 ms FLAT
+across 10k-640k vs publish 108-174 ms and growing with store size. Between
+materializations `dl_query`/`dl_rank`/`dl_select`/`dl_pattern` serve the
+LAST materialized snapshot while `dl_lookup`/`dl_prefix` are LIVE (see
+`src/dl.h`). The snapshot does NOT bound replay at open -- `dl_open` reads
+the root-level base `.dafsa` + WAL replay and never reads `snapshots/<v>/`;
+replay is bounded by `maybeCompact` + `dl_close` (measured open cost:
+123 ms at 200k base facts + 0 WAL records, 501 ms at 64k WAL records). The
+snapshot's only real job is the versioned mmap view, so W trades
+mmap-view STALENESS, not replay cost.
+
 ---
 
 ## 11. Summary of opinionated choices (one-liner each)

@@ -39,7 +39,7 @@ The advisor weighed four options against the goals (scale + "consolidate onto my
 
 ### 3. WAL / crash
 
-Incremental entity add → embed → `m` new facts (one per band) flow through the **same WAL+fsync path** as any `dl_add_fact` (`dl.h:88-92`). Crash recovery is inherited, not re-built. Cost note: 1e6 entities × 16 bands = 1.6e7 extra facts — non-trivial WAL volume but the engine is sized for it; tune `m` down (8) if WAL pressure matters.
+Incremental entity add → embed → `m` new facts (one per band) flow through the **same WAL path** as any `dl_add_fact` (`dl.h:88-92`): appended per fact, fsync'd at the next cycle boundary (publish / close / WAL compaction). Crash recovery is inherited, not re-built. Cost note: 1e6 entities × 16 bands = 1.6e7 extra facts — non-trivial WAL volume but the engine is sized for it; tune `m` down (8) if WAL pressure matters.
 
 ### 4. EDGE CASE — entity deletion / gardening (do not miss this)
 
