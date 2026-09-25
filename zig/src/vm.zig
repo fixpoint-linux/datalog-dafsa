@@ -1723,6 +1723,7 @@ const RdT = struct {
     idb: tupleset.tuple_set,
     delta: tupleset.tuple_set,
     next_delta: tupleset.tuple_set,
+    added: tupleset.tuple_set,
     arity: u8,
 };
 
@@ -1732,6 +1733,7 @@ fn rdFreeTs(rd: [*]RdT, nr: c_int) void {
         ts_free(&rd[@intCast(i)].idb);
         ts_free(&rd[@intCast(i)].delta);
         ts_free(&rd[@intCast(i)].next_delta);
+        ts_free(&rd[@intCast(i)].added);
     }
 }
 
@@ -1838,13 +1840,15 @@ fn evalStratumRecursive(db: *dx.dl_db, rules: [*]?*compiler.compiled_rule, n: c_
         rd[@intCast(i)].arity = ar;
         if (ts_init(&rd[@intCast(i)].idb, ar) != 0 or
             ts_init(&rd[@intCast(i)].delta, ar) != 0 or
-            ts_init(&rd[@intCast(i)].next_delta, ar) != 0)
+            ts_init(&rd[@intCast(i)].next_delta, ar) != 0 or
+            ts_init(&rd[@intCast(i)].added, ar) != 0)
         {
             ri = 0;
             while (ri <= i) : (ri += 1) {
                 ts_free(&rd[@intCast(ri)].idb);
                 ts_free(&rd[@intCast(ri)].delta);
                 ts_free(&rd[@intCast(ri)].next_delta);
+                ts_free(&rd[@intCast(ri)].added);
             }
             c.free(@ptrCast(rd));
             return -1;
@@ -2052,6 +2056,7 @@ fn evalStratumRecursive(db: *dx.dl_db, rules: [*]?*compiler.compiled_rule, n: c_
                     if (ts_contains(&rd[@intCast(hdi)].idb, t) == 0) {
                         _ = ts_add(&rd[@intCast(hdi)].idb, t);
                         _ = ts_add(&rd[@intCast(hdi)].delta, t);
+                        _ = ts_add(&rd[@intCast(hdi)].added, t);
                     }
                 }
                 ts_free(&cand);
@@ -2214,6 +2219,8 @@ fn evalStratumRecursive(db: *dx.dl_db, rules: [*]?*compiler.compiled_rule, n: c_
                         while (ci < rd[@intCast(i)].next_delta.count) : (ci += 1) {
                             _ = ts_add(&rd[@intCast(i)].idb,
                                 rd[@intCast(i)].next_delta.data.? + @as(usize, @intCast(ci)) * @as(usize, rd[@intCast(i)].arity));
+                            _ = ts_add(&rd[@intCast(i)].added,
+                                rd[@intCast(i)].next_delta.data.? + @as(usize, @intCast(ci)) * @as(usize, rd[@intCast(i)].arity));
                         }
                     }
                     const tmp = rd[@intCast(i)].delta;
@@ -2234,18 +2241,40 @@ fn evalStratumRecursive(db: *dx.dl_db, rules: [*]?*compiler.compiled_rule, n: c_
         const rel = dbRel(db, rd[@intCast(i)].rel_id);
         if (rel == null) continue;
 
-        _ = dx.rel_prefix(rel, null, 0, dx.ts_sink_cb, &rd[@intCast(i)].idb);
-        ts_sort(&rd[@intCast(i)].idb);
-        if (vmNomaterializeRef().* != 0 and rd[@intCast(i)].rel_id == vmExportRelidRef().*) {
-            vmExportTsRef().*.?.* = rd[@intCast(i)].idb;
-            rd[@intCast(i)].idb = std.mem.zeroes(tupleset.tuple_set);
-            continue;
-        }
-        if (dx.rel_build_from_tupleset(rel, @ptrCast(@alignCast(&rd[@intCast(i)].idb))) != 0) {
-            permFreeAll(nr, perm_count, perm_ids, perm_cap, idb_perm_shadows);
-            rdFreeTs(rd, nr);
-            c.free(@ptrCast(rd));
-            return -1;
+        if (ivm == 0) {
+            // From-scratch evaluation.  The union into rd.idb IS required
+            // here even without a seed read: earlier (lower) strata already
+            // wrote their heads into the view via rel_add, and this stratum
+            // read them from there — the rebuild below replaces the view, so
+            // those facts must be folded in first or they are lost.
+            _ = dx.rel_prefix(rel, null, 0, dx.ts_sink_cb, &rd[@intCast(i)].idb);
+            ts_sort(&rd[@intCast(i)].idb);
+            if (vmNomaterializeRef().* != 0 and rd[@intCast(i)].rel_id == vmExportRelidRef().*) {
+                vmExportTsRef().*.?.* = rd[@intCast(i)].idb;
+                rd[@intCast(i)].idb = std.mem.zeroes(tupleset.tuple_set);
+                continue;
+            }
+            if (dx.rel_build_from_tupleset(rel, @ptrCast(@alignCast(&rd[@intCast(i)].idb))) != 0) {
+                permFreeAll(nr, perm_count, perm_ids, perm_cap, idb_perm_shadows);
+                rdFreeTs(rd, nr);
+                c.free(@ptrCast(rd));
+                return -1;
+            }
+        } else {
+            // Incremental evaluation: rd.idb = seed (the pre-read old view)
+            // U fresh derivations, so view_start U rd.added is the exact set
+            // the old union-into-tupleset + full DAFSA rebuild produced (the
+            // seed read enumerated the view, hence seed is a subset of
+            // view_start).  Folding only rd.added via dafsa_add_n removes
+            // the O(store) rebuild AND the O(store) re-read of the view.
+            // Insert-only: delete deltas never route here (has_del forces
+            // the full path).
+            if (dx.rel_add_tupleset(rel, @ptrCast(@alignCast(&rd[@intCast(i)].added))) != 0) {
+                permFreeAll(nr, perm_count, perm_ids, perm_cap, idb_perm_shadows);
+                rdFreeTs(rd, nr);
+                c.free(@ptrCast(rd));
+                return -1;
+            }
         }
     }
 
