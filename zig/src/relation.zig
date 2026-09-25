@@ -73,7 +73,27 @@ pub const Relation = struct {
     ov: ?*tupleset.tuple_set = null, // hot-write overlay (append-only union)
     ov_dirty: u64 = 0, // adds since last consolidation (decay/sizing signal)
     ov_epoch: u32 = 0, // access epoch of the newest overlay fact (C20)
+    // Monotonic content revision (publish gate): bumped on every mutation
+    // that changes d ∪ ov or base.  `dirty` cannot serve as a publish gate
+    // because it is never cleared (rel_compact leaves it set), so it says
+    // "mutated at least once this process", not "changed since the last
+    // snapshot".  rev==0 means "never mutated" (calloc-initialized).
+    rev: u64 = 0,
 };
+
+/// Bump the content revision (every mutation site that sets dirty=1 calls
+/// this too; open-time WAL replay deliberately does not — a fresh process
+/// starts at rev 0 and its first publish must serialize everything).
+pub export fn rel_touch(rel: ?*Relation) void {
+    const r = rel orelse return;
+    r.rev +%= 1;
+}
+
+/// Current content revision (publish-gate read side).
+pub export fn rel_rev(rel: ?*const Relation) u64 {
+    const r = rel orelse return 0;
+    return r.rev;
+}
 
 /// typedef int (*rel_enum_cb)(const uint32_t *cols, uint8_t arity, void *user)
 pub const RelEnumCb = ?*const fn (cols: ?[*]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_int;
@@ -206,6 +226,7 @@ pub export fn rel_overlay_add(rel: ?*Relation, cols: [*c]const u32) c_int {
     if (rc == 1) {
         r.ov_dirty += 1;
         r.dirty = 1; // close-time compaction contract (same as rel_add_base)
+        r.rev +%= 1;
     }
     return rc;
 }
@@ -272,6 +293,7 @@ pub export fn rel_overlay_flush(rel: ?*Relation) c_int {
     if (rc < 0) return -1; // partial fold: overlay kept, reads still complete
 
     r.dirty = 1;
+    r.rev +%= 1;
     ts_reset(ov); // capacity kept; hash cleared
     r.ov_dirty = 0;
     return 0;
@@ -503,7 +525,10 @@ fn relAddD(rel: *Relation, d: [*c]dc.dafsa, cols: ?[*]const u32) c_int {
 pub export fn rel_add(rel: ?*Relation, cols: ?[*]const u32) c_int {
     const r = rel orelse return -1;
     const rc = relAddD(r, r.d, cols);
-    if (rc > 0) r.dirty = 1;
+    if (rc > 0) {
+        r.dirty = 1;
+        r.rev +%= 1;
+    }
     return rc;
 }
 
@@ -511,7 +536,10 @@ pub export fn rel_add(rel: ?*Relation, cols: ?[*]const u32) c_int {
 pub export fn rel_add_base(rel: ?*Relation, cols: ?[*]const u32) c_int {
     const r = rel orelse return -1;
     const rc = relAddD(r, r.base, cols);
-    if (rc > 0) r.dirty = 1;
+    if (rc > 0) {
+        r.dirty = 1;
+        r.rev +%= 1;
+    }
     return rc;
 }
 
@@ -550,7 +578,10 @@ fn relDeleteD(rel: *Relation, d: [*c]dc.dafsa, cols: ?[*]const u32) c_int {
 pub export fn rel_delete(rel: ?*Relation, cols: ?[*]const u32) c_int {
     const r = rel orelse return -1;
     const rc = relDeleteD(r, r.d, cols);
-    if (rc > 0) r.dirty = 1;
+    if (rc > 0) {
+        r.dirty = 1;
+        r.rev +%= 1;
+    }
     return rc;
 }
 
@@ -558,7 +589,10 @@ pub export fn rel_delete(rel: ?*Relation, cols: ?[*]const u32) c_int {
 pub export fn rel_delete_base(rel: ?*Relation, cols: ?[*]const u32) c_int {
     const r = rel orelse return -1;
     const rc = relDeleteD(r, r.base, cols);
-    if (rc > 0) r.dirty = 1;
+    if (rc > 0) {
+        r.dirty = 1;
+        r.rev +%= 1;
+    }
     return rc;
 }
 
@@ -820,6 +854,7 @@ pub export fn rel_build_from_tupleset(rel: ?*Relation, ts: ?*const tupleset.tupl
     r.d = new_d;
     if (aliased) r.base = r.d; // keep base aliased for EDB rels
     r.dirty = 1;
+    r.rev +%= 1;
     return 0;
 }
 
@@ -862,7 +897,10 @@ pub export fn rel_add_tupleset(rel: ?*Relation, ts: ?*const tupleset.tuple_set) 
             ts_free(&copy);
             return -1;
         }
-        if (rc > 0) r.dirty = 1;
+        if (rc > 0) {
+            r.dirty = 1;
+            r.rev +%= 1;
+        }
     }
     ts_free(&copy);
     return 0;
@@ -882,6 +920,7 @@ pub export fn rel_build_base_from_tupleset(rel: ?*Relation, ts: ?*const tupleset
     r.base = new_b;
     if (aliased) r.d = r.base; // keep view aliased for EDB rels
     r.dirty = 1;
+    r.rev +%= 1;
     return 0;
 }
 
@@ -925,6 +964,7 @@ pub export fn rel_reset_view(rel: ?*Relation) c_int {
         if (nb == null) return -1;
         r.base = nb;
         r.dirty = 1; // view is about to be re-derived by the VM
+        r.rev +%= 1;
         return 0;
     }
 
@@ -935,7 +975,8 @@ pub export fn rel_reset_view(rel: ?*Relation) c_int {
         dc.dafsa_free(r.d);
         r.d = nv;
     }
-    r.dirty = 1; // view reset for re-derivation
+    r.dirty = 1;
+    r.rev +%= 1; // view reset for re-derivation
     return 0;
 }
 

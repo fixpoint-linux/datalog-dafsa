@@ -206,7 +206,27 @@ pub const DlDb = extern struct {
     // ─── selfreg-dl-storage (beyond C's sizeof(struct dl_db)) ─────────────
     compact_checks: u64 = 0, // add counter for throttled compaction checks
     access_epoch: u32 = 0, // C20: current consolidation epoch (cycle count)
+    // ─── publish gate (beyond C's sizeof) ─────────────────────────────────
+    // saved_rev[i] is the relation.revs content revision already serialized
+    // into the last published snapshot.  SAVED_REV_NONE (max u64) means
+    // "no snapshot from this process has serialized it yet" — forces a full
+    // save on the first publish after open.  Relations opened fresh load
+    // with rev==0, and any post-open mutation bumps rev, so gate == (rev ==
+    // saved_rev) is exactly "byte-identical content to what the previous
+    // snapshot holds".
+    saved_rev: [MAX_RELS]u64 = @splat(SAVED_REV_NONE),
+    saved_rev_var: [MAX_RELS][MAX_VAR_ARITY + 1]u64 = @splat(@splat(SAVED_REV_NONE)),
+    saved_rev_perm: [MAX_PERMS]u64 = @splat(SAVED_REV_NONE),
+    // Identity half of the perm gate: a perm index is FREED and re-created
+    // on rebuild (permindex_build), so its rev counter restarts at 0 and a
+    // rev-only watermark could alias a stale value.  The saved pointer
+    // detects the restart; rev alone suffices for fixed relations and
+    // variadic variants (created once per process, never re-created).
+    saved_perm_rel: [MAX_PERMS]?*anyopaque = @splat(null),
 };
+
+/// Marker for "not yet serialized by any publish of this process".
+const SAVED_REV_NONE: u64 = std.math.maxInt(u64);
 
 // Comptime gate: our extern layouts must be byte-identical to the C header.
 comptime {
@@ -688,6 +708,12 @@ fn dlOpenCommon(dir: ?[*:0]const u8, err_out: ?*c_int, ro: c_int) ?*DlDb {
     db.fixpoint_dirty = 0;
     db.snap_version = 0;
     db.snapshot_retain = 0;
+    // Publish gate: mem.zeroes above clears the default-field sentinels;
+    // re-arm them so the first publish of this process serializes
+    // everything (open-time WAL replay does not bump rev).
+    @memset(&db.saved_rev, SAVED_REV_NONE);
+    for (&db.saved_rev_var) |*row| @memset(row, SAVED_REV_NONE);
+    @memset(&db.saved_rev_perm, SAVED_REV_NONE);
     @memset(std.mem.asBytes(&db.vcache), 0);
     db.fault_hook = null;
     db.fault_user = null;
@@ -4363,6 +4389,16 @@ pub export fn dl_publish_snapshot(db: ?*DlDb) c_int {
     // 2. Determine new version
     const new_version = d.snap_version +% 1;
 
+    // Publish gate: the previous snapshot's directory, for hardlinking
+    // unchanged relations (see relSaveGated).  Empty string when there is
+    // no previous snapshot in this process — the gate then always saves.
+    var prev_snap_dir: [4096:0]u8 = undefined;
+    if (d.snap_version > 0) {
+        _ = snprintf(&prev_snap_dir, 4096, "%s/snapshots/%u", d.dir.?, d.snap_version);
+    } else {
+        prev_snap_dir[0] = 0;
+    }
+
     // 3. Ensure snapshots directory exists
     _ = snprintf(&snapshots_dir, 4096, "%s/snapshots", d.dir.?);
     _ = posix.mkdir(&snapshots_dir, @as(posix.mode_t, 0o755));
@@ -4430,7 +4466,7 @@ pub export fn dl_publish_snapshot(db: ?*DlDb) c_int {
                     _ = fprintf(mf, "%s:%d:%s\n", @as([*c]const u8, @ptrCast(&vname)), @as(c_int, a),
                         if (relation.rel_is_idb(vr) != 0) "idb" else "edb");
                     _ = snprintf(&rel_path, 4096, "%s/%s.dafsa", &tmp_dir, @as([*c]const u8, @ptrCast(&vname)));
-                    if (relation.rel_save(vr, &rel_path) != 0) {
+                    if (relSaveGated(d, vr, &rel_path, &d.saved_rev_var[i][a], &prev_snap_dir) != 0) {
                         _ = c.fclose(mf);
                         return dlPublishFail(&tmp_dir, &new_dir, renamed);
                     }
@@ -4454,7 +4490,7 @@ pub export fn dl_publish_snapshot(db: ?*DlDb) c_int {
                 if (relation.rel_is_idb(d.rels[i].rel) != 0) "idb" else "edb");
 
             _ = snprintf(&rel_path, 4096, "%s/%s.dafsa", &tmp_dir, d.rels[i].name);
-            if (relation.rel_save(d.rels[i].rel, &rel_path) != 0) {
+            if (relSaveGated(d, d.rels[i].rel, &rel_path, &d.saved_rev[i], &prev_snap_dir) != 0) {
                 _ = c.fclose(mf);
                 return dlPublishFail(&tmp_dir, &new_dir, renamed);
             }
@@ -4486,7 +4522,7 @@ pub export fn dl_publish_snapshot(db: ?*DlDb) c_int {
                 _ = fprintf(mf, "%s:%d # perm index of %s\n", @as([*c]const u8, @ptrCast(&pi_name)), @as(c_int, ar), d.rels[@intCast(pe.rel_id)].name);
 
                 _ = snprintf(&pi_path, 4096, "%s/%s.dafsa", &tmp_dir, @as([*c]const u8, @ptrCast(&pi_name)));
-                if (relation.rel_save(pe.pidx_rel, &pi_path) != 0) {
+                if (permSaveGated(d, pe.pidx_rel, &pi_path, @intCast(pi), &prev_snap_dir) != 0) {
                     _ = c.fclose(mf);
                     return dlPublishFail(&tmp_dir, &new_dir, renamed);
                 }
@@ -4564,6 +4600,75 @@ fn dlPublishFail(tmp_dir: [*c]const u8, new_dir: [*c]const u8, renamed: c_int) c
     rmRf(tmp_dir);
     if (renamed != 0) rmRf(new_dir);
     return -1;
+}
+
+/// Publish-side save gate (selfreg-relsave-fix): a relation whose content
+/// revision equals the revision already serialized into the previous
+/// snapshot is byte-identical to that snapshot's file, so re-serializing it
+/// (BFS renumbering + three O(nstates) allocations + full buffer build, per
+/// relation per publish) is pure waste — the dominant cost of a delta
+/// publish at a large store.  Instead, hardlink the previous snapshot's
+/// file into the new snapshot directory.  Snapshot files are immutable once
+/// renamed into place (only rmRf unlinks them, and unlinking one hardlink
+/// never disturbs the other), so the link is exactly the bytes rel_save
+/// would have produced for the same content.  Falls back to a full
+/// rel_save whenever the gate does not apply: first publish of the process
+/// (watermark sentinel), any content change since (rev moved), or hardlink
+/// failure (previous snapshot pruned, cross-device, pathological FS).
+/// Returns 0 on success (file present at dst), -1 on error.
+fn relSaveGated(
+    d: *DlDb,
+    rel: ?*relation.Relation,
+    dst: [*c]const u8,
+    saved_rev: *u64,
+    prev_snap_dir: [*c]const u8,
+) c_int {
+    const rev = relation.rel_rev(rel);
+
+    if (rev != saved_rev.* or d.snap_version == 0) {
+        if (relation.rel_save(rel, dst) != 0) return -1;
+        saved_rev.* = rev;
+        return 0;
+    }
+
+    // Unchanged since the previous snapshot: link prev's file.  dst's
+    // basename is the same as prev's (both <name>.dafsa inside their
+    // snapshot dir).
+    {
+        var s: usize = 0;
+        var i: usize = 0;
+        while (dst[s] != 0) : (s += 1) {
+            if (dst[s] == '/') i = s + 1;
+        }
+        var src: [4096:0]u8 = undefined;
+        const n = snprintf(&src, 4096, "%s/%s", prev_snap_dir, dst + i);
+        if (n < 0 or @as(usize, @intCast(n)) >= 4096) return -1;
+        if (posix.link(&src, dst) != 0) {
+            // Fallback: serialize as before (correctness over speed).
+            if (relation.rel_save(rel, dst) != 0) return -1;
+        }
+    }
+    return 0;
+}
+
+/// Perm-index variant of the gate: the index relation is freed and
+/// re-created on rebuild, so besides the revision watermark the object
+/// identity must match — a fresh object with a coincidentally-equal rev is
+/// always re-serialized.
+fn permSaveGated(
+    d: *DlDb,
+    rel: ?*relation.Relation,
+    dst: [*c]const u8,
+    pi: usize,
+    prev_snap_dir: [*c]const u8,
+) c_int {
+    const ident: ?*anyopaque = @ptrCast(rel);
+    if (rel == null or ident != d.saved_perm_rel[pi]) {
+        const rc = relSaveGated(d, rel, dst, &d.saved_rev_perm[pi], prev_snap_dir);
+        if (rc == 0) d.saved_perm_rel[pi] = ident;
+        return rc;
+    }
+    return relSaveGated(d, rel, dst, &d.saved_rev_perm[pi], prev_snap_dir);
 }
 
 // ─── M6: Permutation index API ─────────────────────────────────────────────
