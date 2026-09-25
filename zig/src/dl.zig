@@ -904,6 +904,14 @@ pub export fn dl_close(db: ?*DlDb) void {
         }
     }
 
+    // selfreg-batched-fsync: clean shutdown IS a cycle boundary.  fsync every
+    // per-relation WAL BEFORE the compact loop, so that even if compaction
+    // fails (dafsa_save error) the appended records are still durable and
+    // recoverable at the next open.  (rel_compact's own ftruncate+fsync would
+    // otherwise discard the un-synced tail; this barrier closes that gap.)
+    if (d.read_only == 0)
+        syncAllWals(d);
+
     // M7/IVM: compact each relation's BASE (save + truncate WAL).  v2: a
     // VARIADIC relation does the same PER VARIANT under <name>.<a>.dafsa.
     var i: usize = 0;
@@ -1700,7 +1708,8 @@ fn dlAddFactVariadic(db: *DlDb, idx: usize, rel_name: [*c]const u8, cols: [*c]co
     if (relation.rel_exact(vr, cols) != 0)
         return 0;
 
-    // 3. WAL-append ADD + sync.
+    // 3. WAL-append ADD (no fsync — durable at the next cycle
+    //    boundary, see dl_publish_snapshot/dl_close).
     if (relation.rel_wal_append_add(vr, &key, @intCast(key_len)) != 0)
         return -1;
 
@@ -1726,7 +1735,8 @@ const COMPACT_CHECK_EVERY: u64 = 64;
 
 /// CAS Slice 2: apply a fact add to the in-memory BASE + IVM delta capture.
 /// selfreg-dl-storage: the hot write lands in the OVERLAY (sorted-array
-/// tupleset, O(1) amortized) + the WAL (durable); the DAFSA is only touched
+/// tupleset, O(1) amortized) + the WAL (the durability record, fsync'd at
+/// cycle boundaries — selfreg-batched-fsync); the DAFSA is only touched
 /// at consolidation (dl_publish_snapshot -> rel_overlay_flush).
 fn addFactApply(db: *DlDb, idx: c_int, cols: [*c]const u32, arity: u8) c_int {
     const rel = db.rels[@intCast(idx)].rel;
@@ -1844,7 +1854,8 @@ pub export fn dl_add_fact(db: ?*DlDb, rel_name: [*c]const u8, cols: [*c]const u3
     if (relation.rel_exact(d.rels[@intCast(idx)].rel, cols) != 0)
         return 0;
 
-    // 3. WAL-append ADD + sync.
+    // 3. WAL-append ADD (no fsync — durable at the next cycle
+    //    boundary, see dl_publish_snapshot/dl_close).
     if (relation.rel_wal_append_add(d.rels[@intCast(idx)].rel, &key, @intCast(key_len)) != 0)
         return -1;
 
@@ -1870,7 +1881,8 @@ fn dlDeleteFactVariadic(db: *DlDb, idx: usize, cols: [*c]const u32, arity: u8) c
     if (relation.rel_overlay_flush(vr) != 0)
         return -1;
 
-    // 2. WAL-append DEL + sync.
+    // 2. WAL-append DEL (no fsync — durable at the next cycle
+    //    boundary, see dl_publish_snapshot/dl_close).
     if (relation.rel_wal_append_del(vr, &key, @intCast(key_len)) != 0)
         return -1;
 
@@ -1913,7 +1925,8 @@ pub export fn dl_delete_fact(db: ?*DlDb, rel_name: [*c]const u8, cols: [*c]const
     if (relation.rel_overlay_flush(d.rels[@intCast(idx)].rel) != 0)
         return -1;
 
-    // 2. WAL-append DEL + sync.
+    // 2. WAL-append DEL (no fsync — durable at the next cycle
+    //    boundary, see dl_publish_snapshot/dl_close).
     if (relation.rel_wal_append_del(d.rels[@intCast(idx)].rel, &key, @intCast(key_len)) != 0)
         return -1;
 
@@ -4264,6 +4277,32 @@ pub export fn dl_access_epoch(db: ?*const DlDb) u32 {
     return d.access_epoch;
 }
 
+/// Cycle-boundary durability barrier for the fact-write path
+/// (selfreg-batched-fsync): fsync every per-relation WAL so all EDB facts
+/// appended since the previous barrier are durable.  Mirrors the txn path's
+/// one-sync-per-commit shape (txnwal_append_record ... then ONE txnwal_sync),
+/// applied at consolidation granularity instead of per fact.  Only EDB facts
+/// reach these WALs (derived IDB facts are recomputable and never appended),
+/// so this barrier is exactly the durability contract for the unrecoverable
+/// class.  Errors are swallowed: the caller (publish / close) is the
+/// boundary, and a failed fsync here is surfaced by the same path's later
+/// durable operations (rel_compact / snapshot fsync); this mirrors dl_close's
+/// existing ignore-on-error convention.
+fn syncAllWals(d: *DlDb) void {
+    var ri: usize = 0;
+    while (ri < d.nrels) : (ri += 1) {
+        if (d.rels[ri].kind == RELK_VARIADIC) {
+            var a: u8 = 1;
+            while (a <= MAX_VAR_ARITY) : (a += 1) {
+                const vr = vrelation.vrel_variant_or_null(d.rels[ri].vrel, a);
+                if (vr != null) _ = relation.rel_wal_sync(vr);
+            }
+        } else {
+            _ = relation.rel_wal_sync(d.rels[ri].rel);
+        }
+    }
+}
+
 pub export fn dl_publish_snapshot(db: ?*DlDb) c_int {
     const d = db orelse return -1;
     var snapshots_dir: [4096:0]u8 = undefined;
@@ -4299,15 +4338,21 @@ pub export fn dl_publish_snapshot(db: ?*DlDb) c_int {
     // Because readers and the writer cannot coexist (C13), publish IS the
     // quiescent boundary — the natural "stop the world".  ALL store
     // maintenance happens here, in one scheduled place:
+    //   0. fsync every per-relation WAL (the cycle-boundary durability
+    //      barrier — selfreg-batched-fsync);
     //   1. fold every relation's hot-write overlay into its DAFSA (C19);
     //   2. resolve supersession (latest-wins is the flush's set union);
     //   3. advance the access epoch (C20 decay bookkeeping);
     //   4. apply decay / fire the size gate (see decayApply below);
     //   5. materialize derived facts (the IVM cascade, step 1 below);
     //   6. serialize the consolidated state into the new snapshot.
-    // Un-consolidated writes stay durable in the fsynced per-relation WALs,
-    // replayed at open — a crash loses nothing committed.
+    // Durability contract (selfreg-batched-fsync): the per-relation WALs are
+    // fsync'd HERE and at dl_close — NOT per append.  Un-consolidated EDB
+    // writes are durable only from this barrier onward; a crash before the
+    // next barrier loses exactly the current cycle's writes (a bounded,
+    // stated exposure), while everything before it replays at open.
     {
+        syncAllWals(d);
         var ri: usize = 0;
         while (ri < d.nrels) : (ri += 1) {
             if (d.rels[ri].kind == RELK_VARIADIC) {

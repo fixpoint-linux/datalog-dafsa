@@ -210,8 +210,9 @@ fn ovEnsure(rel: *Relation) ?*tupleset.tuple_set {
 
 /// Append a fact to the overlay WITHOUT touching the DAFSA (O(1) amortized
 /// hash insert).  Returns 1 added / 0 duplicate (already in DAFSA or
-/// overlay) / -1 error.  This is the hot-write path: the fact is durable
-/// via the caller's WAL append; reads see it through rel_exact/rel_prefix
+/// overlay) / -1 error.  This is the hot-write path: the fact's durability
+/// record is the caller's WAL append (fsync'd at the next cycle boundary —
+/// selfreg-batched-fsync); reads see it through rel_exact/rel_prefix
 /// union; consolidation (rel_overlay_flush) folds it into the DAFSA.
 pub export fn rel_overlay_add(rel: ?*Relation, cols: [*c]const u32) c_int {
     const r = rel orelse return -1;
@@ -314,7 +315,8 @@ fn ovConsolidateForRead(r: *const Relation) void {
 }
 
 /// Free the overlay (relation teardown).  Non-consolidated facts MUST have
-/// been flushed (or are still durable in the WAL) by the caller.
+/// been flushed (or are still recorded in the WAL — synced at the cycle
+/// boundary — by the caller).
 fn ovFree(rel: *Relation) void {
     if (rel.ov) |ov| {
         ts_free(ov);
@@ -1016,22 +1018,54 @@ pub export fn rel_wal_replay_into(rel: ?*Relation) c_int {
     return ctx.ok;
 }
 
+// ─── WAL durability contract (selfreg-batched-fsync) ─────────────────────
+//
+// Per-relation WAL appends are NOT fsync'd per fact.  Durability is at
+// CYCLE granularity (the same buffered-then-one-sync shape as the txn
+// path, and the same conclusion the access-epoch decay block already drew
+// for per-read writes): an append writes the record into the WAL file
+// (O_APPEND, kernel page cache) and returns; the record becomes durable
+// only when rel_wal_sync is called at a cycle boundary — dl_publish_snapshot
+// (consolidation/publish) and dl_close (clean shutdown, which also compacts
+// every dirty relation).  On an UNclean stop (SIGKILL / power loss) between
+// boundaries the current cycle's WAL records are lost: a bounded, stated
+// exposure.  The WAL is the durability record; the DAFSA snapshot is
+// read-optimization, so a crash loses exactly the writes since the last
+// sync point and recovers everything before it via rel_wal_replay_into.
+//
+// C9 split: only DECISIONS/OBSERVATIONS (EDB facts) reach this WAL — every
+// rel_wal_append_* caller is an EDB write (dl_add_fact, dl_delete_fact,
+// dl_cas_revision).  DERIVED (IDB) facts are recomputable and are never
+// WAL-appended (they are materialized into the DAFSA at publish and
+// re-derived), so batching the sync cannot drop the unrecoverable class.
+
 /// int rel_wal_append_add(relation *rel, const unsigned char *key, uint32_t key_len)
+/// Append an ADD record WITHOUT fsync (durability is at cycle boundaries —
+/// see rel_wal_sync).
 pub export fn rel_wal_append_add(rel: ?*Relation, key: [*c]const u8, key_len: u32) c_int {
     const r = rel orelse return -1;
     if (r.wal == null or key == null) return -1;
     if (dc.dafsa_wal_append_add(r.wal, key, key_len) != 0) return -1;
-    if (dc.dafsa_wal_sync(r.wal) != 0) return -1;
     return 0;
 }
 
 /// int rel_wal_append_del(relation *rel, const unsigned char *key, uint32_t key_len)
+/// Append a DEL record WITHOUT fsync (durability is at cycle boundaries —
+/// see rel_wal_sync).
 pub export fn rel_wal_append_del(rel: ?*Relation, key: [*c]const u8, key_len: u32) c_int {
     const r = rel orelse return -1;
     if (r.wal == null or key == null) return -1;
     if (dc.dafsa_wal_append_del(r.wal, key, key_len) != 0) return -1;
-    if (dc.dafsa_wal_sync(r.wal) != 0) return -1;
     return 0;
+}
+
+/// int rel_wal_sync(relation *rel)
+/// Cycle-boundary durability barrier: fsync this relation's WAL so every
+/// record appended since the previous barrier is durable on disk.
+pub export fn rel_wal_sync(rel: ?*Relation) c_int {
+    const r = rel orelse return -1;
+    if (r.wal == null) return -1;
+    return dc.dafsa_wal_sync(r.wal);
 }
 
 /// fsync helper: fsync the directory containing a path.
