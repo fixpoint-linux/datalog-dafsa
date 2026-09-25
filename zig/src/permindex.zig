@@ -30,14 +30,15 @@ extern "c" fn ts_free(ts: ?*tupleset.tuple_set) void;
 extern "c" fn ts_add(ts: ?*tupleset.tuple_set, cols: ?[*]const u32) c_int;
 extern "c" fn ts_sort(ts: ?*tupleset.tuple_set) void;
 
-/// Publish-gate helper: seed a freshly re-created perm-index Relation's rev
-/// counter with the previous object's rev (`carry`), so the logical index's
-/// rev stays MONOTONE across the free/re-create boundary (see the rev_carry
-/// comment in permindex_build).  rel_touch alone cannot do this — it only
-/// bumps by one.  Best-effort on null (caller's error path handles that).
-fn pidxRevSeed(rel: ?*relation.Relation, carry: u64) void {
+/// Publish-gate helper: install `rev` as a freshly re-created perm-index
+/// Relation's rev counter (see the rev_carry comment in permindex_build).
+/// Callers pass the value the rebuilt object must carry; sites with NO
+/// subsequent build bump pass the previous object's rev + 1 so the rebuilt
+/// object's rev is STRICTLY greater than any watermark the replaced object
+/// serialized.  Best-effort on null (caller's error path handles that).
+fn pidxRevSeed(rel: ?*relation.Relation, rev: u64) void {
     const r = rel orelse return;
-    if (carry > 0) r.rev = carry;
+    if (rev > 0) r.rev = rev;
 }
 
 // ─── Build a single permutation index ─────────────────────────────────────
@@ -60,7 +61,10 @@ pub export fn permindex_build(db: ?*dx.dl_db, rel_id: c_int, perm_id: c_int) c_i
         const carry0: u64 = if (pe.*.pidx_rel) |old| relation.rel_rev(@ptrCast(@alignCast(old))) else 0;
         if (pe.*.pidx_rel) |old| relation.rel_free(@ptrCast(@alignCast(old)));
         pe.*.pidx_rel = @ptrCast(relation.rel_create(pe.*.arity));
-        pidxRevSeed(@ptrCast(@alignCast(pe.*.pidx_rel)), carry0);
+        // No build bump on this path: seed carry0 + 1 so the fresh object's
+        // rev is strictly greater than any watermark the replaced object
+        // serialized (carry0 == 0 -> rev 1, which beats a rev-0 watermark).
+        pidxRevSeed(@ptrCast(@alignCast(pe.*.pidx_rel)), carry0 +% 1);
         pe.*.dirty = 0;
         return if (pe.*.pidx_rel != null) 0 else -1;
     }
@@ -70,14 +74,14 @@ pub export fn permindex_build(db: ?*dx.dl_db, rel_id: c_int, perm_id: c_int) c_i
 
     // Publish-gate carry: the index is FREED and re-created below, and the
     // fresh Relation's rev counter starts at 0 while dl.zig's saved_rev_perm
-    // watermark stores the OLD object's last-serialized rev.  A rebuilt
-    // index always lands at rev 1 (rel_create 0 + one build bump) and the
-    // first publish also stores rev 1, so rev alone CANNOT distinguish the
-    // objects — and glibc tcache routinely hands the new pidx_rel the freed
-    // chunk's address, defeating the saved_perm_rel identity check too.
-    // Carrying rev across the free/re-create boundary keeps it monotone per
-    // LOGICAL index, so a rebuilt object's rev is strictly greater than any
-    // rev the previous object serialized: the gate can never alias.
+    // watermark stores the OLD object's last-serialized rev.  glibc tcache
+    // routinely hands the new pidx_rel the freed chunk's address, defeating
+    // the saved_perm_rel identity check, so rev alone must distinguish the
+    // objects.  The invariant: a rebuilt object's rev is STRICTLY greater
+    // than any watermark the previous object serialized.  The non-empty
+    // build path reaches rev_carry + 1 via the rel_build_from_tupleset bump;
+    // the two no-bump paths (absent variant, empty base) seed rev_carry + 1
+    // explicitly — see the pidxRevSeed calls below.
     const rev_carry: u64 = if (pe.*.pidx_rel) |old| relation.rel_rev(@ptrCast(@alignCast(old))) else 0;
 
     // Collect base facts
@@ -93,7 +97,12 @@ pub export fn permindex_build(db: ?*dx.dl_db, rel_id: c_int, perm_id: c_int) c_i
         // Empty relation: create empty perm index
         if (pe.*.pidx_rel) |old| relation.rel_free(@ptrCast(@alignCast(old)));
         pe.*.pidx_rel = @ptrCast(relation.rel_create(ar));
-        pidxRevSeed(@ptrCast(@alignCast(pe.*.pidx_rel)), rev_carry);
+        // No build bump on this path: seed rev_carry + 1 so the fresh
+        // object's rev is strictly greater than any watermark the replaced
+        // object serialized (rev_carry == 0 -> rev 1, beating a rev-0
+        // watermark).  Otherwise the gate could hardlink stale bytes when
+        // tcache reuses the freed chunk's address.
+        pidxRevSeed(@ptrCast(@alignCast(pe.*.pidx_rel)), rev_carry +% 1);
         pe.*.dirty = 0;
         ts_free(&ts);
         return 0;
