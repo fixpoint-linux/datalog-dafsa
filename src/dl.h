@@ -73,8 +73,9 @@ dl_db  *dl_open2(const char *dir, int *err_out);
  * state (committed WAL records included).
  *
  * CAVEAT (pre-existing routing, unchanged): when a snapshot has been
- * published (dl_publish_snapshot), the dl_query/dl_rank/dl_select family
- * prefers that snapshot, while dl_prefix reads the live WAL-replayed state.
+ * published (dl_publish_snapshot, or a budget-triggered dl_consolidate),
+ * the dl_query/dl_rank/dl_select family prefers that snapshot, while
+ * dl_prefix reads the live WAL-replayed state.
  */
 dl_db  *dl_open_ro(const char *dir, int *err_out);
 
@@ -543,6 +544,11 @@ int dl_publish_snapshot(dl_db *db);
  * mode).  So the snapshot is PERIODIC (budget-triggered at consolidation-
  * time) instead of per-publish; dl_publish_snapshot remains the explicit
  * every-call checkpoint.
+ *
+ * BETWEEN materializations, dl_query/dl_rank/dl_select/dl_pattern serve
+ * the LAST materialized snapshot (snap_version does not advance), not the
+ * just-consolidated live store; use dl_lookup/dl_prefix for current state,
+ * or dl_publish_snapshot to force a fresh snapshot now.
  *
  * Returns 0 on success, -1 on error (NULL db, read-only handle, open txn,
  * or a consolidation/materialization failure). */

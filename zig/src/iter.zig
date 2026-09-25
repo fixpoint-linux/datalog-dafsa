@@ -198,8 +198,10 @@ pub export fn dl_iter_open(db: ?*dx.dl_db, rel: [*c]const u8, leading: ?[*]const
 
     if (d0.snap_version > 0) {
         // Snapshot path: OWN the mmap view (NOT view_open_cached — the vcache
-        // is LRU-evicted and fully invalidated by dl_publish_snapshot, which
-        // would dangle a long-lived cursor across iter_next calls).
+        // is LRU-evicted and fully invalidated when a new snapshot
+        // materializes (via dl_publish_snapshot or a budget-triggered
+        // dl_consolidate) and at dl_close — either event would dangle a
+        // long-lived cached view across iter_next calls).
         var path: [8192]u8 = undefined;
         var arity: u8 = 0;
         var variadic: c_int = 0;

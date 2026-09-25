@@ -4002,6 +4002,14 @@ pub export fn dl_query_topdown_adorn(db: ?*DlDb, goal_rel: [*c]const u8, adorn: 
 // dl_publish_timing_reset() zeroes them.  dl_publish_timing_get() copies
 // them out.  NOT ABI-gated symbols (new dl_* additions only; the audit
 // checks the header-declared surface).
+//
+// Scope (selfreg periodic snapshot): n_publishes and t_total_ns count
+// dl_publish_snapshot CALLS only — dl_consolidate bumps neither, so a
+// consolidate-only workload is invisible to them (do not read n_publishes
+// as the number of consolidation cycles; nothing in-tree reads these,
+// tests only).  Once a publish has enabled the timers, dl_consolidate's
+// shared paths do accumulate: consolidate() feeds t_ivm_ns and a
+// budget-triggered materializeSnapshot fills the serialize buckets.
 const timec = @cImport({
     @cDefine("_GNU_SOURCE", "1");
     @cInclude("time.h");
