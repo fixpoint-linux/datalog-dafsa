@@ -3394,6 +3394,20 @@ pub export fn dl_query_magic_adorn(db: ?*DlDb, goal_rel: [*c]const u8, adorn: [*
         }
     }
 
+    // Fast path: canonical left-recursive TC shape (bf adorn).
+    // The magic program for this shape is correct but its tc^bf stratum is
+    // O(n^2) in the semi-naive loop: the recursive rule's delta lands on the
+    // LAST body atom, so every iteration rescans the frozen leading
+    // magic_tc^b relation (O(n) per iteration, O(chain) iterations).  The
+    // BFS below derives the identical result in O(n).  Same interception
+    // point and same recognizer as dl_query_topdown_adorn.
+    {
+        var matched: c_int = 0;
+        const rc = tcRecognizeBf(d, goal_rel, adorn, vals, nvals, cb, user, &matched);
+        if (matched != 0)
+            return rc;
+    }
+
     var edb: DlDb = undefined;
     var prog: magic.magic_program = std.mem.zeroes(magic.magic_program);
     var magic_crules: ?[*]?*compiler.compiled_rule = null;
