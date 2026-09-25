@@ -4272,6 +4272,20 @@ pub export fn dl_publish_snapshot(db: ?*DlDb) c_int {
     var current_path: [4096:0]u8 = undefined;
     var buf: [4096:0]u8 = undefined;
     var renamed: c_int = 0;
+    // Publish-gate staging (defect: watermark committed before durability).
+    // relSaveGated writes the NEW rev here instead of into d.saved_rev*;
+    // the staged values are COMMITTED into the live watermarks only at the
+    // successful end of this publish (step 7).  Until then the live
+    // watermarks keep describing the LAST durable snapshot, so a publish
+    // that fails after a gated save (fclose, fsync, CURRENT flip) leaves
+    // them untouched — the invariant "a watermark never claims content is
+    // in the previous snapshot unless it is actually durable in it" holds
+    // even on the failure path, and a mutation-free retry re-serializes
+    // instead of hardlinking bytes that were never published.
+    var stage_rev: [MAX_RELS]u64 = @splat(SAVED_REV_NONE);
+    var stage_rev_var: [MAX_RELS][MAX_VAR_ARITY + 1]u64 = @splat(@splat(SAVED_REV_NONE));
+    var stage_rev_perm: [MAX_PERMS]u64 = @splat(SAVED_REV_NONE);
+    var stage_perm_rel: [MAX_PERMS]?*anyopaque = @splat(null);
 
     if (d.read_only != 0) return -1;
     if (d.txn != null) return -1;
@@ -4466,7 +4480,8 @@ pub export fn dl_publish_snapshot(db: ?*DlDb) c_int {
                     _ = fprintf(mf, "%s:%d:%s\n", @as([*c]const u8, @ptrCast(&vname)), @as(c_int, a),
                         if (relation.rel_is_idb(vr) != 0) "idb" else "edb");
                     _ = snprintf(&rel_path, 4096, "%s/%s.dafsa", &tmp_dir, @as([*c]const u8, @ptrCast(&vname)));
-                    if (relSaveGated(d, vr, &rel_path, &d.saved_rev_var[i][a], &prev_snap_dir) != 0) {
+                    stage_rev_var[i][a] = d.saved_rev_var[i][a];
+                    if (relSaveGated(d, vr, &rel_path, &stage_rev_var[i][a], &prev_snap_dir) != 0) {
                         _ = c.fclose(mf);
                         return dlPublishFail(&tmp_dir, &new_dir, renamed);
                     }
@@ -4490,7 +4505,8 @@ pub export fn dl_publish_snapshot(db: ?*DlDb) c_int {
                 if (relation.rel_is_idb(d.rels[i].rel) != 0) "idb" else "edb");
 
             _ = snprintf(&rel_path, 4096, "%s/%s.dafsa", &tmp_dir, d.rels[i].name);
-            if (relSaveGated(d, d.rels[i].rel, &rel_path, &d.saved_rev[i], &prev_snap_dir) != 0) {
+            stage_rev[i] = d.saved_rev[i];
+            if (relSaveGated(d, d.rels[i].rel, &rel_path, &stage_rev[i], &prev_snap_dir) != 0) {
                 _ = c.fclose(mf);
                 return dlPublishFail(&tmp_dir, &new_dir, renamed);
             }
@@ -4522,7 +4538,8 @@ pub export fn dl_publish_snapshot(db: ?*DlDb) c_int {
                 _ = fprintf(mf, "%s:%d # perm index of %s\n", @as([*c]const u8, @ptrCast(&pi_name)), @as(c_int, ar), d.rels[@intCast(pe.rel_id)].name);
 
                 _ = snprintf(&pi_path, 4096, "%s/%s.dafsa", &tmp_dir, @as([*c]const u8, @ptrCast(&pi_name)));
-                if (permSaveGated(d, pe.pidx_rel, &pi_path, @intCast(pi), &prev_snap_dir) != 0) {
+                stage_rev_perm[@intCast(pi)] = d.saved_rev_perm[@intCast(pi)];
+                if (permSaveGated(d, pe.pidx_rel, &pi_path, @intCast(pi), &prev_snap_dir, &stage_rev_perm, &stage_perm_rel) != 0) {
                     _ = c.fclose(mf);
                     return dlPublishFail(&tmp_dir, &new_dir, renamed);
                 }
@@ -4582,6 +4599,18 @@ pub export fn dl_publish_snapshot(db: ?*DlDb) c_int {
     vcache_invalidate(&d.vcache);
     d.snap_version = new_version;
 
+    // 7b. Commit the publish-gate watermarks.  The publish is durable NOW
+    // (rename + CURRENT flip both succeeded), so — and only so — the
+    // staged revs may become the live "already serialized into the
+    // previous snapshot" claims.  Slots never offered a save this publish
+    // keep their sentinel (absent variant / null pidx_rel) and so force a
+    // full save if they ever appear later; the perm identity array commits
+    // the same way (its null entries pair with the sentinel revs).
+    d.saved_rev = stage_rev;
+    d.saved_rev_var = stage_rev_var;
+    d.saved_rev_perm = stage_rev_perm;
+    d.saved_perm_rel = stage_perm_rel;
+
     // 8. Opt-in retention
     if (d.snapshot_retain > 0)
         pruneSnapshots(d);
@@ -4615,7 +4644,11 @@ fn dlPublishFail(tmp_dir: [*c]const u8, new_dir: [*c]const u8, renamed: c_int) c
 /// rel_save whenever the gate does not apply: first publish of the process
 /// (watermark sentinel), any content change since (rev moved), or hardlink
 /// failure (previous snapshot pruned, cross-device, pathological FS).
-/// Returns 0 on success (file present at dst), -1 on error.
+/// `saved_rev` points at the caller's STAGED slot (pre-seeded from the live
+/// watermark): the decision reads the last durable value, the write is
+/// committed into d.saved_rev* only if the publish succeeds (see
+/// dl_publish_snapshot step 7b).  Returns 0 on success (file present at
+/// dst), -1 on error.
 fn relSaveGated(
     d: *DlDb,
     rel: ?*relation.Relation,
@@ -4654,21 +4687,36 @@ fn relSaveGated(
 /// Perm-index variant of the gate: the index relation is freed and
 /// re-created on rebuild, so besides the revision watermark the object
 /// identity must match — a fresh object with a coincidentally-equal rev is
-/// always re-serialized.
+/// always re-serialized.  Both the rev watermark and the recorded identity
+/// are staged (committed with the rest at publish success).
 fn permSaveGated(
     d: *DlDb,
     rel: ?*relation.Relation,
     dst: [*c]const u8,
     pi: usize,
     prev_snap_dir: [*c]const u8,
+    stage_rev_perm: *[MAX_PERMS]u64,
+    stage_perm_rel: *[MAX_PERMS]?*anyopaque,
 ) c_int {
     const ident: ?*anyopaque = @ptrCast(rel);
     if (rel == null or ident != d.saved_perm_rel[pi]) {
-        const rc = relSaveGated(d, rel, dst, &d.saved_rev_perm[pi], prev_snap_dir);
-        if (rc == 0) d.saved_perm_rel[pi] = ident;
+        // The object changed since the last publish: the watermark may be
+        // STALE in a way rev cannot see.  A rebuilt index restarts its rev
+        // counter at 0, so the fresh object's rev can coincide with the
+        // value recorded for the OLD object (glibc tcache can also hand
+        // the new pidx_rel the freed chunk's address, defeating the
+        // identity check — the rev CARRY in permindex_build closes that
+        // side; this neutralization is defense-in-depth).  Delegating with
+        // the staged-as-live watermark would let relSaveGated's own
+        // (rev == saved_rev) check pass and hardlink the PREVIOUS
+        // snapshot's bytes while the index content differs.  Neutralize it
+        // first: the sentinel forces a full re-serialize.
+        stage_rev_perm[pi] = SAVED_REV_NONE;
+        const rc = relSaveGated(d, rel, dst, &stage_rev_perm[pi], prev_snap_dir);
+        if (rc == 0) stage_perm_rel[pi] = ident;
         return rc;
     }
-    return relSaveGated(d, rel, dst, &d.saved_rev_perm[pi], prev_snap_dir);
+    return relSaveGated(d, rel, dst, &stage_rev_perm[pi], prev_snap_dir);
 }
 
 // ─── M6: Permutation index API ─────────────────────────────────────────────

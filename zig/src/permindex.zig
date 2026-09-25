@@ -30,6 +30,16 @@ extern "c" fn ts_free(ts: ?*tupleset.tuple_set) void;
 extern "c" fn ts_add(ts: ?*tupleset.tuple_set, cols: ?[*]const u32) c_int;
 extern "c" fn ts_sort(ts: ?*tupleset.tuple_set) void;
 
+/// Publish-gate helper: seed a freshly re-created perm-index Relation's rev
+/// counter with the previous object's rev (`carry`), so the logical index's
+/// rev stays MONOTONE across the free/re-create boundary (see the rev_carry
+/// comment in permindex_build).  rel_touch alone cannot do this — it only
+/// bumps by one.  Best-effort on null (caller's error path handles that).
+fn pidxRevSeed(rel: ?*relation.Relation, carry: u64) void {
+    const r = rel orelse return;
+    if (carry > 0) r.rev = carry;
+}
+
 // ─── Build a single permutation index ─────────────────────────────────────
 
 /// int permindex_build(dl_db *db, int rel_id, int perm_id)
@@ -47,14 +57,28 @@ pub export fn permindex_build(db: ?*dx.dl_db, rel_id: c_int, perm_id: c_int) c_i
         // Fixed relation of a different arity, or a variadic variant that
         // does not exist: build an EMPTY index (an absent variant reads as
         // an empty relation everywhere else too).
+        const carry0: u64 = if (pe.*.pidx_rel) |old| relation.rel_rev(@ptrCast(@alignCast(old))) else 0;
         if (pe.*.pidx_rel) |old| relation.rel_free(@ptrCast(@alignCast(old)));
         pe.*.pidx_rel = @ptrCast(relation.rel_create(pe.*.arity));
+        pidxRevSeed(@ptrCast(@alignCast(pe.*.pidx_rel)), carry0);
         pe.*.dirty = 0;
         return if (pe.*.pidx_rel != null) 0 else -1;
     }
     const base_rel: *const relation.Relation = @ptrCast(@alignCast(base_rel_c));
 
     const ar: u8 = pe.*.arity;
+
+    // Publish-gate carry: the index is FREED and re-created below, and the
+    // fresh Relation's rev counter starts at 0 while dl.zig's saved_rev_perm
+    // watermark stores the OLD object's last-serialized rev.  A rebuilt
+    // index always lands at rev 1 (rel_create 0 + one build bump) and the
+    // first publish also stores rev 1, so rev alone CANNOT distinguish the
+    // objects — and glibc tcache routinely hands the new pidx_rel the freed
+    // chunk's address, defeating the saved_perm_rel identity check too.
+    // Carrying rev across the free/re-create boundary keeps it monotone per
+    // LOGICAL index, so a rebuilt object's rev is strictly greater than any
+    // rev the previous object serialized: the gate can never alias.
+    const rev_carry: u64 = if (pe.*.pidx_rel) |old| relation.rel_rev(@ptrCast(@alignCast(old))) else 0;
 
     // Collect base facts
     var ts: tupleset.tuple_set = undefined;
@@ -69,6 +93,7 @@ pub export fn permindex_build(db: ?*dx.dl_db, rel_id: c_int, perm_id: c_int) c_i
         // Empty relation: create empty perm index
         if (pe.*.pidx_rel) |old| relation.rel_free(@ptrCast(@alignCast(old)));
         pe.*.pidx_rel = @ptrCast(relation.rel_create(ar));
+        pidxRevSeed(@ptrCast(@alignCast(pe.*.pidx_rel)), rev_carry);
         pe.*.dirty = 0;
         ts_free(&ts);
         return 0;
@@ -104,6 +129,9 @@ pub export fn permindex_build(db: ?*dx.dl_db, rel_id: c_int, perm_id: c_int) c_i
             ts_free(&ts);
             return -1;
         }
+        // Seed BEFORE the build bump: final rev = rev_carry + 1 (build),
+        // strictly greater than anything the previous object serialized.
+        pidxRevSeed(@ptrCast(@alignCast(pe.*.pidx_rel)), rev_carry);
 
         if (relation.rel_build_from_tupleset(@ptrCast(@alignCast(pe.*.pidx_rel)), &pts) != 0) {
             relation.rel_free(@ptrCast(@alignCast(pe.*.pidx_rel)));
