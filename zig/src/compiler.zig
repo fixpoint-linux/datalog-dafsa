@@ -3355,40 +3355,51 @@ pub export fn compile_rules(db: ?*dx.dl_db, rules: ?[*]?*parser.rule, n_rules: c
 
     if (compute_strata(d, rules.?, n_rules, rel_strata, recursive, @intCast(nrels)) != 0) return -1;
 
+    // The out-params are published ONLY on success (n>0 <=> rules!=null):
+    // every failure path below frees the partial array itself, so callers
+    // must see *out_rules == null and *out_n == 0 when we return -1.
     const arr: [*]?*compiled_rule = @ptrCast(@alignCast(c.calloc(@as(usize, @intCast(n_rules)), @sizeOf(?*compiled_rule)) orelse return -1));
-
+    out_rules.?.* = null;
     out_n.?.* = 0;
+
+    var n_done: c_int = 0;
+    var failed = false;
     i = 0;
     while (i < n_rules) : (i += 1) {
-        const r = rules.?[@intCast(i)] orelse return -1;
+        const r = rules.?[@intCast(i)] orelse {
+            failed = true;
+            break;
+        };
         arr[@intCast(i)] = compile_one(d, r, rel_strata, recursive);
         if (arr[@intCast(i)] == null) {
-            var j2: c_int = 0;
-            while (j2 < i) : (j2 += 1) compiled_rule_free(arr[@intCast(j2)]);
-            c.free(@ptrCast(arr));
-            return -1;
+            failed = true;
+            break;
         }
+        n_done += 1; // arr[i] is now owned by us and freed by the tail cleanup
         arr[@intCast(i)].?.is_recursive = if (arr[@intCast(i)].?.head_rel_id < @as(u8, @truncate(nrels)) and recursive[@intCast(arr[@intCast(i)].?.head_rel_id)] != 0) 1 else 0;
 
         if (arr[@intCast(i)].?.is_recursive != 0 and db_rel_is_variadic(d, arr[@intCast(i)].?.head_rel_id) != 0) {
             cerr(r.off, "compile error: recursive rule over a variadic head is not supported (rule '{s}')\n", .{cs(arr[@intCast(i)].?.head_pred)});
-            var j2: c_int = 0;
-            while (j2 <= i) : (j2 += 1) compiled_rule_free(arr[@intCast(j2)]);
-            c.free(@ptrCast(arr));
-            return -1;
+            failed = true;
+            break;
         }
 
         if (arr[@intCast(i)].?.has_aggregate != 0 and arr[@intCast(i)].?.is_recursive != 0) {
             cerr(r.off, "compile error: aggregate in recursive rule not supported (rule '{s}')\n", .{cs(arr[@intCast(i)].?.head_pred)});
-            var j2: c_int = 0;
-            while (j2 <= i) : (j2 += 1) compiled_rule_free(arr[@intCast(j2)]);
-            c.free(@ptrCast(arr));
-            return -1;
+            failed = true;
+            break;
         }
-        out_n.?.* += 1;
+    }
+
+    if (failed) {
+        var j2: c_int = 0;
+        while (j2 < n_done) : (j2 += 1) compiled_rule_free(arr[@intCast(j2)]);
+        c.free(@ptrCast(arr));
+        return -1;
     }
 
     out_rules.?.* = arr;
+    out_n.?.* = n_done;
     return 0;
 }
 

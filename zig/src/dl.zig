@@ -3357,7 +3357,7 @@ pub export fn dl_query_rules_ro(db: ?*DlDb, dl_source: [*c]const u8, goal_rel: [
         dlErr("dl_query_rules_ro: compile failed\n", .{});
         {
             var i: c_int = 0;
-            while (i < n_crules) : (i += 1) compiler.compiled_rule_free(crules.?[@intCast(i)]);
+            while (crules != null and i < n_crules) : (i += 1) compiler.compiled_rule_free(crules.?[@intCast(i)]);
             if (crules) |x| c.free(@ptrCast(x));
         }
         evalDbFreeOwned(&edb, n_aliased, &owned);
