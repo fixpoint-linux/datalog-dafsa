@@ -84,6 +84,19 @@ pub const Relation = struct {
     // WAL FILE but not this counter), so it measures total append traffic
     // independent of compaction — the signal for the snapshot-budget trigger.
     wal_appended_bytes: u64 = 0,
+    // ─── U-homog (S2): recorded per-column value kinds ─────────────────────
+    // kind[c] is the value space column c stores, RECORDED when values enter
+    // the store (never inferred from content — the shared interner makes a
+    // stored u32's space unobservable): 0=unknown (empty column, permissive),
+    // 1=int (raw u32), 2=sym (interned id).  A column that would hold BOTH
+    // is rejected LOUDLY at the insert site, so 3=mixed never gets recorded
+    // (3 stays reserved for the compile-time cache join).
+    //
+    // Lives in the Relation tail (not dl_db's) on purpose: every eval clone
+    // (rules_ro/magic/wfs) ALIASES the relation pointers, so kinds ride
+    // along into the clones that check them; a dl_db-tail field would be
+    // invisible to wfs.zig's raw dx.dl_db clone.
+    col_kind: [MAX_ARITY]u8 = @splat(0),
 };
 
 /// Bump the content revision (every mutation site that sets dirty=1 calls
@@ -106,6 +119,38 @@ pub export fn rel_rev(rel: ?*const Relation) u64 {
 pub export fn rel_wal_appended(rel: ?*const Relation) u64 {
     const r = rel orelse return 0;
     return r.wal_appended_bytes;
+}
+
+// ─── U-homog (S2): recorded per-column kinds ───────────────────────────────
+
+/// Column kind values (see Relation.col_kind).
+pub const KIND_UNKNOWN: u8 = 0;
+pub const KIND_INT: u8 = 1;
+pub const KIND_SYM: u8 = 2;
+
+/// uint8_t rel_col_kind(const relation *rel, uint8_t col)
+/// The RECORDED kind of column `col` (0=unknown, 1=int, 2=sym).  Content is
+/// NEVER inferred here — see the col_kind field comment.
+pub export fn rel_col_kind(rel: ?*const Relation, col: u8) u8 {
+    const r = rel orelse return KIND_UNKNOWN;
+    if (col >= MAX_ARITY) return KIND_UNKNOWN;
+    return r.col_kind[col];
+}
+
+/// int rel_kind_note(relation *rel, uint8_t col, uint8_t kind)
+/// Record/fold a kind into column `col`: unknown folds away, a matching kind
+/// is idempotent, and a CONFLICTING kind is refused (-1) WITHOUT mutating —
+/// the caller turns that into the loud insert-time rejection.  kind 3 is not
+/// accepted (mixed is a reject, not a state).
+pub export fn rel_kind_note(rel: ?*Relation, col: u8, kind: u8) c_int {
+    const r = rel orelse return -1;
+    if (col >= MAX_ARITY or kind == 0 or kind > KIND_SYM) return -1;
+    const cur = r.col_kind[col];
+    if (cur == KIND_UNKNOWN) {
+        r.col_kind[col] = kind;
+        return 0;
+    }
+    return if (cur == kind) 0 else -1;
 }
 
 /// typedef int (*rel_enum_cb)(const uint32_t *cols, uint8_t arity, void *user)

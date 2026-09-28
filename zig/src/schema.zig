@@ -109,7 +109,7 @@ export fn dl_schema_add(s: ?*dl_schema, name: ?[*:0]const u8, arity: u8, cols: ?
 }
 
 /// const dl_reldef *dl_schema_find(const dl_schema *s, const char *name)
-export fn dl_schema_find(s: ?*const dl_schema, name: ?[*:0]const u8) ?*const dl_reldef {
+pub export fn dl_schema_find(s: ?*const dl_schema, name: ?[*:0]const u8) ?*const dl_reldef {
     const sch = s orelse return null;
     const name_p = name orelse return null;
     var i: usize = 0;

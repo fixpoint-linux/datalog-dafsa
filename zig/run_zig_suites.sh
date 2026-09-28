@@ -87,6 +87,9 @@ test_schema
 test_typecheck
 test_traverse
 test_search
+test_wfs
+test_homog
+test_reactive
 test_vector_storage
 test_vector_cli
 test_vector_search_content

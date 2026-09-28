@@ -24,6 +24,8 @@ comptime {
     _ = @import("vm.zig"); // U9: src/vm.c
     _ = @import("magic.zig"); // U10: src/magic.c
     _ = @import("topdown.zig"); // U10: src/topdown.c
+    _ = @import("wfs.zig"); // WFS: well-founded-semantics driver (dl_query_wfs_ro)
+    _ = @import("reactive.zig"); // Reactive: fired-event observation (dl_fired_*)
     _ = @import("dl.zig"); // U11: src/dl.c
     _ = @import("index.zig"); // U14: src/index.c
     _ = @import("vector.zig"); // U14: src/vector.c

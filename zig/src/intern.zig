@@ -21,6 +21,7 @@
 const std = @import("std");
 const c = std.c;
 const util = @import("util.zig");
+const dx = @import("dl_internal.zig");
 
 /// dafsa_internal.h: MAX_WORD_LEN guard (intern-side, on str \0 id_u32BE).
 const MAX_WORD_LEN: usize = 65536;
@@ -303,6 +304,18 @@ pub export fn intern_str_of(ir: ?*Interner, sym_id: u32) ?[*:0]const u8 {
     if (sym_id == 0 or sym_id >= s.next_id) return null;
     if (sym_id > s.rev_cap) return null;
     return s.rev.?[sym_id - 1];
+}
+
+/// Zig-internal (NOT a C export — abi_audit stays clean): the number of
+/// interned symbols, i.e. the exclusive upper bound of live sym ids.
+/// compiler.zig's kind inference uses it to tell a stored u32 that IS a
+/// live sym id from a raw int that merely happens to be small.  Takes the
+/// opaque dl_internal interner type (same layout as this module's
+/// Interner, which is what intern.h leaves opaque).
+pub fn liveSymBound(ir: ?*const dx.interner) u32 {
+    if (ir == null) return 0;
+    const s: *const Interner = @ptrCast(@alignCast(ir.?));
+    return s.next_id;
 }
 
 // ─── Accessors ───────────────────────────────────────────────────────────

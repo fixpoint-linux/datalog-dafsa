@@ -25,6 +25,8 @@ test {
     _ = @import("vm.zig");
     _ = @import("magic.zig");
     _ = @import("topdown.zig");
+    _ = @import("wfs.zig");
+    _ = @import("reactive.zig");
     _ = @import("dl.zig");
     _ = @import("index.zig"); // U14: src/index.c
     _ = @import("vector.zig"); // U14: src/vector.c

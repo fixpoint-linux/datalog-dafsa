@@ -26,6 +26,8 @@ const c = std.c;
 
 const parser = @import("parser.zig");
 const regexwalk = @import("regexwalk.zig");
+const schema = @import("schema.zig");
+const relation_mod = @import("relation.zig");
 
 // dl_internal.h pulls in dl.h/intern.h/relation.h/vrelation.h/snapshot.h/
 // permindex.h/termstore.h/compiler.h — so this one @cImport supplies dl_db,
@@ -149,7 +151,7 @@ const use_got_refs = builtin.output_mode == .Lib and builtin.mode != .Debug and
 inline fn gotDataRef(comptime name: []const u8, comptime T: type) *T {
     if (use_got_refs) {
         return asm ("movq " ++ name ++ "@GOTPCREL(%rip), %[p]"
-            : [p] "={rax}" (-> *T)
+            : [p] "={rax}" (-> *T),
         );
     }
     return @extern(*T, .{ .name = name });
@@ -996,7 +998,8 @@ fn compute_strata(db: *dx.dl_db, rules: [*]?*parser.rule, n_rules: c_int, out_st
         while (bi < r.nbody) : (bi += 1) {
             const ba = r.body.?[@intCast(bi)] orelse continue;
             if (is_range_builtin(ba) and ba.nargs >= 2 and
-                ba.args.?[1] != null and ba.args.?[1].?.kind == parser.TOK_IDENT) {
+                ba.args.?[1] != null and ba.args.?[1].?.kind == parser.TOK_IDENT)
+            {
                 const rel_ri = db_find_rel(db, cs(ba.args.?[1].?.text));
                 if (rel_ri >= 0) {
                     if (!add_edge(&edges, &n_edges, &edges_cap, rel_ri, head_ri, 1)) {
@@ -1161,20 +1164,20 @@ fn compute_strata(db: *dx.dl_db, rules: [*]?*parser.rule, n_rules: c_int, out_st
             }
 
             visited = @ptrCast(@alignCast(c.calloc(nrels, @sizeOf(c_int)) orelse blk: {
-                 scc_failed = true;
+                scc_failed = true;
                 break :blk null;
-                }));
+            }));
             if (!scc_failed) {
                 order = @ptrCast(@alignCast(c.malloc(nrels * @sizeOf(c_int)) orelse blk: {
-                     scc_failed = true;
+                    scc_failed = true;
                     break :blk null;
-                    }));
+                }));
             }
             if (!scc_failed) {
                 comp = @ptrCast(@alignCast(c.malloc(nrels * @sizeOf(c_int)) orelse blk: {
-                     scc_failed = true;
+                    scc_failed = true;
                     break :blk null;
-                    }));
+                }));
             }
 
             if (!scc_failed) {
@@ -1182,9 +1185,9 @@ fn compute_strata(db: *dx.dl_db, rules: [*]?*parser.rule, n_rules: c_int, out_st
                 // First pass: iterative DFS on forward graph for postorder.
                 {
                     const stack_node: [*]c_int = @ptrCast(@alignCast(c.malloc((nrels + 1) * @sizeOf(c_int)) orelse blk: {
-                         scc_failed = true;
+                        scc_failed = true;
                         break :blk null;
-                        }));
+                    }));
                     const stack_idx: [*]c_int = @ptrCast(@alignCast(c.malloc((nrels + 1) * @sizeOf(c_int)) orelse blk: {
                         c.free(@ptrCast(stack_node));
                         scc_failed = true;
@@ -1232,9 +1235,9 @@ fn compute_strata(db: *dx.dl_db, rules: [*]?*parser.rule, n_rules: c_int, out_st
                     // Second pass: DFS on reverse graph in reverse postorder.
                     @memset(visited.?[0..nrels], 0);
                     const stack_node: [*]c_int = @ptrCast(@alignCast(c.malloc((nrels + 1) * @sizeOf(c_int)) orelse blk: {
-                         scc_failed = true;
+                        scc_failed = true;
                         break :blk null;
-                        }));
+                    }));
                     const stack_idx: [*]c_int = @ptrCast(@alignCast(c.malloc((nrels + 1) * @sizeOf(c_int)) orelse blk: {
                         c.free(@ptrCast(stack_node));
                         scc_failed = true;
@@ -1346,7 +1349,8 @@ fn compute_strata(db: *dx.dl_db, rules: [*]?*parser.rule, n_rules: c_int, out_st
                     needed = from_s + 1;
                     if (needed > 1000000) needed = 1000000;
                 } else if (out_recursive[@intCast(e.from)] != 0 and comp != null and
-                    comp.?[@intCast(e.from)] != comp.?[@intCast(e.to)]) {
+                    comp.?[@intCast(e.from)] != comp.?[@intCast(e.to)])
+                {
                     needed = from_s + 1;
                     if (needed > 1000000) needed = 1000000;
                 } else {
@@ -2328,7 +2332,8 @@ fn compile_one(db: *dx.dl_db, r: *parser.rule, rel_strata: ?[*]const c_int, recu
                 const ba = r.body.?[@intCast(bi)] orelse return null;
                 if (ba.nargs >= 1 and ba.args.?[0].?.kind == parser.TOK_VAR and
                     strEq(cs(ba.args.?[0].?.text), cs(a.text)) and
-                    (is_arith(ba) or is_str_producing(ba) or is_list_producing(ba))) {
+                    (is_arith(ba) or is_str_producing(ba) or is_list_producing(ba)))
+                {
                     ares = 1;
                     break;
                 }
@@ -2565,7 +2570,8 @@ fn compile_one(db: *dx.dl_db, r: *parser.rule, rel_strata: ?[*]const c_int, recu
                     var q: c_int = 0;
                     while (q < p.nargs) : (q += 1) {
                         if (p.args.?[@intCast(q)].?.kind == parser.TOK_VAR and
-                            strEq(cs(p.args.?[@intCast(q)].?.text), cs(curr.args.?[@intCast(j)].?.text))) {
+                            strEq(cs(p.args.?[@intCast(q)].?.text), cs(curr.args.?[@intCast(j)].?.text)))
+                        {
                             sc[@intCast(j)] = 1;
                             break;
                         }
@@ -2988,6 +2994,326 @@ fn compile_one(db: *dx.dl_db, r: *parser.rule, rel_strata: ?[*]const c_int, recu
     return cr;
 }
 
+// ─── U-homog (S2): recorded per-column kinds + loud constant check ────────
+//
+// Every engine value is a bare u32 — a RAW INTEGER or a 1-based sym_id —
+// sharing one value space with no tag.  A constant whose kind contradicts
+// the column it is probed against can therefore silently collide with a
+// stored id of the other space and answer from the wrong value space:
+//   e={1,2};  q(X):-e(X).  p(X):-e(X),!q(foo).
+// returned ZERO rows (rc=0, no error) because 'foo' interned to sym_id 1
+// and OP_NEG_CHECK probed raw 1.  This pass makes the mismatch LOUD at the
+// single compile chokepoint every strategy path enters (dl_load_rules,
+// dl_query_rules_ro, WFS, magic, topdown, IVM, analyze).
+//
+// S2 kind model — RECORDED, never inferred.  The S1 attempt inferred a
+// column's kind by asking the SHARED interner whether a stored u32 resolves
+// as a symbol; that is unsound in BOTH directions (any interned symbol
+// anywhere makes legitimate small-int columns read as sym; an int interned
+// before the scan folds the column to mixed=permissive), because the value
+// space of a stored u32 is simply not observable.  Instead:
+//   1. an ATTACHED SCHEMA's declared dl_coltype for the relation (the
+//      typechecker has already run at dl_load_rules, so declared kinds keep
+//      the typed path at least as strict);
+//   2. the relation's RECORDED col_kind (relation.zig tail), established
+//      exactly when values enter the store: the CSV coercion site (int cell
+//      -> int kind, non-int cell -> sym kind), dl_add_fact (first value
+//      establishes; a later conflicting kind is refused there), and rule
+//      heads (this check validates the program, so every emitted head tuple
+//      is kind-consistent by construction);
+//   3. HEAD-DERIVED kinds for relations with no data yet: a rule head's
+//      column kind is propagated from the kinds its VARIABLES are bound to
+//      by other atoms of the same rule (iter rule -> iter to fixpoint), so
+//      the reproduced case is loud even though q is EMPTY at compile time.
+//      Head columns fed by CONSTANTS are not propagated (a head constant
+//      does not make its column kind-known).
+//   4. else unknown = PERMISSIVE (an empty column may still legitimately
+//      receive either space; the declared-relation-then-load flow must keep
+//      working).
+// Mixed (3) is only ever a join result in the transient cache below, never
+// a stored kind: the insert sites reject mixed columns loudly.
+//
+// Variadic relations stay permissive (kinds are per (rel,col); variants are
+// per-arity — see the plan's R7).  Builtins/comparisons/aggregates are NOT
+// checked here (S3 threads kinds into the cmp path; X!=foo stays outside).
+
+const KIND_UNKNOWN: u8 = 0;
+const KIND_INT: u8 = 1;
+const KIND_SYM: u8 = 2;
+const KIND_MIXED: u8 = 3;
+
+const HOMOG_MAX_RELS = 64; // mirrors dl_internal MAX_RELS
+const HOMOG_MAX_ARITY = 8; // mirrors MAX_ARITY
+
+/// Kind of one constant token (mirrors typecheck.zig tokenInherentType):
+/// TOK_INT -> int, TOK_IDENT/TOK_STRING -> sym, else unknown.
+fn tokenColKind(t: ?*const parser.token) u8 {
+    const tt = t orelse return KIND_UNKNOWN;
+    return switch (tt.kind) {
+        parser.TOK_INT => KIND_INT,
+        parser.TOK_IDENT, parser.TOK_STRING => KIND_SYM,
+        else => KIND_UNKNOWN, // TOK_VAR / TOK_LIST
+    };
+}
+
+/// Join two kinds: unknown absorbs; int+sym (or anything with mixed) is
+/// mixed.
+fn kindJoin(a: u8, b: u8) u8 {
+    if (a == KIND_UNKNOWN) return b;
+    if (b == KIND_UNKNOWN) return a;
+    if (a == b) return a;
+    return KIND_MIXED;
+}
+
+/// Human name of a kind for the diagnostic.
+fn kindName(k: u8) [*c]const u8 {
+    return switch (k) {
+        KIND_INT => "integers",
+        KIND_SYM => "symbols",
+        else => "mixed values",
+    };
+}
+
+/// dl_coltype -> kind (schema.zig tags).  LIST/OPTIONAL are term handles —
+/// out of scope, permissive.
+fn colTypeKind(tag: c_int) u8 {
+    return switch (tag) {
+        schema.DLT_NATURAL, schema.DLT_BOOL, schema.DLT_CHAR, schema.DLT_DATE, schema.DLT_TIMESTAMP, schema.DLT_SIGNED => KIND_INT,
+        schema.DLT_TEXT, schema.DLT_ENUM => KIND_SYM,
+        else => KIND_UNKNOWN,
+    };
+}
+
+/// Column kind lookup: schema-declared > cache > RECORDED.  No content
+/// inference anywhere — a stored u32's value space is not observable (the
+/// shared interner resolves small raw ints as symbols and vice versa).
+fn relColKind(db: *dx.dl_db, cache: [*][HOMOG_MAX_ARITY]u8, ri: c_int, col: u8, arity: u8) u8 {
+    if (ri < 0 or col >= HOMOG_MAX_ARITY or arity > HOMOG_MAX_ARITY or arity == 0) return KIND_UNKNOWN;
+    const rix: usize = @intCast(ri);
+    if (rix >= db.nrels or rix >= HOMOG_MAX_RELS) return KIND_UNKNOWN;
+    const e = &db.rels[rix];
+    if (e.kind == dx.RELK_VARIADIC) return KIND_UNKNOWN;
+
+    // attached schema: the DECLARED kind is authoritative for relations it
+    // declares (and keeps the typed path at least as strict as before).
+    // db.schema is the opaque dl_internal mirror of schema.zig's concrete
+    // dl_schema (same layout).
+    if (db.schema) |schm| {
+        const schm_typed: ?*const schema.dl_schema = @ptrCast(@alignCast(schm));
+        if (schema.dl_schema_find(schm_typed, e.name)) |rd| {
+            if (col < rd.arity)
+                return colTypeKind(rd.cols[col].tag);
+            return KIND_UNKNOWN;
+        }
+    }
+
+    if (cache[rix][col] != KIND_UNKNOWN) return cache[rix][col];
+
+    // the RECORDED kind (S2): established at insert time, persisted in
+    // rels.txt — visible through every eval clone because clones alias the
+    // relation pointers (Relation tail field).
+    const rel_concrete: ?*const relation_mod.Relation = @ptrCast(@alignCast(e.rel));
+    return relation_mod.rel_col_kind(rel_concrete, col);
+}
+
+/// Head-kind propagation to a fixpoint over `rules`: every rule head's
+/// column takes the kinds its VARIABLES are constrained to by the positive
+/// relational body atoms of the same rule, iterated until stable so a chain
+/// of heads propagates through:
+///   q(X):-e(X).  p(X):-e(X),!q(foo).   derives q:int from e:int.
+/// This is what makes the reproduced case loud even though q is EMPTY at
+/// compile time.  Constants never feed a kind — only vars do — so the
+/// offending constant cannot mask its own check.
+fn propagateHeadKinds(db: *dx.dl_db, rules: [*]?*parser.rule, n_rules: c_int, cache: [*][HOMOG_MAX_ARITY]u8) c_int {
+    var rounds: usize = 0;
+    var changed = true;
+    while (changed and rounds < 64) : (rounds += 1) {
+        changed = false;
+        var i: c_int = 0;
+        while (i < n_rules) : (i += 1) {
+            const r = rules[@intCast(i)] orelse continue;
+            const head = r.head orelse continue;
+            if (head.aggregate != 0) continue;
+            if (head.nargs < 1 or head.nargs > HOMOG_MAX_ARITY) continue;
+            const hri = db_find_rel(db, cs(head.pred));
+            if (hri < 0 or hri >= HOMOG_MAX_RELS) continue;
+            if (db.rels[@intCast(hri)].kind == dx.RELK_VARIADIC) continue;
+            // var -> joined kind from body atoms (positive, relational)
+            var vnames: [HOMOG_MAX_ARITY * 4]?[*c]const u8 = undefined;
+            var vkinds: [HOMOG_MAX_ARITY * 4]u8 = undefined;
+            var nv: usize = 0;
+            var j: c_int = 0;
+            while (j < r.nbody) : (j += 1) {
+                const ba = r.body.?[@intCast(j)] orelse continue;
+                if (ba.aggregate != 0 or ba.negated != 0) continue; // negated binds nothing
+                if (is_builtin_pred(ba)) continue;
+                if (ba.nargs < 1 or ba.nargs > HOMOG_MAX_ARITY) continue;
+                const ri = db_find_rel(db, cs(ba.pred));
+                if (ri < 0) continue;
+                var k: c_int = 0;
+                while (k < ba.nargs) : (k += 1) {
+                    const t = ba.args.?[@intCast(k)] orelse continue;
+                    if (t.kind == parser.TOK_VAR) {
+                        var f: usize = 0;
+                        while (f < nv) : (f += 1)
+                            if (strEq(vnames[f] orelse "", cs(t.text))) break;
+                        if (f == nv) {
+                            if (nv >= vnames.len) continue;
+                            vnames[nv] = cs(t.text);
+                            vkinds[nv] = KIND_UNKNOWN;
+                            nv += 1;
+                        }
+                        if (ba.nargs <= HOMOG_MAX_ARITY)
+                            vkinds[f] = kindJoin(vkinds[f], relColKind(db, cache, ri, @intCast(k), @intCast(ba.nargs)));
+                    }
+                }
+            }
+            if (nv == 0) continue;
+            // head columns fed by a var take that var's kind
+            var hc: c_int = 0;
+            while (hc < head.nargs and hc < HOMOG_MAX_ARITY) : (hc += 1) {
+                const ht = head.args.?[@intCast(hc)] orelse continue;
+                if (ht.kind != parser.TOK_VAR) continue;
+                var f: usize = 0;
+                while (f < nv) : (f += 1)
+                    if (strEq(vnames[f] orelse "", cs(ht.text))) break;
+                if (f == nv) continue;
+                if (vkinds[f] == KIND_UNKNOWN) continue;
+                const hix: usize = @intCast(hri);
+                const joined = kindJoin(cache[hix][@intCast(hc)], vkinds[f]);
+                if (joined != cache[hix][@intCast(hc)]) {
+                    cache[hix][@intCast(hc)] = joined;
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    return 0;
+}
+
+/// Settled kind of (rel,col) with head-kind propagation over the RESIDENT
+/// ruleset (d.ast_rules) folded in — the magic driver's BOUND-value check:
+/// a goal head's column kind is only derivable through its defining rules
+/// (the relation itself is empty at that point), exactly like the
+/// compile-time check.  Returns the kind, or KIND_UNKNOWN.
+pub fn relKindWithRulesPub(db: *dx.dl_db, ri: c_int, col: u8, arity: u8) u8 {
+    var cache = [_][HOMOG_MAX_ARITY]u8{[_]u8{0} ** HOMOG_MAX_ARITY} ** HOMOG_MAX_RELS;
+    const resident: ?[*]?*parser.rule = @ptrCast(@constCast(db.ast_rules));
+    if (propagateHeadKinds(db, resident orelse return KIND_UNKNOWN, db.n_ast_rules, &cache) != 0) return KIND_UNKNOWN;
+    return relColKind(db, &cache, ri, col, arity);
+}
+
+/// U-homog (review SH3): fold the settled head-column kinds of the RESIDENT
+/// ruleset into the RECORDED kinds (Relation.col_kind via rel_kind_note).
+/// Rules are never persisted, so a later process re-derives q's kind only
+/// through this record (rels.txt at close).  Only kinds the propagation
+/// actually settled (definite int/sym, not mixed) are recorded; a recorded
+/// DATA kind on the same column always wins (rel_kind_note refuses the
+/// conflict), so this never overwrites what loaded facts established.  Runs
+/// on the REAL db (never an eval clone): eval clones alias relation
+/// POINTERS, so the record lands in the one shared Relation.
+pub fn recordHeadKindsPub(db: *dx.dl_db) void {
+    if (db.n_ast_rules <= 0) return;
+    const resident: ?[*]?*parser.rule = @ptrCast(@constCast(db.ast_rules));
+    if (resident == null) return;
+
+    var cache = [_][HOMOG_MAX_ARITY]u8{[_]u8{0} ** HOMOG_MAX_ARITY} ** HOMOG_MAX_RELS;
+    if (propagateHeadKinds(db, resident.?, db.n_ast_rules, &cache) != 0) return;
+
+    var ri: usize = 0;
+    while (ri < db.nrels and ri < HOMOG_MAX_RELS) : (ri += 1) {
+        // The recorded kind is only meaningful where the schema does not
+        // already declare it (relColKind prefers the schema; the Relation
+        // tail would carry a shadow copy the schema overrides anyway).
+        const e = &db.rels[ri];
+        if (e.kind == dx.RELK_VARIADIC) continue;
+        const rel: ?*relation_mod.Relation = @ptrCast(@alignCast(e.rel));
+        if (rel == null) continue;
+        const ar = relation_mod.rel_arity(rel);
+        if (ar == 0 or ar > HOMOG_MAX_ARITY) continue;
+        var col: usize = 0;
+        while (col < ar) : (col += 1) {
+            const k = cache[ri][col];
+            if (k != KIND_INT and k != KIND_SYM) continue; // unknown/mixed: never recorded
+            const prev = relation_mod.rel_col_kind(rel, @intCast(col));
+            // Unrecorded but NON-empty: the column may hold AMBIGUOUS
+            // (resolving) values kindNoteRaw deliberately never recorded —
+            // a propagated kind here would mislabel it and false-reject a
+            // later legitimate rule (mirror of the kindNoteRaw guard;
+            // IDB head rels are empty at load_rules, so SH3 still records).
+            if (prev == 0 and relation_mod.rel_count(rel) > 0) continue;
+            if (relation_mod.rel_kind_note(rel, @intCast(col), k) != 0) continue; // data kind wins
+            if (prev == 0 and db.read_only == 0) db.meta_dirty = 1; // rels.txt is stale
+        }
+    }
+}
+
+/// LOUD rejection of one constant/column kind mismatch, via the standard
+/// compile-error channel (cerr with the rule's byte offset).
+fn kindMismatch(a: *const parser.atom, r: *const parser.rule, col: c_int, t: *const parser.token, ck: u8, colk: u8, rule_no: c_int) void {
+    if (ck == KIND_SYM) {
+        cerr(r.off, "compile error: column kind mismatch in {s}/{d}: constant '{s}' is a symbol but column holds {s} (rule {d})\n", .{ cs(a.pred), col, cs(t.text), kindName(colk), rule_no });
+    } else {
+        cerr(r.off, "compile error: column kind mismatch in {s}/{d}: int constant {d} but column holds {s} (rule {d})\n", .{ cs(a.pred), col, t.ival, kindName(colk), rule_no });
+    }
+}
+
+/// Walk one rule's head atom then every body atom (no fixed-size buffer —
+/// the parser imposes no body-atom cap, so a buffering walk would either
+/// overflow or need its own cap).
+const KindAtomIterator = struct {
+    rule: *parser.rule,
+    idx: c_int, // -1 = head, 0..nbody-1 = body
+    fn next(self: *KindAtomIterator) ?*parser.atom {
+        if (self.idx == -1) {
+            self.idx = 0;
+            return self.rule.head;
+        }
+        if (self.idx >= self.rule.nbody) return null;
+        defer self.idx += 1;
+        return self.rule.body.?[@intCast(self.idx)];
+    }
+};
+
+/// S2 kind check over a whole ruleset: settle column kinds (recorded /
+/// schema-declared / head-propagated), then reject every relational-atom
+/// CONSTANT whose kind contradicts its column.  Symmetric (int-vs-sym-col
+/// and sym-vs-int-col both fire).  Returns 0, or -1 after cerr() on the
+/// first mismatch.
+pub fn checkAllRuleConstKinds(db: *dx.dl_db, rules: [*]?*parser.rule, n_rules: c_int) c_int {
+    if (n_rules <= 0) return 0;
+    var cache = [_][HOMOG_MAX_ARITY]u8{[_]u8{0} ** HOMOG_MAX_ARITY} ** HOMOG_MAX_RELS;
+
+    // head-kind propagation first, so the constant check below sees the
+    // settled kinds of empty-but-derived relations.
+    if (propagateHeadKinds(db, rules, n_rules, &cache) != 0) return -1;
+
+    var i: c_int = 0;
+    while (i < n_rules) : (i += 1) {
+        const r = rules[@intCast(i)] orelse continue;
+        var it = KindAtomIterator{ .rule = r, .idx = -1 };
+        while (it.next()) |a| {
+            if (a.aggregate != 0) continue;
+            if (is_builtin_pred(a)) continue;
+            if (a.nargs < 1 or a.nargs > HOMOG_MAX_ARITY) continue;
+            const ri = db_find_rel(db, cs(a.pred));
+            if (ri < 0) continue;
+            var k: c_int = 0;
+            while (k < a.nargs) : (k += 1) {
+                const t = a.args.?[@intCast(k)] orelse continue;
+                const ck = tokenColKind(t);
+                if (ck == KIND_UNKNOWN) continue;
+                const colk = relColKind(db, &cache, ri, @intCast(k), @intCast(a.nargs));
+                if (colk == KIND_UNKNOWN or colk == KIND_MIXED or colk == ck) continue;
+                kindMismatch(a, r, k, t, ck, colk, i + 1);
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
 // ─── Public API ────────────────────────────────────────────────────────────
 
 /// int compile_rules(dl_db*, rule**, int, compiled_rule***, int*)
@@ -3014,6 +3340,11 @@ pub export fn compile_rules(db: ?*dx.dl_db, rules: ?[*]?*parser.rule, n_rules: c
             }
         }
     }
+
+    // U-homog S1: reject int-vs-symbol constant/column kind mismatches at
+    // the single chokepoint every strategy path enters (after the heads are
+    // declared, so head-kind propagation can see every rule head's rel).
+    if (checkAllRuleConstKinds(d, rules.?, n_rules) != 0) return -1;
 
     const nrels = db_rel_count(d);
     const rel_strata: [*]c_int = @ptrCast(@alignCast(c.calloc(nrels, @sizeOf(c_int)) orelse return -1));
@@ -3191,7 +3522,6 @@ test "compile_rules: fact + simple rule bytecode shape (SCAN/PROJECT/HALT)" {
     defer testCloseDb(db, path);
     var ops_buf: [16]u8 = undefined;
 
-
     // The "fact" half: two ground facts in the EDB relation the rule reads.
     try testing.expectEqual(@as(c_int, 0), dx.dl_declare_relation(db, "edge", 2));
     testAddFacts(db, "edge", &.{ 1, 2, 2, 3 }, 2, 2);
@@ -3247,7 +3577,6 @@ test "reorder toggle: 0 restores v1 body order; 1 reorders small-rel-first" {
     const db = testOpenDb(path);
     defer testCloseDb(db, path);
     var ops_buf: [16]u8 = undefined;
-
 
     try testing.expectEqual(@as(c_int, 0), dx.dl_declare_relation(db, "big", 2));
     try testing.expectEqual(@as(c_int, 0), dx.dl_declare_relation(db, "small", 2));
@@ -3312,7 +3641,6 @@ test "perm_select toggle: OP_LOOKUP_PERM vs OP_HASH_JOIN fallback" {
     defer testCloseDb(db, path);
     var ops_buf: [16]u8 = undefined;
 
-
     try testing.expectEqual(@as(c_int, 0), dx.dl_declare_relation(db, "r0", 2));
     try testing.expectEqual(@as(c_int, 0), dx.dl_declare_relation(db, "s", 2));
     testAddFacts(db, "r0", &.{ 1, 2 }, 2, 1);
@@ -3363,7 +3691,6 @@ test "bushy toggle: left-deep when 0, MAT_BEGIN/MAT_JOIN plan when 1" {
     const db = testOpenDb(path);
     defer testCloseDb(db, path);
     var ops_buf: [16]u8 = undefined;
-
 
     inline for (.{ "a", "b", "c", "d" }) |rel| {
         try testing.expectEqual(@as(c_int, 0), dx.dl_declare_relation(db, rel, 2));
@@ -3432,7 +3759,6 @@ test "SCC stratification: recursive tc gets stratum 0 + is_recursive" {
     defer testCloseDb(db, path);
     var ops_buf: [16]u8 = undefined;
 
-
     try testing.expectEqual(@as(c_int, 0), dx.dl_declare_relation(db, "edge", 2));
     testAddFacts(db, "edge", &.{ 1, 2, 2, 3 }, 2, 2);
 
@@ -3483,7 +3809,6 @@ test "stratified negation: NEG_CHECK filter inside the scan frame + stratum 1" {
     const db = testOpenDb(path);
     defer testCloseDb(db, path);
     var ops_buf: [16]u8 = undefined;
-
 
     try testing.expectEqual(@as(c_int, 0), dx.dl_declare_relation(db, "edge", 2));
     try testing.expectEqual(@as(c_int, 0), dx.dl_declare_relation(db, "blocked", 1));

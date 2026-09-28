@@ -41,6 +41,9 @@ const compiler = @import("compiler.zig");
 const regexwalk = @import("regexwalk.zig");
 const schema_mod = @import("schema.zig");
 const magic = @import("magic.zig");
+const wfs = @import("wfs.zig");
+const reactive = @import("reactive.zig");
+const intern_mod = @import("intern.zig");
 
 // dl_internal.h pulls in dl.h/intern.h/relation.h/vrelation.h/snapshot.h/
 // permindex.h/termstore.h/compiler.h/parser.h/regexwalk.h — the reference
@@ -369,7 +372,7 @@ const use_got_refs = builtin.output_mode == .Lib and builtin.mode != .Debug and
 inline fn gotDataRef(comptime name: []const u8, comptime T: type) *T {
     if (use_got_refs) {
         return asm ("movq " ++ name ++ "@GOTPCREL(%rip), %[p]"
-            : [p] "={rax}" (-> *T)
+            : [p] "={rax}" (-> *T),
         );
     }
     return @extern(*T, .{ .name = name });
@@ -793,6 +796,7 @@ fn dlOpenCommon(dir: ?[*:0]const u8, err_out: ?*c_int, ro: c_int) ?*DlDb {
             var rel_names: [MAX_RELS][256]u8 = undefined;
             var rel_arities: [MAX_RELS]u8 = undefined;
             var rel_idb: [MAX_RELS]u8 = undefined;
+            var rel_kinds: [MAX_RELS][8]u8 = @splat(@splat(0)); // U-homog S2
             var n_meta: usize = 0;
 
             var len: isize = getline(&line, &cap, rff);
@@ -835,12 +839,37 @@ fn dlOpenCommon(dir: ?[*:0]const u8, err_out: ?*c_int, ro: c_int) ?*DlDb {
                     }
                 }
                 if (colon2) |c2| {
-                    if (strEq(rest + c2 + 1, "idb")) is_idb = 1;
+                    // the token ends at the NEXT ':' (the U-homog S2 kinds
+                    // field follows) or at the line end.
+                    const tok = rest + c2 + 1;
+                    var te: usize = 0;
+                    while (tok[te] != 0 and tok[te] != ':') te += 1;
+                    is_idb = if (te == 3 and strncmp(tok, "idb", 3) == 0) 1 else 0;
                 }
                 if (buf[0] != 0 and (is_variadic or (arity >= 1 and arity <= 8))) {
                     _ = snprintf(&rel_names[n_meta], 256, "%s", buf);
                     rel_arities[n_meta] = if (is_variadic) 0 else @intCast(arity);
                     rel_idb[n_meta] = is_idb;
+                    // parse the kinds field (chars after the 2nd ':')
+                    if (colon2) |c2| {
+                        var kstr = rest + c2 + 1;
+                        // skip the edb/idb token to the next ':' if present
+                        while (kstr[0] != 0 and kstr[0] != ':') kstr += 1;
+                        if (kstr[0] == ':') {
+                            kstr += 1;
+                            const ar = if (is_variadic) 0 else arity;
+                            var kk: usize = 0;
+                            while (kk < ar and kk < 8) : (kk += 1) {
+                                const ch = kstr[kk];
+                                rel_kinds[n_meta][kk] = switch (ch) {
+                                    'n' => relation.KIND_INT,
+                                    't' => relation.KIND_SYM,
+                                    'm' => 3, // tolerated on read; never written
+                                    else => 0,
+                                };
+                            }
+                        }
+                    }
                     n_meta += 1;
                 }
             }
@@ -850,6 +879,20 @@ fn dlOpenCommon(dir: ?[*:0]const u8, err_out: ?*c_int, ro: c_int) ?*DlDb {
             var mi: usize = 0;
             while (mi < n_meta) : (mi += 1) {
                 _ = dlDeclareRelationKind(db, @ptrCast(&rel_names[mi]), rel_arities[mi], rel_idb[mi], 1);
+                // U-homog S2: restore the recorded kinds (after the declare
+                // created the Relation object).
+                if (rel_arities[mi] > 0) {
+                    const kri = findRel(db, @ptrCast(&rel_names[mi]));
+                    if (kri >= 0) {
+                        if (db.rels[@intCast(kri)].rel) |rel| {
+                            var kk: usize = 0;
+                            while (kk < rel_arities[mi] and kk < 8) : (kk += 1) {
+                                if (rel_kinds[mi][kk] != 0 and rel_kinds[mi][kk] <= relation.KIND_SYM)
+                                    _ = relation.rel_kind_note(rel, @intCast(kk), rel_kinds[mi][kk]);
+                            }
+                        }
+                    }
+                }
             }
         }
         c.free(@ptrCast(rels_path.?));
@@ -886,6 +929,10 @@ pub export fn dl_close(db: ?*DlDb) void {
 
     // M4: close all cached snapshot views
     vcache_invalidate(&d.vcache);
+
+    // Reactive (Capability 2 R1): drop any open observation session so the
+    // freed db pointer is never left keyed.
+    reactive.reactiveForget(@ptrCast(d));
 
     // M6: free permutation indices
     permindex_free_all(d);
@@ -1031,6 +1078,11 @@ fn isReservedPiName(name: [*c]const u8) bool {
 }
 
 /// Persist relation metadata (name:arity:edb|idb per line), atomically.
+/// U-homog S2: a 4th field ":<kinds>" is appended when any column kind is
+/// recorded — one char per column, u/n/t (unknown/int/sym; mixed is never
+/// stored).  Omitted entirely when all kinds are unknown, so pre-S2 stores
+/// keep their exact bytes (and old engines keep reading new ones: their
+/// parser stops at the 2nd ':').
 fn writeRelsTxt(db: *DlDb) void {
     const rels_path = makePath(db, "rels", ".txt") orelse return;
 
@@ -1038,6 +1090,7 @@ fn writeRelsTxt(db: *DlDb) void {
     var i: usize = 0;
     while (i < db.nrels) : (i += 1) {
         total += strLen(db.rels[i].name) + 16;
+        total += 10; // U-homog S2: ":nnnnnnnn" kinds suffix
     }
 
     const buf_mem = c.malloc(total) orelse {
@@ -1051,14 +1104,37 @@ fn writeRelsTxt(db: *DlDb) void {
     while (i < db.nrels) : (i += 1) {
         var n: c_int = undefined;
         if (db.rels[i].kind == RELK_VARIADIC) {
-            n = snprintf(buf + p, total - p, "%s:*:%s\n",
-                db.rels[i].name,
-                if (vrelation.vrel_any_idb(db.rels[i].vrel) != 0) "idb" else "edb");
+            n = snprintf(buf + p, total - p, "%s:*:%s\n", db.rels[i].name, if (vrelation.vrel_any_idb(db.rels[i].vrel) != 0) "idb" else "edb");
         } else {
-            n = snprintf(buf + p, total - p, "%s:%d:%s\n",
-                db.rels[i].name,
-                @as(c_int, relation.rel_arity(db.rels[i].rel)),
-                if (relation.rel_is_idb(db.rels[i].rel) != 0) "idb" else "edb");
+            n = snprintf(buf + p, total - p, "%s:%d:%s", db.rels[i].name, @as(c_int, relation.rel_arity(db.rels[i].rel)), if (relation.rel_is_idb(db.rels[i].rel) != 0) "idb" else "edb");
+            if (n < 0) {
+                c.free(buf_mem);
+                c.free(@ptrCast(rels_path));
+                return;
+            }
+            p += @intCast(n);
+            // U-homog S2: append ":<kinds>" only when at least one column
+            // kind is recorded (all-unknown lines stay byte-identical).
+            const ar = relation.rel_arity(db.rels[i].rel);
+            var any = false;
+            var kc: u8 = 0;
+            while (kc < ar) : (kc += 1) {
+                if (relation.rel_col_kind(db.rels[i].rel, kc) != 0) any = true;
+            }
+            if (any) {
+                var kbuf: [9]u8 = undefined;
+                kc = 0;
+                while (kc < ar) : (kc += 1) {
+                    kbuf[kc] = switch (relation.rel_col_kind(db.rels[i].rel, kc)) {
+                        relation.KIND_INT => 'n',
+                        relation.KIND_SYM => 't',
+                        else => 'u',
+                    };
+                }
+                n = snprintf(buf + p, total - p, ":%.*s\n", @as(c_int, ar), @as([*c]const u8, &kbuf));
+            } else {
+                n = snprintf(buf + p, total - p, "\n");
+            }
         }
         if (n < 0) {
             c.free(buf_mem);
@@ -1198,7 +1274,8 @@ fn dlDeclareRelationKind(db: *DlDb, name: [*c]const u8, arity: u8, is_idb: c_int
     db.rels[ridx].rel = if (arity == 0) null else rel;
     db.rels[ridx].vrel = if (arity == 0) vrel else null;
     if (db.rels[ridx].name == null or
-        (if (arity == 0) db.rels[ridx].vrel == null else db.rels[ridx].rel == null)) {
+        (if (arity == 0) db.rels[ridx].vrel == null else db.rels[ridx].rel == null))
+    {
         if (arity == 0) vrelation.vrel_free(db.rels[ridx].vrel) else relation.rel_free(db.rels[ridx].rel);
         if (db.rels[ridx].name) |n| c.free(@ptrCast(n));
         db.nrels -= 1;
@@ -1513,6 +1590,7 @@ pub export fn dl_load_facts(db: ?*DlDb, rel_name: [*c]const u8, csv_path: [*c]co
     var loaded: c_int = 0;
     var delta_failed: c_int = 0;
     var n_new: c_int = 0;
+    var lineno: c_int = 0;
 
     var linelen: isize = getline(&line, &linecap, f);
     while (linelen > 0) : (linelen = getline(&line, &linecap, f)) {
@@ -1532,6 +1610,7 @@ pub export fn dl_load_facts(db: ?*DlDb, rel_name: [*c]const u8, csv_path: [*c]co
             lb[l] = 0;
         }
         if (l == 0) continue;
+        lineno += 1;
 
         nf = csvSplit(lb, &fields, @intCast(arity));
         if (nf != @as(c_int, arity)) continue; // wrong field count: skip
@@ -1544,6 +1623,15 @@ pub export fn dl_load_facts(db: ?*DlDb, rel_name: [*c]const u8, csv_path: [*c]co
                     break;
                 }
                 cols[@intCast(i)] = @truncate(val);
+                // U-homog S2: record the kind exactly where it is known.
+                if (kindNoteDefinite(d, @intCast(idx), @intCast(i), relation.KIND_INT) != 0) {
+                    dlErr("error: {s}:{d}: mixed int/symbol values in column {d} of {s}\n", .{ csv_path, lineno, i + 1, rel_name });
+                    ts_free(&ts);
+                    ts_free(&delta);
+                    _ = c.fclose(f);
+                    if (line) |lp| c.free(@ptrCast(lp));
+                    return -1;
+                }
             } else {
                 const sym = intern_str(d.ir, fields[@intCast(i)]);
                 if (sym == 0) {
@@ -1554,6 +1642,14 @@ pub export fn dl_load_facts(db: ?*DlDb, rel_name: [*c]const u8, csv_path: [*c]co
                     return -1;
                 }
                 cols[@intCast(i)] = sym;
+                if (kindNoteDefinite(d, @intCast(idx), @intCast(i), relation.KIND_SYM) != 0) {
+                    dlErr("error: {s}:{d}: mixed int/symbol values in column {d} of {s}\n", .{ csv_path, lineno, i + 1, rel_name });
+                    ts_free(&ts);
+                    ts_free(&delta);
+                    _ = c.fclose(f);
+                    if (line) |lp| c.free(@ptrCast(lp));
+                    return -1;
+                }
             }
         }
 
@@ -1744,6 +1840,73 @@ fn dlAddFactVariadic(db: *DlDb, idx: usize, rel_name: [*c]const u8, cols: [*c]co
 /// 64 adds amortizes it to O(states/64) while still compacting promptly.
 const COMPACT_CHECK_EVERY: u64 = 64;
 
+// ─── U-homog (S2): column-kind recording at the insert sites ──────────────
+
+/// Record a column kind on a fixed relation (CSV site — the cell's STRING
+/// form makes the kind definite).  Returns -1 on a CONFLICT with the
+/// recorded kind (the caller rejects the load loudly).  Bumps meta_dirty
+/// when the recording makes rels.txt stale (a kinds field it does not yet
+/// carry), so the kinds persist across the CLI's separate processes.
+fn kindNoteDefinite(db: *DlDb, idx: usize, col: usize, kind: u8) c_int {
+    const rel = db.rels[idx].rel orelse return 0;
+    const prev = relation.rel_col_kind(rel, @intCast(col));
+    if (relation.rel_kind_note(rel, @intCast(col), kind) != 0) return -1;
+    if (prev == 0 and db.read_only == 0) db.meta_dirty = 1;
+    return 0;
+}
+
+/// Does the open txn hold a buffered ADD for relation `idx`?  The txn site
+/// kind-checks at BUFFER time (rows apply at commit), so an unrecorded
+/// column about to receive a buffered row is NOT first-row-empty.
+fn relHasPendingTxnAdd(db: *DlDb, idx: usize) bool {
+    const t = db.txn orelse return false;
+    const ops = t.ops orelse return false;
+    var i: usize = 0;
+    while (i < t.nops) : (i += 1) {
+        if (ops[i].kind == TXN_ADD and ops[i].rel_id == @as(c_int, @intCast(idx))) return true;
+    }
+    return false;
+}
+
+/// Kind-check + record one raw-u32 fact (dl_add_fact / dl_txn_add_fact).
+/// The u32 API cannot observe a value's space, but ONE direction is sound:
+/// a value that does NOT resolve as a live sym id (ids are dense
+/// 1..next_id-1) is DEFINITELY a raw int — REJECT it against a sym-kind
+/// column.  A resolving value is ambiguous (a raw int below next_id
+/// resolves too, whenever any symbol is interned), so it neither records
+/// nor rejects: a loud-but-wrong reject is worse than the gap.
+/// RECORDING is narrower still (review SH1): an unrecorded column may
+/// already hold AMBIGUOUS (resolving) values that were deliberately never
+/// recorded — recording INT when a definite int arrives later would
+/// mislabel a column that holds BOTH spaces, blessing the exact collision
+/// this check exists to catch.  So INT is recorded only when the fact is
+/// the column's FIRST row (relation empty, no buffered txn ADD) — the one
+/// case where "first definite" really is "first value".  Returns 0, or -1
+/// on the definite conflict.
+fn kindNoteRaw(db: *DlDb, idx: usize, cols: [*c]const u32, arity: u8) c_int {
+    const rel = db.rels[idx].rel orelse return 0;
+    const ir_x: ?*dx.interner = @ptrCast(@alignCast(db.ir));
+    const bound = intern_mod.liveSymBound(ir_x);
+    var i: usize = 0;
+    while (i < arity) : (i += 1) {
+        const v = cols[i];
+        const resolves = v > 0 and v < bound and dx.intern_str_of(ir_x, v) != null;
+        if (resolves) continue; // ambiguous: neither records nor rejects
+        const prev = relation.rel_col_kind(rel, @intCast(i));
+        if (prev == relation.KIND_SYM) {
+            dlErr("error: mixed int/symbol values in column {d} of {s} (value {d} is not a live symbol id)\n", .{ i + 1, db.rels[idx].name orelse @as([*c]const u8, "?"), v });
+            return -1;
+        }
+        if (prev == 0) {
+            if (relation.rel_count(rel) == 0 and !relHasPendingTxnAdd(db, idx)) {
+                if (relation.rel_kind_note(rel, @intCast(i), relation.KIND_INT) != 0) return -1;
+                if (db.read_only == 0) db.meta_dirty = 1;
+            }
+        }
+    }
+    return 0;
+}
+
 /// CAS Slice 2: apply a fact add to the in-memory BASE + IVM delta capture.
 /// selfreg-dl-storage: the hot write lands in the OVERLAY (sorted-array
 /// tupleset, O(1) amortized) + the WAL (the durability record, fsync'd at
@@ -1826,6 +1989,10 @@ pub export fn dl_add_fact(db: ?*DlDb, rel_name: [*c]const u8, cols: [*c]const u3
         return dlAddFactVariadic(d, @intCast(idx), rel_name, cols, arity);
 
     if (arity != relation.rel_arity(d.rels[@intCast(idx)].rel)) return -1;
+
+    // U-homog S2: kind-check + record BEFORE any durable effect (the WAL
+    // append below) so a rejected fact leaves no trace.
+    if (kindNoteRaw(d, @intCast(idx), cols, arity) != 0) return -1;
 
     var key: [33]u8 = undefined;
     var key_len: usize = undefined;
@@ -2160,6 +2327,10 @@ pub export fn dl_txn_add_fact(db: ?*DlDb, rel: [*c]const u8, cols: [*c]const u32
     if (idx < 0) return -1;
     if (d.rels[@intCast(idx)].kind == RELK_VARIADIC) return -1;
     if (arity != relation.rel_arity(d.rels[@intCast(idx)].rel)) return -1;
+
+    // U-homog S2: kind-check + record at BUFFER time so a conflicting op
+    // never enters the txn.
+    if (kindNoteRaw(d, @intCast(idx), cols, arity) != 0) return -1;
 
     var op = std.mem.zeroes(TxnOp);
     op.kind = TXN_ADD;
@@ -2697,7 +2868,6 @@ pub export fn dl_range_count_bound(db: ?*const DlDb, rel_name: [*c]const u8, lea
 // ─── Rule loading & compilation (M1) ───────────────────────────────────────
 
 /// M8: AST deep-copy — retain rules for the magic-sets transform.
-
 fn astTokFree(t: ?*parser.token) void {
     const tt = t orelse return;
     if (tt.children) |ch| {
@@ -2913,6 +3083,40 @@ pub export fn dl_load_rules(db: ?*DlDb, dl_source: [*c]const u8) c_int {
         return -1;
     }
 
+    // U-homog (review SH2): compile_rules checked only the NEW rules, so a
+    // constant that conflicts through a PREVIOUSLY loaded rule's head kind
+    // would slip in when the same program is split across load_rules calls.
+    // Re-check over the CONCATENATED resident+new rule set (borrowed
+    // pointers, nothing cloned) BEFORE anything is appended, so a rejected
+    // load leaves the db exactly as it was — the same diagnostic the
+    // equivalent single combined load produces.
+    {
+        const nres: usize = @intCast(d.n_ast_rules);
+        const total: usize = nres + @as(usize, @intCast(n_rules));
+        if (total > 0) {
+            const merged_mem = c.malloc(total * @sizeOf(?*parser.rule)) orelse {
+                var ci: c_int = 0;
+                while (ci < n_compiled) : (ci += 1) compiler.compiled_rule_free(new_crules.?[@intCast(ci)]);
+                c.free(@ptrCast(new_crules));
+                freeRulesAndParser(rules, n_rules, p);
+                return -1;
+            };
+            const merged: [*]?*parser.rule = @ptrCast(@alignCast(merged_mem));
+            if (nres > 0) @memcpy(merged[0..nres], d.ast_rules.?[0..nres]);
+            @memcpy(merged[nres..total], rules.?[0..@intCast(n_rules)]);
+            const dxi: *dx.dl_db = @ptrCast(d); // DlDb and dx.dl_db share the C layout
+            const bad = compiler.checkAllRuleConstKinds(dxi, merged, @intCast(total));
+            c.free(merged_mem);
+            if (bad != 0) {
+                var ci: c_int = 0;
+                while (ci < n_compiled) : (ci += 1) compiler.compiled_rule_free(new_crules.?[@intCast(ci)]);
+                c.free(@ptrCast(new_crules));
+                freeRulesAndParser(rules, n_rules, p);
+                return -1;
+            }
+        }
+    }
+
     // M8: retain a DEEP copy of the rule AST for the magic-sets transform.
     {
         const cloned = c.calloc(@intCast(n_rules), @sizeOf(?*parser.rule)) orelse {
@@ -2948,7 +3152,7 @@ pub export fn dl_load_rules(db: ?*DlDb, dl_source: [*c]const u8) c_int {
                 return -1;
             };
             const na_rules: [*]?*parser.rule = @ptrCast(@alignCast(na));
-            @memcpy(na_rules[@intCast(d.n_ast_rules) .. @intCast(d.n_ast_rules + n_rules)], cloned_rules[0..@intCast(n_rules)]);
+            @memcpy(na_rules[@intCast(d.n_ast_rules)..@intCast(d.n_ast_rules + n_rules)], cloned_rules[0..@intCast(n_rules)]);
             c.free(cloned);
             d.ast_rules = na_rules;
             d.n_ast_rules += n_rules;
@@ -2966,7 +3170,7 @@ pub export fn dl_load_rules(db: ?*DlDb, dl_source: [*c]const u8) c_int {
             return -1;
         };
         const merged_rules: [*]?*compiler.compiled_rule = @ptrCast(@alignCast(merged));
-        @memcpy(merged_rules[@intCast(d.n_crules) .. @intCast(new_total)], new_crules.?[0..@intCast(n_compiled)]);
+        @memcpy(merged_rules[@intCast(d.n_crules)..@intCast(new_total)], new_crules.?[0..@intCast(n_compiled)]);
         c.free(@ptrCast(new_crules));
         d.crules = merged_rules;
         d.n_crules = new_total;
@@ -2975,6 +3179,13 @@ pub export fn dl_load_rules(db: ?*DlDb, dl_source: [*c]const u8) c_int {
     // IVM Slice 1: the rule set changed.
     d.full_reeval_pending = 1;
     d.fixpoint_dirty = 1;
+
+    // U-homog (review SH3): record the rules' derived head-column kinds so
+    // they survive this process — rels.txt carries them to a later one
+    // (rules themselves are never persisted), and the in-db record makes
+    // the settled kind visible to eval clones without re-running the
+    // propagation.  Recorded DATA kinds always win (conflicts refused).
+    compiler.recordHeadKindsPub(@ptrCast(d));
 
     freeRulesAndParser(rules, n_rules, p);
     return 0;
@@ -3207,6 +3418,50 @@ pub export fn dl_query_rules_ro(db: ?*DlDb, dl_source: [*c]const u8, goal_rel: [
     return result;
 }
 
+// ─── Well-founded semantics query (negation over recursion) ────────────────
+
+/// long dl_query_wfs_ro(dl_db*, const char *dl_source, const char *goal_rel,
+///                       int truth, dl_tuple_cb cb, void *user)
+///
+/// Read-only arbitrary-rule query evaluated under WELL-FOUNDED semantics
+/// (van Gelder alternating fixpoint, zig/src/wfs.zig): the program may
+/// negate a predicate of its own recursion cycle — the class every other
+/// entry rejects as "unstratifiable" (compiler.zig:1048/1365/1384).  The
+/// canonical case is  win(X) :- move(X,Y), !win(Y).
+///
+/// Mirrors dl_query_rules_ro's shape (parse -> clone -> declare -> rewrite
+/// -> compile -> driver -> goal scan -> teardown) and leaves `db` 100%
+/// untouched.  Slice 1 subset: pure relational rules over EDB + IDB,
+/// negation of IDB predicates only, safe negation; aggregates/builtins/
+/// lists/patterns/variadic/arithmetic are rejected with a diagnostic.
+///
+/// `truth` selects the streamed slice of the 3-valued model:
+///   0 = TRUE-only (implemented), 1 = FALSE-only, 2 = UNDEFINED-only,
+///   3 = all-with-tag (modes 1-3 return DL_WFS_ERR_NOT_IMPLEMENTED).
+/// Returns the tuple count streamed, or a negative DL_WFS_ERR_* (dl.h).
+pub export fn dl_query_wfs_ro(db: ?*DlDb, dl_source: [*c]const u8, goal_rel: [*c]const u8, truth: c_int, cb: DlTupleCb, user: ?*anyopaque) c_long {
+    const d = db orelse return -1;
+    if (dl_source == null or goal_rel == null or cb == null) return -1;
+
+    const p = parse_create(dl_source) orelse return -1;
+    var n_rules: c_int = 0;
+    const rules = parse_rules(p, &n_rules);
+    if (rules == null) {
+        parse_free(p);
+        return -1;
+    }
+    if (rulesReferenceRev(rules, n_rules)) {
+        freeRulesAndParser(rules, n_rules, p);
+        return -1;
+    }
+
+    // wfs_eval_query rewrites the AST in place; the nodes are freed here
+    // right after, exactly like dl_query_rules_ro's ownership discipline.
+    const rc = wfs.wfs_eval_query(@ptrCast(d), rules, n_rules, goal_rel, truth, cb, user);
+    freeRulesAndParser(rules, n_rules, p);
+    return rc;
+}
+
 // ─── M4: time-travel (as-of) queries ───────────────────────────────────────
 
 pub export fn dl_query_version(db: ?*DlDb, version: u32, goal_rel: [*c]const u8, cb: DlTupleCb, user: ?*anyopaque) c_long {
@@ -3250,6 +3505,11 @@ fn evalDbClone(src: *const DlDb, out: *DlDb) void {
     out.ir = src.ir;
     out.terms = src.terms;
     out.lock_fd = -1;
+    // U-homog: the schema MUST ride along — the compile-time kind check
+    // uses the DECLARED coltype when a schema is attached, and a clone
+    // without it would fall back to recorded kinds and answer differently
+    // than dl_load_rules did on the same db/program.
+    out.schema = src.schema;
     var i: usize = 0;
     while (i < src.nrels) : (i += 1) {
         out.rels[i].name = src.rels[i].name;
@@ -3415,6 +3675,39 @@ pub export fn dl_query_magic_adorn(db: ?*DlDb, goal_rel: [*c]const u8, adorn: [*
 
     if (nvals == 0)
         return dl_query(d, goal_rel, cb, user);
+
+    // U-homog S2: a BOUND value whose kind contradicts the goal column's
+    // kind is the same int/sym id-space collision the compile-time check
+    // rejects for rule constants — the magic bound compiles into an
+    // eq_const probe exactly like a rule constant.  Only ONE direction is
+    // observable through the u32 API, and it is the sound one: a value that
+    // does NOT resolve as a live sym id (ids are dense 1..next_id-1, so
+    // non-resolving == not a live id) is DEFINITELY a raw int, and a raw
+    // int against a sym-kind column is a mismatch.  The other direction
+    // (resolving value vs int-kind column) is AMBIGUOUS — a raw int below
+    // next_id resolves too whenever any symbol is interned — and MUST NOT
+    // reject (pre-S1 it answered 0 rows, not an error).
+    {
+        const dxi: *dx.dl_db = @ptrCast(d); // DlDb and dx.dl_db share the C layout
+        const ir_x: ?*dx.interner = @ptrCast(@alignCast(d.ir));
+        var bi2: usize = 0;
+        var vi2: usize = 0;
+        while (bi2 < alen) : (bi2 += 1) {
+            if (adorn[bi2] != 'b') continue;
+            const v = vals.?[vi2];
+            vi2 += 1;
+            const colk = compiler.relKindWithRulesPub(dxi, goal_idx, @intCast(bi2), goal_arity);
+            if (colk != 2) continue; // int/unknown/mixed: nothing observable
+            const resolves = v > 0 and v < intern_mod.liveSymBound(ir_x) and
+                dx.intern_str_of(ir_x, v) != null;
+            if (!resolves) {
+                dlErr("dl_query_magic: column kind mismatch in {s}/{d}: bound value {d} is an integer but column holds symbols\n", .{
+                    goal_rel, bi2, v,
+                });
+                return -1;
+            }
+        }
+    }
 
     // EDB goal → direct full-scan + per-position filter.
     if (!astHasHead(d, goal_rel)) {
@@ -3608,7 +3901,7 @@ fn tcBfsEdgeCb(cols: ?[*]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c
     emit[0] = ctx.seed;
     emit[1] = w;
     ctx.count += 1;
-    if (ctx.cb.?( &emit, 2, ctx.user) != 0) {
+    if (ctx.cb.?(&emit, 2, ctx.user) != 0) {
         ctx.stop = 1;
         return 1;
     }
@@ -3667,9 +3960,7 @@ fn tcRecognizeBf(db: *DlDb, goal_rel: [*c]const u8, adorn: [*c]const u8, vals: ?
         while (i < 2) : (i += 1) {
             const r = db.ast_rules.?[@intCast(i)].?;
             if (r.has_negation != 0 or r.has_aggregate != 0) return 0;
-            if (r.nbody == 1 and B == null) B = r
-            else if (r.nbody == 2 and R == null) R = r
-            else return 0;
+            if (r.nbody == 1 and B == null) B = r else if (r.nbody == 2 and R == null) R = r else return 0;
         }
     }
     if (B == null or R == null) return 0;
@@ -4376,6 +4667,23 @@ fn sumRelWalAppended(d: *DlDb) u64 {
 /// (that is materializeSnapshot, gated by the budget trigger in
 /// dl_consolidate and unconditional in dl_publish_snapshot).
 fn consolidate(d: *DlDb) c_int {
+    return consolidateInner(d, null);
+}
+
+/// Observation hook for reactive steps (zig/src/reactive.zig): when non-null,
+/// the SAME cascade (prologue + dispatch + epilogue — never a second copy)
+/// additionally reports which dispatch branch ran.  `null` is the ordinary
+/// path; the hook must not change any decision the cascade makes.
+pub const CascadeWatch = struct {
+    /// Set when the branch that ran was one of the vm_execute FULL
+    /// RE-EVALUATION branches (program outside the incremental class —
+    /// pending full re-eval, ineligible aggregate, delete vs DRed-ineligible,
+    /// insert vs neither, IVM-ineligible with nothing pending): the reported
+    /// diff is still correct, but it was NOT produced incrementally.
+    fallback: bool = false,
+};
+
+fn consolidateInner(d: *DlDb, watch: ?*CascadeWatch) c_int {
     const t_mark: u64 = if (pub_timers_on) nowNs() else 0;
     {
         syncAllWals(d);
@@ -4416,6 +4724,7 @@ fn consolidate(d: *DlDb) c_int {
             }
         }
         if (d.full_reeval_pending != 0) {
+            if (watch) |w| w.fallback = true;
             if (vm_execute(d, d.crules, d.n_crules) != 0)
                 return -1;
             vm_clear_deltas(d);
@@ -4427,17 +4736,20 @@ fn consolidate(d: *DlDb) c_int {
                     return -1;
                 }
             } else {
+                if (watch) |w| w.fallback = true;
                 if (vm_execute(d, d.crules, d.n_crules) != 0)
                     return -1;
                 vm_clear_deltas(d);
                 vm_clear_deletes(d);
             }
         } else if (has_del != 0 and vm_dred_eligible(d) == 0) {
+            if (watch) |w| w.fallback = true;
             if (vm_execute(d, d.crules, d.n_crules) != 0)
                 return -1;
             vm_clear_deltas(d);
             vm_clear_deletes(d);
         } else if (has_ins != 0 and vm_ivm_eligible(d) == 0 and vm_dred_eligible(d) == 0) {
+            if (watch) |w| w.fallback = true;
             if (vm_execute(d, d.crules, d.n_crules) != 0)
                 return -1;
             vm_clear_deltas(d);
@@ -4448,6 +4760,7 @@ fn consolidate(d: *DlDb) c_int {
                 return -1;
             }
         } else if (vm_ivm_eligible(d) == 0) {
+            if (watch) |w| w.fallback = true;
             if (vm_execute(d, d.crules, d.n_crules) != 0)
                 return -1;
             vm_clear_deltas(d);
@@ -4470,6 +4783,17 @@ fn consolidate(d: *DlDb) c_int {
         pub_timers.t_ivm_ns += nowNs() - t_mark;
     }
     return 0;
+}
+
+/// One reactive step's maintenance barrier: the SAME consolidateInner
+/// cascade (prologue + dispatch + epilogue — dl.zig's single copy) with the
+/// observation hook armed.  Returns 0 on success, -1 on a maintenance error,
+/// -2 when the branch that ran was a full re-evaluation FALLBACK (the
+/// reported diff is still correct, but the step was not incremental).
+pub fn consolidateForReactive(d: *DlDb, w: *CascadeWatch) c_int {
+    const rc = consolidateInner(d, w);
+    if (rc != 0) return rc;
+    return if (w.fallback) -2 else 0;
 }
 
 /// Snapshot materialization: serialize the consolidated state into a NEW
@@ -4568,8 +4892,7 @@ fn materializeSnapshot(d: *DlDb) c_int {
 
             if (d.rels[i].kind == RELK_VARIADIC) {
                 var a: u8 = 0;
-                _ = fprintf(mf, "%s:*:%s\n", d.rels[i].name,
-                    if (vrelation.vrel_any_idb(d.rels[i].vrel) != 0) "idb" else "edb");
+                _ = fprintf(mf, "%s:*:%s\n", d.rels[i].name, if (vrelation.vrel_any_idb(d.rels[i].vrel) != 0) "idb" else "edb");
                 a = 1;
                 while (a <= MAX_VAR_ARITY) : (a += 1) {
                     var vname: [384:0]u8 = undefined;
@@ -4579,8 +4902,7 @@ fn materializeSnapshot(d: *DlDb) c_int {
                         _ = c.fclose(mf);
                         return dlPublishFail(&tmp_dir, &new_dir, renamed);
                     }
-                    _ = fprintf(mf, "%s:%d:%s\n", @as([*c]const u8, @ptrCast(&vname)), @as(c_int, a),
-                        if (relation.rel_is_idb(vr) != 0) "idb" else "edb");
+                    _ = fprintf(mf, "%s:%d:%s\n", @as([*c]const u8, @ptrCast(&vname)), @as(c_int, a), if (relation.rel_is_idb(vr) != 0) "idb" else "edb");
                     _ = snprintf(&rel_path, 4096, "%s/%s.dafsa", &tmp_dir, @as([*c]const u8, @ptrCast(&vname)));
                     stage_rev_var[i][a] = d.saved_rev_var[i][a];
                     if (relSaveGated(d, vr, &rel_path, &stage_rev_var[i][a], &prev_snap_dir) != 0) {
@@ -4603,8 +4925,7 @@ fn materializeSnapshot(d: *DlDb) c_int {
             }
 
             const arity = relation.rel_arity(d.rels[i].rel);
-            _ = fprintf(mf, "%s:%d:%s\n", d.rels[i].name, @as(c_int, arity),
-                if (relation.rel_is_idb(d.rels[i].rel) != 0) "idb" else "edb");
+            _ = fprintf(mf, "%s:%d:%s\n", d.rels[i].name, @as(c_int, arity), if (relation.rel_is_idb(d.rels[i].rel) != 0) "idb" else "edb");
 
             _ = snprintf(&rel_path, 4096, "%s/%s.dafsa", &tmp_dir, d.rels[i].name);
             stage_rev[i] = d.saved_rev[i];
@@ -4786,6 +5107,66 @@ pub export fn dl_set_snapshot_budget(db: ?*DlDb, bytes: u64) c_int {
     d.snapshot_budget_bytes = bytes;
     return 0;
 }
+
+// ─── Reactive fired-event facility (Capability 2, slice R1) ─────────────────
+//
+// reactive.zig observes derived head relations across one dispatch of the
+// maintenance machinery.  The step mechanism is DIFF-CAPTURE around the
+// EXISTING cascade: dl_fired_step runs the SAME consolidateInner cascade
+// (via consolidateForReactive — prologue, dispatch and epilogue live ONLY
+// here, never copied), then reports the watched relations' added/removed
+// tuples.  ZERO vm.zig/magic.zig/topdown.zig/compiler.zig behaviour is
+// touched; with no observation session open (the default) nothing here runs
+// at all.
+
+/// int dl_set_reactive(dl_db *db, const char *rel_name, int on)
+///
+/// Mark a rule-head relation as watched for the CURRENT observation session
+/// (see dl_fired_init): `on` != 0 arms it, `on` == 0 disarms it.  Refuses
+/// (-1, stderr diagnostic) a relation that is neither a derived view nor the
+/// head of a loaded rule — fired events are rule-derived head changes, and a
+/// diff over a directly-written EDB relation would conflate direct writes
+/// with derived tuples.
+pub export fn dl_set_reactive(db: ?*DlDb, rel: [*c]const u8, on: c_int) c_int {
+    return reactive.dlSetReactive(if (db) |d| @ptrCast(d) else null, rel, on);
+}
+
+/// long dl_fired_init(dl_db *db)
+///
+/// Open an observation session on `db` (0 on success; DL_REACTIVE_ERR_* on
+/// error, a negative result distinct from any tuple count).  While the
+/// session is open, dl_set_reactive may arm rule-head relations and
+/// dl_fired_step runs the maintenance machinery, reporting exactly the
+/// watched heads' newly-true tuples.  Nothing about the session changes any
+/// evaluation: default-off, engine bit-identical until init.
+pub export fn dl_fired_init(db: ?*DlDb) c_long {
+    return reactive.dlFiredInit(if (db) |d| @ptrCast(d) else null);
+}
+
+/// long dl_fired_step(dl_db *db, dl_fired_cb cb, void *user)
+///
+/// Run the EXISTING delta-dispatch chain (dl_consolidate's cascade — never a
+/// strategy re-decision) and stream the watched heads' newly-true tuples to
+/// `cb` as DL_REACTIVE_ADDED events, then tuples removed by the same step as
+/// DL_REACTIVE_REMOVED (the R1 diff boundary; first-class retraction firing
+/// is slice R2).  DL_REACTIVE_FALLBACK is OR-ed into the returned count when
+/// the cascade took its full-re-evaluation branch (program outside the
+/// incremental class, e.g. a regex-walk rule) — the diff is still correct,
+/// but it was NOT produced incrementally.  Returns the number of fired
+/// tuples, or a negative DL_REACTIVE_ERR_*.
+pub export fn dl_fired_step(db: ?*DlDb, cb: reactive.FiredCb, user: ?*anyopaque) c_long {
+    return reactive.dlFiredStep(if (db) |d| @ptrCast(d) else null, cb, user);
+}
+
+/// long dl_fired_clear(dl_db *db)
+///
+/// Close the observation session, releasing all watch state.  After clear
+/// the engine is bit-identical to a db that never observed (state is
+/// session-scoped only).  Returns 0, or DL_REACTIVE_ERR_ARGS / _NOT_INIT.
+pub export fn dl_fired_clear(db: ?*DlDb) c_long {
+    return reactive.dlFiredClear(if (db) |d| @ptrCast(d) else null);
+}
+
 
 /// Best-effort publish failure cleanup: rm_rf(tmp) and, if renamed, rm_rf(new).
 fn dlPublishFail(tmp_dir: [*c]const u8, new_dir: [*c]const u8, renamed: c_int) c_int {

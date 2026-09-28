@@ -430,6 +430,122 @@ long dl_query(dl_db *db, const char *goal_rel, dl_tuple_cb cb, void *user);
 long dl_query_rules_ro(dl_db *db, const char *dl_source,
                        const char *goal_rel, dl_tuple_cb cb, void *user);
 
+/* ─── Well-founded semantics (negation over recursion) ─────────────────── */
+
+/* Truth slice of the well-founded partial model streamed by
+ * dl_query_wfs_ro's `truth` parameter.  Mode 0 is implemented in slice 1;
+ * modes 1-3 return DL_WFS_ERR_NOT_IMPLEMENTED (never a wrong answer). */
+#define DL_WFS_TRUE_ONLY   0   /* stream atoms TRUE in the WFS model   */
+#define DL_WFS_FALSE_ONLY  1   /* stream atoms FALSE in the WFS model  */
+#define DL_WFS_UNDEF_ONLY  2   /* stream atoms UNDEFINED               */
+#define DL_WFS_ALL_TAGGED  3   /* all atoms, truth tag appended (later)*/
+
+/* Negative results of dl_query_wfs_ro (distinct from the tuple count). */
+#define DL_WFS_ERR_REJECTED        (-2) /* program outside the S1 subset          */
+#define DL_WFS_ERR_OOM             (-3) /* allocation failure                     */
+#define DL_WFS_ERR_NOT_IMPLEMENTED (-4) /* truth mode 1/2/3 in this slice         */
+#define DL_WFS_ERR_NO_CONVERGE     (-5) /* alternating fixpoint round cap exceeded */
+#define DL_WFS_ERR_INTERNAL        (-6) /* internal invariant violated            */
+
+/* Read-only arbitrary-rule query evaluated under WELL-FOUNDED semantics
+ * (van Gelder alternating fixpoint): the program may negate a predicate of
+ * its own recursion cycle — the class every other entry rejects as
+ * "unstratifiable".  Canonical case:  win(X) :- move(X,Y), !win(Y).
+ *
+ * Same shape and db-isolation contract as dl_query_rules_ro (parse ->
+ * clone -> declare -> AST REWRITE -> compile -> driver -> goal scan ->
+ * teardown; db is 100% untouched, nothing is written to disk).  The
+ * negated atom is rewritten into a POSITIVE atom over a driver-owned
+ * complement relation, so the existing compiler and VM are reused as-is.
+ *
+ * Slice-1 subset (violations return DL_WFS_ERR_REJECTED with a stderr
+ * diagnostic): pure relational rules over EDB + IDB, negation of IDB
+ * predicates only, safe negation (a negated atom's variables must be bound
+ * by earlier positive body atoms); no aggregates, builtins, lists, regex
+ * patterns, variadic relations, or arithmetic.  Stratified programs are
+ * answered identically to dl_query_rules_ro (the well-founded model of a
+ * stratified program is its stratified least fixpoint).
+ *
+ * Returns the tuple count streamed, or a negative DL_WFS_ERR_* above. */
+long dl_query_wfs_ro(dl_db *db, const char *dl_source,
+                     const char *goal_rel, int truth,
+                     dl_tuple_cb cb, void *user);
+
+/* ─── Reactive fired events (Capability 2, slice R1) ───────────────────── */
+
+/* dl_fired_cb `event` values: a watched rule-head relation's tuples ADDED by
+ * the step (DL_REACTIVE_ADDED) and tuples REMOVED by the same step
+ * (DL_REACTIVE_REMOVED — the R1 diff boundary for delete-driven steps;
+ * first-class retraction firing is slice R2). */
+#define DL_REACTIVE_ADDED    0
+#define DL_REACTIVE_REMOVED  1
+
+/* OR-ed into dl_fired_step's returned count when the dispatch took the
+ * engine's FULL re-evaluation fallback (the program is outside the
+ * incremental class — regex-walk/perm atoms, unsupported aggregates, a
+ * pending full re-eval — or IVM/DRed are both ineligible): the reported
+ * diff is still correct, but it was NOT produced incrementally.  Never
+ * silent. */
+#define DL_REACTIVE_FALLBACK 0x40000000
+
+/* Negative results of dl_fired_init/dl_fired_step/dl_fired_clear (distinct
+ * from a fired-tuple count, which is >= 0). */
+#define DL_REACTIVE_ERR_ARGS      (-1) /* NULL db/cb, read-only handle      */
+#define DL_REACTIVE_ERR_NOT_INIT  (-2) /* no session open (step/clear)      */
+#define DL_REACTIVE_ERR_OOM       (-3) /* allocation failure                */
+#define DL_REACTIVE_ERR_DISPATCH  (-4) /* the dispatch itself failed        */
+#define DL_REACTIVE_ERR_CONFLICT  (-5) /* a session is already open (init), or the session table is full */
+#define DL_REACTIVE_ERR_INTERNAL  (-6) /* internal invariant violated       */
+
+/* Fired-event streaming callback: `event` is a DL_REACTIVE_* kind, `cols`
+ * has `arity` entries and is valid only for the duration of the call.
+ * Return non-zero to stop the step early (the step's returned count covers
+ * only the events already delivered). */
+typedef int (*dl_fired_cb)(int event, const uint32_t *cols,
+                           uint8_t arity, void *user);
+
+/* Open a reactive observation session on `db` (sessions are not nestable —
+ * a second init returns DL_REACTIVE_ERR_CONFLICT until dl_fired_clear).
+ * While it is open, dl_set_reactive arms rule-head relations and
+ * dl_fired_step dispatches the maintenance machinery, reporting exactly the
+ * watched heads' newly-true tuples.  DEFAULT-OFF: with no session open the
+ * engine's behaviour is bit-identical to a build without the facility;
+ * session state is process-local (never persisted).  Returns 0, or a
+ * DL_REACTIVE_ERR_*. */
+long dl_fired_init(dl_db *db);
+
+/* Arm (on != 0) or disarm (on == 0) watching of rule-head relation `rel`
+ * for the CURRENT session.  Refuses (-1, with a stderr diagnostic) a
+ * relation that is neither a derived view nor the head of a loaded rule:
+ * fired events are RULE-DERIVED head changes, and a diff over a
+ * directly-written EDB relation would conflate direct writes with derived
+ * tuples.  Arm/disarm is idempotent.  Requires an open session (else -1);
+ * an armed relation reports from the NEXT step on. */
+int dl_set_reactive(dl_db *db, const char *rel, int on);
+
+/* Run the EXISTING delta-dispatch chain (dl_consolidate's cascade — the
+ * engine's own strategy choice, never re-decided; the step runs the SAME
+ * prologue + dispatch + epilogue, so it IS a full consolidation, durability
+ * barrier included) and stream the watched heads' changes: newly-true
+ * tuples as DL_REACTIVE_ADDED events, then tuples removed by the same step
+ * as DL_REACTIVE_REMOVED.  The diff boundary is the previous STEP: tuples
+ * derived between steps (e.g. by an interleaved dl_consolidate) are
+ * reported exactly once at the next step.  An aborted step (a non-zero
+ * callback return) leaves every watcher after the aborting one at its
+ * pre-step baseline, so its next step reports the tuples the aborted step
+ * derived for it exactly once.  Returns the number of tuples
+ * streamed, OR-ed with DL_REACTIVE_FALLBACK when the cascade took its
+ * full-re-evaluation branch, or a negative DL_REACTIVE_ERR_* (no session
+ * open → DL_REACTIVE_ERR_NOT_INIT).  With nothing armed the step still
+ * clears the maintenance backlog but reports zero events. */
+long dl_fired_step(dl_db *db, dl_fired_cb cb, void *user);
+
+/* Close the observation session, releasing all watch state.  Afterwards the
+ * db is indistinguishable from one that never observed.  Returns 0, or
+ * DL_REACTIVE_ERR_ARGS / DL_REACTIVE_ERR_NOT_INIT. */
+long dl_fired_clear(dl_db *db);
+
+
 /* Prefix-bind k leading columns and enumerate via cb.
  * Reads from snapshot if published, else falls back to in-memory path. */
 long dl_query_bound(dl_db *db, const char *goal_rel,
