@@ -3124,6 +3124,15 @@ fn relColKind(db: *dx.dl_db, cache: [*][HOMOG_MAX_ARITY]u8, ri: c_int, col: u8, 
 /// This is what makes the reproduced case loud even though q is EMPTY at
 /// compile time.  Constants never feed a kind — only vars do — so the
 /// offending constant cannot mask its own check.
+///
+/// S3c: the RESULT variables of aggregate and arithmetic atoms carry a kind
+/// by construction and feed the head like any body var — count/sum and an
+/// arith result are a raw u32 (INT); min/max pick a value FROM the source
+/// column, so the result takes the source var's settled kind (mirrors
+/// typecheck typeAggregate).  Without this, `c(N):-e(X),N=count()` gave
+/// c:no-kind and a downstream `q(N):-c(N),f(N).` over symbols silently
+/// answered the id-collision join (MEASURED pre-S3c: rc=0, q={2} where the
+/// standard is {}).
 fn propagateHeadKinds(db: *dx.dl_db, rules: [*]?*parser.rule, n_rules: c_int, cache: [*][HOMOG_MAX_ARITY]u8) c_int {
     var rounds: usize = 0;
     var changed = true;
@@ -3139,8 +3148,8 @@ fn propagateHeadKinds(db: *dx.dl_db, rules: [*]?*parser.rule, n_rules: c_int, ca
             if (hri < 0 or hri >= HOMOG_MAX_RELS) continue;
             if (db.rels[@intCast(hri)].kind == dx.RELK_VARIADIC) continue;
             // var -> joined kind from body atoms (positive, relational)
-            var vnames: [HOMOG_MAX_ARITY * 4]?[*c]const u8 = undefined;
-            var vkinds: [HOMOG_MAX_ARITY * 4]u8 = undefined;
+            var vnames: [MAX_VARS]?[*c]const u8 = undefined;
+            var vkinds: [MAX_VARS]u8 = undefined;
             var nv: usize = 0;
             var j: c_int = 0;
             while (j < r.nbody) : (j += 1) {
@@ -3168,6 +3177,45 @@ fn propagateHeadKinds(db: *dx.dl_db, rules: [*]?*parser.rule, n_rules: c_int, ca
                     }
                 }
             }
+            // S3c: RESULT kinds of the aggregate / arithmetic atoms the walk
+            // above skipped.  count/sum and an arith result are a raw u32 by
+            // construction (INT); min/max pick a value FROM the source column,
+            // so the result takes the source var's settled kind (mirrors
+            // typecheck typeAggregate).  Negated ones bind nothing (skipped).
+            j = 0;
+            while (j < r.nbody) : (j += 1) {
+                const ba = r.body.?[@intCast(j)] orelse continue;
+                var rname: ?[*c]const u8 = null;
+                var rk: u8 = KIND_UNKNOWN;
+                if (ba.aggregate != 0) {
+                    if (ba.negated != 0) continue;
+                    rname = cs(ba.pred); // the aggregate atom's pred IS the result var
+                    const op: [*c]const u8 = if (ba.agg_op) |op| cs(op.text) else "";
+                    if (strEq(op, "count") or strEq(op, "sum")) {
+                        rk = KIND_INT;
+                    } else if (strEq(op, "min") or strEq(op, "max")) {
+                        if (ba.nargs >= 1 and ba.args.?[0] != null and ba.args.?[0].?.kind == parser.TOK_VAR) {
+                            if (ruleVarFind(vnames[0..nv], nv, cs(ba.args.?[0].?.text))) |sf| rk = vkinds[sf];
+                        }
+                    } else continue; // unknown aggregate op: compile_one rejects it
+                } else if (ba.negated == 0 and is_arith(ba)) {
+                    if (ba.nargs >= 1 and ba.args.?[0] != null and ba.args.?[0].?.kind == parser.TOK_VAR) {
+                        rname = cs(ba.args.?[0].?.text);
+                        rk = KIND_INT;
+                    }
+                } else continue;
+                if (rname == null or rk == KIND_UNKNOWN) continue;
+                var f: usize = 0;
+                while (f < nv) : (f += 1)
+                    if (strEq(vnames[f] orelse "", rname.?)) break;
+                if (f == nv) {
+                    if (nv >= vnames.len) continue; // RK2: never overflow the table
+                    vnames[nv] = rname;
+                    vkinds[nv] = KIND_UNKNOWN;
+                    nv += 1;
+                }
+                vkinds[f] = kindJoin(vkinds[f], rk);
+            }
             if (nv == 0) continue;
             // head columns fed by a var take that var's kind
             var hc: c_int = 0;
@@ -3189,6 +3237,255 @@ fn propagateHeadKinds(db: *dx.dl_db, rules: [*]?*parser.rule, n_rules: c_int, ca
         }
     }
 
+    return 0;
+}
+
+/// Index of `name` in the per-rule var table, or null (S3b lookups).
+fn ruleVarFind(names: []const ?[*c]const u8, n: usize, name: [*c]const u8) ?usize {
+    var f: usize = 0;
+    while (f < n) : (f += 1)
+        if (strEq(names[f] orelse "", name)) return f;
+    return null;
+}
+
+/// First EX_VAR in `e` whose settled kind is SYM, or null — R4: arithmetic
+/// requires int-like operands (a symbol id has no numeric value).
+fn exprSymVar(e: ?*const parser.expr, names: []const ?[*c]const u8, kinds: []const u8, n: usize) ?usize {
+    const ee = e orelse return null;
+    if (ee.kind == parser.EX_VAR) {
+        const f = ruleVarFind(names, n, cs(ee.@"var")) orelse return null;
+        return if (kinds[f] == KIND_SYM) f else null;
+    }
+    if (ee.kind == parser.EX_BINOP)
+        return exprSymVar(ee.l, names, kinds, n) orelse exprSymVar(ee.r, names, kinds, n);
+    return null;
+}
+
+/// S3a (R1 — JOIN/OCCURRENCE): build a per-RULE variable → kind table from
+/// the positive AND NEGATED relational body atoms and reject any variable
+/// that JOINS INT and SYM (mixed) — the silent id-collision join
+/// (MEASURED: e={1,2} int + f={a,b} sym, q(X):-e(X),f(X) answered {a,b}
+/// where the standard is {}).  UNKNOWN absorbs (a fresh/empty column stays
+/// permissive — the S1/S2 rule; declare-then-load must keep working); SAME
+/// kind is fine.  Negated atoms are INCLUDED — a negated atom still PROBES
+/// the column (MEASURED J3: e int, !s(X) with s sym answered {} where the
+/// standard is {1,2}), so they constrain the var's kind exactly like a
+/// positive occurrence (unlike propagateHeadKinds, where negation binds
+/// nothing for head propagation and is skipped).  IDB-propagated head kinds
+/// feed in through `cache` (already settled by propagateHeadKinds before
+/// this is called), so a join against a derived-int relation is loud too
+/// (MEASURED J1).  Builtins/comparisons/aggregates are skipped here (a
+/// comparison-only or head-only var is out of S3a's scope — S3b/S3c); the
+/// guard style mirrors propagateHeadKinds (RK2: a full-table rule is
+/// rejected loudly by compile_one's MAX_VARS cap before it can matter).
+///
+/// S3b (R2/R3/R4 + R5 var-var) reuses the SAME table for the builtin atoms
+/// the table build skips: a var's DEFINITE kind is INT-only or SYM-only
+/// (both-sites vars were rejected by the join check above, so at this point
+/// every table var is definite-or-unknown).  A var with NO relational site
+/// — an aggregate result (count/sum/...), a string-produced var
+/// (length/lower/...) or a fresh column — is UNKNOWN and stays PERMISSIVE
+/// (RK1: those kinds are not derivable from relational atoms).
+///   R2  ordered cmp (< <= > >=): a SYM-kind var operand is loud — intern
+///       ids have no order (MEASURED B3/B4, and the orchestrator's
+///       V2>=V3 zero-rows case).  A symbol CONSTANT in an ordered
+///       comparison is already a parse error (parser.zig:1297).
+///   R3  equality X=Y: both sides definite and differing is loud — the
+///       occurrence-consistency typecheck.zig:623 thins to (MEASURED E1).
+///   R4  arithmetic X=E: a SYM-kind expr var and a SYM-kind result var are
+///       both loud (MEASURED ARITHOP/D2).
+///   R5  != var-var: occurrence-consistency only, exactly like R3 — the
+///       symbol-CONST rhs of `X != foo` is DOCUMENTED-valid
+///       (language.html comparison section, suite-pinned test_m9_arith
+///       T8d) and is never looked at here (MEASURED NEQ2 is silently
+///       wrong: 2 rows where the standard keeps 4).
+/// Str/list/range builtins stay out of scope (plan slice 4); negated
+/// builtins are skipped because compile_rule already rejects them.
+///
+/// S3c: the RESULT vars of aggregate / arithmetic atoms get a kind in the
+/// RELATIONAL-table build too, so a downstream rule joining them is checked
+/// (the head-propagation side lives in propagateHeadKinds).
+fn checkRuleVarKinds(db: *dx.dl_db, cache: [*][HOMOG_MAX_ARITY]u8, r: *parser.rule, rule_no: c_int) c_int {
+    const VN: usize = MAX_VARS; // compile_one rejects >64 distinct vars outright, so this table never truncates
+    var vnames: [VN]?[*c]const u8 = undefined;
+    var vint_rel: [VN]?[*c]const u8 = undefined;
+    var vint_col: [VN]u8 = undefined;
+    var vsym_rel: [VN]?[*c]const u8 = undefined;
+    var vsym_col: [VN]u8 = undefined;
+    var nv: usize = 0;
+
+    var j: c_int = 0;
+    while (j < r.nbody) : (j += 1) {
+        const ba = r.body.?[@intCast(j)] orelse continue;
+        if (ba.aggregate != 0) continue; // aggregate result, not a column probe
+        if (is_builtin_pred(ba)) continue; // cmp/arith/str/list/range — S3b/S3c
+        if (ba.nargs < 1 or ba.nargs > HOMOG_MAX_ARITY) continue;
+        const ri = db_find_rel(db, cs(ba.pred));
+        if (ri < 0) continue;
+        // negated atoms are INCLUDED — they still probe the column (J3)
+        var k: c_int = 0;
+        while (k < ba.nargs) : (k += 1) {
+            const t = ba.args.?[@intCast(k)] orelse continue;
+            if (t.kind != parser.TOK_VAR) continue;
+            const col: u8 = @intCast(k);
+            const ck = relColKind(db, cache, ri, col, @intCast(ba.nargs));
+            var f: usize = 0;
+            while (f < nv) : (f += 1)
+                if (strEq(vnames[f] orelse "", cs(t.text))) break;
+            if (f == nv) {
+                if (nv >= VN) continue; // RK2: never overflow the stack table
+                vnames[nv] = cs(t.text);
+                vint_rel[nv] = null;
+                vsym_rel[nv] = null;
+                nv += 1;
+            }
+            if (ck == KIND_INT and vint_rel[f] == null) {
+                vint_rel[f] = cs(ba.pred);
+                vint_col[f] = col;
+            } else if (ck == KIND_SYM and vsym_rel[f] == null) {
+                vsym_rel[f] = cs(ba.pred);
+                vsym_col[f] = col;
+            }
+        }
+    }
+
+    // S3c: RESULT vars of the aggregate / arithmetic atoms the walk above
+    // skipped carry a kind by construction — count/sum and an arith result
+    // are a raw u32 (INT); min/max pick a value FROM the source column, so
+    // the result takes the source var's settled kind (mirrors typecheck
+    // typeAggregate).  The producing builtin is the site in the diagnostic;
+    // a result var with no second site stays permissive like any other.
+    j = 0;
+    while (j < r.nbody) : (j += 1) {
+        const ba = r.body.?[@intCast(j)] orelse continue;
+        var rname: ?[*c]const u8 = null;
+        var site: ?[*c]const u8 = null;
+        var rk: u8 = KIND_UNKNOWN;
+        if (ba.aggregate != 0) {
+            if (ba.negated != 0) continue;
+            rname = cs(ba.pred); // the aggregate atom's pred IS the result var
+            const op: [*c]const u8 = if (ba.agg_op) |o| cs(o.text) else "";
+            site = if (op[0] != 0) op else rname;
+            if (strEq(op, "count") or strEq(op, "sum")) {
+                rk = KIND_INT;
+            } else if (strEq(op, "min") or strEq(op, "max")) {
+                if (ba.nargs >= 1 and ba.args.?[0] != null and ba.args.?[0].?.kind == parser.TOK_VAR) {
+                    if (ruleVarFind(vnames[0..nv], nv, cs(ba.args.?[0].?.text))) |sf| {
+                        rk = if (vint_rel[sf] != null) KIND_INT else if (vsym_rel[sf] != null) KIND_SYM else KIND_UNKNOWN;
+                    }
+                }
+            } else continue; // unknown aggregate op: compile_one rejects it
+        } else if (ba.negated == 0 and is_arith(ba)) {
+            if (ba.nargs >= 1 and ba.args.?[0] != null and ba.args.?[0].?.kind == parser.TOK_VAR) {
+                rname = cs(ba.args.?[0].?.text);
+                site = "arith";
+                rk = KIND_INT;
+            }
+        } else continue;
+        if (rname == null or site == null or rk == KIND_UNKNOWN) continue;
+        var f: usize = 0;
+        while (f < nv) : (f += 1)
+            if (strEq(vnames[f] orelse "", rname.?)) break;
+        if (f == nv) {
+            if (nv >= VN) continue; // RK2 guard (unreachable: MAX_VARS bound)
+            vnames[nv] = rname;
+            vint_rel[nv] = null;
+            vsym_rel[nv] = null;
+            nv += 1;
+        }
+        if (rk == KIND_INT and vint_rel[f] == null) {
+            vint_rel[f] = site;
+            vint_col[f] = 0;
+        } else if (rk == KIND_SYM and vsym_rel[f] == null) {
+            vsym_rel[f] = site;
+            vsym_col[f] = 0;
+        }
+    }
+
+    // Fire ONLY when the var has BOTH a definite INT site and a definite
+    // SYM site: a kind that folded to MIXED through a MIXED column (e.g. a
+    // mixed head across rules) carries no second site and stays permissive
+    // — the S1/S2 rule (a mixed column is a documented permissive state).
+    var f: usize = 0;
+    while (f < nv) : (f += 1) {
+        if (vint_rel[f] == null or vsym_rel[f] == null) continue;
+        cerr(r.off, "compile error: variable {s} joins integer and symbol columns ({s}/{d} and {s}/{d}) (rule {d})\n", .{
+            vnames[f].?, vint_rel[f].?, vint_col[f], vsym_rel[f].?, vsym_col[f], rule_no,
+        });
+        return -1;
+    }
+
+    // settled per-var kind for S3b: INT, SYM or UNKNOWN (no both-sites var
+    // survives the join check above, so this is never MIXED here).
+    var vk: [VN]u8 = undefined;
+    f = 0;
+    while (f < nv) : (f += 1)
+        vk[f] = if (vint_rel[f] != null) KIND_INT else if (vsym_rel[f] != null) KIND_SYM else KIND_UNKNOWN;
+
+    // ── S3b: kind-correctness of the builtin atoms (R2/R3/R4 + R5) ──
+    // Only VAR operands are kinded: an INT constant in a cmp/arith is fine
+    // by itself (B1/D1), and the SYMBOL constant rhs of `X != foo` is
+    // documented-valid (T8d) — never inspected here.
+    var j2: c_int = 0;
+    while (j2 < r.nbody) : (j2 += 1) {
+        const ba = r.body.?[@intCast(j2)] orelse continue;
+        if (ba.negated != 0) continue; // compile_rule rejects negated builtins
+        if (is_comparison(ba)) {
+            const ordered = !strEq(cs(ba.pred), "!=");
+            var si: usize = 0;
+            while (si < 2) : (si += 1) {
+                const t = ba.args.?[si] orelse continue;
+                if (t.kind != parser.TOK_VAR) continue;
+                const vf = ruleVarFind(&vnames, nv, cs(t.text)) orelse continue;
+                if (vk[vf] != KIND_SYM) continue;
+                if (ordered) {
+                    // R2: intern ids have no order.
+                    cerr(r.off, "compile error: ordered comparison '{s}' over symbol variable {s} is not meaningful (intern ids have no order) (rule {d})\n", .{ cs(ba.pred), vnames[vf].?, rule_no });
+                    return -1;
+                }
+                // R5 var-var half: only both-definite-differing is loud.
+                const other = ba.args.?[1 - si] orelse continue;
+                if (other.kind != parser.TOK_VAR) continue;
+                const of = ruleVarFind(&vnames, nv, cs(other.text)) orelse continue;
+                if (vk[of] != KIND_INT) continue; // unknown/sym-vs-sym is fine
+                cerr(r.off, "compile error: variables {s} and {s} in '{s}' hold different kinds (symbols vs integers) (rule {d})\n", .{ vnames[vf].?, vnames[of].?, cs(ba.pred), rule_no });
+                return -1;
+            }
+        } else if (is_equality(ba) and !is_list_assign(ba)) {
+            // R3: occurrence consistency (mirrors typecheck.zig:623).
+            var k0: u8 = KIND_UNKNOWN;
+            var lhs: ?*const parser.token = null;
+            if (ba.args.?[0] != null and ba.args.?[0].?.kind == parser.TOK_VAR) {
+                lhs = ba.args.?[0];
+                if (ruleVarFind(&vnames, nv, cs(lhs.?.text))) |vf| k0 = vk[vf];
+            }
+            var k1: u8 = KIND_UNKNOWN;
+            var rhs: ?*const parser.token = null;
+            if (ba.args.?[1] != null and ba.args.?[1].?.kind == parser.TOK_VAR) {
+                rhs = ba.args.?[1];
+                if (ruleVarFind(&vnames, nv, cs(rhs.?.text))) |vf| k1 = vk[vf];
+            }
+            if (k0 != KIND_UNKNOWN and k1 != KIND_UNKNOWN and k0 != k1) {
+                cerr(r.off, "compile error: variables {s} and {s} in equality hold different kinds (symbols vs integers) (rule {d})\n", .{ cs(lhs.?.text), cs(rhs.?.text), rule_no });
+                return -1;
+            }
+        } else if (is_arith(ba)) {
+            // R4: operands...
+            if (exprSymVar(ba.arith, &vnames, &vk, nv)) |vf| {
+                cerr(r.off, "compile error: arithmetic on symbol variable {s} (symbols have no numeric value) (rule {d})\n", .{ vnames[vf].?, rule_no });
+                return -1;
+            }
+            // ...and the RESULT var (nargs==1, args[0] is the result).
+            if (ba.args != null and ba.nargs >= 1 and ba.args.?[0] != null and ba.args.?[0].?.kind == parser.TOK_VAR) {
+                if (ruleVarFind(&vnames, nv, cs(ba.args.?[0].?.text))) |vf| {
+                    if (vk[vf] == KIND_SYM) {
+                        cerr(r.off, "compile error: arithmetic result assigned to symbol variable {s} (rule {d})\n", .{ vnames[vf].?, rule_no });
+                        return -1;
+                    }
+                }
+            }
+        }
+    }
     return 0;
 }
 
@@ -3288,6 +3585,19 @@ pub fn checkAllRuleConstKinds(db: *dx.dl_db, rules: [*]?*parser.rule, n_rules: c
     // head-kind propagation first, so the constant check below sees the
     // settled kinds of empty-but-derived relations.
     if (propagateHeadKinds(db, rules, n_rules, &cache) != 0) return -1;
+
+    // S3a (R1): per-rule var→kind join check over positive AND negated
+    // relational body atoms (the cache carries propagated head kinds, so
+    // joins against derived-int relations are loud here too).  Runs before
+    // the constant walk; a var with BOTH an int site and a sym site
+    // rejects with a cerr naming both.
+    {
+        var i: c_int = 0;
+        while (i < n_rules) : (i += 1) {
+            const r = rules[@intCast(i)] orelse continue;
+            if (checkRuleVarKinds(db, &cache, r, i + 1) != 0) return -1;
+        }
+    }
 
     var i: c_int = 0;
     while (i < n_rules) : (i += 1) {

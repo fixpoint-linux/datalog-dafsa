@@ -36,6 +36,7 @@
 
 #include "dl.h"
 #include "schema.h"
+#include "compiler.h"    /* compile_last_error (T23: the LSP error sink) */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -149,6 +150,61 @@ static void load_rows_sym(const char *rel, uint8_t arity,
         for (c = 0; c < arity; c++) {
             if (c) fputc(',', f);
             fprintf(f, "%s", cells[(size_t)i * arity + (size_t)c]);
+        }
+        fputc('\n', f);
+    }
+    fclose(f);
+    assert(dl_load_facts(g_db, rel, path) == nrows);
+}
+
+/* S3b helpers: arity-2 variants of the two loaders above (comparison rules
+ * need two columns to relate). */
+static void load_rows_u32_2(const char *rel, uint8_t arity,
+                            const uint32_t *cols, int nrows)
+{
+    char path[256];
+    FILE *f;
+    int i, c;
+
+    assert(arity == 2);
+    assert(dl_declare_relation(g_db, rel, arity) == 0);
+    snprintf(path, sizeof path, "build-tmp/homogdb/%s.csv", rel);
+    f = fopen(path, "w");
+    assert(f);
+    for (i = 0; i < nrows; i++) {
+        for (c = 0; c < arity; c++) {
+            if (c) fputc(',', f);
+            fprintf(f, "%u", cols[(size_t)i * arity + (size_t)c]);
+        }
+        fputc('\n', f);
+    }
+    fclose(f);
+    assert(dl_load_facts(g_db, rel, path) == nrows);
+}
+
+static void load_rows_sym2(const char *rel, uint8_t arity,
+                           const char **cells, int nrows)
+{
+    assert(arity == 2);
+    load_rows_sym(rel, arity, cells, nrows);
+}
+
+/* S3c: arity-8 loader for the wide-rule fixtures (the kind tables are
+ * per-rule var tables, so the ceiling probe needs many COLUMNS). */
+static void load_rows_u32_8(const char *rel, const uint32_t *row, int nrows)
+{
+    char path[256];
+    FILE *f;
+    int i, c;
+
+    assert(dl_declare_relation(g_db, rel, 8) == 0);
+    snprintf(path, sizeof path, "build-tmp/homogdb/%s.csv", rel);
+    f = fopen(path, "w");
+    assert(f);
+    for (i = 0; i < nrows; i++) {
+        for (c = 0; c < 8; c++) {
+            if (c) fputc(',', f);
+            fprintf(f, "%u", row[c]);
         }
         fputc('\n', f);
     }
@@ -1117,7 +1173,1181 @@ static void test_propagation_skips_ambiguous(void)
     PASS();
 }
 
-/* ─── main ─────────────────────────────────────────────────────────────── */
+/* ─── T18: S3a (R1) — the JOIN rule: cross-kind join is LOUD ───────────── */
+/* MEASURED before S3a: e={1,2} int + f={a,b} sym, q(X):-e(X),f(X). -> rc=0
+ * and q={a,b} from the ID COLLISION (a interns to 1, joins raw 1); the
+ * standard answer is {} (no value is both an int and a symbol).  The
+ * var-kind table makes the join LOUD, naming BOTH sites. */
+static void test_join_cross_kind_loud(void)
+{
+    uint32_t e_rows[2];
+    int rc;
+
+    TEST("homog: q(X):-e(X),f(X) int-sym join is LOUD (dl_load_rules)");
+
+    setup();
+    e_rows[0] = 1; e_rows[1] = 2;
+    load_rows_u32("e", 1, e_rows, 2);
+    {
+        const char *cells[2] = { "a", "b" };
+        load_rows_sym("f", 1, cells, 2);
+    }
+
+    rc = dl_load_rules(g_db, "q(X):-e(X),f(X).\n");
+    if (rc != -1) {
+        printf("(rc=%d) ", rc);
+        teardown();
+        FAIL("cross-kind join accepted by dl_load_rules");
+        return;
+    }
+    teardown();
+    PASS();
+
+    TEST("homog: same join via dl_query_rules_ro is LOUD");
+    setup();
+    e_rows[0] = 1; e_rows[1] = 2;
+    load_rows_u32("e", 1, e_rows, 2);
+    {
+        const char *cells[2] = { "a", "b" };
+        load_rows_sym("f", 1, cells, 2);
+    }
+    {
+        tuple_set res;
+        long n;
+        memset(&res, 0, sizeof res);
+        n = dl_query_rules_ro(g_db, "q2(X):-e(X),f(X).\n", "q2", tset_cb, &res);
+        tset_free(&res);
+        if (n >= 0) {
+            printf("(n=%ld) ", n);
+            teardown();
+            FAIL("cross-kind join answered via rules_ro");
+            return;
+        }
+    }
+    teardown();
+    PASS();
+}
+
+/* ─── T19: J1 — the join against an IDB-PROPAGATED kind is LOUD ────────── */
+/* q's int kind is derived by the head-kind fixpoint (q(X):-e(X)); the var
+ * table sees it through the same cache, so p(X):-q(X),j(X) with j sym is
+ * loud.  MEASURED before S3a: rc=0, p={a,b} (collision).  Also covers the
+ * SPLIT-load merged path (dl.zig merged-set check): loading the two rules
+ * as separate calls must reject on the SECOND call. */
+static void test_join_idb_propagated_loud(void)
+{
+    uint32_t e_rows[2];
+    int rc;
+
+    TEST("homog: p(X):-q(X),j(X) with q derived-int, j sym is LOUD");
+
+    setup();
+    e_rows[0] = 1; e_rows[1] = 2;
+    load_rows_u32("e", 1, e_rows, 2);
+    {
+        const char *cells[2] = { "a", "b" };
+        load_rows_sym("j", 1, cells, 2);
+    }
+
+    rc = dl_load_rules(g_db, "q(X):-e(X).\np(X):-q(X),j(X).\n");
+    if (rc != -1) {
+        printf("(rc=%d) ", rc);
+        teardown();
+        FAIL("IDB-propagated cross-kind join accepted");
+        return;
+    }
+    teardown();
+    PASS();
+
+    TEST("homog: the same join split across two load_rules calls is LOUD");
+
+    setup();
+    e_rows[0] = 1; e_rows[1] = 2;
+    load_rows_u32("e", 1, e_rows, 2);
+    {
+        const char *cells[2] = { "a", "b" };
+        load_rows_sym("j", 1, cells, 2);
+    }
+    if (dl_load_rules(g_db, "q(X):-e(X).\n") != 0) {
+        teardown();
+        FAIL("defining rule failed to load");
+        return;
+    }
+    rc = dl_load_rules(g_db, "p(X):-q(X),j(X).\n");
+    if (rc != -1) {
+        printf("(rc=%d) ", rc);
+        teardown();
+        FAIL("split load evaded the join check (merged-set hole)");
+        return;
+    }
+    teardown();
+    PASS();
+}
+
+/* ─── T20: J3 — the NEGATED cross-kind join is LOUD ─────────────────────── */
+/* A negated atom still probes the column: e={1,2} int, s={a} sym,
+ * p(X):-e(X),!s(X). MEASURED before S3a: rc=0 and p={} (a interns to 1,
+ * the negation eats raw 1); the standard answer is {1,2}. */
+static void test_join_negated_cross_kind_loud(void)
+{
+    uint32_t e_rows[2];
+    int rc;
+
+    TEST("homog: p(X):-e(X),!s(X) int-sym negated join is LOUD");
+
+    setup();
+    e_rows[0] = 1; e_rows[1] = 2;
+    load_rows_u32("e", 1, e_rows, 2);
+    {
+        const char *cells[1] = { "a" };
+        load_rows_sym("s", 1, cells, 1);
+    }
+
+    rc = dl_load_rules(g_db, "p(X):-e(X),!s(X).\n");
+    if (rc != -1) {
+        printf("(rc=%d) ", rc);
+        teardown();
+        FAIL("negated cross-kind join accepted");
+        return;
+    }
+    teardown();
+    PASS();
+}
+
+/* ─── T21: same-kind joins and the mixed-head control LOAD ──────────────── */
+static void test_join_same_kind_controls(void)
+{
+    uint32_t e_rows[2];
+    tuple_set res;
+    long n;
+    int rc;
+
+    TEST("homog: int-int join control loads and answers {2}");
+
+    setup();
+    e_rows[0] = 1; e_rows[1] = 2;
+    load_rows_u32("e", 1, e_rows, 2);
+    {
+        uint32_t g_rows[2]; g_rows[0] = 2; g_rows[1] = 3;
+        load_rows_u32("g", 1, g_rows, 2);
+    }
+    rc = dl_load_rules(g_db, "q(X):-e(X),g(X).\n");
+    if (rc != 0) {
+        printf("(rc=%d) ", rc);
+        teardown();
+        FAIL("int-int join control failed to load");
+        return;
+    }
+    assert(dl_compile(g_db) == 0);
+    memset(&res, 0, sizeof res);
+    n = dl_query(g_db, "q", tset_cb, &res);
+    if (n < 0 || res.count != 1 || res.data[0] != 2) {
+        printf("(n=%ld cnt=%ld) ", n, res.count);
+        tset_free(&res);
+        teardown();
+        FAIL("int-int join: q != {2}");
+        return;
+    }
+    tset_free(&res);
+    teardown();
+    PASS();
+
+    TEST("homog: sym-sym join control loads and answers {b}");
+
+    setup();
+    {
+        const char *ec[2] = { "a", "b" };
+        const char *fc[2] = { "b", "c" };
+        load_rows_sym("e", 1, ec, 2);
+        load_rows_sym("f", 1, fc, 2);
+    }
+    rc = dl_load_rules(g_db, "q(X):-e(X),f(X).\n");
+    if (rc != 0) {
+        printf("(rc=%d) ", rc);
+        teardown();
+        FAIL("sym-sym join control failed to load");
+        return;
+    }
+    assert(dl_compile(g_db) == 0);
+    memset(&res, 0, sizeof res);
+    n = dl_query(g_db, "q", tset_cb, &res);
+    if (n < 0 || res.count != 1 ||
+        res.data[0] != dl_intern_str_find(g_db, "b")) {
+        printf("(n=%ld cnt=%ld) ", n, res.count);
+        tset_free(&res);
+        teardown();
+        FAIL("sym-sym join: q != {b}");
+        return;
+    }
+    tset_free(&res);
+    teardown();
+    PASS();
+
+    TEST("homog: negated same-kind join control (J4) loads; p={2}");
+
+    setup();
+    e_rows[0] = 1; e_rows[1] = 2;
+    load_rows_u32("e", 1, e_rows, 2);
+    {
+        uint32_t g_rows[1]; g_rows[0] = 1;
+        load_rows_u32("g", 1, g_rows, 1);
+    }
+    rc = dl_load_rules(g_db, "p(X):-e(X),!g(X).\n");
+    if (rc != 0) {
+        printf("(rc=%d) ", rc);
+        teardown();
+        FAIL("negated same-kind join control failed to load");
+        return;
+    }
+    assert(dl_compile(g_db) == 0);
+    memset(&res, 0, sizeof res);
+    n = dl_query(g_db, "p", tset_cb, &res);
+    if (n < 0 || res.count != 1 || res.data[0] != 2) {
+        printf("(n=%ld cnt=%ld) ", n, res.count);
+        tset_free(&res);
+        teardown();
+        FAIL("negated same-kind join: p != {2}");
+        return;
+    }
+    tset_free(&res);
+    teardown();
+    PASS();
+
+    TEST("homog: mixed head across rules (FP13) stays permissive");
+
+    setup();
+    e_rows[0] = 1; e_rows[1] = 2;
+    load_rows_u32("e", 1, e_rows, 2);
+    {
+        const char *cells[2] = { "a", "b" };
+        load_rows_sym("f", 1, cells, 2);
+    }
+    rc = dl_load_rules(g_db, "p(X):-e(X).\np(X):-f(X).\n");
+    if (rc != 0) {
+        printf("(rc=%d) ", rc);
+        teardown();
+        FAIL("mixed head across rules rejected (per-rule consistency only)");
+        return;
+    }
+    /* ...and a downstream rule over the mixed head joins NOTHING definite:
+     * p's column kind folded to MIXED, which is permissive by contract */
+    rc = dl_load_rules(g_db, "r(X):-p(X),e(X).\n");
+    if (rc != 0) {
+        printf("(rc=%d) ", rc);
+        teardown();
+        FAIL("downstream rule over a mixed head rejected");
+        return;
+    }
+    teardown();
+    PASS();
+
+    TEST("homog: fresh/unknown relation joined stays permissive");
+
+    setup();
+    e_rows[0] = 1; e_rows[1] = 2;
+    load_rows_u32("e", 1, e_rows, 2);
+    assert(dl_declare_relation(g_db, "g", 1) == 0); /* declared, EMPTY */
+    rc = dl_load_rules(g_db, "q(X):-e(X),g(X).\n");
+    if (rc != 0) {
+        printf("(rc=%d) ", rc);
+        teardown();
+        FAIL("join against a fresh/empty relation rejected");
+        return;
+    }
+    teardown();
+    PASS();
+}
+
+/* ─── T22: WFS path — the join check reaches every strategy path ────────── */
+static void test_join_wfs_paths(void)
+{
+    uint32_t e_rows[2];
+    tuple_set res;
+    long n;
+
+    TEST("homog: WFS rejects the cross-kind join (LOUD) and answers int-int");
+
+    setup();
+    e_rows[0] = 1; e_rows[1] = 2;
+    load_rows_u32("e", 1, e_rows, 2);
+    {
+        const char *cells[2] = { "a", "b" };
+        load_rows_sym("f", 1, cells, 2);
+    }
+    memset(&res, 0, sizeof res);
+    n = dl_query_wfs_ro(g_db, "qw(X):-e(X),f(X).\n", "qw", 0, tset_cb, &res);
+    tset_free(&res);
+    if (n >= 0) {
+        printf("(n=%ld) ", n);
+        teardown();
+        FAIL("WFS answered the cross-kind join");
+        return;
+    }
+
+    /* int-int control through WFS: g={2,3} joined with e={1,2} -> {2} */
+    {
+        uint32_t g_rows[2]; g_rows[0] = 2; g_rows[1] = 3;
+        load_rows_u32("g", 1, g_rows, 2);
+    }
+    memset(&res, 0, sizeof res);
+    n = dl_query_wfs_ro(g_db, "qi(X):-e(X),g(X).\n", "qi", 0, tset_cb, &res);
+    if (n < 0 || res.count != 1 || res.data[0] != 2) {
+        printf("(n=%ld cnt=%ld) ", n, res.count);
+        tset_free(&res);
+        teardown();
+        FAIL("WFS int-int join control: qi != {2}");
+        return;
+    }
+    tset_free(&res);
+    teardown();
+    PASS();
+}
+
+/* ─── T23: the diagnostic names BOTH join sites ─────────────────────────── */
+/* compile_last_error is the LSP error sink (compiler.h:143); the join
+ * diagnostic must name the variable and both relations/columns so the
+ * offending site is actionable. */
+static void test_join_diagnostic_names_sites(void)
+{
+    uint32_t e_rows[2];
+
+    TEST("homog: join diagnostic names the var and both rel/col sites");
+
+    setup();
+    e_rows[0] = 1; e_rows[1] = 2;
+    load_rows_u32("e", 1, e_rows, 2);
+    {
+        const char *cells[2] = { "a", "b" };
+        load_rows_sym("f", 1, cells, 2);
+    }
+    if (dl_load_rules(g_db, "q(X):-e(X),f(X).\n") != -1) {
+        teardown();
+        FAIL("cross-kind join accepted (diagnostic test)");
+        return;
+    }
+    {
+        const char *msg = compile_last_error(NULL);
+        if (msg == NULL ||
+            strstr(msg, "variable X joins") == NULL ||
+            strstr(msg, "e/0") == NULL ||
+            strstr(msg, "f/0") == NULL) {
+            printf("(msg=%s) ", msg ? msg : "(null)");
+            teardown();
+            FAIL("join diagnostic does not name the var and both sites");
+            return;
+        }
+    }
+    teardown();
+    PASS();
+}
+
+/* ─── T24: S3b R2 — ordered comparison over SYMBOL variables is LOUD ──── */
+/* MEASURED before S3b: pair={mon/tue, mon/wed} sym, q(V1):-pair(V1,V2),
+ * pair(V3,V4),V2>=V4. loaded rc=0 and answered 1 row — the engine compares
+ * INTERN IDS, which have no order (the orchestrator's "is on or after" case
+ * answers ZERO rows silently on other data).  R2 makes any SYM-kind operand
+ * of < <= > >= loud.  An int-literal RHS vs a sym var (B4) and a sym var vs
+ * a sym var (B3) are both covered; a symbol CONSTANT in an ordered
+ * comparison is already a parse error (parser.zig:1297). */
+static void test_cmp_ordered_sym_loud(void)
+{
+    int rc;
+
+    TEST("homog: q(V1):-pair(V1,V2),pair(V3,V4),V2>=V4 (sym cols) is LOUD");
+
+    setup();
+    {
+        const char *cells[4] = { "mon", "tue", "mon", "wed" };
+        load_rows_sym2("pair", 2, cells, 2);
+    }
+    rc = dl_load_rules(g_db, "q(V1):-pair(V1,V2),pair(V3,V4),V2>=V4.\n");
+    if (rc != -1) {
+        printf("(rc=%d) ", rc);
+        teardown();
+        FAIL("ordered comparison over symbol columns accepted");
+        return;
+    }
+    teardown();
+    PASS();
+
+    TEST("homog: sym var vs int literal in ordered cmp (X>1) is LOUD");
+
+    setup();
+    {
+        const char *cells[2] = { "a", "b" };
+        load_rows_sym("f", 1, cells, 2);
+    }
+    rc = dl_load_rules(g_db, "q(X):-f(X),X>1.\n");
+    if (rc != -1) {
+        printf("(rc=%d) ", rc);
+        teardown();
+        FAIL("ordered comparison sym-var vs int-literal accepted");
+        return;
+    }
+    teardown();
+    PASS();
+
+    TEST("homog: sym var vs sym var ordered cmp (X<Y) is LOUD");
+
+    setup();
+    {
+        const char *cells[4] = { "b", "a", "a", "c" };
+        load_rows_sym2("pair", 2, cells, 2);
+    }
+    rc = dl_load_rules(g_db, "lt(X,Y):-pair(X,Y),X<Y.\n");
+    if (rc != -1) {
+        printf("(rc=%d) ", rc);
+        teardown();
+        FAIL("sym-vs-sym ordered comparison accepted");
+        return;
+    }
+    teardown();
+    PASS();
+}
+
+/* ─── T25: ordered comparisons over INT columns keep loading ───────────── */
+static void test_cmp_ordered_int_controls(void)
+{
+    tuple_set res;
+    long n;
+    int rc;
+
+    TEST("homog: int var-var X<Y control loads and answers {(1,2)}");
+
+    setup();
+    {
+        uint32_t all[4]; all[0] = 1; all[1] = 2; all[2] = 2; all[3] = 1;
+        load_rows_u32_2("pair", 2, all, 2);
+    }
+    rc = dl_load_rules(g_db, "lt(X,Y):-pair(X,Y),X<Y.\n");
+    if (rc != 0) {
+        printf("(rc=%d) ", rc);
+        teardown();
+        FAIL("int var-var ordered comparison failed to load");
+        return;
+    }
+    assert(dl_compile(g_db) == 0);
+    memset(&res, 0, sizeof res);
+    n = dl_query(g_db, "lt", tset_cb, &res);
+    if (n < 0 || res.count != 1 || res.data[0] != 1 || res.data[1] != 2) {
+        printf("(n=%ld cnt=%ld) ", n, res.count);
+        tset_free(&res);
+        teardown();
+        FAIL("int var-var X<Y: lt != {(1,2)}");
+        return;
+    }
+    tset_free(&res);
+    teardown();
+    PASS();
+
+    TEST("homog: int var vs int literal X>1 control loads and answers {2,3}");
+
+    setup();
+    {
+        uint32_t vr[3]; vr[0] = 1; vr[1] = 2; vr[2] = 3;
+        load_rows_u32("val", 1, vr, 3);
+    }
+    rc = dl_load_rules(g_db, "q(X):-val(X),X>1.\n");
+    if (rc != 0) {
+        printf("(rc=%d) ", rc);
+        teardown();
+        FAIL("int X>1 control failed to load");
+        return;
+    }
+    assert(dl_compile(g_db) == 0);
+    memset(&res, 0, sizeof res);
+    n = dl_query(g_db, "q", tset_cb, &res);
+    if (n < 0 || res.count != 2) {
+        printf("(n=%ld cnt=%ld) ", n, res.count);
+        tset_free(&res);
+        teardown();
+        FAIL("int X>1: q != {2,3}");
+        return;
+    }
+    tset_free(&res);
+    teardown();
+    PASS();
+}
+
+/* ─── T26: S3b R3 — equality across kinds is LOUD, same-kind loads ─────── */
+/* MEASURED before S3b: q(X,Y):-e(X),f(Y),X=Y with e int / f sym loaded
+ * rc=0 and answered 2 rows (a interns to id 1 and joins raw 1) where the
+ * standard is {} — no value is both an int and a symbol. */
+static void test_eq_cross_kind_loud(void)
+{
+    uint32_t e_rows[2];
+    tuple_set res;
+    long n;
+    int rc;
+
+    TEST("homog: q(X,Y):-e(X),f(Y),X=Y int-vs-sym is LOUD");
+
+    setup();
+    e_rows[0] = 1; e_rows[1] = 2;
+    load_rows_u32("e", 1, e_rows, 2);
+    {
+        const char *cells[2] = { "a", "b" };
+        load_rows_sym("f", 1, cells, 2);
+    }
+    rc = dl_load_rules(g_db, "q(X,Y):-e(X),f(Y),X=Y.\n");
+    if (rc != -1) {
+        printf("(rc=%d) ", rc);
+        teardown();
+        FAIL("cross-kind equality accepted");
+        return;
+    }
+    teardown();
+    PASS();
+
+    TEST("homog: X=Y same-kind int control loads; q has 2 rows");
+
+    setup();
+    {
+        uint32_t all[4]; all[0] = 1; all[1] = 1; all[2] = 2; all[3] = 2;
+        load_rows_u32_2("pair", 2, all, 2);
+    }
+    rc = dl_load_rules(g_db, "q(X,Y):-pair(X,Y),X=Y.\n");
+    if (rc != 0) {
+        printf("(rc=%d) ", rc);
+        teardown();
+        FAIL("same-kind int equality failed to load");
+        return;
+    }
+    assert(dl_compile(g_db) == 0);
+    memset(&res, 0, sizeof res);
+    n = dl_query(g_db, "q", tset_cb, &res);
+    if (n < 0 || res.count != 2) {
+        printf("(n=%ld cnt=%ld) ", n, res.count);
+        tset_free(&res);
+        teardown();
+        FAIL("same-kind int equality: q != 2 rows");
+        return;
+    }
+    tset_free(&res);
+    teardown();
+    PASS();
+
+    TEST("homog: X=Y same-kind sym control loads (bind direction)");
+
+    setup();
+    {
+        const char *cells[4] = { "a", "a", "b", "b" };
+        load_rows_sym2("pair", 2, cells, 2);
+    }
+    rc = dl_load_rules(g_db, "q(Y):-pair(X,Y),X=Y.\n");
+    if (rc != 0) {
+        printf("(rc=%d) ", rc);
+        teardown();
+        FAIL("same-kind sym equality failed to load");
+        return;
+    }
+    teardown();
+    PASS();
+}
+
+/* ─── T27: S3b R4 — arithmetic on symbol variables is LOUD ────────────── */
+/* MEASURED before S3b: q(X):-f(X),X=1+1 with f sym loaded rc=0 and answered
+ * {b} — a=1 + 1 = 2 collides with b's intern id.  The operand form
+ * (X=Y+1 with Y sym) compared intern ids as numbers. */
+static void test_arith_sym_loud(void)
+{
+    uint32_t e_rows[2];
+    int rc;
+
+    TEST("homog: q(X):-f(X),X=1+1 (sym result var) is LOUD");
+
+    setup();
+    {
+        const char *cells[2] = { "a", "b" };
+        load_rows_sym("f", 1, cells, 2);
+    }
+    rc = dl_load_rules(g_db, "q(X):-f(X),X=1+1.\n");
+    if (rc != -1) {
+        printf("(rc=%d) ", rc);
+        teardown();
+        FAIL("arithmetic result into a symbol variable accepted");
+        return;
+    }
+    teardown();
+    PASS();
+
+    TEST("homog: q(X):-e(X),f(Y),X=Y+1 (sym operand var) is LOUD");
+
+    setup();
+    e_rows[0] = 1; e_rows[1] = 2;
+    load_rows_u32("e", 1, e_rows, 2);
+    {
+        const char *cells[2] = { "a", "b" };
+        load_rows_sym("f", 1, cells, 2);
+    }
+    rc = dl_load_rules(g_db, "q(X):-e(X),f(Y),X=Y+1.\n");
+    if (rc != -1) {
+        printf("(rc=%d) ", rc);
+        teardown();
+        FAIL("arithmetic on a symbol operand variable accepted");
+        return;
+    }
+    teardown();
+    PASS();
+
+    TEST("homog: int arithmetic controls load (X=1+1 / S=A+B on int cols)");
+
+    setup();
+    e_rows[0] = 1; e_rows[1] = 2;
+    load_rows_u32("e", 1, e_rows, 2);
+    {
+        uint32_t all[4]; all[0] = 1; all[1] = 2; all[2] = 2; all[3] = 1;
+        load_rows_u32_2("pair", 2, all, 2);
+    }
+    rc = dl_load_rules(g_db, "q(X):-e(X),X=1+1.\ns(A,B,S):-pair(A,B),S=A+B.\n");
+    if (rc != 0) {
+        printf("(rc=%d) ", rc);
+        teardown();
+        FAIL("int arithmetic control failed to load");
+        return;
+    }
+    teardown();
+    PASS();
+}
+
+/* ─── T28: != controls — the documented allows keep loading ───────────── */
+/* X != foo on an INT column is DOCUMENTED-valid (language.html comparison
+ * section: "!= additionally accepts a symbol constant on the right (it
+ * interns the symbol and compares symbol ids)") and SUITE-PINNED
+ * (test_m9_arith T8d, values high so ids never collide).  X != a on a SYM
+ * column, X != 1 on an int column and sym X != Y same-kind are all correct
+ * and must keep loading. */
+static void test_neq_documented_controls(void)
+{
+    uint32_t v_rows[3];
+    tuple_set res;
+    long n;
+    int rc;
+
+    TEST("homog: r(X):-val(X),X!=foo int-col DOCUMENTED control loads");
+
+    setup();
+    v_rows[0] = 100; v_rows[1] = 200; v_rows[2] = 300;
+    load_rows_u32("val", 1, v_rows, 3);
+    rc = dl_load_rules(g_db, "r(X):-val(X),X!=foo.\n");
+    if (rc != 0) {
+        printf("(rc=%d) ", rc);
+        teardown();
+        FAIL("X!=foo on an int column rejected (documented-valid, T8d)");
+        return;
+    }
+    assert(dl_compile(g_db) == 0);
+    memset(&res, 0, sizeof res);
+    n = dl_query(g_db, "r", tset_cb, &res);
+    if (n < 0 || res.count != 3) {
+        printf("(n=%ld cnt=%ld) ", n, res.count);
+        tset_free(&res);
+        teardown();
+        FAIL("X!=foo int-col control: r != {100,200,300}");
+        return;
+    }
+    tset_free(&res);
+    teardown();
+    PASS();
+
+    TEST("homog: q(X):-f(X),X!=a sym-col control loads; q={b}");
+
+    setup();
+    {
+        const char *cells[2] = { "a", "b" };
+        load_rows_sym("f", 1, cells, 2);
+    }
+    rc = dl_load_rules(g_db, "q(X):-f(X),X!=a.\n");
+    if (rc != 0) {
+        printf("(rc=%d) ", rc);
+        teardown();
+        FAIL("X!=a on a sym column rejected");
+        return;
+    }
+    assert(dl_compile(g_db) == 0);
+    memset(&res, 0, sizeof res);
+    n = dl_query(g_db, "q", tset_cb, &res);
+    if (n < 0 || res.count != 1 ||
+        res.data[0] != dl_intern_str_find(g_db, "b")) {
+        printf("(n=%ld cnt=%ld) ", n, res.count);
+        tset_free(&res);
+        teardown();
+        FAIL("X!=a sym-col control: q != {b}");
+        return;
+    }
+    tset_free(&res);
+    teardown();
+    PASS();
+
+    TEST("homog: q(X):-val(X),X!=1 int-col control loads; q={2}");
+
+    setup();
+    {
+        uint32_t vr[2]; vr[0] = 1; vr[1] = 2;
+        load_rows_u32("val", 1, vr, 2);
+    }
+    rc = dl_load_rules(g_db, "q(X):-val(X),X!=1.\n");
+    if (rc != 0) {
+        printf("(rc=%d) ", rc);
+        teardown();
+        FAIL("X!=1 on an int column rejected");
+        return;
+    }
+    assert(dl_compile(g_db) == 0);
+    memset(&res, 0, sizeof res);
+    n = dl_query(g_db, "q", tset_cb, &res);
+    if (n < 0 || res.count != 1 || res.data[0] != 2) {
+        printf("(n=%ld cnt=%ld) ", n, res.count);
+        tset_free(&res);
+        teardown();
+        FAIL("X!=1 int-col control: q != {2}");
+        return;
+    }
+    tset_free(&res);
+    teardown();
+    PASS();
+
+    TEST("homog: q(X):-e(X),e(Y),X!=Y sym same-kind var-var control loads");
+
+    setup();
+    {
+        const char *cells[2] = { "a", "b" };
+        load_rows_sym("e", 1, cells, 2);
+    }
+    rc = dl_load_rules(g_db, "q(X):-e(X),e(Y),X!=Y.\n");
+    if (rc != 0) {
+        printf("(rc=%d) ", rc);
+        teardown();
+        FAIL("sym X!=Y same-kind rejected");
+        return;
+    }
+    teardown();
+    PASS();
+}
+
+/* ─── T29: S3b R5 — != var-var across kinds is LOUD; unknown stays soft ── */
+/* MEASURED before S3b: r(X,Y):-e(X),f(Y),X!=Y with e int / f sym loaded
+ * rc=0 and answered 2 of the 4 standard rows (a=id1 makes 1!=a false).  The
+ * S3a join rule does NOT catch it (X and Y are different vars, each with a
+ * single kind-consistent site).  Aggregate- and string-produced vars have no
+ * relational kind (UNKNOWN) and must stay permissive (FP7/FP8). */
+static void test_neq_cross_kind_loud(void)
+{
+    uint32_t e_rows[2];
+    int rc;
+
+    TEST("homog: r(X,Y):-e(X),f(Y),X!=Y int-vs-sym var-var is LOUD");
+
+    setup();
+    e_rows[0] = 1; e_rows[1] = 2;
+    load_rows_u32("e", 1, e_rows, 2);
+    {
+        const char *cells[2] = { "a", "b" };
+        load_rows_sym("f", 1, cells, 2);
+    }
+    rc = dl_load_rules(g_db, "r(X,Y):-e(X),f(Y),X!=Y.\n");
+    if (rc != -1) {
+        printf("(rc=%d) ", rc);
+        teardown();
+        FAIL("cross-kind != var-var accepted");
+        return;
+    }
+    teardown();
+    PASS();
+
+    TEST("homog: aggregate result N>=2 (FP7) and length N>2 (FP8) load");
+
+    setup();
+    {
+        uint32_t er[4]; er[0] = 1; er[1] = 2; er[2] = 1; er[3] = 3;
+        load_rows_u32_2("edge", 2, er, 2);
+        const char *sc[3] = { "ab", "abc", "abcd" };
+        load_rows_sym("str", 1, sc, 3);
+    }
+    rc = dl_load_rules(g_db,
+        "cnt(X,N):-edge(X,Y),N=count().\n"
+        "big(X):-cnt(X,N),N>=2.\n"
+        "long(S):-str(S),N=length(S),N>2.\n");
+    if (rc != 0) {
+        printf("(rc=%d) ", rc);
+        teardown();
+        FAIL("aggregate/str-produced var in an ordered cmp rejected (RK1)");
+        return;
+    }
+    teardown();
+    PASS();
+
+    TEST("homog: fresh/unknown column in an ordered cmp stays permissive");
+
+    setup();
+    e_rows[0] = 1; e_rows[1] = 2;
+    load_rows_u32("e", 1, e_rows, 2);
+    assert(dl_declare_relation(g_db, "g", 1) == 0); /* declared, EMPTY */
+    rc = dl_load_rules(g_db, "q(X):-e(X),g(X),X>1.\n");
+    if (rc != 0) {
+        printf("(rc=%d) ", rc);
+        teardown();
+        FAIL("unknown-kind operand in an ordered cmp rejected");
+        return;
+    }
+    teardown();
+    PASS();
+}
+
+/* ─── T30: S3c — aggregate-RESULT head columns carry a kind ────────────── */
+/* MEASURED before S3c: with e={1,2} int and f={a,b} sym (a=id1, b=id2),
+ * 'c(N):-e(X),N=count(). q(N):-c(N),f(N).' loaded rc=0 and answered q={2}
+ * — the count 2 collides with b's sym id; the standard is {}. The count
+ * result is a raw u32 by construction, so the head column is INT and the
+ * downstream join/eq must be loud. The GROUP-var case was already covered
+ * (the group var occurs in a body atom) but untested — pinned here too. */
+static void test_agg_result_head_loud(void)
+{
+    uint32_t e_rows[2];
+    int rc;
+
+    TEST("homog: agg-result head joined against sym rel is LOUD");
+
+    setup();
+    e_rows[0] = 1; e_rows[1] = 2;
+    load_rows_u32("e", 1, e_rows, 2);
+    {
+        const char *cells[2] = { "a", "b" };
+        load_rows_sym("f", 1, cells, 2);
+    }
+    rc = dl_load_rules(g_db,
+        "c(N):-e(X),N=count().\n"
+        "q(N):-c(N),f(N).\n");
+    if (rc != -1) {
+        printf("(rc=%d) ", rc);
+        teardown();
+        FAIL("agg-result head join accepted");
+        return;
+    }
+    PASS();
+
+    TEST("homog: agg-result head through equality is LOUD");
+
+    setup();
+    e_rows[0] = 1; e_rows[1] = 2;
+    load_rows_u32("e", 1, e_rows, 2);
+    {
+        const char *cells[2] = { "a", "b" };
+        load_rows_sym("f", 1, cells, 2);
+    }
+    rc = dl_load_rules(g_db,
+        "c(N):-e(X),N=count().\n"
+        "q(N):-c(N),f(Y),N=Y.\n");
+    if (rc != -1) {
+        printf("(rc=%d) ", rc);
+        teardown();
+        FAIL("agg-result head via equality accepted");
+        return;
+    }
+    teardown();
+    PASS();
+
+    TEST("homog: agg GROUP var cross-kind is LOUD (covered since S3a)");
+
+    setup();
+    e_rows[0] = 1; e_rows[1] = 2;
+    load_rows_u32("e", 1, e_rows, 2);
+    {
+        const char *cells[2] = { "a", "b" };
+        load_rows_sym("f", 1, cells, 2);
+    }
+    rc = dl_load_rules(g_db,
+        "cnt(K,N):-f(K),N=count().\n"
+        "q(K):-cnt(K,N),e(K).\n");
+    if (rc != -1) {
+        printf("(rc=%d) ", rc);
+        teardown();
+        FAIL("agg GROUP-var cross-kind accepted");
+        return;
+    }
+    teardown();
+    PASS();
+
+    TEST("homog: count result in an ordered cmp still loads (FP7)");
+
+    setup();
+    e_rows[0] = 1; e_rows[1] = 2;
+    load_rows_u32("e", 1, e_rows, 2);
+    rc = dl_load_rules(g_db,
+        "c(N):-e(X),N=count().\n"
+        "big(N):-c(N),N>=1.\n");
+    if (rc != 0) {
+        printf("(rc=%d) ", rc);
+        teardown();
+        FAIL("count result in an ordered cmp rejected");
+        return;
+    }
+    teardown();
+    PASS();
+
+    TEST("homog: min result takes the SOURCE kind (sym stays sym)");
+
+    setup();
+    {
+        const char *cells[2] = { "b", "a" };
+        load_rows_sym("f", 1, cells, 2);
+    }
+    /* min over a sym column produces a sym id: joining it back into the sym
+     * relation must stay VALID ... */
+    rc = dl_load_rules(g_db,
+        "m(N):-f(X),N=min(X).\n"
+        "q(N):-m(N),f(N).\n");
+    if (rc != 0) {
+        printf("(rc=%d) ", rc);
+        teardown();
+        FAIL("min(sym) result joined back into sym rejected");
+        return;
+    }
+    PASS();
+
+    /* ... while an ordered comparison over it is loud exactly like any sym
+     * var (R2). */
+    TEST("homog: min(sym) result in an ordered cmp is LOUD (R2)");
+
+    rc = dl_load_rules(g_db,
+        "m(N):-f(X),N=min(X).\n"
+        "q(N):-m(N),N>0.\n");
+    if (rc != -1) {
+        printf("(rc=%d) ", rc);
+        teardown();
+        FAIL("min(sym) result in an ordered cmp accepted");
+        return;
+    }
+    teardown();
+    PASS();
+
+    TEST("homog: min(int) result joined back into int loads");
+
+    setup();
+    e_rows[0] = 2; e_rows[1] = 1;
+    load_rows_u32("e", 1, e_rows, 2);
+    rc = dl_load_rules(g_db,
+        "m(N):-e(X),N=min(X).\n"
+        "q(N):-m(N),e(N).\n");
+    if (rc != 0) {
+        printf("(rc=%d) ", rc);
+        teardown();
+        FAIL("min(int) result joined into int rejected");
+        return;
+    }
+    teardown();
+    PASS();
+}
+
+/* ─── T31: S3c — arithmetic-RESULT head columns carry a kind ───────────── */
+/* MEASURED before S3c: 's(N):-e(X),N=X+1. q(N):-s(N),f(N).' loaded rc=0 and
+ * answered q={2} (s={2,3}, 2 collides with b's id); standard {}. An arith
+ * result is a raw u32 by construction, so the head column is INT. */
+static void test_arith_result_head_loud(void)
+{
+    uint32_t e_rows[2];
+    int rc;
+
+    TEST("homog: arith-result head joined against sym rel is LOUD");
+
+    setup();
+    e_rows[0] = 1; e_rows[1] = 2;
+    load_rows_u32("e", 1, e_rows, 2);
+    {
+        const char *cells[2] = { "a", "b" };
+        load_rows_sym("f", 1, cells, 2);
+    }
+    rc = dl_load_rules(g_db,
+        "s(N):-e(X),N=X+1.\n"
+        "q(N):-s(N),f(N).\n");
+    if (rc != -1) {
+        printf("(rc=%d) ", rc);
+        teardown();
+        FAIL("arith-result head join accepted");
+        return;
+    }
+    PASS();
+
+    TEST("homog: arith-result head through equality is LOUD");
+
+    setup();
+    e_rows[0] = 1; e_rows[1] = 2;
+    load_rows_u32("e", 1, e_rows, 2);
+    {
+        const char *cells[2] = { "a", "b" };
+        load_rows_sym("f", 1, cells, 2);
+    }
+    rc = dl_load_rules(g_db,
+        "s(N):-e(X),N=X+1.\n"
+        "q(N):-s(N),f(Y),N=Y.\n");
+    if (rc != -1) {
+        printf("(rc=%d) ", rc);
+        teardown();
+        FAIL("arith-result head via equality accepted");
+        return;
+    }
+    teardown();
+    PASS();
+
+    TEST("homog: same-rule arith result joined with a sym var is LOUD");
+
+    setup();
+    e_rows[0] = 1; e_rows[1] = 2;
+    load_rows_u32("e", 1, e_rows, 2);
+    {
+        const char *cells[2] = { "a", "b" };
+        load_rows_sym("f", 1, cells, 2);
+    }
+    rc = dl_load_rules(g_db,
+        "q(N):-e(X),N=X+1,f(Y),N=Y.\n");
+    if (rc != -1) {
+        printf("(rc=%d) ", rc);
+        teardown();
+        FAIL("same-rule arith-result/sym equality accepted");
+        return;
+    }
+    teardown();
+    PASS();
+
+    TEST("homog: arith result into an int head/relation still loads");
+
+    setup();
+    e_rows[0] = 1; e_rows[1] = 2;
+    load_rows_u32("e", 1, e_rows, 2);
+    rc = dl_load_rules(g_db,
+        "s(N):-e(X),N=X+1.\n"
+        "q(N):-s(N),e(N).\n");
+    if (rc != 0) {
+        printf("(rc=%d) ", rc);
+        teardown();
+        FAIL("arith-result head joined into int rejected");
+        return;
+    }
+    teardown();
+    PASS();
+}
+
+/* ─── T32: S3c controls — range/list-produced vars in comparisons ──────── */
+/* RK1 family: vars produced by range()/list builtins have no relational
+ * kind source, so comparisons over them stay permissive (MEASURED: both
+ * load). One control line each to pin the family against future
+ * over-tightening. */
+static void test_range_list_cmp_controls(void)
+{
+    uint32_t e_rows[2];
+    int rc;
+
+    TEST("homog: range-produced var in an ordered cmp loads");
+
+    setup();
+    e_rows[0] = 1; e_rows[1] = 2;
+    load_rows_u32("e", 1, e_rows, 2);
+    rc = dl_load_rules(g_db, "q(X):-range(X,e,1,2),X>0.\n");
+    if (rc != 0) {
+        printf("(rc=%d) ", rc);
+        teardown();
+        FAIL("range-produced var in cmp rejected");
+        return;
+    }
+    teardown();
+    PASS();
+
+    TEST("homog: list-produced var (car) into length/cmp loads");
+
+    setup();
+    {
+        const char *cells[1] = { "[ab]" };
+        load_rows_sym("lst", 1, cells, 1);
+    }
+    rc = dl_load_rules(g_db, "q(N):-lst(L),X=car(L),N=length(X),N>0.\n");
+    if (rc != 0) {
+        printf("(rc=%d) ", rc);
+        teardown();
+        FAIL("list-produced var into cmp rejected");
+        return;
+    }
+    teardown();
+    PASS();
+}
+
+/* ─── T33: S3c — no var-count ceiling: a wide rule is still fully checked */
+/* MEASURED before S3c: the per-rule kind tables held 32 vars and silently
+ * `continue`d past the 33rd distinct var, which dropped every LATER
+ * occurrence — a 4-relation arity-8 program with 32 filler vars plus the
+ * cross-kind join e(X),f(X) loaded rc=0 (evading the identical check that
+ * rejects it at 24 fillers). The tables are now MAX_VARS(64)-sized, matching
+ * compile_one's loud 64-distinct-var rejection, so a wide rule cannot
+ * silently escape the check. */
+static void test_wide_rule_still_checked(void)
+{
+    static uint32_t wrow[8] = { 1, 1, 1, 1, 1, 1, 1, 1 };
+    uint32_t e_rows[2];
+    char prog[1024], atom[64];
+    const char *pc = "ABCDEFGH";
+    int r, rc;
+
+    TEST("homog: 33-distinct-var cross-kind join is LOUD (no ceiling)");
+
+    setup();
+    for (r = 0; r < 4; r++) {
+        char name[8];
+        snprintf(name, sizeof name, "w%d", r);
+        load_rows_u32_8(name, wrow, 1);
+    }
+    e_rows[0] = 1; e_rows[1] = 2;
+    load_rows_u32("e", 1, e_rows, 2);
+    {
+        const char *cells[2] = { "a", "b" };
+        load_rows_sym("f", 1, cells, 2);
+    }
+    strcpy(prog, "q(X):-");
+    for (r = 0; r < 4; r++) {
+        snprintf(atom, sizeof atom,
+            "w%d(%c%d,%c%d,%c%d,%c%d,%c%d,%c%d,%c%d,%c%d),",
+            r, pc[0], r, pc[1], r, pc[2], r, pc[3], r,
+            pc[4], r, pc[5], r, pc[6], r, pc[7], r);
+        strcat(prog, atom);
+    }
+    strcat(prog, "e(X),f(X).");
+    rc = dl_load_rules(g_db, prog);
+    if (rc != -1) {
+        printf("(rc=%d) ", rc);
+        teardown();
+        FAIL("33-var cross-kind join accepted (kind check truncated)");
+        return;
+    }
+    teardown();
+    PASS();
+
+    TEST("homog: 33-distinct-var all-INT rule still loads");
+
+    setup();
+    for (r = 0; r < 4; r++) {
+        char name[8];
+        snprintf(name, sizeof name, "w%d", r);
+        load_rows_u32_8(name, wrow, 1);
+    }
+    e_rows[0] = 1; e_rows[1] = 2;
+    load_rows_u32("e", 1, e_rows, 2);
+    strcpy(prog, "q(X):-");
+    for (r = 0; r < 4; r++) {
+        snprintf(atom, sizeof atom,
+            "w%d(%c%d,%c%d,%c%d,%c%d,%c%d,%c%d,%c%d,%c%d),",
+            r, pc[0], r, pc[1], r, pc[2], r, pc[3], r,
+            pc[4], r, pc[5], r, pc[6], r, pc[7], r);
+        strcat(prog, atom);
+    }
+    strcat(prog, "e(X).");
+    rc = dl_load_rules(g_db, prog);
+    if (rc != 0) {
+        printf("(rc=%d) ", rc);
+        teardown();
+        FAIL("33-var all-INT rule rejected");
+        return;
+    }
+    teardown();
+    PASS();
+}
 
 int main(void)
 {
@@ -1140,6 +2370,22 @@ int main(void)
     test_addfact_ambiguity_pins();
     test_idb_kind_persists();
     test_propagation_skips_ambiguous();
+    test_join_cross_kind_loud();
+    test_join_idb_propagated_loud();
+    test_join_negated_cross_kind_loud();
+    test_join_same_kind_controls();
+    test_join_wfs_paths();
+    test_join_diagnostic_names_sites();
+    test_cmp_ordered_sym_loud();
+    test_cmp_ordered_int_controls();
+    test_eq_cross_kind_loud();
+    test_arith_sym_loud();
+    test_neq_documented_controls();
+    test_neq_cross_kind_loud();
+    test_agg_result_head_loud();
+    test_arith_result_head_loud();
+    test_range_list_cmp_controls();
+    test_wide_rule_still_checked();
 
     printf("\n%d/%d tests passed\n", tests_run - tests_failed, tests_run);
     return tests_failed ? 1 : 0;

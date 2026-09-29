@@ -151,6 +151,18 @@ r(X)     :- val(X), X != foo.        # != accepts a symbol-constant RHS
     An ungrounded comparison operand (a variable not bound by any positive body
     atom) is a loud compile error.
   </p>
+  <p>
+    Comparisons are only meaningful over integers. An ordering comparison over
+    a variable that holds <em>symbols</em> is a loud compile error (symbol ids
+    are interned handles and carry no order); the same holds for a
+    <code>!=</code>/<code>=</code> between a symbol variable and an integer
+    variable. The symbol-constant right-hand side of <code>X != foo</code> is
+    the documented exception: it interns the constant and compares symbol ids
+    on any column. Variables produced by aggregates and arithmetic hold
+    integers (<code>N = count()</code>, <code>N = X + 1</code>) and may be
+    compared freely; <code>min</code>/<code>max</code> pass the source
+    column's kind through.
+  </p>
 
   <h2 id="arithmetic">Arithmetic</h2>
   <p>
@@ -200,6 +212,10 @@ cnt(N) :- edge(X, Y), N = count().</code></pre>
     <li>Aggregates are not allowed inside negation, in recursive rules, or in
       rules whose head contains a constant.</li>
     <li>Aggregates over a variadic relation are rejected.</li>
+    <li>The aggregate result holds an integer for <code>count</code>/<code>sum</code>
+      and the source column's kind for <code>min</code>/<code>max</code>; a
+      downstream join or comparison that mixes it with the other kind is a
+      compile error.</li>
   </ul>
 
   <h2 id="strings">String builtins</h2>
