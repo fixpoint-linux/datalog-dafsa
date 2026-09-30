@@ -222,6 +222,18 @@ pub export fn compile_last_error(off: ?*c_uint) ?[*:0]const u8 {
     return null;
 }
 
+/// void compile_clear_error(void)
+/// Reset the LSP error sink WITHOUT a compile_rules call.  G1's
+/// populate-after-load recheck calls checkAllRuleConstKinds directly (not via
+/// compile_rules, which would reset the sink itself), so it clears the sink
+/// first to ensure compile_last_error reports THIS recheck's diagnostic
+/// rather than a stale message from the last dl_load_rules.
+pub export fn compile_clear_error() void {
+    compile_has_err = 0;
+    compile_err_off = 0;
+    compile_err_msg[0] = 0;
+}
+
 // ─── dl_db internals access (authoritative layout in dl_internal.h) ───────
 
 fn db_find_rel(db: *dx.dl_db, name: [*c]const u8) c_int {
@@ -244,6 +256,17 @@ fn db_rel_name(db: *dx.dl_db, idx: c_int) ?[*c]const u8 {
 
 fn db_rel_count(db: *dx.dl_db) usize {
     return db.nrels;
+}
+
+/// B3: does the relation at `idx` hold ZERO rows?  (rel_count = DAFSA
+/// words + overlay tuples; the same predicate recordHeadKindsPub uses to
+/// decide whether a propagated kind may land on a non-empty relation.)
+fn headEmpty(db: *dx.dl_db, idx: c_int) bool {
+    if (idx < 0 or @as(usize, @intCast(idx)) >= db.nrels) return true;
+    const e = &db.rels[@intCast(idx)];
+    if (e.kind == dx.RELK_VARIADIC) return false; // variadic kinds are untracked (G5)
+    const rel: ?*const relation_mod.Relation = @ptrCast(@alignCast(e.rel));
+    return relation_mod.rel_count(rel) == 0;
 }
 
 fn db_get_interner(db: *dx.dl_db) ?*dx.interner {
@@ -3041,6 +3064,15 @@ const KIND_UNKNOWN: u8 = 0;
 const KIND_INT: u8 = 1;
 const KIND_SYM: u8 = 2;
 const KIND_MIXED: u8 = 3;
+// KIND_LIST marks a term-handle result (cons/car/cdr/append).  A handle lives
+// at TERM_BASE=0x80000000+ so it can never collide with a small raw int or a
+// low interned sym id — joining a list result against an int/sym column is
+// permissive by construction (the join check stays INT-vs-SYM only).  But an
+// ORDERED comparison over a handle is meaningless (intern order), so R2
+// rejects it exactly as it rejects a SYM var.  KIND_LIST never reaches a
+// recorded Relation.col_kind: rel_kind_note rejects kind>KIND_SYM, so it
+// lives only in the transient per-rule cache/vk arrays (RK-G3-LIST).
+const KIND_LIST: u8 = 4;
 
 const HOMOG_MAX_RELS = 64; // mirrors dl_internal MAX_RELS
 const HOMOG_MAX_ARITY = 8; // mirrors MAX_ARITY
@@ -3134,6 +3166,16 @@ fn relColKind(db: *dx.dl_db, cache: [*][HOMOG_MAX_ARITY]u8, ri: c_int, col: u8, 
 /// answered the id-collision join (MEASURED pre-S3c: rc=0, q={2} where the
 /// standard is {}).
 fn propagateHeadKinds(db: *dx.dl_db, rules: [*]?*parser.rule, n_rules: c_int, cache: [*][HOMOG_MAX_ARITY]u8) c_int {
+    // G2: cross-rule MIXED-HEAD conflict.  A head column that is INT in one
+    // rule and SYM in another is itself the defect — the shared u32 value
+    // space makes the two derivations dedupe against each other (MEASURED:
+    // p(X):-e(X). p(X):-f(X). with e=int{1,2} f=sym{a,b} -> p holds 2 rows
+    // where the standard is 4).  Track the rule that first established each
+    // head column's DEFINITE kind; a later rule contributing the OPPOSITE
+    // definite kind to the same column is a loud cross-rule conflict (the
+    // cross-rule analog of the S3a per-rule join check).  cache already holds
+    // the joined kind; this only records WHICH rule set it definite.
+    var head_src: [HOMOG_MAX_RELS][HOMOG_MAX_ARITY]c_int = [_][HOMOG_MAX_ARITY]c_int{[_]c_int{0} ** HOMOG_MAX_ARITY} ** HOMOG_MAX_RELS;
     var rounds: usize = 0;
     var changed = true;
     while (changed and rounds < 64) : (rounds += 1) {
@@ -3203,6 +3245,24 @@ fn propagateHeadKinds(db: *dx.dl_db, rules: [*]?*parser.rule, n_rules: c_int, ca
                         rname = cs(ba.args.?[0].?.text);
                         rk = KIND_INT;
                     }
+                } else if (ba.negated == 0 and is_str_producing(ba)) {
+                    // G3: str producers — length->INT, concat/lower/upper->SYM.
+                    // Kinds ONLY the result (args[0]); list producers are NOT
+                    // fed here (KIND_LIST has no kindJoin meaning and never
+                    // records — a list-derived head stays UNKNOWN/permissive).
+                    if (ba.nargs >= 1 and ba.args.?[0] != null and ba.args.?[0].?.kind == parser.TOK_VAR) {
+                        rname = cs(ba.args.?[0].?.text);
+                        rk = if (strEq(cs(ba.pred), "length")) KIND_INT else KIND_SYM;
+                    }
+                } else if (ba.negated == 0 and is_range_builtin(ba)) {
+                    // G3: range result = leading column of the named relation.
+                    if (ba.nargs == 4 and ba.args.?[0] != null and ba.args.?[0].?.kind == parser.TOK_VAR and ba.args.?[1] != null and ba.args.?[1].?.kind == parser.TOK_IDENT) {
+                        const rri = db_find_rel(db, cs(ba.args.?[1].?.text));
+                        if (rri >= 0) {
+                            rname = cs(ba.args.?[0].?.text);
+                            rk = relColKind(db, cache, rri, 0, db_rel_arity(db, rri));
+                        }
+                    }
                 } else continue;
                 if (rname == null or rk == KIND_UNKNOWN) continue;
                 var f: usize = 0;
@@ -3228,9 +3288,72 @@ fn propagateHeadKinds(db: *dx.dl_db, rules: [*]?*parser.rule, n_rules: c_int, ca
                 if (f == nv) continue;
                 if (vkinds[f] == KIND_UNKNOWN) continue;
                 const hix: usize = @intCast(hri);
-                const joined = kindJoin(cache[hix][@intCast(hc)], vkinds[f]);
-                if (joined != cache[hix][@intCast(hc)]) {
-                    cache[hix][@intCast(hc)] = joined;
+                const hc_u: usize = @intCast(hc);
+                const cur_cache = cache[hix][hc_u];
+                var cur = cur_cache;
+                // G2 facts-first: seed `cur` from the head column's
+                // schema-or-RECORDED kind (rels.txt / attached schema — set
+                // by an earlier fact load), so a data-established kind
+                // participates in the conflict check exactly like a
+                // propagated one (a facts-then-rules p: int facts + a
+                // sym-deriving rule is the same collision, MEASURED 2 rows
+                // vs std 4).  A LOCAL zeroed cache makes relColKind resolve
+                // schema > recorded WITHOUT the propagation cache, so the
+                // seed never mutates and only folds into the check below.
+                if (cur == KIND_UNKNOWN) {
+                    var zero = [_][HOMOG_MAX_ARITY]u8{[_]u8{0} ** HOMOG_MAX_ARITY} ** HOMOG_MAX_RELS;
+                    cur = relColKind(db, &zero, hri, @intCast(hc_u), @intCast(head.nargs));
+                    // B3 (decision): a RECORDED kind only binds when the
+                    // relation actually HOLDS ROWS.  A recorded kind on an
+                    // EMPTY relation was written by a previous program's
+                    // RULES (SH3/recordHeadKindsPub) or facts that are gone;
+                    // there is nothing to collide with and the int-rows-
+                    // later case is already covered by G1's populate-after-
+                    // load recheck, so seeding it here only false-rejects a
+                    // fresh program (MEASURED: HEAD loaded it, rc=0).
+                    if (cur != KIND_UNKNOWN and headEmpty(db, hri)) cur = KIND_UNKNOWN;
+                }
+                const contrib = vkinds[f];
+                // G2 cross-rule mixed-head: a DEFINITE int contribution to a
+                // head column already DEFINITELY sym (or vice versa) from a
+                // PRIOR rule or from RECORDED FACTS is the cross-rule kind
+                // conflict.  UNKNOWN absorbs (the S1/S2 permissive rule — a
+                // fresh/empty column or a mixed-but-single-source column
+                // stays permissive); SAME kind is fine.  Name BOTH rules.
+                // (Rule numbers are 1-based indices into the CURRENT merged
+                // AST being checked — after several dl_load_rules calls they
+                // number from 1 over the merged resident+new set, so "rule
+                // N" may name a rule other than the Nth source string.)
+                if ((cur == KIND_INT and contrib == KIND_SYM) or (cur == KIND_SYM and contrib == KIND_INT)) {
+                    const prev_rule = head_src[hix][hc_u];
+                    if (prev_rule == 0) {
+                        // B3: name the REAL source of the pre-existing kind.
+                        // With rows present it is the recorded FACTS (or a
+                        // schema); with none (rules-derived-only, possible
+                        // cross-session via SH3) the recorded kind itself.
+                        const has_rows = !headEmpty(db, hri);
+                        if (has_rows) {
+                            cerr(r.off, "compile error: head column {s}/{d} holds {s} in its recorded facts but {s} in rule {d} — a column cannot be integer in one source and symbol in another\n", .{
+                                cs(head.pred), hc, kindName(cur), kindName(contrib), i + 1,
+                            });
+                        } else {
+                            cerr(r.off, "compile error: head column {s}/{d} holds {s} by its recorded kind (a previous program's derivation) but {s} in rule {d} — a column cannot be integer in one source and symbol in another\n", .{
+                                cs(head.pred), hc, kindName(cur), kindName(contrib), i + 1,
+                            });
+                        }
+                    } else {
+                        cerr(r.off, "compile error: head column {s}/{d} holds {s} in rule {d} and {s} in rule {d} — a column cannot be integer in one derivation and symbol in another\n", .{
+                            cs(head.pred), hc, kindName(cur), prev_rule, kindName(contrib), i + 1,
+                        });
+                    }
+                    return -1;
+                }
+                const joined = kindJoin(cur, contrib);
+                if (joined != cur_cache) {
+                    cache[hix][hc_u] = joined;
+                    // record the first rule that set this column DEFINITE
+                    // (INT or SYM); MIXED carries no single source.
+                    if (joined != KIND_MIXED and head_src[hix][hc_u] == 0) head_src[hix][hc_u] = i + 1;
                     changed = true;
                 }
             }
@@ -3248,13 +3371,14 @@ fn ruleVarFind(names: []const ?[*c]const u8, n: usize, name: [*c]const u8) ?usiz
     return null;
 }
 
-/// First EX_VAR in `e` whose settled kind is SYM, or null — R4: arithmetic
-/// requires int-like operands (a symbol id has no numeric value).
+/// First EX_VAR in `e` whose settled kind is NOT int-like — R4: arithmetic
+/// requires operands with a numeric value.  A symbol id has none, and neither
+/// does a list term handle (KIND_LIST, TERM_BASE+); both are loud.
 fn exprSymVar(e: ?*const parser.expr, names: []const ?[*c]const u8, kinds: []const u8, n: usize) ?usize {
     const ee = e orelse return null;
     if (ee.kind == parser.EX_VAR) {
         const f = ruleVarFind(names, n, cs(ee.@"var")) orelse return null;
-        return if (kinds[f] == KIND_SYM) f else null;
+        return if (kinds[f] == KIND_SYM or kinds[f] == KIND_LIST) f else null;
     }
     if (ee.kind == parser.EX_BINOP)
         return exprSymVar(ee.l, names, kinds, n) orelse exprSymVar(ee.r, names, kinds, n);
@@ -3312,6 +3436,11 @@ fn checkRuleVarKinds(db: *dx.dl_db, cache: [*][HOMOG_MAX_ARITY]u8, r: *parser.ru
     var vint_col: [VN]u8 = undefined;
     var vsym_rel: [VN]?[*c]const u8 = undefined;
     var vsym_col: [VN]u8 = undefined;
+    // G3: a LIST result (cons/car/cdr/append) feeds a third track.  It never
+    // fires the join check (a term handle never collides with a small id),
+    // but it sets vk=KIND_LIST so R2 rejects an ordered cmp over it.
+    var vlist_rel: [VN]?[*c]const u8 = undefined;
+    var vlist_col: [VN]u8 = undefined;
     var nv: usize = 0;
 
     var j: c_int = 0;
@@ -3337,6 +3466,7 @@ fn checkRuleVarKinds(db: *dx.dl_db, cache: [*][HOMOG_MAX_ARITY]u8, r: *parser.ru
                 vnames[nv] = cs(t.text);
                 vint_rel[nv] = null;
                 vsym_rel[nv] = null;
+                vlist_rel[nv] = null;
                 nv += 1;
             }
             if (ck == KIND_INT and vint_rel[f] == null) {
@@ -3381,6 +3511,79 @@ fn checkRuleVarKinds(db: *dx.dl_db, cache: [*][HOMOG_MAX_ARITY]u8, r: *parser.ru
                 site = "arith";
                 rk = KIND_INT;
             }
+        } else if (ba.negated == 0 and is_str_producing(ba)) {
+            // G3: str producers — args[0] is the RESULT var.  length->INT
+            // (byte count); concat/lower/upper -> SYM (an interned string id).
+            // Kinds ONLY the result, never the INPUT operands (T6e: a sym
+            // var fed to length is fine by design).
+            if (ba.nargs >= 1 and ba.args.?[0] != null and ba.args.?[0].?.kind == parser.TOK_VAR) {
+                rname = cs(ba.args.?[0].?.text);
+                site = cs(ba.pred);
+                rk = if (strEq(site.?, "length")) KIND_INT else KIND_SYM;
+            }
+        } else if (ba.negated == 0 and is_list_producing(ba)) {
+            // G3: list producers — args[0] is the RESULT var.
+            // cons/cdr/append return a TERM HANDLE -> KIND_LIST: it never
+            // collides with a small id in a join, but an ordered cmp over it
+            // is meaningless -> R2 rejects it.  car is the exception: it
+            // returns the head ELEMENT, not a handle (term_car yields
+            // s.head[h-TERM_BASE] — an int, a sym id, or a nested-list
+            // handle, MEASURED: test_lists T4/T9 pin H==X/H==1/H==7), so NO
+            // single kind is sound and it stays UNKNOWN/permissive.
+            if (ba.nargs >= 1 and ba.args.?[0] != null and ba.args.?[0].?.kind == parser.TOK_VAR) {
+                if (!strEq(cs(ba.pred), "car")) {
+                    rname = cs(ba.args.?[0].?.text);
+                    site = cs(ba.pred);
+                    rk = KIND_LIST;
+                }
+            }
+        } else if (ba.negated == 0 and is_range_builtin(ba)) {
+            // G3: range(X, Rel, Lo, Hi) — X's kind is DATA-DEPENDENT (the
+            // leading column of the named relation); resolve it where
+            // possible, else UNKNOWN (range over a fresh/unknown relation
+            // stays permissive, as T32's control and language.html:307).
+            if (ba.nargs == 4 and ba.args.?[0] != null and ba.args.?[0].?.kind == parser.TOK_VAR and ba.args.?[1] != null and ba.args.?[1].?.kind == parser.TOK_IDENT) {
+                const rri = db_find_rel(db, cs(ba.args.?[1].?.text));
+                if (rri >= 0) {
+                    rname = cs(ba.args.?[0].?.text);
+                    site = "range";
+                    rk = relColKind(db, cache, rri, 0, db_rel_arity(db, rri));
+                }
+            }
+        } else if (ba.negated == 0 and is_list_filter(ba)) {
+            // member(X, L) as a GENERATOR binds X to L's elements.  When L
+            // is a constant list literal whose elements are ALL one kind —
+            // all integer constants, or all symbol constants — X is that
+            // kind (fed like any producer result).  Any other operand
+            // shape (a var list, a mixed/nested literal, a | tail, an
+            // empty list) is data-dependent: X stays UNKNOWN/permissive —
+            // the documented member-generator floor.
+            if (ba.nargs == 2 and ba.args.?[0] != null and ba.args.?[0].?.kind == parser.TOK_VAR and
+                ba.args.?[1] != null and ba.args.?[1].?.kind == parser.TOK_LIST)
+            {
+                const lit = ba.args.?[1].?;
+                if (lit.tail == null and lit.nchildren > 0) {
+                    var lk: u8 = KIND_UNKNOWN;
+                    var ci: c_int = 0;
+                    while (ci < lit.nchildren) : (ci += 1) {
+                        const ch = lit.children.?[@intCast(ci)] orelse {
+                            lk = KIND_UNKNOWN;
+                            break;
+                        };
+                        const ek = tokenColKind(ch);
+                        if (ek == KIND_UNKNOWN or (lk != KIND_UNKNOWN and lk != ek)) {
+                            lk = KIND_UNKNOWN; // var/nested/mixed element
+                            break;
+                        }
+                        lk = ek;
+                    }
+                    if (lk != KIND_UNKNOWN) {
+                        rname = cs(ba.args.?[0].?.text);
+                        site = "member";
+                        rk = lk;
+                    }
+                }
+            }
         } else continue;
         if (rname == null or site == null or rk == KIND_UNKNOWN) continue;
         var f: usize = 0;
@@ -3391,6 +3594,7 @@ fn checkRuleVarKinds(db: *dx.dl_db, cache: [*][HOMOG_MAX_ARITY]u8, r: *parser.ru
             vnames[nv] = rname;
             vint_rel[nv] = null;
             vsym_rel[nv] = null;
+            vlist_rel[nv] = null;
             nv += 1;
         }
         if (rk == KIND_INT and vint_rel[f] == null) {
@@ -3399,6 +3603,9 @@ fn checkRuleVarKinds(db: *dx.dl_db, cache: [*][HOMOG_MAX_ARITY]u8, r: *parser.ru
         } else if (rk == KIND_SYM and vsym_rel[f] == null) {
             vsym_rel[f] = site;
             vsym_col[f] = 0;
+        } else if (rk == KIND_LIST and vlist_rel[f] == null) {
+            vlist_rel[f] = site;
+            vlist_col[f] = 0;
         }
     }
 
@@ -3415,12 +3622,14 @@ fn checkRuleVarKinds(db: *dx.dl_db, cache: [*][HOMOG_MAX_ARITY]u8, r: *parser.ru
         return -1;
     }
 
-    // settled per-var kind for S3b: INT, SYM or UNKNOWN (no both-sites var
-    // survives the join check above, so this is never MIXED here).
+    // settled per-var kind for S3b: INT, SYM, LIST or UNKNOWN (no
+    // both-INT-and-SYM var survives the join check above; a list result can
+    // coexist with an INT/SYM site — the join check stays INT-vs-SYM only,
+    // since a term handle never collides with a small id, RK-G3-LIST).
     var vk: [VN]u8 = undefined;
     f = 0;
     while (f < nv) : (f += 1)
-        vk[f] = if (vint_rel[f] != null) KIND_INT else if (vsym_rel[f] != null) KIND_SYM else KIND_UNKNOWN;
+        vk[f] = if (vint_rel[f] != null) KIND_INT else if (vsym_rel[f] != null) KIND_SYM else if (vlist_rel[f] != null) KIND_LIST else KIND_UNKNOWN;
 
     // ── S3b: kind-correctness of the builtin atoms (R2/R3/R4 + R5) ──
     // Only VAR operands are kinded: an INT constant in a cmp/arith is fine
@@ -3437,13 +3646,18 @@ fn checkRuleVarKinds(db: *dx.dl_db, cache: [*][HOMOG_MAX_ARITY]u8, r: *parser.ru
                 const t = ba.args.?[si] orelse continue;
                 if (t.kind != parser.TOK_VAR) continue;
                 const vf = ruleVarFind(&vnames, nv, cs(t.text)) orelse continue;
-                if (vk[vf] != KIND_SYM) continue;
+                if (vk[vf] != KIND_SYM and vk[vf] != KIND_LIST) continue;
                 if (ordered) {
-                    // R2: intern ids have no order.
-                    cerr(r.off, "compile error: ordered comparison '{s}' over symbol variable {s} is not meaningful (intern ids have no order) (rule {d})\n", .{ cs(ba.pred), vnames[vf].?, rule_no });
+                    // R2: intern ids (SYM) and term handles (LIST) have no
+                    // order — an ordered cmp over either is meaningless.
+                    const kn = if (vk[vf] == KIND_LIST) "list" else "symbol";
+                    cerr(r.off, "compile error: ordered comparison '{s}' over {s} variable {s} is not meaningful (handles have no order) (rule {d})\n", .{ cs(ba.pred), kn, vnames[vf].?, rule_no });
                     return -1;
                 }
-                // R5 var-var half: only both-definite-differing is loud.
+                // R5 var-var half: only both-definite-differing is loud.  A
+                // LIST var in a `!=` is permissive (a handle never equals a
+                // small int/sym id), so only the SYM arm proceeds here.
+                if (vk[vf] == KIND_LIST) continue;
                 const other = ba.args.?[1 - si] orelse continue;
                 if (other.kind != parser.TOK_VAR) continue;
                 const of = ruleVarFind(&vnames, nv, cs(other.text)) orelse continue;
@@ -3472,7 +3686,8 @@ fn checkRuleVarKinds(db: *dx.dl_db, cache: [*][HOMOG_MAX_ARITY]u8, r: *parser.ru
         } else if (is_arith(ba)) {
             // R4: operands...
             if (exprSymVar(ba.arith, &vnames, &vk, nv)) |vf| {
-                cerr(r.off, "compile error: arithmetic on symbol variable {s} (symbols have no numeric value) (rule {d})\n", .{ vnames[vf].?, rule_no });
+                const kn = if (vk[vf] == KIND_LIST) "list" else "symbol";
+                cerr(r.off, "compile error: arithmetic on {s} variable {s} ({s}s have no numeric value) (rule {d})\n", .{ kn, vnames[vf].?, kn, rule_no });
                 return -1;
             }
             // ...and the RESULT var (nargs==1, args[0] is the result).
@@ -3580,6 +3795,14 @@ const KindAtomIterator = struct {
 /// first mismatch.
 pub fn checkAllRuleConstKinds(db: *dx.dl_db, rules: [*]?*parser.rule, n_rules: c_int) c_int {
     if (n_rules <= 0) return 0;
+    // Fresh check, fresh sink: every caller (compile_rules, the SH2 merged
+    // re-check in dl_load_rules, the G1 fact-load recheck) runs this as an
+    // independent verdict, so a stale message from an EARLIER check (whose
+    // cerr was first-error-wins into a sink that checkAllRuleConstKinds
+    // never cleared) must not shadow this one's diagnostic.
+    compile_has_err = 0;
+    compile_err_off = 0;
+    compile_err_msg[0] = 0;
     var cache = [_][HOMOG_MAX_ARITY]u8{[_]u8{0} ** HOMOG_MAX_ARITY} ** HOMOG_MAX_RELS;
 
     // head-kind propagation first, so the constant check below sees the

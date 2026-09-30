@@ -158,10 +158,16 @@ r(X)     :- val(X), X != foo.        # != accepts a symbol-constant RHS
     <code>!=</code>/<code>=</code> between a symbol variable and an integer
     variable. The symbol-constant right-hand side of <code>X != foo</code> is
     the documented exception: it interns the constant and compares symbol ids
-    on any column. Variables produced by aggregates and arithmetic hold
-    integers (<code>N = count()</code>, <code>N = X + 1</code>) and may be
+    on any column &mdash; including an integer column, where a small symbol id
+    can equal a raw integer value, so the answer depends on intern order.
+    Variables produced by aggregates and arithmetic hold integers
+    (<code>N = count()</code>, <code>N = X + 1</code>) and may be
     compared freely; <code>min</code>/<code>max</code> pass the source
-    column's kind through.
+    column's kind through. The result variables of the string, list and range
+    builtins carry kinds too (see <a href="#strings">String builtins</a>,
+    <a href="#lists">Lists</a> and <a href="#range">Range</a>). A list
+    result is also rejected as an arithmetic operand — a term handle has no
+    numeric value.
   </p>
 
   <h2 id="arithmetic">Arithmetic</h2>
@@ -245,6 +251,17 @@ cont(X)      :- str(X),    contains(X, "ll").</code></pre>
     integer operand is rejected. A producer result longer than 4096 bytes
     backtracks (no tuple).
   </p>
+  <p>
+    A producer&rsquo;s <em>result</em> carries a kind. <code>concat</code>,
+    <code>lower</code> and <code>upper</code> yield a symbol (an interned
+    string id): an ordering comparison over their result is a loud compile
+    error (symbol ids carry no order), as is joining it against an integer
+    column (a symbol column and an integer column are different value
+    spaces). <code>length</code> yields an integer (a byte count) and may be
+    compared and joined freely. Only the result is typed — the <em>input</em>
+    operand is unaffected (a symbol variable fed to <code>length</code> stays
+    valid).
+  </p>
 
   <h2 id="lists">Lists</h2>
   <p>
@@ -278,6 +295,25 @@ from_var(H, T)   :- p(L), [H | T] = L.       # assignment from a var
     to build), or in a negated atom (patterns cannot bind variables under
     negation). The tail after <code>|</code> must be a variable.
   </p>
+  <p>
+    <code>cons</code>, <code>cdr</code> and <code>append</code> return a list
+    (a term handle): an ordering comparison over their result is a loud
+    compile error (handles have no order), and so is arithmetic over it.
+    Joining such a result against an integer or symbol column, or using it
+    in <code>!=</code>, stays valid — a handle never collides with a small
+    raw integer or symbol id. <code>car</code> is different: it returns the
+    head <em>element</em>, not a handle, so its result kind is that of the
+    element (an integer, a symbol, or a nested list) and is not known
+    statically — comparisons over a <code>car</code> result are unchecked.
+  </p>
+  <p>
+    As a generator, <code>member(X, L)</code> binds X to L&rsquo;s elements.
+    When L is a constant literal whose elements are all integers (or all
+    symbols), X carries that kind and an ordering comparison over it is
+    checked like any other variable. When L is a variable or holds mixed
+    elements, X&rsquo;s kind is not known statically and comparisons over it
+    are unchecked.
+  </p>
 
   <h2 id="range">Range</h2>
   <p>
@@ -306,6 +342,14 @@ q(X, Lo, Hi) :- bounds(Lo, Hi), range(X, r, Lo, Hi).   # var bounds
     <code>Rel</code> must be a known, non-variadic relation of arity &ge; 1.
     Range over a recursive relation, an unknown relation, a negated range, or
     an ungrounded bound variable is a loud compile error.
+  </p>
+  <p>
+    The result variable takes the <em>kind of the named relation&rsquo;s
+    leading column</em>: over an integer column a comparison over the range
+    variable is meaningful, while over a symbol column an ordering comparison
+    is a loud compile error. When the relation&rsquo;s leading column has no
+    established kind (a fresh or empty relation), the result stays untyped and
+    comparisons over it are unchecked.
   </p>
 
   <h2 id="regex">Regex patterns</h2>

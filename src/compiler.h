@@ -142,6 +142,10 @@ void compiled_rule_free(compiled_rule *cr);
  * compile_rules() invocation. */
 const char *compile_last_error(uint32_t *off);
 
+/* Reset the LSP error sink without a compile_rules() call.  Used by the G1
+ * populate-after-load recheck, which calls checkAllRuleConstKinds directly. */
+void compile_clear_error(void);
+
 /* ─── BUSHY (v2) compile-time toggles ────────────────────────────────────
  *
  * g_bushy (default 1): emit binary-tree (bushy) join plans for eligible

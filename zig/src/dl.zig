@@ -160,6 +160,25 @@ pub const Txn = extern struct {
     ops: ?[*]TxnOp,
     nops: usize,
     cap: usize,
+    // U-homog: rollback snapshot of every relation's col_kind[0..arity) at
+    // begin-time.  dl_txn_add_fact records kinds at BUFFER time (rows apply
+    // at commit), so WITHOUT this a rolled-back txn leaves its recorded
+    // kind behind (MEASURED: txn add int 77, rollback, then a sym CSV load
+    // is rejected forever).  Rollback restores the snapshot; the commit
+    // success path never reads it.  Set of (rel,arity) pairs actually
+    // snapshotted by txn_add_fact (MAX_RELS mirrors dl_internal).
+    ksnap_rels: [MAX_RELS]c_int = [_]c_int{-1} ** MAX_RELS,
+    ksnap_arities: [MAX_RELS]u8 = [_]u8{0} ** MAX_RELS,
+    ksnap_kinds: [8 * MAX_RELS]u8 = [_]u8{0} ** (8 * MAX_RELS),
+    ksnap_n: usize = 0,
+    // B2 (review): begin-time meta_dirty.  A buffer-time kindNoteRaw sets
+    // meta_dirty=1 AND ensureRevRel (dl_txn_cas) flushes rels.txt eagerly
+    // via dl_declare_relation, so by the time commit fails the poisoned
+    // kind may already be ON DISK.  Abort restores the kinds in memory,
+    // rewrites rels.txt when any kind actually changed, and restores this
+    // begin-time flag (an unconditional clear would drop a LEGITIMATE
+    // pre-txn unflushed kind's pending flush).
+    meta_dirty_at_begin: c_int = 0,
 };
 
 /// view_cache_slot (snapshot.h) — rel_name[64] + view* + used.
@@ -245,7 +264,11 @@ comptime {
     std.debug.assert(@offsetOf(RelEntry, "rel") == @offsetOf(dx.rel_entry, "rel"));
     std.debug.assert(@sizeOf(TxnOp) == @sizeOf(dx.txn_op));
     std.debug.assert(@offsetOf(TxnOp, "cols") == @offsetOf(dx.txn_op, "cols"));
-    std.debug.assert(@sizeOf(Txn) == @sizeOf(dx.txn));
+    // Txn deliberately does NOT assert size equality: dl.zig's Txn carries
+    // Zig-only rollback-snapshot fields past the C header's 3 fields.  C
+    // never dereferences txn (dl_internal.h holds it as an opaque pointer),
+    // and the buffer is allocated/freed exclusively by the Zig side.
+    std.debug.assert(@offsetOf(Txn, "ops") == @offsetOf(dx.txn, "ops"));
     std.debug.assert(@sizeOf(ViewCacheSlot) == @sizeOf(dx.view_cache_slot));
     std.debug.assert(@sizeOf(PermIndexEntry) == @sizeOf(dx.perm_index_entry));
 
@@ -921,7 +944,10 @@ pub export fn dl_close(db: ?*DlDb) void {
     const d = db orelse return;
 
     // CAS Slice 2: an open transaction is never committed implicitly.
+    // B4 (review): undo the buffer-time kind recordings first (same as a
+    // rollback/commit-failure — the buffered rows never applied), then free.
     if (d.txn) |t| {
+        txnKindRestore(d);
         if (t.ops) |ops| c.free(@ptrCast(ops));
         c.free(@ptrCast(t));
         d.txn = null;
@@ -1592,6 +1618,19 @@ pub export fn dl_load_facts(db: ?*DlDb, rel_name: [*c]const u8, csv_path: [*c]co
     var n_new: c_int = 0;
     var lineno: c_int = 0;
 
+    // U-homog (G1): capture pre-load state for the rollback.  A fact-load is
+    // NOT atomic by ordering (unlike SH2's pre-append recheck): the kind is
+    // recorded per-cell DURING the parse, before the base is rebuilt.  EVERY
+    // failure return in the parse loop below (the mixed-conflict rejects, the
+    // intern/ts_add OOMs) AND the post-parse recheck (kindRecheckAfterLoad)
+    // must undo the kind mutations so a failed load leaves no partial kind.
+    // Track which columns of THIS relation transitioned 0 -> definite (their
+    // pre-load value was 0, so restore = clear) and the pre-load meta_dirty;
+    // loadKindRollback() applies the restore at every failure site.
+    const load_rel = d.rels[@intCast(idx)].rel;
+    const meta_dirty_before: c_int = d.meta_dirty;
+    var new_cols: [8]bool = .{false} ** 8;
+
     var linelen: isize = getline(&line, &linecap, f);
     while (linelen > 0) : (linelen = getline(&line, &linecap, f)) {
         var fields: [8][*c]u8 = undefined;
@@ -1624,17 +1663,21 @@ pub export fn dl_load_facts(db: ?*DlDb, rel_name: [*c]const u8, csv_path: [*c]co
                 }
                 cols[@intCast(i)] = @truncate(val);
                 // U-homog S2: record the kind exactly where it is known.
-                if (kindNoteDefinite(d, @intCast(idx), @intCast(i), relation.KIND_INT) != 0) {
+                const kn = kindNoteDefinite(d, @intCast(idx), @intCast(i), relation.KIND_INT);
+                if (kn < 0) {
                     dlErr("error: {s}:{d}: mixed int/symbol values in column {d} of {s}\n", .{ csv_path, lineno, i + 1, rel_name });
+                    loadKindRollback(d, load_rel, &new_cols, arity, meta_dirty_before);
                     ts_free(&ts);
                     ts_free(&delta);
                     _ = c.fclose(f);
                     if (line) |lp| c.free(@ptrCast(lp));
                     return -1;
                 }
+                if (kn == 1) new_cols[@intCast(i)] = true;
             } else {
                 const sym = intern_str(d.ir, fields[@intCast(i)]);
                 if (sym == 0) {
+                    loadKindRollback(d, load_rel, &new_cols, arity, meta_dirty_before);
                     ts_free(&ts);
                     ts_free(&delta);
                     _ = c.fclose(f);
@@ -1642,20 +1685,24 @@ pub export fn dl_load_facts(db: ?*DlDb, rel_name: [*c]const u8, csv_path: [*c]co
                     return -1;
                 }
                 cols[@intCast(i)] = sym;
-                if (kindNoteDefinite(d, @intCast(idx), @intCast(i), relation.KIND_SYM) != 0) {
+                const kn = kindNoteDefinite(d, @intCast(idx), @intCast(i), relation.KIND_SYM);
+                if (kn < 0) {
                     dlErr("error: {s}:{d}: mixed int/symbol values in column {d} of {s}\n", .{ csv_path, lineno, i + 1, rel_name });
+                    loadKindRollback(d, load_rel, &new_cols, arity, meta_dirty_before);
                     ts_free(&ts);
                     ts_free(&delta);
                     _ = c.fclose(f);
                     if (line) |lp| c.free(@ptrCast(lp));
                     return -1;
                 }
+                if (kn == 1) new_cols[@intCast(i)] = true;
             }
         }
 
         {
             const rc = ts_add(&ts, &cols);
             if (rc < 0) {
+                loadKindRollback(d, load_rel, &new_cols, arity, meta_dirty_before);
                 ts_free(&ts);
                 ts_free(&delta);
                 _ = c.fclose(f);
@@ -1672,6 +1719,27 @@ pub export fn dl_load_facts(db: ?*DlDb, rel_name: [*c]const u8, csv_path: [*c]co
 
     if (line) |lp| c.free(@ptrCast(lp));
     _ = c.fclose(f);
+
+    // U-homog (G1): populate-after-load recheck.  If this load NEWLY
+    // established a column kind on a db that already holds compiled rules,
+    // re-run the kind check over the resident AST BEFORE the base is rebuilt
+    // or anything is flushed to disk.  A reject here means a rule that
+    // referenced the now-kind column as UNKNOWN now conflicts; fail the LOAD
+    // loudly.  Run before rel_build_base / intern_save / rel_save_base so a
+    // rejected load leaves the base, interner-on-disk and DAFSA untouched —
+    // only the transient col_kind mutation needs rolling back (below).
+    if (anyNewCol(&new_cols, arity)) {
+        if (kindRecheckAfterLoad(d) != 0) {
+            // Rollback (RK-G1-rollback): restore the recorded col_kind and
+            // meta_dirty to their pre-load state so a failed load leaves no
+            // partial kind.  The facts live only in the transient ts
+            // (discarded); the base was never rebuilt.
+            loadKindRollback(d, load_rel, &new_cols, arity, meta_dirty_before);
+            ts_free(&ts);
+            ts_free(&delta);
+            return -1;
+        }
+    }
 
     ts_sort(&ts);
     if (relation.rel_build_base_from_tupleset(d.rels[@intCast(idx)].rel, &ts) != 0) {
@@ -1844,14 +1912,21 @@ const COMPACT_CHECK_EVERY: u64 = 64;
 
 /// Record a column kind on a fixed relation (CSV site — the cell's STRING
 /// form makes the kind definite).  Returns -1 on a CONFLICT with the
-/// recorded kind (the caller rejects the load loudly).  Bumps meta_dirty
-/// when the recording makes rels.txt stale (a kinds field it does not yet
-/// carry), so the kinds persist across the CLI's separate processes.
+/// recorded kind (the caller rejects the load loudly); 1 when this call
+/// NEWLY established a kind (a 0 -> definite transition, the only case that
+/// can make a previously-UNKNOWN column conflict with a resident rule — G1
+/// re-checks only on this return); 0 when the kind was already recorded
+/// (idempotent, no new establishment).  Bumps meta_dirty when the recording
+/// makes rels.txt stale (a kinds field it does not yet carry), so the kinds
+/// persist across the CLI's separate processes.
 fn kindNoteDefinite(db: *DlDb, idx: usize, col: usize, kind: u8) c_int {
     const rel = db.rels[idx].rel orelse return 0;
     const prev = relation.rel_col_kind(rel, @intCast(col));
     if (relation.rel_kind_note(rel, @intCast(col), kind) != 0) return -1;
-    if (prev == 0 and db.read_only == 0) db.meta_dirty = 1;
+    if (prev == 0) {
+        if (db.read_only == 0) db.meta_dirty = 1;
+        return 1; // newly recorded: G1 re-check trigger
+    }
     return 0;
 }
 
@@ -1881,12 +1956,14 @@ fn relHasPendingTxnAdd(db: *DlDb, idx: usize) bool {
 /// mislabel a column that holds BOTH spaces, blessing the exact collision
 /// this check exists to catch.  So INT is recorded only when the fact is
 /// the column's FIRST row (relation empty, no buffered txn ADD) — the one
-/// case where "first definite" really is "first value".  Returns 0, or -1
-/// on the definite conflict.
+/// case where "first definite" really is "first value".  Returns 1 when
+/// this call NEWLY recorded INT (a 0 -> INT transition — the G1 re-check
+/// trigger), 0 otherwise, or -1 on the definite conflict.
 fn kindNoteRaw(db: *DlDb, idx: usize, cols: [*c]const u32, arity: u8) c_int {
     const rel = db.rels[idx].rel orelse return 0;
     const ir_x: ?*dx.interner = @ptrCast(@alignCast(db.ir));
     const bound = intern_mod.liveSymBound(ir_x);
+    var newly: c_int = 0;
     var i: usize = 0;
     while (i < arity) : (i += 1) {
         const v = cols[i];
@@ -1901,11 +1978,68 @@ fn kindNoteRaw(db: *DlDb, idx: usize, cols: [*c]const u32, arity: u8) c_int {
             if (relation.rel_count(rel) == 0 and !relHasPendingTxnAdd(db, idx)) {
                 if (relation.rel_kind_note(rel, @intCast(i), relation.KIND_INT) != 0) return -1;
                 if (db.read_only == 0) db.meta_dirty = 1;
+                newly = 1; // newly recorded: G1 re-check trigger
             }
         }
     }
-    return 0;
+    return newly;
 }
+
+// ─── U-homog (G1): populate-after-load recheck ───────────────────────────
+
+/// G1: when a fact-load NEWLY establishes a definite column kind (a 0 ->
+/// INT/SYM transition) on a db that ALREADY holds compiled rules
+/// (n_ast_rules > 0), re-run the kind check over the resident AST.  A rule
+/// that referenced the column as UNKNOWN at compile time (empty column ->
+/// permissive) may now conflict with the newly-recorded kind.  This mirrors
+/// the SH2 merged re-check dl_load_rules does at :3108 — the same
+/// checkAllRuleConstKinds over the resident AST — but fired by a FACT load
+/// rather than a rule load.
+///
+/// Fires ONLY on a real 0 -> definite transition: an idempotent re-load of
+/// the SAME kind into an already-kind column does NOT trigger (the
+/// recording helpers return "newly recorded" only on that transition), so a
+/// relation filled over several loads stays permissive after the first.
+/// Facts loaded BEFORE the rules (dlb's order) never trigger: ast_rules is
+/// empty at fact-load time.  Cost is O(rules*rounds) per TRIGGERING load
+/// only — MEASURED 0.30ms at 200 rules, 0.08ms at 50 — never per query.
+///
+/// Returns 0 (ok) or -1 (loud load failure: the check emits its diagnostic
+/// to the compile error sink; the caller rolls back the kind mutation and
+/// fails the LOAD, not a later query).
+fn kindRecheckAfterLoad(db: *DlDb) c_int {
+    if (db.n_ast_rules <= 0) return 0;
+    const ars = db.ast_rules orelse return 0;
+    const dxi: *dx.dl_db = @ptrCast(db); // DlDb and dx.dl_db share the C layout
+    compiler.compile_clear_error();
+    return compiler.checkAllRuleConstKinds(dxi, ars, db.n_ast_rules);
+}
+
+/// True if any column in `cols[0..arity)` was newly recorded this load.
+fn anyNewCol(cols: *const [8]bool, arity: u8) bool {
+    var i: usize = 0;
+    while (i < arity) : (i += 1) {
+        if (cols[i]) return true;
+    }
+    return false;
+}
+
+/// U-homog (G1): the fact-load rollback.  Restore the RECORDED col_kind of
+/// every newly-recorded column to 0 (their pre-load value) and meta_dirty to
+/// its pre-load state, so a rejected load leaves no partial kind.  Called at
+/// EVERY failure return in dl_load_facts (the mid-CSV mixed-conflict and OOM
+/// paths fail with EARLIER rows' kinds already recorded) — the all-or-nothing
+/// discipline the G1 recheck path already had.
+fn loadKindRollback(db: *DlDb, rel: ?*relation.Relation, cols: *const [8]bool, arity: u8, meta_dirty_before: c_int) void {
+    if (rel) |rp| {
+        var ci: u8 = 0;
+        while (ci < arity) : (ci += 1) {
+            if (cols[ci]) relation.rel_col_kind_set(rp, ci, 0);
+        }
+    }
+    db.meta_dirty = meta_dirty_before;
+}
+
 
 /// CAS Slice 2: apply a fact add to the in-memory BASE + IVM delta capture.
 /// selfreg-dl-storage: the hot write lands in the OVERLAY (sorted-array
@@ -1992,7 +2126,41 @@ pub export fn dl_add_fact(db: ?*DlDb, rel_name: [*c]const u8, cols: [*c]const u3
 
     // U-homog S2: kind-check + record BEFORE any durable effect (the WAL
     // append below) so a rejected fact leaves no trace.
-    if (kindNoteRaw(d, @intCast(idx), cols, arity) != 0) return -1;
+    const add_rel = d.rels[@intCast(idx)].rel;
+    var kk_before: [8]u8 = .{0} ** 8;
+    if (add_rel) |rel| {
+        var ci: u8 = 0;
+        while (ci < arity) : (ci += 1) kk_before[ci] = relation.rel_col_kind(rel, ci);
+    }
+    const kn = kindNoteRaw(d, @intCast(idx), cols, arity);
+    if (kn < 0) {
+        // B1 (review): kindNoteRaw walks the columns left-to-right RECORDING
+        // INT as it goes, so a conflict on a later column leaves the earlier
+        // columns recorded.  Restore the snapshot so a rejected add is
+        // all-or-nothing for kinds (the same contract the G1 branch below
+        // already enforces for its reject).
+        if (add_rel) |rel| {
+            var ci: u8 = 0;
+            while (ci < arity) : (ci += 1)
+                relation.rel_col_kind_set(rel, ci, kk_before[ci]);
+        }
+        return -1;
+    }
+
+    // U-homog (G1): if this add NEWLY established a column kind on a db with
+    // resident rules, recheck the resident AST.  On a reject, roll back the
+    // kind mutation (the fact has not been written yet — no WAL, no overlay)
+    // and fail the add loudly.
+    if (kn == 1) {
+        if (kindRecheckAfterLoad(d) != 0) {
+            if (add_rel) |rel| {
+                var ci: u8 = 0;
+                while (ci < arity) : (ci += 1)
+                    relation.rel_col_kind_set(rel, ci, kk_before[ci]);
+            }
+            return -1;
+        }
+    }
 
     var key: [33]u8 = undefined;
     var key_len: usize = undefined;
@@ -2277,19 +2445,102 @@ fn txnBufOp(db: *DlDb, op: *const TxnOp) c_int {
     return 0;
 }
 
+// ─── U-homog: txn kind-rollback snapshot ───────────────────────────────────
+
+/// Snapshot rel's col_kind[0..arity) into the txn ONCE (first add for that
+/// relation) so dl_txn_rollback can undo what dl_txn_add_fact recorded at
+/// BUFFER time.  O(arity) per distinct relation per txn; bounded by
+/// MAX_RELS slots (a 65th distinct relation in one txn just loses its
+/// rollback coverage — the pre-txn behavior).
+fn txnKindSnap(db: *DlDb, rel_id: c_int, arity: u8) void {
+    const t = db.txn orelse return;
+    if (t.ksnap_n >= MAX_RELS) return; // snapshot full: no coverage
+    const rel = db.rels[@intCast(rel_id)].rel orelse return;
+    var i: usize = 0;
+    while (i < t.ksnap_n) : (i += 1) {
+        if (t.ksnap_rels[i] == rel_id) return; // already snapshotted
+    }
+    const s = t.ksnap_n;
+    t.ksnap_rels[s] = rel_id;
+    t.ksnap_arities[s] = arity;
+    var ci: u8 = 0;
+    while (ci < arity) : (ci += 1)
+        t.ksnap_kinds[s * 8 + ci] = relation.rel_col_kind(rel, ci);
+    t.ksnap_n += 1;
+}
+
+/// Restore every snapshotted relation's col_kind (dl_txn_rollback only —
+/// the commit success path never calls this).
+fn txnKindRestore(db: *DlDb) void {
+    const t = db.txn orelse return;
+    var s: usize = 0;
+    while (s < t.ksnap_n) : (s += 1) {
+        const rel_id = t.ksnap_rels[s];
+        if (rel_id < 0) continue;
+        if (db.rels[@intCast(rel_id)].rel) |rel| {
+            const art = t.ksnap_arities[s];
+            var ci: u8 = 0;
+            while (ci < art) : (ci += 1)
+                relation.rel_col_kind_set(rel, ci, t.ksnap_kinds[s * 8 + ci]);
+        }
+    }
+}
+
+/// Abort an open txn: undo the buffer-time kind recordings (the buffered
+/// rows never applied — exactly the rollback condition), then free the
+/// buffer.  B2 (review): EVERY failure return of dl_txn_commit goes through
+/// here — including the ROUTINE CAS-conflict DL_E_CONFLICT — not just
+/// dl_txn_rollback.
+///
+/// DURABILITY: the buffer-time kindNoteRaw set meta_dirty, and
+/// ensureRevRel's eager dl_declare_relation may have already flushed the
+/// poisoned kind to rels.txt, so restoring only the in-memory col_kind
+/// leaves the poison durable across reopen (MEASURED).  When a snapshotted
+/// kind actually differs from its restored value, rewrite rels.txt so the
+/// file matches the restored state, then restore the begin-time meta_dirty
+/// (unconditionally clearing it would drop a LEGITIMATE pre-txn unflushed
+/// kind's pending close-time flush).
+fn txnAbort(db: *DlDb) void {
+    const kinds_changed = blk: {
+        const t = db.txn orelse break :blk false;
+        var s: usize = 0;
+        while (s < t.ksnap_n) : (s += 1) {
+            const rel_id = t.ksnap_rels[s];
+            if (rel_id < 0) break;
+            if (db.rels[@intCast(rel_id)].rel) |rel| {
+                const art = t.ksnap_arities[s];
+                var ci: u8 = 0;
+                while (ci < art) : (ci += 1) {
+                    if (relation.rel_col_kind(rel, ci) != t.ksnap_kinds[s * 8 + ci]) break :blk true;
+                }
+            }
+        }
+        break :blk false;
+    };
+    txnKindRestore(db);
+    if (kinds_changed) {
+        writeRelsTxt(db);
+        db.meta_dirty = db.txn.?.meta_dirty_at_begin;
+    }
+    txnDiscard(db);
+}
+
 pub export fn dl_txn_begin(db: ?*DlDb) c_int {
     const d = db orelse return -1;
     if (d.read_only != 0) return -1;
     if (d.txn != null) return -1; // reject nested transactions
     const mem = c.calloc(1, @sizeOf(Txn)) orelse return -1;
     d.txn = @ptrCast(@alignCast(mem));
+    d.txn.?.meta_dirty_at_begin = d.meta_dirty;
     return 0;
 }
 
 pub export fn dl_txn_rollback(db: ?*DlDb) c_int {
     const d = db orelse return -1;
     if (d.txn == null) return -1;
-    txnDiscard(d);
+    // U-homog: undo the kinds dl_txn_add_fact recorded at BUFFER time (the
+    // buffered rows never applied, so their kinds must not survive either).
+    txnAbort(d);
     return 0;
 }
 
@@ -2329,8 +2580,44 @@ pub export fn dl_txn_add_fact(db: ?*DlDb, rel: [*c]const u8, cols: [*c]const u32
     if (arity != relation.rel_arity(d.rels[@intCast(idx)].rel)) return -1;
 
     // U-homog S2: kind-check + record at BUFFER time so a conflicting op
-    // never enters the txn.
-    if (kindNoteRaw(d, @intCast(idx), cols, arity) != 0) return -1;
+    // never enters the txn.  Snapshot the pre-add col_kind FIRST: the rows
+    // apply only at COMMIT, so the txn must be able to undo this recording
+    // on rollback (txnKindSnap takes it once per relation).
+    txnKindSnap(d, idx, arity);
+    const txn_rel = d.rels[@intCast(idx)].rel;
+    var kk_before: [8]u8 = .{0} ** 8;
+    if (txn_rel) |r| {
+        var ci: u8 = 0;
+        while (ci < arity) : (ci += 1) kk_before[ci] = relation.rel_col_kind(r, ci);
+    }
+    const kn = kindNoteRaw(d, @intCast(idx), cols, arity);
+    if (kn < 0) {
+        // B1 (review): same all-or-nothing restore as dl_add_fact — the
+        // left-to-right walk may have recorded earlier columns before the
+        // conflicting one rejected the add.
+        if (txn_rel) |r| {
+            var ci: u8 = 0;
+            while (ci < arity) : (ci += 1)
+                relation.rel_col_kind_set(r, ci, kk_before[ci]);
+        }
+        return -1;
+    }
+
+    // U-homog (G1): a newly-established kind on a db with resident rules
+    // rechecks the AST; on reject, roll back the kind (the op has not been
+    // buffered yet) and refuse the add.  kindNoteRaw records INT only on a
+    // column's first row; a sym-establishing txn add is ambiguous to the
+    // raw API and stays permissive (RK-G1-flag-precision).
+    if (kn == 1) {
+        if (kindRecheckAfterLoad(d) != 0) {
+            if (txn_rel) |r| {
+                var ci: u8 = 0;
+                while (ci < arity) : (ci += 1)
+                    relation.rel_col_kind_set(r, ci, kk_before[ci]);
+            }
+            return -1;
+        }
+    }
 
     var op = std.mem.zeroes(TxnOp);
     op.kind = TXN_ADD;
@@ -2375,11 +2662,11 @@ pub export fn dl_txn_commit(db: ?*DlDb) c_int {
             if (t.ops.?[i].kind == TXN_CAS) {
                 var cur: u32 = 0;
                 if (revGet(d, t.ops.?[i].entity_sym, &cur) != 0) {
-                    txnDiscard(d);
+                    txnAbort(d);
                     return -1;
                 }
                 if (cur != t.ops.?[i].expected) {
-                    txnDiscard(d);
+                    txnAbort(d);
                     return DL_E_CONFLICT;
                 }
             }
@@ -2393,13 +2680,13 @@ pub export fn dl_txn_commit(db: ?*DlDb) c_int {
         if (fwd_path == null or rev_path == null) {
             if (fwd_path) |x| c.free(@ptrCast(x));
             if (rev_path) |x| c.free(@ptrCast(x));
-            txnDiscard(d);
+            txnAbort(d);
             return -1;
         }
         if (intern_save(d.ir, fwd_path.?, rev_path.?) != 0) {
             c.free(@ptrCast(fwd_path.?));
             c.free(@ptrCast(rev_path.?));
-            txnDiscard(d);
+            txnAbort(d);
             return -1;
         }
         c.free(@ptrCast(fwd_path.?));
@@ -2407,12 +2694,12 @@ pub export fn dl_txn_commit(db: ?*DlDb) c_int {
     }
     if (term_is_dirty(d.terms) != 0) {
         const tpath = makePath(d, "terms", ".bin") orelse {
-            txnDiscard(d);
+            txnAbort(d);
             return -1;
         };
         if (term_save(d.terms, tpath) != 0) {
             c.free(@ptrCast(tpath));
-            txnDiscard(d);
+            txnAbort(d);
             return -1;
         }
         c.free(@ptrCast(tpath));
@@ -2421,7 +2708,7 @@ pub export fn dl_txn_commit(db: ?*DlDb) c_int {
     // (d) Append one record per buffered op + a COMMIT marker, then fsync.
     {
         const w = txnwal.txnwal_open_rw(d.dir.?) orelse {
-            txnDiscard(d);
+            txnAbort(d);
             return -1;
         };
         var i: usize = 0;
@@ -2435,13 +2722,13 @@ pub export fn dl_txn_commit(db: ?*DlDb) c_int {
                 _ = encodeFactKey(&key, &key_len, &del_cols, 2);
                 if (txnwal.txnwal_append_record(w, "rev", 3, TXNWAL_OP_DEL, &key, @intCast(key_len)) != 0) {
                     txnwal.txnwal_close(w);
-                    txnDiscard(d);
+                    txnAbort(d);
                     return -1;
                 }
                 _ = encodeFactKey(&key, &key_len, &add_cols, 2);
                 if (txnwal.txnwal_append_record(w, "rev", 3, TXNWAL_OP_ADD, &key, @intCast(key_len)) != 0) {
                     txnwal.txnwal_close(w);
-                    txnDiscard(d);
+                    txnAbort(d);
                     return -1;
                 }
             } else {
@@ -2452,7 +2739,7 @@ pub export fn dl_txn_commit(db: ?*DlDb) c_int {
                 _ = encodeFactKey(&key, &key_len, &op.cols, op.arity);
                 if (txnwal.txnwal_append_record(w, rname, @intCast(strLen(rname)), wop, &key, @intCast(key_len)) != 0) {
                     txnwal.txnwal_close(w);
-                    txnDiscard(d);
+                    txnAbort(d);
                     return -1;
                 }
             }
@@ -2460,18 +2747,18 @@ pub export fn dl_txn_commit(db: ?*DlDb) c_int {
         if (d.fault_hook) |hook| {
             if (hook(DL_FPOINT_TXN_BEFORE_MARKER, d.fault_user) != 0) {
                 txnwal.txnwal_close(w);
-                txnDiscard(d);
+                txnAbort(d);
                 return -1;
             }
         }
         if (txnwal.txnwal_append_commit(w) != 0) {
             txnwal.txnwal_close(w);
-            txnDiscard(d);
+            txnAbort(d);
             return -1;
         }
         if (txnwal.txnwal_sync(w) != 0) {
             txnwal.txnwal_close(w);
-            txnDiscard(d);
+            txnAbort(d);
             return -1;
         }
         txnwal.txnwal_close(w);
@@ -2487,7 +2774,7 @@ pub export fn dl_txn_commit(db: ?*DlDb) c_int {
                 const del_cols = [2]u32{ op.entity_sym, op.expected };
                 const add_cols = [2]u32{ op.entity_sym, op.next };
                 if (rel_id < 0) {
-                    txnDiscard(d);
+                    txnAbort(d);
                     return -1;
                 }
                 _ = deleteFactApply(d, rel_id, &del_cols, 2);
@@ -3078,26 +3365,22 @@ pub export fn dl_load_rules(db: ?*DlDb, dl_source: [*c]const u8) c_int {
 
     var new_crules: ?[*]?*compiler.compiled_rule = null;
     var n_compiled: c_int = 0;
-    if (compile_rules(d, rules, n_rules, &new_crules, &n_compiled) != 0) {
-        freeRulesAndParser(rules, n_rules, p);
-        return -1;
-    }
 
-    // U-homog (review SH2): compile_rules checked only the NEW rules, so a
+    // U-homog (review SH2): compile_rules checks only the NEW rules, so a
     // constant that conflicts through a PREVIOUSLY loaded rule's head kind
     // would slip in when the same program is split across load_rules calls.
     // Re-check over the CONCATENATED resident+new rule set (borrowed
-    // pointers, nothing cloned) BEFORE anything is appended, so a rejected
-    // load leaves the db exactly as it was — the same diagnostic the
-    // equivalent single combined load produces.
+    // pointers, nothing cloned) BEFORE anything is appended — and BEFORE
+    // compile_rules, so a cross-rule conflict reports the MERGED rule
+    // numbering (naming both rules) rather than the new-only numbering the
+    // subset check would print first.  A rejected load leaves the db exactly
+    // as it was — the same diagnostic the equivalent single combined load
+    // produces.
     {
         const nres: usize = @intCast(d.n_ast_rules);
         const total: usize = nres + @as(usize, @intCast(n_rules));
         if (total > 0) {
             const merged_mem = c.malloc(total * @sizeOf(?*parser.rule)) orelse {
-                var ci: c_int = 0;
-                while (ci < n_compiled) : (ci += 1) compiler.compiled_rule_free(new_crules.?[@intCast(ci)]);
-                c.free(@ptrCast(new_crules));
                 freeRulesAndParser(rules, n_rules, p);
                 return -1;
             };
@@ -3108,13 +3391,15 @@ pub export fn dl_load_rules(db: ?*DlDb, dl_source: [*c]const u8) c_int {
             const bad = compiler.checkAllRuleConstKinds(dxi, merged, @intCast(total));
             c.free(merged_mem);
             if (bad != 0) {
-                var ci: c_int = 0;
-                while (ci < n_compiled) : (ci += 1) compiler.compiled_rule_free(new_crules.?[@intCast(ci)]);
-                c.free(@ptrCast(new_crules));
                 freeRulesAndParser(rules, n_rules, p);
                 return -1;
             }
         }
+    }
+
+    if (compile_rules(d, rules, n_rules, &new_crules, &n_compiled) != 0) {
+        freeRulesAndParser(rules, n_rules, p);
+        return -1;
     }
 
     // M8: retain a DEEP copy of the rule AST for the magic-sets transform.

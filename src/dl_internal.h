@@ -67,6 +67,9 @@ typedef struct txn {
     txn_op  *ops;          /* dynamically grown buffer */
     size_t   nops;         /* number of buffered operations */
     size_t   cap;          /* allocated capacity of ops */
+    /* U-homog (Zig-side only): rollback snapshot of each relation's
+     * col_kind taken by dl_txn_add_fact at buffer time, restored by
+     * dl_txn_rollback.  Opaque to C consumers (dl_db holds txn* only). */
 } txn;
 
 /* ─── Authoritative dl_db layout ───────────────────────────────────────── */

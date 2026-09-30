@@ -137,6 +137,16 @@ pub export fn rel_col_kind(rel: ?*const Relation, col: u8) u8 {
     return r.col_kind[col];
 }
 
+/// void rel_col_kind_set(relation *rel, uint8_t col, uint8_t kind)
+/// Directly set the RECORDED kind of column `col`.  Used ONLY by the G1
+/// populate-after-load rollback to restore col_kind to its pre-load state
+/// (kind 0 / UNKNOWN) after a rejected recheck — NOT a general mutator.
+pub export fn rel_col_kind_set(rel: ?*Relation, col: u8, kind: u8) void {
+    const r = rel orelse return;
+    if (col >= MAX_ARITY) return;
+    r.col_kind[col] = kind;
+}
+
 /// int rel_kind_note(relation *rel, uint8_t col, uint8_t kind)
 /// Record/fold a kind into column `col`: unknown folds away, a matching kind
 /// is idempotent, and a CONFLICTING kind is refused (-1) WITHOUT mutating —
