@@ -400,10 +400,17 @@ def resolve_path() -> str:
     env = os.environ.get("DLBLIB")
     if env:
         return env
-    here = os.path.dirname(os.path.abspath(__file__))
+    # REALPATH, not abspath: this module can be reached through a SYMLINKED import
+    # root (e.g. ~/thing/dlb -> <repo>/python), and the kernel resolves ".." against
+    # the symlink TARGET while abspath resolves it textually. Mixing the two makes
+    # os.path.exists() true for a path the loader cannot open — measured: a
+    # symlinked root returned "<other-tree>/zig-out/lib/..." while exists() had
+    # followed the link to this repo's own zig-out. Resolving first makes the
+    # existence check and the returned path agree in every layout.
+    here = os.path.dirname(os.path.realpath(__file__))
     candidate = os.path.join(here, "..", "..", "zig-out", "lib", "libdatalog.so")
     if os.path.exists(candidate):
-        return os.path.abspath(candidate)
+        return os.path.realpath(candidate)
     if os.path.exists(_CANONICAL):
         return _CANONICAL
     return "libdatalog.so"  # loader default search
