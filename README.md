@@ -186,6 +186,25 @@ relations are rejected.
 **Build.** `dlp` is a deferred cosmocc tool (its C dependencies — the engine and the
 dhall-c core — are both removed; it is not built by the canonical Zig build).
 
+## Python bindings — `python/`
+
+[`python/dlb`](python/README.md) is an in-process Python binding over
+`libdatalog.so` (stdlib `ctypes` only, no third-party dependency). It lives here
+because it is **1:1 with the engine's C ABI** (`dafsa_abi_version()`, ABI 1,
+checked at every library load), so an ABI change and its Python mirror land in one
+commit.
+
+```sh
+python3 python/tests/test_binding.py     # 42 correctness tests (needs libdatalog.so)
+python3 python/tests/bench_envelope.py   # the measured latency/concurrency envelope
+```
+
+`python/ENVELOPE.md` is the recorded envelope — the load-bearing deliverable, with
+numbers that miss the ≲10 µs per-step budget reported rather than tuned away.
+Library resolution: `$DLBLIB` → `zig-out/lib/libdatalog.so` in this repo → the
+developer's checkout → the loader's default path. Put `<repo>/python` on
+`sys.path` to `import dlb`.
+
 ## API Summary
 
 Public C API in [`src/dl.h`](src/dl.h). All value arrays are u32 (raw ints or symbol ids).

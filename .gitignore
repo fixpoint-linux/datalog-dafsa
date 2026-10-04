@@ -80,3 +80,7 @@ dist/
 zig-out/
 zig/.zig-cache/
 /tests/test_vector_search_content
+
+# python
+__pycache__/
+*.py[cod]
