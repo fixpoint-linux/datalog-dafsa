@@ -118,10 +118,15 @@ pub const vm_override = extern struct {
 
 comptime {
     // LP64 layout: int(4) @0, pad, pointer(8) @8, int(4) @16, pad -> 24.
-    std.debug.assert(@sizeOf(vm_override) == 24);
+    // { int; const tuple_set *; int } — the C layout is pointer-width
+    // dependent: 24 bytes with ts@8/perm_id@16 on LP64, 12 bytes with ts@4/
+    // perm_id@8 on ILP32.  Pin the width's own numbers rather than the LP64
+    // ones (both vm.zig and topdown.zig declare this type; each pins itself).
+    const lp64 = @sizeOf(usize) == 8;
+    std.debug.assert(@sizeOf(vm_override) == (if (lp64) 24 else 12));
     std.debug.assert(@offsetOf(vm_override, "body_idx") == 0);
-    std.debug.assert(@offsetOf(vm_override, "ts") == 8);
-    std.debug.assert(@offsetOf(vm_override, "perm_id") == 16);
+    std.debug.assert(@offsetOf(vm_override, "ts") == (if (lp64) 8 else 4));
+    std.debug.assert(@offsetOf(vm_override, "perm_id") == (if (lp64) 16 else 8));
 }
 
 // ─── Data globals (test-observable; MUST be writable export var D/B symbols) ─

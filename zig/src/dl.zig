@@ -75,11 +75,17 @@ const dc = @import("dafsa_c.zig");
 // builds are the same ABI by construction.  S_IFMT/S_ISDIR come from
 // sys/stat.h on gnu and linux/stat.h on musl (asm/stat.h has only the
 // struct, not the macros).
+const musl_ilp32 = builtin.target.abi.isMusl() and @sizeOf(usize) == 4;
+
 const posix = @cImport({
     @cDefine("_GNU_SOURCE", "1");
     if (builtin.target.abi.isMusl()) {
-        @cInclude("asm/stat.h");
-        @cInclude("linux/stat.h");
+        if (musl_ilp32) {
+            @cInclude("linux/stat.h"); // S_IFMT/S_ISDIR macros; the struct is Stat below
+        } else {
+            @cInclude("asm/stat.h");
+            @cInclude("linux/stat.h");
+        }
     } else {
         @cInclude("sys/stat.h");
     }
@@ -89,28 +95,61 @@ const posix = @cImport({
     @cInclude("stdio.h");
 });
 
-// STAT LAYOUT GUARD: the kernel struct stat is a DROP-IN for the libc struct
-// in stat/lstat/fstatat calls; a layout mismatch would be a silent-wrong-
-// result bug (wrong modes/sizes), not a compile error — so pin it at comptime.
+// THE TARGET-CORRECT struct stat.
+//
+// x86_64: the kernel <asm/stat.h> struct is byte-identical to libc's, so it is
+// used as a drop-in (only the field names differ).
+//
+// i386: it is NOT a drop-in.  <asm/stat.h> there declares the OLD 16-bit-field
+// kernel struct (sizeof 68), while musl's libc fills a 144-byte struct — a
+// buffer overflow plus silently wrong modes/sizes.  Neither can musl's own
+// <sys/stat.h> be used: Zig 0.16's translate-c turns its `struct timespec`
+// (an unnamed bitfield) into `opaque {}` and takes struct stat with it.  So the
+// layout is declared here, MEASURED with `zig cc -target x86-linux-musl` against
+// the target's own <sys/stat.h>: sizeof 144; dev 0 ino 88 nlink 20 mode 16 uid 24
+// gid 28 rdev 32 size 44 blksize 52 blocks 56, __st_*tim32 64/72/80, atim 96
+// mtim 112 ctim 128 (each 16 bytes, tv_nsec at +8).
+const Stat = if (musl_ilp32) StatI386Musl else posix.struct_stat;
+
+const StatTimespec = extern struct { tv_sec: i64, tv_nsec: c_long, _pad: c_long };
+
+pub const StatI386Musl = extern struct {
+    st_dev: u64, // @0
+    __st_dev_padding: c_int, // @8
+    __st_ino_truncated: c_long, // @12
+    st_mode: c_uint, // @16
+    st_nlink: c_uint, // @20
+    st_uid: c_uint, // @24
+    st_gid: c_uint, // @28
+    st_rdev: u64, // @32
+    __st_rdev_padding: c_int, // @40
+    st_size: i64, // @44
+    st_blksize: c_long, // @52
+    st_blocks: i64, // @56
+    __st_atim32: [2]c_long, // @64
+    __st_mtim32: [2]c_long, // @72
+    __st_ctim32: [2]c_long, // @80
+    st_ino: u64, // @88
+    st_atim: StatTimespec, // @96
+    st_mtim: StatTimespec, // @112
+    st_ctim: StatTimespec, // @128
+};
+
+// STAT LAYOUT GUARD: the struct passed to stat/lstat/fstatat MUST be the struct
+// libc fills — a mismatch is a silent-wrong-result bug (wrong modes/sizes), not
+// a compile error — so pin sizeof and every offset read below at comptime.
 comptime {
-    const S = posix.struct_stat;
-    if (@sizeOf(S) != 144)
-        @compileError("struct stat layout drift: expected x86_64 sizeof 144");
-    // The kernel struct names the mtime field st_mtime; glibc's names the
-    // embedded timespec st_mtim.  Same offset either way (88).
-    const mtime_name = if (builtin.target.abi.isMusl()) "st_mtime" else "st_mtim";
-    const expect = .{
-        .{ "st_dev", 0 },
-        .{ "st_ino", 8 },
-        .{ "st_nlink", 16 },
-        .{ "st_mode", 24 },
-        .{ "st_uid", 28 },
-        .{ "st_gid", 32 },
-        .{ "st_rdev", 40 },
-        .{ "st_size", 48 },
-        .{ "st_blksize", 56 },
-        .{ "st_blocks", 64 },
-        .{ mtime_name, 88 },
+    const S = Stat;
+    const want: usize = if (musl_ilp32) 144 else 144;
+    if (@sizeOf(S) != want)
+        @compileError("struct stat layout drift on target '" ++ @tagName(builtin.target.cpu.arch) ++
+            "': sizeof mismatch — the 144-byte layout here is MEASURED only for x86_64-musl (kernel <asm/stat.h>) and i386-musl (the StatI386Musl declaration); another 32-bit musl target needs its own measured branch");
+    const expect = if (musl_ilp32) .{
+        .{ "st_dev", 0 }, .{ "st_mode", 16 }, .{ "st_size", 44 }, .{ "st_ino", 88 },
+    } else .{
+        .{ "st_dev", 0 }, .{ "st_ino", 8 }, .{ "st_nlink", 16 }, .{ "st_mode", 24 },
+        .{ "st_uid", 28 }, .{ "st_gid", 32 }, .{ "st_rdev", 40 }, .{ "st_size", 48 },
+        .{ "st_blksize", 56 }, .{ "st_blocks", 64 },
     };
     for (expect) |e| {
         if (@offsetOf(S, e[0]) != e[1])
@@ -118,11 +157,25 @@ comptime {
     }
 }
 
-// libc stat-family calls + mkdir over the kernel struct (declared here:
-// asm/stat.h carries only the struct, not the prototypes).
-extern fn stat(path: [*c]const u8, buf: *posix.struct_stat) c_int;
-extern fn lstat(path: [*c]const u8, buf: *posix.struct_stat) c_int;
-extern fn fstatat(dirfd: c_int, path: [*c]const u8, buf: *posix.struct_stat, flags: c_int) c_int;
+// libc stat-family calls + mkdir over `Stat`.  i386 musl __REDIRs the whole
+// family to the time64 symbols (sys/stat.h: stat->__stat_time64,
+// lstat->__lstat_time64, fstatat->__fstatat_time64); a bare `extern fn fstatat`
+// binds the OLD-time compat entry point, which was MEASURED to fill only 96 of
+// the 144 bytes (the 64-bit-time tail untouched) — no error, garbage mtimes.
+// Bind the same symbol a C compile would.
+const stat_syms = struct {
+    extern fn stat(path: [*c]const u8, buf: *Stat) c_int;
+    extern fn lstat(path: [*c]const u8, buf: *Stat) c_int;
+    extern fn fstatat(dirfd: c_int, path: [*c]const u8, buf: *Stat, flags: c_int) c_int;
+};
+const stat_syms_time64 = struct {
+    extern fn __stat_time64(path: [*c]const u8, buf: *Stat) c_int;
+    extern fn __lstat_time64(path: [*c]const u8, buf: *Stat) c_int;
+    extern fn __fstatat_time64(dirfd: c_int, path: [*c]const u8, buf: *Stat, flags: c_int) c_int;
+};
+const stat = if (musl_ilp32) &stat_syms_time64.__stat_time64 else &stat_syms.stat;
+const lstat = if (musl_ilp32) &stat_syms_time64.__lstat_time64 else &stat_syms.lstat;
+const fstatat = if (musl_ilp32) &stat_syms_time64.__fstatat_time64 else &stat_syms.fstatat;
 extern fn mkdir(path: [*c]const u8, mode: posix.mode_t) c_int;
 
 // ─── libc decls not in std.c (precedent: vm.zig / snapshot.zig) ────────────
@@ -634,7 +687,7 @@ pub export fn db_rel_at_arity_rw(db: ?*DlDb, rel_id: c_int, arity: u8) ?*relatio
 /// Does any on-disk file exist for variant a of `name`?  (declare-time scan)
 fn variantFilesExist(db: *const DlDb, name: [*c]const u8, a: u8) bool {
     const suffixes = [_][*c]const u8{ ".dafsa", ".wal", ".base.dafsa" };
-    var st: posix.struct_stat = undefined;
+    var st: Stat = undefined;
     var i: usize = 0;
     while (i < 3) : (i += 1) {
         const p = makeVpath(db, name, a, suffixes[i]);
@@ -647,7 +700,7 @@ fn variantFilesExist(db: *const DlDb, name: [*c]const u8, a: u8) bool {
 
 /// A variadic variant's rule-head-ness is derived from FILE EXISTENCE.
 fn variantIsIdbOnDisk(db: *const DlDb, name: [*c]const u8, a: u8) bool {
-    var st: posix.struct_stat = undefined;
+    var st: Stat = undefined;
     const p = makeVpath(db, name, a, ".base.dafsa");
     const exists = if (p) |pp| stat(pp, &st) == 0 else false;
     if (p) |pp| c.free(@ptrCast(pp));
@@ -716,7 +769,7 @@ pub export fn dl_open(dir: ?[*:0]const u8) ?*DlDb {
 /// the path cannot be formed (over-long dir).
 fn roProbeExists(dir: [*c]const u8, name: [*c]const u8) c_int {
     var path: [4096:0]u8 = undefined;
-    var st: posix.struct_stat = undefined;
+    var st: Stat = undefined;
     const n = snprintf(&path, 4096, "%s/%s", dir, name);
     if (n < 0 or n >= 4096) return -1;
     return if (stat(&path, &st) == 0) 1 else 0;
@@ -731,7 +784,7 @@ fn dlOpenCommon(dir: ?[*:0]const u8, err_out: ?*c_int, ro: c_int) ?*DlDb {
     const dirn: [*c]const u8 = dir.?;
 
     if (ro != 0) {
-        var st: posix.struct_stat = undefined;
+        var st: Stat = undefined;
         if (stat(dirn, &st) != 0 or !posix.S_ISDIR(st.st_mode)) {
             if (err_out) |e| e.* = -1;
             return null;
@@ -4704,7 +4757,7 @@ fn rmRf(path: [*c]const u8) void {
         var e = posix.readdir(d);
         while (e != null) : (e = posix.readdir(d)) {
             var child: [4096:0]u8 = undefined;
-            var st: posix.struct_stat = undefined;
+            var st: Stat = undefined;
             if (strEq(@ptrCast(&e.*.d_name), ".") or strEq(@ptrCast(&e.*.d_name), ".."))
                 continue;
             _ = snprintf(&child, 4096, "%s/%s", path, @as([*c]const u8, @ptrCast(&e.*.d_name)));
@@ -4738,7 +4791,7 @@ fn snapshotEnumerate(db_dir: [*c]const u8, out: *?[*]u32, count: *usize) c_long 
 
     var e = posix.readdir(d);
     while (e != null) : (e = posix.readdir(d)) {
-        var st: posix.struct_stat = undefined;
+        var st: Stat = undefined;
         const name: [*c]const u8 = @ptrCast(&e.*.d_name);
 
         if (strEq(name, ".") or strEq(name, "..")) continue;

@@ -201,7 +201,7 @@ fn u64SetGrow(s: *U64Set) c_int {
     var i: usize = 0;
     while (s.cap != 0 and i < s.cap) : (i += 1) {
         if (s.slots.?[i] != 0) {
-            var idx = u64SetHash(s.slots.?[i]) & (ncap - 1);
+            var idx: usize = @intCast(u64SetHash(s.slots.?[i]) & (ncap - 1));
             while (ns[idx] != 0) idx = (idx + 1) & (ncap - 1);
             ns[idx] = s.slots.?[i];
         }
@@ -215,7 +215,7 @@ fn u64SetGrow(s: *U64Set) c_int {
 /// Returns true if k is present in the set.  Read-only probe.
 fn u64SetContains(s: *const U64Set, k: u64) bool {
     if (s.cap == 0) return false;
-    var idx = u64SetHash(k) & (s.cap - 1);
+    var idx: usize = @intCast(u64SetHash(k) & (s.cap - 1));
     while (s.slots.?[idx] != 0) {
         if (s.slots.?[idx] == k) return true;
         idx = (idx + 1) & (s.cap - 1);
@@ -229,7 +229,7 @@ fn u64SetAdd(s: *U64Set, k: u64) c_int {
     if (s.cap == 0 or (s.count +% 1) * 4 >= s.cap * 3) {
         if (u64SetGrow(s) != 0) return -1;
     }
-    var idx = u64SetHash(k) & (s.cap - 1);
+    var idx: usize = @intCast(u64SetHash(k) & (s.cap - 1));
     while (s.slots.?[idx] != 0) {
         if (s.slots.?[idx] == k) return 0;
         idx = (idx + 1) & (s.cap - 1);

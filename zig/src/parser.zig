@@ -428,7 +428,7 @@ fn lex(p: *parser) c_int {
         s += 1;
         while (s[0] != 0 and s[0] != '\'') s += 1;
         if (s[0] != '\'') {
-            perr(p, ptrOff(p, s), "parser: unclosed single-quoted string at position {d}\n", .{@as(c_long, ptrOff(p, s))});
+            perr(p, ptrOff(p, s), "parser: unclosed single-quoted string at position {d}\n", .{@as(c_long, @intCast(ptrOff(p, s)))});
             return -1;
         }
         t = tokNew(TOK_STRING, start, @intFromPtr(s) - @intFromPtr(start));
@@ -439,7 +439,7 @@ fn lex(p: *parser) c_int {
         s += 1; // skip opening quote
         while (s[0] != 0 and s[0] != '"') s += 1;
         if (s[0] != '"') {
-            perr(p, ptrOff(p, s), "parser: unclosed string at position {d}\n", .{@as(c_long, ptrOff(p, s))});
+            perr(p, ptrOff(p, s), "parser: unclosed string at position {d}\n", .{@as(c_long, @intCast(ptrOff(p, s)))});
             return -1;
         }
         t = tokNew(TOK_IDENT, start, @intFromPtr(s) - @intFromPtr(start));
@@ -451,7 +451,7 @@ fn lex(p: *parser) c_int {
         while (s[0] >= '0' and s[0] <= '9') {
             val = val * 10 + (s[0] - '0');
             if (val > 0xFFFFFFFF) {
-                perr(p, ptrOff(p, s), "parser: integer overflow at position {d}\n", .{@as(c_long, ptrOff(p, s))});
+                perr(p, ptrOff(p, s), "parser: integer overflow at position {d}\n", .{@as(c_long, @intCast(ptrOff(p, s)))});
                 return -1;
             }
             s += 1;
@@ -482,7 +482,7 @@ fn lex(p: *parser) c_int {
         }
     } else {
         // '{s}' on a 1-byte array writes the raw byte, matching C's %c.
-        perr(p, ptrOff(p, s), "parser: unexpected character '{s}' (0x{x:0>2}) at position {d}\n", .{ [_]u8{s[0]}, @as(c_uint, s[0]), @as(c_long, ptrOff(p, s)) });
+        perr(p, ptrOff(p, s), "parser: unexpected character '{s}' (0x{x:0>2}) at position {d}\n", .{ [_]u8{s[0]}, @as(c_uint, s[0]), @as(c_long, @intCast(ptrOff(p, s))) });
         return -1;
     }
 

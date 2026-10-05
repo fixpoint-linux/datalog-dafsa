@@ -1316,7 +1316,7 @@ fn prodViewDfs(ctx: *ProdViewCtx, dstate: u32, rstate: u32, depth: usize) c_int 
 
     // Iterate edges via view_edge_next
     var rc: c_int = 0;
-    var cur: [*c]const u8 = ctx.v.*.csr + @as(usize, ctx.v.*.state_off[@intCast(dstate)]);
+    var cur: [*c]const u8 = ctx.v.*.csr + @as(usize, @intCast(ctx.v.*.state_off[@intCast(dstate)]));
     var sym: u8 = 0;
     var tgt: u32 = 0;
 
@@ -1658,7 +1658,7 @@ fn symProdViewDfs(ctx: *SymProdViewCtx, dstate: u32, rstate: u32, depth: usize) 
             // Check for NUL terminator + accepting regex state (before the
             // visited-set insert, exactly as the recursive form did).
             {
-                var cur: [*c]const u8 = ctx.v.*.csr + @as(usize, ctx.v.*.state_off[@intCast(f.dstate)]);
+                var cur: [*c]const u8 = ctx.v.*.csr + @as(usize, @intCast(ctx.v.*.state_off[@intCast(f.dstate)]));
                 var sym: u8 = 0;
                 var tgt: u32 = 0;
                 while (dc.view_edge_next(ctx.v, f.dstate, &cur, &sym, &tgt) == 0) {
@@ -1671,7 +1671,7 @@ fn symProdViewDfs(ctx: *SymProdViewCtx, dstate: u32, rstate: u32, depth: usize) 
                         var cur2: u32 = tgt;
                         var i: usize = 0;
                         while (i < 4) : (i += 1) {
-                            var cur_p: [*c]const u8 = ctx.v.*.csr + @as(usize, ctx.v.*.state_off[@intCast(cur2)]);
+                            var cur_p: [*c]const u8 = ctx.v.*.csr + @as(usize, @intCast(ctx.v.*.state_off[@intCast(cur2)]));
                             var sym_p: u8 = 0;
                             var tgt_p: u32 = 0;
                             // First edge must exist (the payload byte).
@@ -1716,7 +1716,7 @@ fn symProdViewDfs(ctx: *SymProdViewCtx, dstate: u32, rstate: u32, depth: usize) 
             }
 
             // Initialize the resume cursor for the child-iteration loop.
-            f.cur = ctx.v.*.csr + @as(usize, ctx.v.*.state_off[@intCast(f.dstate)]);
+            f.cur = ctx.v.*.csr + @as(usize, @intCast(ctx.v.*.state_off[@intCast(f.dstate)]));
         }
 
         // Descend into one child at a time.

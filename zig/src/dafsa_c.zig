@@ -62,7 +62,24 @@ pub const State = extern struct {
 };
 
 comptime {
-    if (@sizeOf(State) != 64) @compileError("dafsa_c State must be 64B (engine internal.zig)");
+    // This mirror must stay byte-identical to the engine's State
+    // (vendor/dafsa/zig/src/internal.zig, which pins the SAME numbers from its
+    // side — the two files do not import each other).  The cache-line sizing
+    // is an LP64 property: the C oracle's `_Static_assert(sizeof(State) == 64)`
+    // FAILS on i386, where the 4-byte `trans_heap` makes State 60 with `trans`
+    // at 28 (MEASURED from vendor/dafsa_internal.h with `zig cc`, both widths).
+    const lp64 = @sizeOf(usize) == 8;
+    const want: usize = if (lp64) 64 else 60;
+    const want_trans: usize = if (lp64) 32 else 28;
+    if (@sizeOf(State) != want)
+        @compileError("dafsa_c State layout drift: sizeof (64 on LP64, 60 on ILP32)");
+    if (@offsetOf(State, "trans") != want_trans)
+        @compileError("dafsa_c State layout drift: trans offset (32 on LP64, 28 on ILP32)");
+    const expect = .{ .{ "refcount", 0 }, .{ "is_final", 4 }, .{ "ntrans", 8 }, .{ "in_head", 12 }, .{ "sig", 16 }, .{ "trans_heap", 24 } };
+    for (expect) |e| {
+        if (@offsetOf(State, e[0]) != e[1])
+            @compileError("dafsa_c State layout drift: " ++ e[0]);
+    }
 }
 
 // ─── struct dafsa (dafsa_internal.h:76-115 / abi.zig CFacade) ─────────────
