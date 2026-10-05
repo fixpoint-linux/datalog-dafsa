@@ -84,3 +84,7 @@ zig/.zig-cache/
 # python
 __pycache__/
 *.py[cod]
+
+# zig install outputs
+/bin/
+/zig-out/
