@@ -73,6 +73,28 @@ pub fn build(b: *std.Build) void {
     lmod.addIncludePath(b.path("../vendor/dafsa"));
     b.installArtifact(lib);
 
+    // ─── libdatalog.a (STATIC twin of the .so) ────────────────────────────
+    // Same Zig sources, same dafsa_abi module — a separate artifact because
+    // linkage is per-artifact in the Zig build API.  Installed alongside
+    // the .so so consumers (fx-core's musl build) can pick the static
+    // archive when a fully-static link is required: a musl-static binary
+    // cannot link a glibc-built .so, and vice versa.
+    const static_lib = b.addLibrary(.{
+        .name = "datalog",
+        .linkage = .static,
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const smod = static_lib.root_module;
+    smod.root_source_file = b.path("src/hybrid.zig");
+    smod.addImport("dafsa_abi", dafsa_abi);
+    smod.addIncludePath(b.path("../src"));
+    smod.addIncludePath(b.path("../vendor/dafsa"));
+    b.installArtifact(static_lib);
+
     // ─── dl CLI, dynamically linked against the 100%-Zig .so ─────────────
     // (test_m4_review popen()s ./dl and test_vector_cli execv()s it; the
     // smoke suite drives it too — all relinked/pointed at the Zig build.)

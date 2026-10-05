@@ -63,14 +63,67 @@ const dc = @import("dafsa_c.zig");
 // POSIX filesystem/lock primitives (stat/lstat/fstatat/mkdir/open/fcntl/
 // flock/opendir/readdir/dirfd/rename/unlink/rmdir) with _GNU_SOURCE so
 // glibc exposes the full declarations (stat/lstat/fstatat/dirfd/S_ISDIR).
+//
+// TARGET-GATED struct stat (the Zig 0.16 translate-c blocker): musl's
+// sys/stat.h does not survive translation (struct timespec demotes to
+// opaque), so on musl the KERNEL <asm/stat.h> is used instead — its layout
+// is byte-for-byte identical to the libc struct on x86_64 (MEASURED; the
+// comptime guard below pins it at every compile).  On glibc the plain
+// sys/stat.h is kept: glibc headers already define `struct stat`, and
+// including asm/stat.h too would be a redefinition error.  The comptime
+// guard asserts BOTH paths give the same layout, so the musl and gnu
+// builds are the same ABI by construction.  S_IFMT/S_ISDIR come from
+// sys/stat.h on gnu and linux/stat.h on musl (asm/stat.h has only the
+// struct, not the macros).
 const posix = @cImport({
     @cDefine("_GNU_SOURCE", "1");
-    @cInclude("sys/stat.h");
+    if (builtin.target.abi.isMusl()) {
+        @cInclude("asm/stat.h");
+        @cInclude("linux/stat.h");
+    } else {
+        @cInclude("sys/stat.h");
+    }
     @cInclude("fcntl.h");
     @cInclude("unistd.h");
     @cInclude("dirent.h");
     @cInclude("stdio.h");
 });
+
+// STAT LAYOUT GUARD: the kernel struct stat is a DROP-IN for the libc struct
+// in stat/lstat/fstatat calls; a layout mismatch would be a silent-wrong-
+// result bug (wrong modes/sizes), not a compile error — so pin it at comptime.
+comptime {
+    const S = posix.struct_stat;
+    if (@sizeOf(S) != 144)
+        @compileError("struct stat layout drift: expected x86_64 sizeof 144");
+    // The kernel struct names the mtime field st_mtime; glibc's names the
+    // embedded timespec st_mtim.  Same offset either way (88).
+    const mtime_name = if (builtin.target.abi.isMusl()) "st_mtime" else "st_mtim";
+    const expect = .{
+        .{ "st_dev", 0 },
+        .{ "st_ino", 8 },
+        .{ "st_nlink", 16 },
+        .{ "st_mode", 24 },
+        .{ "st_uid", 28 },
+        .{ "st_gid", 32 },
+        .{ "st_rdev", 40 },
+        .{ "st_size", 48 },
+        .{ "st_blksize", 56 },
+        .{ "st_blocks", 64 },
+        .{ mtime_name, 88 },
+    };
+    for (expect) |e| {
+        if (@offsetOf(S, e[0]) != e[1])
+            @compileError("struct stat layout drift: " ++ e[0] ++ " offset mismatch");
+    }
+}
+
+// libc stat-family calls + mkdir over the kernel struct (declared here:
+// asm/stat.h carries only the struct, not the prototypes).
+extern fn stat(path: [*c]const u8, buf: *posix.struct_stat) c_int;
+extern fn lstat(path: [*c]const u8, buf: *posix.struct_stat) c_int;
+extern fn fstatat(dirfd: c_int, path: [*c]const u8, buf: *posix.struct_stat, flags: c_int) c_int;
+extern fn mkdir(path: [*c]const u8, mode: posix.mode_t) c_int;
 
 // ─── libc decls not in std.c (precedent: vm.zig / snapshot.zig) ────────────
 extern "c" fn strdup(s: [*c]const u8) ?[*:0]u8;
@@ -585,7 +638,7 @@ fn variantFilesExist(db: *const DlDb, name: [*c]const u8, a: u8) bool {
     var i: usize = 0;
     while (i < 3) : (i += 1) {
         const p = makeVpath(db, name, a, suffixes[i]);
-        const exists = if (p) |pp| posix.stat(pp, &st) == 0 else false;
+        const exists = if (p) |pp| stat(pp, &st) == 0 else false;
         if (p) |pp| c.free(@ptrCast(pp));
         if (exists) return true;
     }
@@ -596,7 +649,7 @@ fn variantFilesExist(db: *const DlDb, name: [*c]const u8, a: u8) bool {
 fn variantIsIdbOnDisk(db: *const DlDb, name: [*c]const u8, a: u8) bool {
     var st: posix.struct_stat = undefined;
     const p = makeVpath(db, name, a, ".base.dafsa");
-    const exists = if (p) |pp| posix.stat(pp, &st) == 0 else false;
+    const exists = if (p) |pp| stat(pp, &st) == 0 else false;
     if (p) |pp| c.free(@ptrCast(pp));
     return exists;
 }
@@ -666,7 +719,7 @@ fn roProbeExists(dir: [*c]const u8, name: [*c]const u8) c_int {
     var st: posix.struct_stat = undefined;
     const n = snprintf(&path, 4096, "%s/%s", dir, name);
     if (n < 0 or n >= 4096) return -1;
-    return if (posix.stat(&path, &st) == 0) 1 else 0;
+    return if (stat(&path, &st) == 0) 1 else 0;
 }
 
 /// Shared body of dl_open2 (read-write) and dl_open_ro.
@@ -679,7 +732,7 @@ fn dlOpenCommon(dir: ?[*:0]const u8, err_out: ?*c_int, ro: c_int) ?*DlDb {
 
     if (ro != 0) {
         var st: posix.struct_stat = undefined;
-        if (posix.stat(dirn, &st) != 0 or !posix.S_ISDIR(st.st_mode)) {
+        if (stat(dirn, &st) != 0 or !posix.S_ISDIR(st.st_mode)) {
             if (err_out) |e| e.* = -1;
             return null;
         }
@@ -690,7 +743,7 @@ fn dlOpenCommon(dir: ?[*:0]const u8, err_out: ?*c_int, ro: c_int) ?*DlDb {
             return null;
         }
     } else {
-        _ = posix.mkdir(dirn, @as(posix.mode_t, 0o755));
+        _ = mkdir(dirn, @as(posix.mode_t, 0o755));
     }
 
     var lock_path: [4096:0]u8 = undefined;
@@ -4591,6 +4644,16 @@ const timec = @cImport({
     @cInclude("time.h");
 });
 
+// Local timespec shape (C ABI: two isize fields) — musl's time.h struct
+// timespec does not survive translate-c either; clock_gettime is handed
+// the same layout via a local extern.
+const Timespec = extern struct {
+    sec: isize,
+    nsec: isize,
+};
+const CLOCK_MONOTONIC: c_int = 1;
+extern fn clock_gettime(clk_id: c_int, tp: *Timespec) c_int;
+
 pub const dl_publish_timing_out = extern struct {
     n_publishes: u64, // number of publishes accumulated
     t_intern_ns: u64, // interner save (symbols.dafsa + symbols.array)
@@ -4618,9 +4681,9 @@ fn pubTimersCheckEnv() void {
 
 fn nowNs() u64 {
     // std.time.nanoTimestamp was dropped in 0.16; clock_gettime directly.
-    var ts: timec.struct_timespec = undefined;
-    _ = timec.clock_gettime(timec.CLOCK_MONOTONIC, &ts);
-    return @as(u64, @intCast(ts.tv_sec)) * 1_000_000_000 + @as(u64, @intCast(ts.tv_nsec));
+    var ts: Timespec = undefined;
+    _ = clock_gettime(CLOCK_MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
 }
 
 /// void dl_publish_timing_get(dl_publish_timing_out *out)
@@ -4645,7 +4708,7 @@ fn rmRf(path: [*c]const u8) void {
             if (strEq(@ptrCast(&e.*.d_name), ".") or strEq(@ptrCast(&e.*.d_name), ".."))
                 continue;
             _ = snprintf(&child, 4096, "%s/%s", path, @as([*c]const u8, @ptrCast(&e.*.d_name)));
-            if (posix.lstat(&child, &st) == 0 and posix.S_ISDIR(st.st_mode))
+            if (lstat(&child, &st) == 0 and posix.S_ISDIR(st.st_mode))
                 rmRf(&child) // recurse first
             else
                 _ = posix.unlink(&child);
@@ -4687,7 +4750,7 @@ fn snapshotEnumerate(db_dir: [*c]const u8, out: *?[*]u32, count: *usize) c_long 
         if (v < 1 or v > 0xFFFFFFFF) continue;
 
         // Only real version DIRECTORIES are enumerated.
-        if (posix.fstatat(posix.dirfd(d), name, &st, 0) != 0 or !posix.S_ISDIR(st.st_mode))
+        if (fstatat(posix.dirfd(d), name, &st, 0) != 0 or !posix.S_ISDIR(st.st_mode))
             continue;
 
         if (n == alloc) {
@@ -5126,12 +5189,12 @@ fn materializeSnapshot(d: *DlDb) c_int {
 
     // 3. Ensure snapshots directory exists
     _ = snprintf(&snapshots_dir, 4096, "%s/snapshots", d.dir.?);
-    _ = posix.mkdir(&snapshots_dir, @as(posix.mode_t, 0o755));
+    _ = mkdir(&snapshots_dir, @as(posix.mode_t, 0o755));
 
     // 4. Build into <db>/snapshots/<new_v>.tmp/
     _ = snprintf(&tmp_dir, 4096, "%s/snapshots/%u.tmp", d.dir.?, new_version);
     rmRf(&tmp_dir);
-    if (posix.mkdir(&tmp_dir, @as(posix.mode_t, 0o755)) != 0)
+    if (mkdir(&tmp_dir, @as(posix.mode_t, 0o755)) != 0)
         return -1;
 
     // 4a. Save interner
