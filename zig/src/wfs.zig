@@ -113,12 +113,6 @@ const RELK_VARIADIC: u8 = 1;
 
 // ─── extern bindings (same discipline as vm.zig/topdown.zig) ───────────────
 
-// tupleset.zig export fns (not `pub`).
-extern "c" fn ts_init(ts: ?*tupleset.tuple_set, arity: u8) c_int;
-extern "c" fn ts_free(ts: ?*tupleset.tuple_set) void;
-extern "c" fn ts_add(ts: ?*tupleset.tuple_set, cols: ?[*]const u32) c_int;
-extern "c" fn ts_sort(ts: ?*tupleset.tuple_set) void;
-
 extern "c" fn strdup(s: [*:0]const u8) ?[*:0]u8;
 // The INSERTING intern (intern.zig's intern_str): what the compiler's
 // token_const (compiler.zig:460) uses for TOK_IDENT — buildDomain must agree
@@ -209,7 +203,7 @@ fn tsSubset(a: *const tupleset.tuple_set, b: *const tupleset.tuple_set) bool {
 /// out := a ∩ b (both sorted).  Fresh ts; caller frees.
 fn tsIntersect(a: *const tupleset.tuple_set, b: *const tupleset.tuple_set) ?tupleset.tuple_set {
     var out: tupleset.tuple_set = undefined;
-    if (ts_init(&out, a.arity) != 0) return null;
+    if (tupleset.ts_init(&out, a.arity) != 0) return null;
     var ai: c_long = 0;
     var bi: c_long = 0;
     const ar = a.arity;
@@ -219,8 +213,8 @@ fn tsIntersect(a: *const tupleset.tuple_set, b: *const tupleset.tuple_set) ?tupl
         var k: usize = 0;
         while (k < ar and at[k] == bt[k]) k += 1;
         if (k == ar) {
-            if (ts_add(&out, at) < 0) {
-                ts_free(&out);
+            if (tupleset.ts_add(&out, at) < 0) {
+                tupleset.ts_free(&out);
                 return null;
             }
             ai += 1;
@@ -231,19 +225,19 @@ fn tsIntersect(a: *const tupleset.tuple_set, b: *const tupleset.tuple_set) ?tupl
             bi += 1;
         }
     }
-    ts_sort(&out);
+    tupleset.ts_sort(&out);
     return out;
 }
 
 /// Snapshot a relation's view into a fresh sorted ts.
 fn snapRel(rel: ?*const relation.Relation, arity: u8) ?tupleset.tuple_set {
     var ts: tupleset.tuple_set = undefined;
-    if (ts_init(&ts, arity) != 0) return null;
+    if (tupleset.ts_init(&ts, arity) != 0) return null;
     if (relation.rel_prefix(rel, null, 0, relation.ts_sink_cb, &ts) < 0) {
-        ts_free(&ts);
+        tupleset.ts_free(&ts);
         return null;
     }
-    ts_sort(&ts);
+    tupleset.ts_sort(&ts);
     return ts;
 }
 
@@ -281,22 +275,22 @@ fn cloneDeclareInmem(db: *dl.DlDb, name: [*:0]const u8, arity: u8) c_int {
 fn cloneDeepcopyView(src: ?*const relation.Relation, arity: u8) ?*relation.Relation {
     const dst = relation.rel_create(arity) orelse return null;
     var ts: tupleset.tuple_set = undefined;
-    if (ts_init(&ts, arity) != 0) {
+    if (tupleset.ts_init(&ts, arity) != 0) {
         relation.rel_free(dst);
         return null;
     }
     if (relation.rel_prefix(src, null, 0, relation.ts_sink_cb, &ts) < 0) {
-        ts_free(&ts);
+        tupleset.ts_free(&ts);
         relation.rel_free(dst);
         return null;
     }
-    ts_sort(&ts);
+    tupleset.ts_sort(&ts);
     if (relation.rel_build_from_tupleset(dst, &ts) != 0) {
-        ts_free(&ts);
+        tupleset.ts_free(&ts);
         relation.rel_free(dst);
         return null;
     }
-    ts_free(&ts);
+    tupleset.ts_free(&ts);
     return dst;
 }
 
@@ -400,7 +394,7 @@ fn checkSubset(rules: [*]?*parser.rule, n_rules: c_int) c_int {
 /// complement atom a bound lookup over a subset of Active^arity, so the
 /// complement content outside Active^arity is never probed.
 fn buildDomain(db: *const dl.DlDb, rules: [*]?*parser.rule, n_rules: c_int, dom: *tupleset.tuple_set) c_int {
-    if (ts_init(dom, 1) != 0) return -1;
+    if (tupleset.ts_init(dom, 1) != 0) return -1;
     var ri: usize = 0;
     while (ri < db.nrels) : (ri += 1) {
         if (db.rels[ri].kind != RELK_FIXED) continue; // variadic values are never probed (S1)
@@ -408,9 +402,9 @@ fn buildDomain(db: *const dl.DlDb, rules: [*]?*parser.rule, n_rules: c_int, dom:
         const ar = relation.rel_arity(rel);
         if (ar == 0) continue;
         var ts: tupleset.tuple_set = undefined;
-        if (ts_init(&ts, ar) != 0) return -1;
+        if (tupleset.ts_init(&ts, ar) != 0) return -1;
         if (relation.rel_prefix(rel, null, 0, relation.ts_sink_cb, &ts) < 0) {
-            ts_free(&ts);
+            tupleset.ts_free(&ts);
             return -1;
         }
         var ti: c_long = 0;
@@ -419,10 +413,10 @@ fn buildDomain(db: *const dl.DlDb, rules: [*]?*parser.rule, n_rules: c_int, dom:
             var k: u8 = 0;
             while (k < ar) : (k += 1) {
                 const v: [*]const u32 = @ptrCast(&row[k]);
-                _ = ts_add(dom, v);
+                _ = tupleset.ts_add(dom, v);
             }
         }
-        ts_free(&ts);
+        tupleset.ts_free(&ts);
     }
 
     // Constants appearing in the rules.
@@ -460,25 +454,25 @@ fn buildDomain(db: *const dl.DlDb, rules: [*]?*parser.rule, n_rules: c_int, dom:
                     if (v == 0) return -1; // OOM/overlong key — loud, never skip
                 } else continue;
                 const vp: [*]const u32 = @ptrCast(&v);
-                _ = ts_add(dom, vp);
+                _ = tupleset.ts_add(dom, vp);
             }
         }
     }
-    ts_sort(dom);
+    tupleset.ts_sort(dom);
     return 0;
 }
 
 /// out := Active^arity (cartesian product; odometer order, then sorted).
 fn enumerateProduct(dom: *const tupleset.tuple_set, arity: u8, out: *tupleset.tuple_set) c_int {
     const n: c_long = dom.count;
-    if (n == 0) return ts_init(out, arity); // empty domain → empty complement
+    if (n == 0) return tupleset.ts_init(out, arity); // empty domain → empty complement
     var total: c_long = 1;
     var a: u8 = 0;
     while (a < arity) : (a += 1) {
         total *= n;
         if (total > WFS_COMPLEMENT_CAP) return -1; // too large — clean reject
     }
-    if (ts_init(out, arity) != 0) return -1;
+    if (tupleset.ts_init(out, arity) != 0) return -1;
     var idx: [MAX_ARITY]c_long = [_]c_long{0} ** MAX_ARITY;
     var row: [MAX_ARITY]u32 = undefined;
     var t: c_long = 0;
@@ -486,7 +480,7 @@ fn enumerateProduct(dom: *const tupleset.tuple_set, arity: u8, out: *tupleset.tu
         a = 0;
         while (a < arity) : (a += 1)
             row[a] = dom.data.?[@intCast(idx[a])];
-        if (ts_add(out, &row) < 0) return -1;
+        if (tupleset.ts_add(out, &row) < 0) return -1;
         var d: u8 = arity; // odometer increment
         while (d > 0) {
             d -= 1;
@@ -495,7 +489,7 @@ fn enumerateProduct(dom: *const tupleset.tuple_set, arity: u8, out: *tupleset.tu
             idx[d] = 0;
         }
     }
-    ts_sort(out);
+    tupleset.ts_sort(out);
     return 0;
 }
 
@@ -538,14 +532,14 @@ const WfsState = struct {
 };
 
 fn freeSnaps(snaps: []HeadSnap) void {
-    for (snaps) |*s| ts_free(&s.ts);
+    for (snaps) |*s| tupleset.ts_free(&s.ts);
 }
 
 fn teardown(st: *WfsState) void {
-    if (st.dom_ok) ts_free(&st.dom);
+    if (st.dom_ok) tupleset.ts_free(&st.dom);
     if (st.comps_ok) {
         var i: usize = 0;
-        while (i < st.n_comps) : (i += 1) ts_free(&st.comps[i].full);
+        while (i < st.n_comps) : (i += 1) tupleset.ts_free(&st.comps[i].full);
     }
     if (st.prev_ok) freeSnaps(st.prev[0..st.n_heads]);
     if (st.prev2_ok) freeSnaps(st.prev2[0..st.n_heads]);
@@ -805,8 +799,8 @@ pub fn wfs_eval_query(
                 const pv_snap = snapRel(edb.rels[@intCast(cp.pred_idx)].rel, cp.arity) orelse return DL_WFS_ERR_OOM;
                 var pv: tupleset.tuple_set = pv_snap;
                 var cts: tupleset.tuple_set = undefined;
-                if (ts_init(&cts, cp.arity) != 0) {
-                    ts_free(&pv);
+                if (tupleset.ts_init(&cts, cp.arity) != 0) {
+                    tupleset.ts_free(&pv);
                     return DL_WFS_ERR_OOM;
                 }
                 // cts := full \ pv  (both sorted — merge walk)
@@ -831,13 +825,13 @@ pub fn wfs_eval_query(
                         }
                         break; // ft < vt — difference element
                     }
-                    if (!skip) _ = ts_add(&cts, ft);
+                    if (!skip) _ = tupleset.ts_add(&cts, ft);
                     fi += 1;
                 }
-                ts_sort(&cts);
+                tupleset.ts_sort(&cts);
                 const rc = relation.rel_build_from_tupleset(edb.rels[@intCast(cp.comp_idx)].rel, &cts);
-                ts_free(&cts);
-                ts_free(&pv);
+                tupleset.ts_free(&cts);
+                tupleset.ts_free(&pv);
                 if (rc != 0) {
                     wfsErr("dl_query_wfs_ro: complement materialization failed\n", .{});
                     return -1;
@@ -960,7 +954,7 @@ pub fn wfs_eval_query(
                 emitted += 1;
                 if (cb.?(t, out_ts.arity, user) != 0) break;
             }
-            if (out_owned) ts_free(&out_ts);
+            if (out_owned) tupleset.ts_free(&out_ts);
         }
         return emitted;
     }
@@ -971,33 +965,33 @@ pub fn wfs_eval_query(
 test "tsEq / tsSubset / tsIntersect basics" {
     var a: tupleset.tuple_set = undefined;
     var b: tupleset.tuple_set = undefined;
-    try std.testing.expect(ts_init(&a, 1) == 0);
-    try std.testing.expect(ts_init(&b, 1) == 0);
-    _ = ts_add(&a, &[_]u32{2});
-    _ = ts_add(&a, &[_]u32{3});
-    ts_sort(&a);
-    _ = ts_add(&b, &[_]u32{3});
-    ts_sort(&b);
+    try std.testing.expect(tupleset.ts_init(&a, 1) == 0);
+    try std.testing.expect(tupleset.ts_init(&b, 1) == 0);
+    _ = tupleset.ts_add(&a, &[_]u32{2});
+    _ = tupleset.ts_add(&a, &[_]u32{3});
+    tupleset.ts_sort(&a);
+    _ = tupleset.ts_add(&b, &[_]u32{3});
+    tupleset.ts_sort(&b);
     try std.testing.expect(!tsEq(&a, &b));
     try std.testing.expect(tsSubset(&b, &a));
     try std.testing.expect(!tsSubset(&a, &b));
     var inter = tsIntersect(&a, &b).?;
     try std.testing.expectEqual(@as(c_long, 1), inter.count);
     try std.testing.expectEqual(@as(u32, 3), inter.data.?[0]);
-    ts_free(&a);
-    ts_free(&b);
-    ts_free(&inter);
+    tupleset.ts_free(&a);
+    tupleset.ts_free(&b);
+    tupleset.ts_free(&inter);
 }
 
 test "enumerateProduct content" {
     var dom: tupleset.tuple_set = undefined;
-    try std.testing.expect(ts_init(&dom, 1) == 0);
-    _ = ts_add(&dom, &[_]u32{7});
-    _ = ts_add(&dom, &[_]u32{9});
-    ts_sort(&dom);
+    try std.testing.expect(tupleset.ts_init(&dom, 1) == 0);
+    _ = tupleset.ts_add(&dom, &[_]u32{7});
+    _ = tupleset.ts_add(&dom, &[_]u32{9});
+    tupleset.ts_sort(&dom);
     var p2: tupleset.tuple_set = undefined;
     try std.testing.expectEqual(@as(c_int, 0), enumerateProduct(&dom, 2, &p2));
     try std.testing.expectEqual(@as(c_long, 4), p2.count);
-    ts_free(&p2);
-    ts_free(&dom);
+    tupleset.ts_free(&p2);
+    tupleset.ts_free(&dom);
 }

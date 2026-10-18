@@ -19,15 +19,7 @@
 
 const std = @import("std");
 const c = std.c;
-const tupleset = @import("tupleset.zig"); // pub tuple_set type only
-
-// ts_* are `export fn`s in tupleset.zig (C ABI); link against them directly.
-extern "c" fn ts_init(ts: ?*tupleset.tuple_set, arity: u8) c_int;
-extern "c" fn ts_free(ts: ?*tupleset.tuple_set) void;
-extern "c" fn ts_add(ts: ?*tupleset.tuple_set, cols: ?[*]const u32) c_int;
-extern "c" fn ts_sort(ts: ?*tupleset.tuple_set) void;
-extern "c" fn ts_contains(ts: ?*const tupleset.tuple_set, cols: ?[*]const u32) c_int;
-extern "c" fn ts_reset(ts: ?*tupleset.tuple_set) void;
+const tupleset = @import("tupleset.zig");
 
 // The dafsa engine is now Zig; dafsa_c.zig hand-declares its C-layout
 // structs (struct dafsa/State/Edge/dafsa_wal) and exported ABI
@@ -267,7 +259,7 @@ fn ovEnsure(rel: *Relation) ?*tupleset.tuple_set {
     if (rel.ov == null) {
         const m = c.malloc(@sizeOf(tupleset.tuple_set)) orelse return null;
         const ts: *tupleset.tuple_set = @ptrCast(@alignCast(m));
-        if (ts_init(ts, rel.arity) != 0) {
+        if (tupleset.ts_init(ts, rel.arity) != 0) {
             c.free(m);
             return null;
         }
@@ -290,7 +282,7 @@ pub export fn rel_overlay_add(rel: ?*Relation, cols: [*c]const u32) c_int {
     if (relExactD(r, r.d, cols) != 0) return 0;
 
     const ov = ovEnsure(r) orelse return -1;
-    const rc = ts_add(ov, cols);
+    const rc = tupleset.ts_add(ov, cols);
     if (rc < 0) return -1;
     if (rc == 1) {
         r.ov_dirty += 1;
@@ -338,7 +330,7 @@ pub export fn rel_overlay_flush(rel: ?*Relation) c_int {
     const r = rel orelse return -1;
     const ov = r.ov orelse return 0;
     if (ov.count == 0) {
-        ts_reset(ov);
+        tupleset.ts_reset(ov);
         return 0;
     }
 
@@ -363,7 +355,7 @@ pub export fn rel_overlay_flush(rel: ?*Relation) c_int {
 
     r.dirty = 1;
     r.rev +%= 1;
-    ts_reset(ov); // capacity kept; hash cleared
+    tupleset.ts_reset(ov); // capacity kept; hash cleared
     r.ov_dirty = 0;
     return 0;
 }
@@ -387,7 +379,7 @@ fn ovConsolidateForRead(r: *const Relation) void {
 /// boundary — by the caller).
 fn ovFree(rel: *Relation) void {
     if (rel.ov) |ov| {
-        ts_free(ov);
+        tupleset.ts_free(ov);
         c.free(ov);
         rel.ov = null;
     }
@@ -626,7 +618,7 @@ pub export fn rel_exact(rel: ?*const Relation, cols: ?[*]const u32) c_int {
     const r = rel orelse return 0;
     if (relExactD(r, r.d, cols) != 0) return 1;
     if (r.ov) |ov| {
-        if (ov.count > 0 and ts_contains(ov, cols) != 0) return 1;
+        if (ov.count > 0 and tupleset.ts_contains(ov, cols) != 0) return 1;
     }
     return 0;
 }
@@ -865,7 +857,7 @@ pub export fn rel_range_each(rel: ?*const Relation, lo: u32, hi: u32, cb: RelEnu
 pub export fn ts_sink_cb(cols: ?[*]const u32, arity: u8, user: ?*anyopaque) c_int {
     _ = arity;
     const ts: *tupleset.tuple_set = @ptrCast(@alignCast(user orelse return -1));
-    return if (ts_add(ts, cols) < 0) -1 else 0;
+    return if (tupleset.ts_add(ts, cols) < 0) -1 else 0;
 }
 
 /// Build a fresh minimal DAFSA from a SORTED, DEDUPLICATED tuple_set.
@@ -950,21 +942,21 @@ pub export fn rel_add_tupleset(rel: ?*Relation, ts: ?*const tupleset.tuple_set) 
     // individual add still merges through the live equivalence registry
     // (minimality is preserved exactly as for arbitrary-order adds).
     var copy: tupleset.tuple_set = undefined;
-    if (ts_init(&copy, t.arity) != 0) return -1;
+    if (tupleset.ts_init(&copy, t.arity) != 0) return -1;
     var i: c_long = 0;
     while (i < t.count) : (i += 1) {
-        if (ts_add(&copy, t.data.? + @as(usize, @intCast(i)) * @as(usize, t.arity)) < 0) {
-            ts_free(&copy);
+        if (tupleset.ts_add(&copy, t.data.? + @as(usize, @intCast(i)) * @as(usize, t.arity)) < 0) {
+            tupleset.ts_free(&copy);
             return -1;
         }
     }
-    ts_sort(&copy);
+    tupleset.ts_sort(&copy);
 
     i = 0;
     while (i < copy.count) : (i += 1) {
         const rc = relAddD(r, r.d, copy.data.? + @as(usize, @intCast(i)) * @as(usize, copy.arity));
         if (rc < 0) {
-            ts_free(&copy);
+            tupleset.ts_free(&copy);
             return -1;
         }
         if (rc > 0) {
@@ -972,7 +964,7 @@ pub export fn rel_add_tupleset(rel: ?*Relation, ts: ?*const tupleset.tuple_set) 
             r.rev +%= 1;
         }
     }
-    ts_free(&copy);
+    tupleset.ts_free(&copy);
     return 0;
 }
 
@@ -999,14 +991,14 @@ pub export fn rel_build_base_from_tupleset(rel: ?*Relation, ts: ?*const tupleset
 fn dafsaCopyFrom(rel: *const Relation, src: [*c]const dc.dafsa) [*c]dc.dafsa {
     if (src == null) return null;
     var ts: tupleset.tuple_set = undefined;
-    if (ts_init(&ts, rel.arity) != 0) return null;
+    if (tupleset.ts_init(&ts, rel.arity) != 0) return null;
     if (relPrefixD(rel, src, null, 0, ts_sink_cb, &ts) < 0) {
-        ts_free(&ts);
+        tupleset.ts_free(&ts);
         return null;
     }
-    ts_sort(&ts);
+    tupleset.ts_sort(&ts);
     const out = dafsaBuildFromTs(&ts, rel.arity);
-    ts_free(&ts);
+    tupleset.ts_free(&ts);
     return out;
 }
 
@@ -1600,20 +1592,20 @@ test "rel_add_tupleset incremental fold matches bulk rebuild" {
     try std.testing.expectEqual(@as(c_int, 0), rel_reset_view(r2));
 
     var ts: tupleset.tuple_set = undefined;
-    try std.testing.expectEqual(@as(c_int, 0), ts_init(&ts, 2));
-    defer ts_free(&ts);
+    try std.testing.expectEqual(@as(c_int, 0), tupleset.ts_init(&ts, 2));
+    defer tupleset.ts_free(&ts);
     // Unsorted, with internal duplicates — exercises the no-sort, no-delete
     // contract.
     const rows = [_][2]u32{ .{ 5, 5 }, .{ 1, 2 }, .{ 2, 1 }, .{ 1, 3 } };
     for (rows) |row| {
-        try std.testing.expectEqual(@as(c_int, 1), ts_add(&ts, &row));
+        try std.testing.expectEqual(@as(c_int, 1), tupleset.ts_add(&ts, &row));
     }
 
     // Incremental fold takes the ts AS-IS (unsorted — its contract needs no
     // order); the bulk rebuild gets the sorted ts that dafsa_build_sorted
     // requires.  Both DAFSAs must accept the same set.
     try std.testing.expectEqual(@as(c_int, 0), rel_add_tupleset(r1, &ts));
-    ts_sort(&ts);
+    tupleset.ts_sort(&ts);
     try std.testing.expectEqual(@as(c_int, 0), rel_build_from_tupleset(r2, &ts));
 
     for (rows) |row| {
@@ -1637,14 +1629,14 @@ test "rel_add_tupleset incremental fold matches bulk rebuild" {
 
     // Empty tupleset: no-op, still ok.
     var empty: tupleset.tuple_set = undefined;
-    try std.testing.expectEqual(@as(c_int, 0), ts_init(&empty, 2));
-    defer ts_free(&empty);
+    try std.testing.expectEqual(@as(c_int, 0), tupleset.ts_init(&empty, 2));
+    defer tupleset.ts_free(&empty);
     try std.testing.expectEqual(@as(c_int, 0), rel_add_tupleset(r1, &empty));
 
     // Arity mismatch rejected.
     var bad: tupleset.tuple_set = undefined;
-    try std.testing.expectEqual(@as(c_int, 0), ts_init(&bad, 3));
-    defer ts_free(&bad);
+    try std.testing.expectEqual(@as(c_int, 0), tupleset.ts_init(&bad, 3));
+    defer tupleset.ts_free(&bad);
     try std.testing.expectEqual(@as(c_int, -1), rel_add_tupleset(r1, &bad));
 
     // Null ts rejected.
@@ -1678,13 +1670,13 @@ test "rel_build_from_tupleset bulk build" {
     defer rel_free(r);
 
     var ts: tupleset.tuple_set = undefined;
-    try std.testing.expectEqual(@as(c_int, 0), ts_init(&ts, 2));
-    defer ts_free(&ts);
+    try std.testing.expectEqual(@as(c_int, 0), tupleset.ts_init(&ts, 2));
+    defer tupleset.ts_free(&ts);
 
-    _ = ts_add(&ts, &.{ 3, 1 });
-    _ = ts_add(&ts, &.{ 1, 2 });
-    _ = ts_add(&ts, &.{ 2, 2 });
-    ts_sort(&ts);
+    _ = tupleset.ts_add(&ts, &.{ 3, 1 });
+    _ = tupleset.ts_add(&ts, &.{ 1, 2 });
+    _ = tupleset.ts_add(&ts, &.{ 2, 2 });
+    tupleset.ts_sort(&ts);
 
     try std.testing.expectEqual(@as(c_int, 0), rel_build_from_tupleset(r, &ts));
     // Merged final states (see roundtrip test above), not word count.

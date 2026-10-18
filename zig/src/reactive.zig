@@ -81,24 +81,16 @@ pub const DL_REACTIVE_ERR_INTERNAL: c_long = -6;
 /// events already delivered.
 pub const FiredCb = ?*const fn (event: c_int, cols: [*c]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_int;
 
-// ─── extern bindings (same discipline as wfs.zig) ──────────────────────────
-
-// tupleset.zig export fns (not `pub`).
-extern "c" fn ts_init(ts: ?*tupleset.tuple_set, arity: u8) c_int;
-extern "c" fn ts_free(ts: ?*tupleset.tuple_set) void;
-extern "c" fn ts_add(ts: ?*tupleset.tuple_set, cols: ?[*]const u32) c_int;
-extern "c" fn ts_sort(ts: ?*tupleset.tuple_set) void;
-
 // ─── unit tests ────────────────────────────────────────────────────────────
 // reactive.zig's correctness-critical primitives, tested directly (the C
 // suite exercises the whole step; these pin the pieces a diff is built of).
 
 fn mk2(rows: []const [2]u32) !tupleset.tuple_set {
     var ts: tupleset.tuple_set = undefined;
-    try std.testing.expect(ts_init(&ts, 2) == 0);
+    try std.testing.expect(tupleset.ts_init(&ts, 2) == 0);
     // ts_add: 1 = inserted, 0 = duplicate (inputs here are distinct), -1 = error.
-    for (rows) |r| try std.testing.expect(ts_add(&ts, &r) >= 0);
-    ts_sort(&ts);
+    for (rows) |r| try std.testing.expect(tupleset.ts_add(&ts, &r) >= 0);
+    tupleset.ts_sort(&ts);
     return ts;
 }
 
@@ -118,9 +110,9 @@ test "tsMinus: set difference over sorted tuple sets" {
         var b = try mk2(&.{.{ 9, 9 }});
         var d = tsMinus(&a, &b).?;
         try expectTs2(&d, &.{ .{ 1, 2 }, .{ 3, 4 } });
-        ts_free(&d);
-        ts_free(&b);
-        ts_free(&a);
+        tupleset.ts_free(&d);
+        tupleset.ts_free(&b);
+        tupleset.ts_free(&a);
     }
     // Full overlap: nothing survives.
     {
@@ -128,9 +120,9 @@ test "tsMinus: set difference over sorted tuple sets" {
         var b = try mk2(&.{ .{ 1, 2 }, .{ 3, 4 } });
         var d = tsMinus(&a, &b).?;
         try expectTs2(&d, &.{});
-        ts_free(&d);
-        ts_free(&b);
-        ts_free(&a);
+        tupleset.ts_free(&d);
+        tupleset.ts_free(&b);
+        tupleset.ts_free(&a);
     }
     // Interleaved: first-difference compare must walk BOTH sides.
     {
@@ -138,13 +130,13 @@ test "tsMinus: set difference over sorted tuple sets" {
         var b = try mk2(&.{ .{ 1, 2 }, .{ 3, 0 }, .{ 5, 6 }, .{ 7, 1 } });
         var d = tsMinus(&a, &b).?;
         try expectTs2(&d, &.{ .{ 2, 9 }, .{ 5, 5 } });
-        ts_free(&d);
+        tupleset.ts_free(&d);
         // Asymmetry: the same pair the other way round keeps b's extras.
         var d2 = tsMinus(&b, &a).?;
         try expectTs2(&d2, &.{ .{ 3, 0 }, .{ 5, 6 } });
-        ts_free(&d2);
-        ts_free(&b);
-        ts_free(&a);
+        tupleset.ts_free(&d2);
+        tupleset.ts_free(&b);
+        tupleset.ts_free(&a);
     }
     // First-exhausts tail dump: b's lone tuple sorts before all of a's —
     // the walk runs off b, then must dump a's whole tail (the early-stop
@@ -154,13 +146,13 @@ test "tsMinus: set difference over sorted tuple sets" {
         var b = try mk2(&.{.{ 0, 0 }});
         var d = tsMinus(&a, &b).?;
         try expectTs2(&d, &.{ .{ 1, 1 }, .{ 2, 2 }, .{ 3, 3 }, .{ 4, 4 } });
-        ts_free(&d);
+        tupleset.ts_free(&d);
         // Mirror: b's (0,0) is absent from a, so it survives.
         var d2 = tsMinus(&b, &a).?;
         try expectTs2(&d2, &.{.{ 0, 0 }});
-        ts_free(&d2);
-        ts_free(&b);
-        ts_free(&a);
+        tupleset.ts_free(&d2);
+        tupleset.ts_free(&b);
+        tupleset.ts_free(&a);
     }
     // First exhausts INSIDE second (first is a mid-sorted subset): every
     // first-tuple is consumed by matches and the result is empty.
@@ -169,9 +161,9 @@ test "tsMinus: set difference over sorted tuple sets" {
         var sup = try mk2(&.{ .{ 1, 1 }, .{ 2, 2 }, .{ 3, 3 }, .{ 4, 4 } });
         var d = tsMinus(&sub, &sup).?;
         try expectTs2(&d, &.{});
-        ts_free(&d);
-        ts_free(&sup);
-        ts_free(&sub);
+        tupleset.ts_free(&d);
+        tupleset.ts_free(&sup);
+        tupleset.ts_free(&sub);
     }
     // Both empty.
     {
@@ -179,9 +171,9 @@ test "tsMinus: set difference over sorted tuple sets" {
         var b = try mk2(&.{});
         var d = tsMinus(&a, &b).?;
         try expectTs2(&d, &.{});
-        ts_free(&d);
-        ts_free(&b);
-        ts_free(&a);
+        tupleset.ts_free(&d);
+        tupleset.ts_free(&b);
+        tupleset.ts_free(&a);
     }
     // Lexicographic compare is COLUMN-wise on u32 values: (1, 0x20000000)
     // before (1, 0x90000000), difference keeps the low one.
@@ -190,28 +182,28 @@ test "tsMinus: set difference over sorted tuple sets" {
         var b = try mk2(&.{.{ 1, 0x90000000 }});
         var d = tsMinus(&a, &b).?;
         try expectTs2(&d, &.{.{ 1, 0x20000000 }});
-        ts_free(&d);
-        ts_free(&b);
-        ts_free(&a);
+        tupleset.ts_free(&d);
+        tupleset.ts_free(&b);
+        tupleset.ts_free(&a);
     }
     // Arity mismatch never reaches tsMinus (both sides come from the SAME
     // relation); an arity-1 pair guards the single-column walk.
     {
         var a: tupleset.tuple_set = undefined;
         var b: tupleset.tuple_set = undefined;
-        try std.testing.expect(ts_init(&a, 1) == 0);
-        try std.testing.expect(ts_init(&b, 1) == 0);
-        try std.testing.expect(ts_add(&a, &[_]u32{5}) == 1);
-        try std.testing.expect(ts_add(&a, &[_]u32{7}) == 1);
-        try std.testing.expect(ts_add(&b, &[_]u32{7}) == 1);
-        ts_sort(&a);
-        ts_sort(&b);
+        try std.testing.expect(tupleset.ts_init(&a, 1) == 0);
+        try std.testing.expect(tupleset.ts_init(&b, 1) == 0);
+        try std.testing.expect(tupleset.ts_add(&a, &[_]u32{5}) == 1);
+        try std.testing.expect(tupleset.ts_add(&a, &[_]u32{7}) == 1);
+        try std.testing.expect(tupleset.ts_add(&b, &[_]u32{7}) == 1);
+        tupleset.ts_sort(&a);
+        tupleset.ts_sort(&b);
         var d = tsMinus(&a, &b).?;
         try std.testing.expectEqual(@as(c_long, 1), d.count);
         try std.testing.expectEqual(@as(u32, 5), d.data.?[0]);
-        ts_free(&d);
-        ts_free(&b);
-        ts_free(&a);
+        tupleset.ts_free(&d);
+        tupleset.ts_free(&b);
+        tupleset.ts_free(&a);
     }
 }
 
@@ -262,26 +254,26 @@ fn reactiveErr(comptime fmt: []const u8, args: anytype) void {
 /// tuple_set.  Caller frees.
 fn snapshotRel(rel: ?*const relation.Relation) ?tupleset.tuple_set {
     var ts: tupleset.tuple_set = undefined;
-    if (ts_init(&ts, relation.rel_arity(rel)) != 0) return null;
+    if (tupleset.ts_init(&ts, relation.rel_arity(rel)) != 0) return null;
     if (relation.rel_prefix(rel, null, 0, tsSink, &ts) < 0) {
-        ts_free(&ts);
+        tupleset.ts_free(&ts);
         return null;
     }
-    ts_sort(&ts);
+    tupleset.ts_sort(&ts);
     return ts;
 }
 
 fn tsSink(cols: ?[*]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_int {
     _ = arity;
     const ts: *tupleset.tuple_set = @ptrCast(@alignCast(user orelse return -1));
-    return if (ts_add(ts, cols) < 0) -1 else 0;
+    return if (tupleset.ts_add(ts, cols) < 0) -1 else 0;
 }
 
 /// `first` ⊖ `second`: tuples of `first` absent from `second` (both sorted,
 /// same arity).  Fresh sorted ts; caller frees.  null on OOM.
 fn tsMinus(first: *const tupleset.tuple_set, second: *const tupleset.tuple_set) ?tupleset.tuple_set {
     var out: tupleset.tuple_set = undefined;
-    if (ts_init(&out, first.arity) != 0) return null;
+    if (tupleset.ts_init(&out, first.arity) != 0) return null;
     var fi: c_long = 0;
     var si: c_long = 0;
     const ar = first.arity;
@@ -294,8 +286,8 @@ fn tsMinus(first: *const tupleset.tuple_set, second: *const tupleset.tuple_set) 
             fi += 1;
             si += 1;
         } else if (ft[k] < st[k]) {
-            if (ts_add(&out, ft) < 0) {
-                ts_free(&out);
+            if (tupleset.ts_add(&out, ft) < 0) {
+                tupleset.ts_free(&out);
                 return null;
             }
             fi += 1;
@@ -304,12 +296,12 @@ fn tsMinus(first: *const tupleset.tuple_set, second: *const tupleset.tuple_set) 
         }
     }
     while (fi < first.count) : (fi += 1) {
-        if (ts_add(&out, first.data.? + @as(usize, @intCast(fi)) * ar) < 0) {
-            ts_free(&out);
+        if (tupleset.ts_add(&out, first.data.? + @as(usize, @intCast(fi)) * ar) < 0) {
+            tupleset.ts_free(&out);
             return null;
         }
     }
-    ts_sort(&out);
+    tupleset.ts_sort(&out);
     return out;
 }
 
@@ -384,7 +376,7 @@ pub fn reactiveForget(db: *dl.DlDb) void {
 fn freeWatched(st: *ReactiveState) void {
     var i: usize = 0;
     while (i < MAX_WATCHED) : (i += 1) {
-        if (st.watch[i]) |*w| ts_free(&w.before);
+        if (st.watch[i]) |*w| tupleset.ts_free(&w.before);
         st.watch[i] = null;
     }
     st.n_watch = 0;
@@ -442,7 +434,7 @@ fn captureStep(st: *ReactiveState, cb: FiredCb, user: ?*anyopaque) c_long {
         // Newly true = after ⊖ before.
         var added_o: ?tupleset.tuple_set = tsMinus(after, &w.before);
         if (added_o == null) {
-            ts_free(after);
+            tupleset.ts_free(after);
             return DL_REACTIVE_ERR_OOM;
         }
         const added = &added_o.?;
@@ -450,19 +442,19 @@ fn captureStep(st: *ReactiveState, cb: FiredCb, user: ?*anyopaque) c_long {
             const em = emitTuples(cb, DL_REACTIVE_ADDED, added, user);
             fired += em.delivered;
             if (em.aborted) {
-                ts_free(added);
-                ts_free(&w.before); // the baseline advances to after: free the OLD one first
+                tupleset.ts_free(added);
+                tupleset.ts_free(&w.before); // the baseline advances to after: free the OLD one first
                 w.before = after_o.?;
                 return fired; // callback aborted the step
             }
         }
-        ts_free(added);
+        tupleset.ts_free(added);
 
         // R1 boundary: a delete-driven step reports disappearances as
         // REMOVED events; first-class retraction firing is slice R2.
         var removed_o: ?tupleset.tuple_set = tsMinus(&w.before, after);
         if (removed_o == null) {
-            ts_free(after);
+            tupleset.ts_free(after);
             return DL_REACTIVE_ERR_OOM;
         }
         const removed = &removed_o.?;
@@ -470,14 +462,14 @@ fn captureStep(st: *ReactiveState, cb: FiredCb, user: ?*anyopaque) c_long {
             const em = emitTuples(cb, DL_REACTIVE_REMOVED, removed, user);
             fired += em.delivered;
             if (em.aborted) {
-                ts_free(removed);
-                ts_free(&w.before); // the baseline advances to after: free the OLD one first
+                tupleset.ts_free(removed);
+                tupleset.ts_free(&w.before); // the baseline advances to after: free the OLD one first
                 w.before = after_o.?;
                 return fired; // callback aborted the step
             }
         }
-        ts_free(removed);
-        ts_free(&w.before);
+        tupleset.ts_free(removed);
+        tupleset.ts_free(&w.before);
         w.before = after_o.?; // becomes the next step's baseline
     }
     return fired;
@@ -542,7 +534,7 @@ pub fn dlSetReactive(db: ?*dl.DlDb, rel_name: [*c]const u8, on: c_int) c_int {
         }
         if (on == 0) {
             if (st.watch[i]) |*w| {
-                ts_free(&w.before);
+                tupleset.ts_free(&w.before);
                 st.watch[i] = null;
                 st.n_watch -= 1;
             }

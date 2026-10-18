@@ -50,16 +50,6 @@ extern "c" fn strlen(s: [*c]const u8) usize;
 extern "c" fn strncmp(a: [*c]const u8, b: [*c]const u8, n: usize) c_int;
 extern "c" fn strstr(a: [*c]const u8, b: [*c]const u8) [*c]u8;
 
-// tuple_set ops are `export fn`s in tupleset.zig (private to that module) —
-// reach them through raw extern bindings, exactly like relation.zig does.
-extern "c" fn ts_init(ts: ?*tupleset.tuple_set, arity: u8) c_int;
-extern "c" fn ts_free(ts: ?*tupleset.tuple_set) void;
-extern "c" fn ts_contains(ts: ?*const tupleset.tuple_set, cols: ?[*]const u32) c_int;
-extern "c" fn ts_add(ts: ?*tupleset.tuple_set, cols: ?[*]const u32) c_int;
-extern "c" fn ts_prefix(ts: ?*const tupleset.tuple_set, p: ?[*]const u32, k: u8, first_idx_out: ?[*]c_long) c_long;
-extern "c" fn ts_sort(ts: ?*tupleset.tuple_set) void;
-extern "c" fn ts_reset(ts: ?*tupleset.tuple_set) void;
-
 // ─── Constants (mirror src/compiler.h / src/dl_internal.h) ────────────────
 
 const MAX_VARS = 64;
@@ -114,7 +104,8 @@ comptime {
     // { int; const tuple_set *; int } — the C layout is pointer-width
     // dependent: 24 bytes with ts@8/perm_id@16 on LP64, 12 bytes with ts@4/
     // perm_id@8 on ILP32.  Pin the width's own numbers rather than the LP64
-    // ones (both vm.zig and topdown.zig declare this type; each pins itself).
+    // ones.  This is the ONE definition; topdown.zig asserts the same layout
+    // against this type.
     const lp64 = @sizeOf(usize) == 8;
     std.debug.assert(@sizeOf(vm_override) == (if (lp64) 24 else 12));
     std.debug.assert(@offsetOf(vm_override, "body_idx") == 0);
@@ -486,7 +477,7 @@ fn backtrack(frames: []VmFrame, sp: *c_int, b: *Bindings, p: [*]const vm_instr, 
 fn matCaptureCb(cols: [*c]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_int {
     _ = arity;
     const ts: *tupleset.tuple_set = @ptrCast(@alignCast(user orelse return -1));
-    return if (ts_add(ts, cols) < 0) 1 else 0;
+    return if (tupleset.ts_add(ts, cols) < 0) 1 else 0;
 }
 
 fn matHash(k: [*c]const u32, cc: c_int) u64 {
@@ -760,7 +751,7 @@ fn execRange(
 
                 if (ov_ts != null and ov_ts.?.count > 0) {
                     var first: [1]c_long = undefined;
-                    const cnt = ts_prefix(ov_ts, &pref, @intCast(k), &first);
+                    const cnt = tupleset.ts_prefix(ov_ts, &pref, @intCast(k), &first);
                     if (cnt == 0) {
                         if (backtrack(frames[0..], &sp, &b, p, &ip) == 0) ip = end;
                         break :blk;
@@ -827,7 +818,7 @@ fn execRange(
 
                 if (ov_ts != null and ov_ts.?.count > 0) {
                     var first: [1]c_long = undefined;
-                    const cnt = ts_prefix(ov_ts, &pref, @intCast(k), &first);
+                    const cnt = tupleset.ts_prefix(ov_ts, &pref, @intCast(k), &first);
                     if (cnt == 0) {
                         f.perm = null;
                         if (backtrack(frames[0..], &sp, &b, p, &ip) == 0) ip = end;
@@ -884,26 +875,26 @@ fn execRange(
                 const ov_ts = findOv(@intCast(in.body_idx), ov, n_ov);
 
                 var all_ts: tupleset.tuple_set = undefined;
-                if (ts_init(&all_ts, @intCast(ar)) != 0) return -1;
+                if (tupleset.ts_init(&all_ts, @intCast(ar)) != 0) return -1;
 
                 if (ov_ts != null and ov_ts.?.count > 0) {
                     var ci: c_long = 0;
                     while (ci < ov_ts.?.count) : (ci += 1) {
-                        _ = ts_add(&all_ts, ov_ts.?.data.? + @as(usize, @intCast(ci)) * @as(usize, ov_ts.?.arity));
+                        _ = tupleset.ts_add(&all_ts, ov_ts.?.data.? + @as(usize, @intCast(ci)) * @as(usize, ov_ts.?.arity));
                     }
                 } else {
                     const r = dl.db_rel_at_arity_ro(db, rel_id, @intCast(ar));
                     if (r == null) {
-                        ts_free(&all_ts);
+                        tupleset.ts_free(&all_ts);
                         if (backtrack(frames[0..], &sp, &b, p, &ip) == 0) ip = end;
                         break :blk;
                     }
                     _ = relation.rel_prefix(r, null, 0, relation.ts_sink_cb, &all_ts);
-                    ts_sort(&all_ts);
+                    tupleset.ts_sort(&all_ts);
                 }
 
                 if (all_ts.count == 0) {
-                    ts_free(&all_ts);
+                    tupleset.ts_free(&all_ts);
                     if (backtrack(frames[0..], &sp, &b, p, &ip) == 0) ip = end;
                     break :blk;
                 }
@@ -917,8 +908,8 @@ fn execRange(
 
                 {
                     var match_ts: tupleset.tuple_set = undefined;
-                    if (ts_init(&match_ts, @intCast(ar)) != 0) {
-                        ts_free(&all_ts);
+                    if (tupleset.ts_init(&match_ts, @intCast(ar)) != 0) {
+                        tupleset.ts_free(&all_ts);
                         return -1;
                     }
 
@@ -940,33 +931,33 @@ fn execRange(
                             var jj: c_int = 0;
                             while (jj < ar) : (jj += 1)
                                 prow[@intCast(jj)] = row[@intCast(perm_arr[@intCast(jj)])];
-                            _ = ts_add(&match_ts, &prow);
+                            _ = tupleset.ts_add(&match_ts, &prow);
                         }
                     }
 
                     if (match_ts.count == 0) {
-                        ts_free(&match_ts);
-                        ts_free(&all_ts);
+                        tupleset.ts_free(&match_ts);
+                        tupleset.ts_free(&all_ts);
                         if (backtrack(frames[0..], &sp, &b, p, &ip) == 0) ip = end;
                         break :blk;
                     }
 
-                    ts_sort(&match_ts);
+                    tupleset.ts_sort(&match_ts);
 
                     f.tuples.arity = @intCast(ar);
                     f.tuples.count = match_ts.count;
                     f.tuples.cap = match_ts.count;
                     const mem = c.malloc(@as(usize, @intCast(match_ts.count)) * @as(usize, @intCast(ar)) * @sizeOf(u32)) orelse {
-                        ts_free(&match_ts);
-                        ts_free(&all_ts);
+                        tupleset.ts_free(&match_ts);
+                        tupleset.ts_free(&all_ts);
                         return -1;
                     };
                     f.tuples.data = @ptrCast(@alignCast(mem));
                     @memcpy(f.tuples.data.?[0 .. @as(usize, @intCast(match_ts.count)) * @as(usize, @intCast(ar))], match_ts.data.?[0 .. @as(usize, @intCast(match_ts.count)) * @as(usize, @intCast(ar))]);
-                    ts_free(&match_ts);
+                    tupleset.ts_free(&match_ts);
                 }
 
-                ts_free(&all_ts);
+                tupleset.ts_free(&all_ts);
 
                 bSave(&f.saved, &b);
                 f.perm = perm_arr;
@@ -995,7 +986,7 @@ fn execRange(
                 }
                 const ts = &pool.?[@intCast(buf)];
                 if (ts.arity == 0) {
-                    if (ts_init(ts, @intCast(ar)) != 0) return -1;
+                    if (tupleset.ts_init(ts, @intCast(ar)) != 0) return -1;
                 }
                 const sub = execRange(db, cr, ip + 1, end_ip, ov, n_ov, dry, cb, user, matCaptureCb, ts, pool, n_pool);
                 if (sub < 0) return -1;
@@ -1658,7 +1649,7 @@ fn execRule(
     if (pool) |pl| {
         k = 0;
         while (k < n_mat) : (k += 1) {
-            if (pl[@intCast(k)].arity != 0) ts_free(&pl[@intCast(k)]);
+            if (pl[@intCast(k)].arity != 0) tupleset.ts_free(&pl[@intCast(k)]);
         }
         c.free(@ptrCast(pl));
     }
@@ -1689,7 +1680,7 @@ const CandCtx = struct {
 fn candCb(cols: [*c]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_int {
     _ = arity;
     const ctx: *CandCtx = @ptrCast(@alignCast(user orelse return -1));
-    return if (ts_add(ctx.ts, cols) < 0) -1 else 0;
+    return if (tupleset.ts_add(ctx.ts, cols) < 0) -1 else 0;
 }
 
 // ─── Non-recursive evaluation (M1 path) ────────────────────────────────────
@@ -1727,10 +1718,10 @@ const RdT = struct {
 fn rdFreeTs(rd: [*]RdT, nr: c_int) void {
     var i: c_int = 0;
     while (i < nr) : (i += 1) {
-        ts_free(&rd[@intCast(i)].idb);
-        ts_free(&rd[@intCast(i)].delta);
-        ts_free(&rd[@intCast(i)].next_delta);
-        ts_free(&rd[@intCast(i)].added);
+        tupleset.ts_free(&rd[@intCast(i)].idb);
+        tupleset.ts_free(&rd[@intCast(i)].delta);
+        tupleset.ts_free(&rd[@intCast(i)].next_delta);
+        tupleset.ts_free(&rd[@intCast(i)].added);
     }
 }
 
@@ -1739,7 +1730,7 @@ fn permFreeAll(nr: c_int, perm_count: [*]c_int, perm_ids: [*]?[*]c_int, perm_cap
     while (rdi < nr) : (rdi += 1) {
         var pi: c_int = 0;
         while (pi < perm_count[@intCast(rdi)]) : (pi += 1) {
-            ts_free(&idb_perm_shadows[@intCast(rdi)].?[@intCast(pi)]);
+            tupleset.ts_free(&idb_perm_shadows[@intCast(rdi)].?[@intCast(pi)]);
         }
         if (perm_ids[@intCast(rdi)]) |p| c.free(@ptrCast(p));
         if (idb_perm_shadows[@intCast(rdi)]) |s| c.free(@ptrCast(s));
@@ -1759,7 +1750,7 @@ fn rebuildPermShadows(db: *dl.DlDb, nr: c_int, rd: [*]RdT, perm_count: [*]c_int,
             const perm_arr = db.perms[@intCast(db_pi)].perm;
             const ar = db.perms[@intCast(db_pi)].arity;
             const shadow = &idb_perm_shadows[@intCast(rdi)].?[@intCast(pi)];
-            ts_reset(shadow);
+            tupleset.ts_reset(shadow);
             var ci: c_long = 0;
             while (ci < rd[@intCast(rdi)].idb.count) : (ci += 1) {
                 const row = rd[@intCast(rdi)].idb.data.? + @as(usize, @intCast(ci)) * @as(usize, rd[@intCast(rdi)].idb.arity);
@@ -1767,9 +1758,9 @@ fn rebuildPermShadows(db: *dl.DlDb, nr: c_int, rd: [*]RdT, perm_count: [*]c_int,
                 var j: c_int = 0;
                 while (j < ar) : (j += 1)
                     prow[@intCast(j)] = row[perm_arr[@intCast(j)]];
-                _ = ts_add(shadow, &prow);
+                _ = tupleset.ts_add(shadow, &prow);
             }
-            ts_sort(shadow);
+            tupleset.ts_sort(shadow);
         }
     }
 }
@@ -1835,17 +1826,17 @@ fn evalStratumRecursive(db: *dl.DlDb, rules: [*]?*compiler.compiled_rule, n: c_i
         const ar: u8 = if (rc != null) relation.rel_arity(rc) else 0;
         rd[@intCast(i)].rel_id = rp[@intCast(i)];
         rd[@intCast(i)].arity = ar;
-        if (ts_init(&rd[@intCast(i)].idb, ar) != 0 or
-            ts_init(&rd[@intCast(i)].delta, ar) != 0 or
-            ts_init(&rd[@intCast(i)].next_delta, ar) != 0 or
-            ts_init(&rd[@intCast(i)].added, ar) != 0)
+        if (tupleset.ts_init(&rd[@intCast(i)].idb, ar) != 0 or
+            tupleset.ts_init(&rd[@intCast(i)].delta, ar) != 0 or
+            tupleset.ts_init(&rd[@intCast(i)].next_delta, ar) != 0 or
+            tupleset.ts_init(&rd[@intCast(i)].added, ar) != 0)
         {
             ri = 0;
             while (ri <= i) : (ri += 1) {
-                ts_free(&rd[@intCast(ri)].idb);
-                ts_free(&rd[@intCast(ri)].delta);
-                ts_free(&rd[@intCast(ri)].next_delta);
-                ts_free(&rd[@intCast(ri)].added);
+                tupleset.ts_free(&rd[@intCast(ri)].idb);
+                tupleset.ts_free(&rd[@intCast(ri)].delta);
+                tupleset.ts_free(&rd[@intCast(ri)].next_delta);
+                tupleset.ts_free(&rd[@intCast(ri)].added);
             }
             c.free(@ptrCast(rd));
             return -1;
@@ -1912,7 +1903,7 @@ fn evalStratumRecursive(db: *dl.DlDb, rules: [*]?*compiler.compiled_rule, n: c_i
                 perm_cap[@intCast(rdi)] = nc;
             }
             perm_ids[@intCast(rdi)].?[@intCast(pc)] = pi;
-            if (ts_init(&idb_perm_shadows[@intCast(rdi)].?[@intCast(pc)], db.perms[@intCast(pi)].arity) != 0) {
+            if (tupleset.ts_init(&idb_perm_shadows[@intCast(rdi)].?[@intCast(pc)], db.perms[@intCast(pi)].arity) != 0) {
                 permFreeAll(nr, perm_count, perm_ids, perm_cap, idb_perm_shadows);
                 rdFreeTs(rd, nr);
                 c.free(@ptrCast(rd));
@@ -1984,7 +1975,7 @@ fn evalStratumRecursive(db: *dl.DlDb, rules: [*]?*compiler.compiled_rule, n: c_i
             const hdi = rp_idx[@intCast(hri)];
 
             var seed: tupleset.tuple_set = undefined;
-            if (ts_init(&seed, rd[@intCast(hdi)].arity) != 0) {
+            if (tupleset.ts_init(&seed, rd[@intCast(hdi)].arity) != 0) {
                 permFreeAll(nr, perm_count, perm_ids, perm_cap, idb_perm_shadows);
                 rdFreeTs(rd, nr);
                 c.free(@ptrCast(rd));
@@ -1995,7 +1986,7 @@ fn evalStratumRecursive(db: *dl.DlDb, rules: [*]?*compiler.compiled_rule, n: c_i
 
             const m = execRule(db, cr, null, 0, 1, candCb, &ctx);
             if (m < 0) {
-                ts_free(&seed);
+                tupleset.ts_free(&seed);
                 permFreeAll(nr, perm_count, perm_ids, perm_cap, idb_perm_shadows);
                 rdFreeTs(rd, nr);
                 c.free(@ptrCast(rd));
@@ -2005,10 +1996,10 @@ fn evalStratumRecursive(db: *dl.DlDb, rules: [*]?*compiler.compiled_rule, n: c_i
             var ci: c_long = 0;
             while (ci < seed.count) : (ci += 1) {
                 const t = seed.data.? + @as(usize, @intCast(ci)) * @as(usize, seed.arity);
-                _ = ts_add(&rd[@intCast(hdi)].idb, t);
-                _ = ts_add(&rd[@intCast(hdi)].delta, t);
+                _ = tupleset.ts_add(&rd[@intCast(hdi)].idb, t);
+                _ = tupleset.ts_add(&rd[@intCast(hdi)].delta, t);
             }
-            ts_free(&seed);
+            tupleset.ts_free(&seed);
         } else {
             const hri: c_int = @intCast(cr.head_rel_id);
             const hdi = rp_idx[@intCast(hri)];
@@ -2030,7 +2021,7 @@ fn evalStratumRecursive(db: *dl.DlDb, rules: [*]?*compiler.compiled_rule, n: c_i
                 ov[0].perm_id = -1;
 
                 var cand: tupleset.tuple_set = undefined;
-                if (ts_init(&cand, rd[@intCast(hdi)].arity) != 0) {
+                if (tupleset.ts_init(&cand, rd[@intCast(hdi)].arity) != 0) {
                     permFreeAll(nr, perm_count, perm_ids, perm_cap, idb_perm_shadows);
                     rdFreeTs(rd, nr);
                     c.free(@ptrCast(rd));
@@ -2040,7 +2031,7 @@ fn evalStratumRecursive(db: *dl.DlDb, rules: [*]?*compiler.compiled_rule, n: c_i
 
                 const n_out = execRule(db, cr, &ov, 1, 1, candCb, &ctx);
                 if (n_out < 0) {
-                    ts_free(&cand);
+                    tupleset.ts_free(&cand);
                     permFreeAll(nr, perm_count, perm_ids, perm_cap, idb_perm_shadows);
                     rdFreeTs(rd, nr);
                     c.free(@ptrCast(rd));
@@ -2050,21 +2041,21 @@ fn evalStratumRecursive(db: *dl.DlDb, rules: [*]?*compiler.compiled_rule, n: c_i
                 var ci: c_long = 0;
                 while (ci < cand.count) : (ci += 1) {
                     const t = cand.data.? + @as(usize, @intCast(ci)) * @as(usize, cand.arity);
-                    if (ts_contains(&rd[@intCast(hdi)].idb, t) == 0) {
-                        _ = ts_add(&rd[@intCast(hdi)].idb, t);
-                        _ = ts_add(&rd[@intCast(hdi)].delta, t);
-                        _ = ts_add(&rd[@intCast(hdi)].added, t);
+                    if (tupleset.ts_contains(&rd[@intCast(hdi)].idb, t) == 0) {
+                        _ = tupleset.ts_add(&rd[@intCast(hdi)].idb, t);
+                        _ = tupleset.ts_add(&rd[@intCast(hdi)].delta, t);
+                        _ = tupleset.ts_add(&rd[@intCast(hdi)].added, t);
                     }
                 }
-                ts_free(&cand);
+                tupleset.ts_free(&cand);
             }
         }
     }
 
     i = 0;
     while (i < nr) : (i += 1) {
-        ts_sort(&rd[@intCast(i)].idb);
-        ts_sort(&rd[@intCast(i)].delta);
+        tupleset.ts_sort(&rd[@intCast(i)].idb);
+        tupleset.ts_sort(&rd[@intCast(i)].delta);
     }
 
     rebuildPermShadows(db, nr, rd, perm_count, perm_ids, idb_perm_shadows);
@@ -2101,12 +2092,12 @@ fn evalStratumRecursive(db: *dl.DlDb, rules: [*]?*compiler.compiled_rule, n: c_i
 
             if (need_idb_sort != 0) {
                 i = 0;
-                while (i < nr) : (i += 1) ts_sort(&rd[@intCast(i)].idb);
+                while (i < nr) : (i += 1) tupleset.ts_sort(&rd[@intCast(i)].idb);
             }
 
             i = 0;
             while (i < nr) : (i += 1)
-                ts_reset(&rd[@intCast(i)].next_delta);
+                tupleset.ts_reset(&rd[@intCast(i)].next_delta);
 
             ri = 0;
             while (ri < n) : (ri += 1) {
@@ -2165,7 +2156,7 @@ fn evalStratumRecursive(db: *dl.DlDb, rules: [*]?*compiler.compiled_rule, n: c_i
                     }
 
                     var cand: tupleset.tuple_set = undefined;
-                    if (ts_init(&cand, rd[@intCast(hdi)].arity) != 0) {
+                    if (tupleset.ts_init(&cand, rd[@intCast(hdi)].arity) != 0) {
                         permFreeAll(nr, perm_count, perm_ids, perm_cap, idb_perm_shadows);
                         rdFreeTs(rd, nr);
                         c.free(@ptrCast(rd));
@@ -2176,7 +2167,7 @@ fn evalStratumRecursive(db: *dl.DlDb, rules: [*]?*compiler.compiled_rule, n: c_i
 
                     const n_out = execRule(db, cr, &overrides, n_ov, 1, candCb, &ctx);
                     if (n_out < 0) {
-                        ts_free(&cand);
+                        tupleset.ts_free(&cand);
                         permFreeAll(nr, perm_count, perm_ids, perm_cap, idb_perm_shadows);
                         rdFreeTs(rd, nr);
                         c.free(@ptrCast(rd));
@@ -2186,12 +2177,12 @@ fn evalStratumRecursive(db: *dl.DlDb, rules: [*]?*compiler.compiled_rule, n: c_i
                     var ci: c_long = 0;
                     while (ci < cand.count) : (ci += 1) {
                         const t = cand.data.? + @as(usize, @intCast(ci)) * @as(usize, cand.arity);
-                        if (ts_contains(&rd[@intCast(hdi)].idb, t) == 0) {
-                            _ = ts_add(&rd[@intCast(hdi)].next_delta, t);
+                        if (tupleset.ts_contains(&rd[@intCast(hdi)].idb, t) == 0) {
+                            _ = tupleset.ts_add(&rd[@intCast(hdi)].next_delta, t);
                         }
                     }
 
-                    ts_free(&cand);
+                    tupleset.ts_free(&cand);
                 }
             }
 
@@ -2210,22 +2201,22 @@ fn evalStratumRecursive(db: *dl.DlDb, rules: [*]?*compiler.compiled_rule, n: c_i
             i = 0;
             while (i < nr) : (i += 1) {
                 if (rd[@intCast(i)].next_delta.count > 0) {
-                    ts_sort(&rd[@intCast(i)].next_delta);
+                    tupleset.ts_sort(&rd[@intCast(i)].next_delta);
                     {
                         var ci: c_long = 0;
                         while (ci < rd[@intCast(i)].next_delta.count) : (ci += 1) {
-                            _ = ts_add(&rd[@intCast(i)].idb,
+                            _ = tupleset.ts_add(&rd[@intCast(i)].idb,
                                 rd[@intCast(i)].next_delta.data.? + @as(usize, @intCast(ci)) * @as(usize, rd[@intCast(i)].arity));
-                            _ = ts_add(&rd[@intCast(i)].added,
+                            _ = tupleset.ts_add(&rd[@intCast(i)].added,
                                 rd[@intCast(i)].next_delta.data.? + @as(usize, @intCast(ci)) * @as(usize, rd[@intCast(i)].arity));
                         }
                     }
                     const tmp = rd[@intCast(i)].delta;
                     rd[@intCast(i)].delta = rd[@intCast(i)].next_delta;
                     rd[@intCast(i)].next_delta = tmp;
-                    ts_reset(&rd[@intCast(i)].next_delta);
+                    tupleset.ts_reset(&rd[@intCast(i)].next_delta);
                 } else {
-                    ts_free(&rd[@intCast(i)].delta);
+                    tupleset.ts_free(&rd[@intCast(i)].delta);
                     rd[@intCast(i)].delta = std.mem.zeroes(tupleset.tuple_set);
                     rd[@intCast(i)].delta.arity = rd[@intCast(i)].arity;
                 }
@@ -2245,7 +2236,7 @@ fn evalStratumRecursive(db: *dl.DlDb, rules: [*]?*compiler.compiled_rule, n: c_i
             // read them from there — the rebuild below replaces the view, so
             // those facts must be folded in first or they are lost.
             _ = relation.rel_prefix(rel, null, 0, relation.ts_sink_cb, &rd[@intCast(i)].idb);
-            ts_sort(&rd[@intCast(i)].idb);
+            tupleset.ts_sort(&rd[@intCast(i)].idb);
             if (vmNomaterializeRef().* != 0 and rd[@intCast(i)].rel_id == vmExportRelidRef().*) {
                 vmExportTsRef().*.?.* = rd[@intCast(i)].idb;
                 rd[@intCast(i)].idb = std.mem.zeroes(tupleset.tuple_set);
@@ -2391,7 +2382,7 @@ pub export fn vm_execute_ivm(db: ?*dl.DlDb) c_int {
     while (i < MAX_RELS) : (i += 1) {
         const dp = d.delta_pending[@intCast(i)];
         if (dp != null and tsFromPending(dp).?.count > 0)
-            ts_sort(tsFromPending(dp));
+            tupleset.ts_sort(tsFromPending(dp));
     }
     const cr = d.crules orelse return -1;
     return vmExecuteMode(d, cr, d.n_crules, 1);
@@ -2512,7 +2503,7 @@ pub export fn vm_clear_deltas(db: ?*dl.DlDb) void {
         const dp = d.delta_pending[@intCast(i)];
         if (dp != null) {
             const tsp: *tupleset.tuple_set = @ptrCast(@alignCast(dp));
-            ts_free(tsp);
+            tupleset.ts_free(tsp);
             c.free(@ptrCast(tsp));
             d.delta_pending[@intCast(i)] = null;
         }
@@ -2533,7 +2524,7 @@ fn ivmCaptureCb(cols: [*c]const u32, arity: u8, user: ?*anyopaque) callconv(.c) 
     _ = arity;
     const cap: *IvmCapture = @ptrCast(@alignCast(user orelse return 1));
     if (cap.err != 0) return 1;
-    if (ts_add(cap.ts, cols) < 0) {
+    if (tupleset.ts_add(cap.ts, cols) < 0) {
         cap.err = -1;
         return 1;
     }
@@ -2560,16 +2551,16 @@ pub export fn vm_propagate_deltas(db: ?*dl.DlDb) c_int {
             d.delta_pending[i] = null;
             const tsp: *tupleset.tuple_set = @ptrCast(@alignCast(dp));
             if (tsp.count == 0) {
-                ts_free(tsp);
+                tupleset.ts_free(tsp);
                 c.free(@ptrCast(tsp));
                 continue;
             }
-            ts_sort(tsp);
+            tupleset.ts_sort(tsp);
             if (qn == qcap) {
                 const nc: usize = if (qcap != 0) qcap *% 2 else 16;
                 const old: ?*anyopaque = if (queue) |q| @ptrCast(q) else null;
                 const nq = c.realloc(old, nc * @sizeOf(IvmWork)) orelse {
-                    ts_free(tsp);
+                    tupleset.ts_free(tsp);
                     c.free(@ptrCast(tsp));
                     break :fail;
                 };
@@ -2605,7 +2596,7 @@ pub export fn vm_propagate_deltas(db: ?*dl.DlDb) c_int {
 
                     const head_ts = c.malloc(@sizeOf(tupleset.tuple_set)) orelse break :fail;
                     const hts: *tupleset.tuple_set = @ptrCast(@alignCast(head_ts));
-                    if (ts_init(hts, harity) != 0) {
+                    if (tupleset.ts_init(hts, harity) != 0) {
                         c.free(head_ts);
                         break :fail;
                     }
@@ -2619,7 +2610,7 @@ pub export fn vm_propagate_deltas(db: ?*dl.DlDb) c_int {
 
                     const m = execRule(d, cr, &ov, 1, 0, ivmCaptureCb, &cap);
                     if (m < 0 or cap.err != 0) {
-                        ts_free(hts);
+                        tupleset.ts_free(hts);
                         c.free(@ptrCast(hts));
                         break :fail;
                     }
@@ -2627,17 +2618,17 @@ pub export fn vm_propagate_deltas(db: ?*dl.DlDb) c_int {
                     if (hts.count > 0) {
                         permindex.permindex_mark_dirty(d, @intCast(cr.head_rel_id));
                         if (permindex.permindex_build_dirty(d) != 0) {
-                            ts_free(hts);
+                            tupleset.ts_free(hts);
                             c.free(@ptrCast(hts));
                             break :fail;
                         }
-                        ts_sort(hts);
+                        tupleset.ts_sort(hts);
 
                         if (qn == qcap) {
                             const nc: usize = if (qcap != 0) qcap *% 2 else 16;
                             const old: ?*anyopaque = if (queue) |q| @ptrCast(q) else null;
                             const nq = c.realloc(old, nc * @sizeOf(IvmWork)) orelse {
-                                ts_free(hts);
+                                tupleset.ts_free(hts);
                                 c.free(@ptrCast(hts));
                                 break :fail;
                             };
@@ -2648,13 +2639,13 @@ pub export fn vm_propagate_deltas(db: ?*dl.DlDb) c_int {
                         queue.?[qn].ts = hts;
                         qn += 1;
                     } else {
-                        ts_free(hts);
+                        tupleset.ts_free(hts);
                         c.free(@ptrCast(hts));
                     }
                 }
             }
 
-            ts_free(w.ts.?);
+            tupleset.ts_free(w.ts.?);
             c.free(@ptrCast(w.ts.?));
         }
 
@@ -2662,7 +2653,7 @@ pub export fn vm_propagate_deltas(db: ?*dl.DlDb) c_int {
     }
 
     while (qh < qn) {
-        ts_free(queue.?[qh].ts.?);
+        tupleset.ts_free(queue.?[qh].ts.?);
         c.free(@ptrCast(queue.?[qh].ts.?));
         qh += 1;
     }
@@ -2705,7 +2696,7 @@ pub export fn vm_clear_deletes(db: ?*dl.DlDb) void {
         const dp = d.del_pending[@intCast(i)];
         if (dp != null) {
             const tsp: *tupleset.tuple_set = @ptrCast(@alignCast(dp));
-            ts_free(tsp);
+            tupleset.ts_free(tsp);
             c.free(@ptrCast(tsp));
             d.del_pending[@intCast(i)] = null;
         }
@@ -2747,7 +2738,7 @@ pub export fn vm_dred_delete(db: ?*dl.DlDb) c_int {
     while (i < MAX_RELS) : (i += 1) {
         const dp = d.delta_pending[@intCast(i)];
         if (dp != null and tsFromPending(dp).?.count > 0) {
-            ts_sort(tsFromPending(dp));
+            tupleset.ts_sort(tsFromPending(dp));
             if (i < @as(c_int, @intCast(d.nrels))) changed[@intCast(i)] = 1;
             any_change = 1;
         }
@@ -2784,16 +2775,16 @@ pub export fn vm_dred_delete(db: ?*dl.DlDb) c_int {
         if (dtsp.count == 0) continue;
         const mem = c.malloc(@sizeOf(tupleset.tuple_set)) orelse break :out;
         const ts: *tupleset.tuple_set = @ptrCast(@alignCast(mem));
-        if (ts_init(ts, relation.rel_arity(d.rels[@intCast(i)].rel)) != 0) {
+        if (tupleset.ts_init(ts, relation.rel_arity(d.rels[@intCast(i)].rel)) != 0) {
             c.free(mem);
             over[@intCast(i)] = null;
             break :out;
         }
         var ci: c_long = 0;
         while (ci < dtsp.count) : (ci += 1) {
-            _ = ts_add(ts, dtsp.data.? + @as(usize, @intCast(ci)) * @as(usize, dtsp.arity));
+            _ = tupleset.ts_add(ts, dtsp.data.? + @as(usize, @intCast(ci)) * @as(usize, dtsp.arity));
         }
-        ts_sort(ts);
+        tupleset.ts_sort(ts);
         over[@intCast(i)] = ts;
     }
 
@@ -2874,12 +2865,12 @@ pub export fn vm_dred_delete(db: ?*dl.DlDb) c_int {
                     ov[0].ts = ob;
                     ov[0].perm_id = -1;
                     var cand: tupleset.tuple_set = undefined;
-                    if (ts_init(&cand, relation.rel_arity(d.rels[@intCast(hid)].rel)) != 0)
+                    if (tupleset.ts_init(&cand, relation.rel_arity(d.rels[@intCast(hid)].rel)) != 0)
                         break :out;
                     var ctx = CandCtx{ .ts = &cand };
                     const m = execRule(d, cr, &ov, 1, 1, candCb, &ctx);
                     if (m < 0) {
-                        ts_free(&cand);
+                        tupleset.ts_free(&cand);
                         break :out;
                     }
                     var ci: c_long = 0;
@@ -2887,35 +2878,35 @@ pub export fn vm_dred_delete(db: ?*dl.DlDb) c_int {
                         const t = cand.data.? + @as(usize, @intCast(ci)) * @as(usize, cand.arity);
                         if (over[@intCast(hid)] == null) {
                             const mem = c.malloc(@sizeOf(tupleset.tuple_set)) orelse {
-                                ts_free(&cand);
+                                tupleset.ts_free(&cand);
                                 break :out;
                             };
                             const hts: *tupleset.tuple_set = @ptrCast(@alignCast(mem));
-                            if (ts_init(hts, cand.arity) != 0) {
+                            if (tupleset.ts_init(hts, cand.arity) != 0) {
                                 c.free(mem);
                                 over[@intCast(hid)] = null;
-                                ts_free(&cand);
+                                tupleset.ts_free(&cand);
                                 break :out;
                             }
                             over[@intCast(hid)] = hts;
                         }
-                        const ar = ts_add(over[@intCast(hid)], t);
+                        const ar = tupleset.ts_add(over[@intCast(hid)], t);
                         if (ar < 0) {
-                            ts_free(&cand);
+                            tupleset.ts_free(&cand);
                             break :out;
                         }
                         if (ar == 1) again = 1;
                     }
-                    ts_free(&cand);
+                    tupleset.ts_free(&cand);
                     if (over[@intCast(hid)] != null and over[@intCast(hid)].?.count > 1)
-                        ts_sort(over[@intCast(hid)]);
+                        tupleset.ts_sort(over[@intCast(hid)]);
                 }
             }
         }
         i = 0;
         while (i < MAX_RELS) : (i += 1) {
             if (over[@intCast(i)] != null and over[@intCast(i)].?.count > 0)
-                ts_sort(over[@intCast(i)]);
+                tupleset.ts_sort(over[@intCast(i)]);
         }
     }
 
@@ -3008,7 +2999,7 @@ pub export fn vm_dred_delete(db: ?*dl.DlDb) c_int {
     i = 0;
     while (i < MAX_RELS) : (i += 1) {
         if (over[@intCast(i)]) |ts| {
-            ts_free(ts);
+            tupleset.ts_free(ts);
             c.free(@ptrCast(ts));
         }
     }
@@ -3316,7 +3307,7 @@ fn aggMaintainRule(db: *dl.DlDb, cr: *const compiler.compiled_rule) c_int {
         return aggUpdateGroup(db, cr, null);
     }
 
-    if (ts_init(&groups, @intCast(n_key)) != 0) return -1;
+    if (tupleset.ts_init(&groups, @intCast(n_key)) != 0) return -1;
 
     which = 0;
     while (which < 2) : (which += 1) {
@@ -3327,28 +3318,28 @@ fn aggMaintainRule(db: *dl.DlDb, cr: *const compiler.compiled_rule) c_int {
         gi = 0;
         while (gi < tsp.count) : (gi += 1) {
             const t = tsp.data.? + @as(usize, @intCast(gi)) * @as(usize, tsp.arity);
-            if (ts_add(&groups, t) < 0) {
-                ts_free(&groups);
+            if (tupleset.ts_add(&groups, t) < 0) {
+                tupleset.ts_free(&groups);
                 return -1;
             }
         }
     }
 
     if (groups.count == 0) {
-        ts_free(&groups);
+        tupleset.ts_free(&groups);
         return 0;
     }
-    ts_sort(&groups);
+    tupleset.ts_sort(&groups);
 
     gi = 0;
     while (gi < groups.count) : (gi += 1) {
         const g = groups.data.? + @as(usize, @intCast(gi)) * @as(usize, groups.arity);
         if (aggUpdateGroup(db, cr, g) != 0) {
-            ts_free(&groups);
+            tupleset.ts_free(&groups);
             return -1;
         }
     }
-    ts_free(&groups);
+    tupleset.ts_free(&groups);
     return 0;
 }
 

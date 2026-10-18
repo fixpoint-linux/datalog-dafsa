@@ -174,7 +174,7 @@ fn ts_sort_rows(data: [*]u32, arity: u8, n_rows: usize) void {
 // ─── Public API ───────────────────────────────────────────────────────────
 
 /// int ts_init(tuple_set *ts, uint8_t arity) — arity 1..8.
-export fn ts_init(ts: ?*tuple_set, arity: u8) c_int {
+pub export fn ts_init(ts: ?*tuple_set, arity: u8) c_int {
     const t = ts orelse return -1;
     if (arity == 0 or arity > 8) return -1;
     t.* = std.mem.zeroes(tuple_set);
@@ -183,7 +183,7 @@ export fn ts_init(ts: ?*tuple_set, arity: u8) c_int {
 }
 
 /// void ts_free(tuple_set *ts)
-export fn ts_free(ts: ?*tuple_set) void {
+pub export fn ts_free(ts: ?*tuple_set) void {
     const t = ts orelse return;
     if (t.data) |d| c.free(@ptrCast(d));
     if (t.htab) |h| c.free(@ptrCast(h));
@@ -192,7 +192,7 @@ export fn ts_free(ts: ?*tuple_set) void {
 
 /// int ts_contains(const tuple_set *ts, const uint32_t *cols)
 /// O(1) membership test via hash set.  1 if present, 0 if absent.
-export fn ts_contains(ts: ?*const tuple_set, cols: ?[*]const u32) c_int {
+pub export fn ts_contains(ts: ?*const tuple_set, cols: ?[*]const u32) c_int {
     const t = ts orelse return 0;
     const cols_p = cols orelse return 0;
     if (t.count == 0) return 0;
@@ -201,7 +201,7 @@ export fn ts_contains(ts: ?*const tuple_set, cols: ?[*]const u32) c_int {
 
 /// int ts_add(tuple_set *ts, const uint32_t *cols)
 /// Returns 1 if added (new), 0 if duplicate, -1 on error.
-export fn ts_add(ts: ?*tuple_set, cols: ?[*]const u32) c_int {
+pub export fn ts_add(ts: ?*tuple_set, cols: ?[*]const u32) c_int {
     const t = ts orelse return -1;
     const cols_p = cols orelse return -1;
 
@@ -247,7 +247,7 @@ export fn ts_add(ts: ?*tuple_set, cols: ?[*]const u32) c_int {
 /// Binary search for the contiguous range of tuples whose leading k columns
 /// equal p[0..k-1].  Returns the match count; sets first_idx_out[0].
 /// The array MUST be sorted (call ts_sort first).
-export fn ts_prefix(ts: ?*const tuple_set, p: ?[*]const u32, k: u8, first_idx_out: ?[*]c_long) c_long {
+pub export fn ts_prefix(ts: ?*const tuple_set, p: ?[*]const u32, k: u8, first_idx_out: ?[*]c_long) c_long {
     if (first_idx_out) |out| out[0] = 0;
     const t = ts orelse return 0;
     const p_p = p orelse return 0;
@@ -326,7 +326,7 @@ export fn ts_prefix(ts: ?*const tuple_set, p: ?[*]const u32, k: u8, first_idx_ou
 
 /// void ts_sort(tuple_set *ts) — sort rows and dedup (safety net), then
 /// rebuild the hash table (positions changed after sort+dedup).
-export fn ts_sort(ts: ?*tuple_set) void {
+pub export fn ts_sort(ts: ?*tuple_set) void {
     const t = ts orelse return;
     if (t.count <= 1 or t.arity == 0) return;
     const ar = t.arity;
@@ -374,7 +374,7 @@ export fn ts_sort(ts: ?*tuple_set) void {
 }
 
 /// void ts_reset(tuple_set *ts) — reset to empty, keeping allocated capacity.
-export fn ts_reset(ts: ?*tuple_set) void {
+pub export fn ts_reset(ts: ?*tuple_set) void {
     const t = ts orelse return;
     t.count = 0;
     if (t.htab) |htab| {

@@ -33,50 +33,24 @@ const tupleset = @import("tupleset.zig");
 const magic = @import("magic.zig");
 const relation = @import("relation.zig");
 const dl = @import("dl.zig");
+const vm = @import("vm.zig");
 
 const vm_instr = compiler.vm_instr;
 const compiled_rule = compiler.compiled_rule;
 const tuple_set = tupleset.tuple_set;
 const DlTupleCb = relation.RelEnumCb;
 
-// vm_exec_rule is vm.zig's `pub export fn`.  It stays on the extern path
-// because `vm_override` is duplicated here (byte-identical to vm.zig's) and
-// unifying the two would force a cast or a deleted declaration.
-extern "c" fn vm_exec_rule(
-    db: ?*dl.DlDb,
-    cr: ?*const compiler.compiled_rule,
-    ov: ?[*]const vm_override,
-    n_ov: c_int,
-    dry: c_int,
-    cb: DlTupleCb,
-    user: ?*anyopaque,
-) c_long;
-
-// tuple_set ops are `export fn`s in tupleset.zig — reach them through raw
-// extern bindings, exactly like vm.zig does.
-extern "c" fn ts_init(ts: ?*tuple_set, arity: u8) c_int;
-extern "c" fn ts_free(ts: ?*tuple_set) void;
-extern "c" fn ts_add(ts: ?*tuple_set, cols: ?[*]const u32) c_int;
-extern "c" fn ts_sort(ts: ?*tuple_set) void;
-
-/// typedef struct { int body_idx; const tuple_set *ts; int perm_id; }
-/// vm_override (vm.h:38-42) — byte-identical to vm.zig's definition.
-pub const vm_override = extern struct {
-    body_idx: c_int,
-    ts: ?*const tuple_set,
-    perm_id: c_int,
-};
-
 comptime {
+    // vm_override (vm.h:38-42) is vm.zig's type — there is no local copy.
     // { int; const tuple_set *; int } — the C layout is pointer-width
     // dependent: 24 bytes with ts@8/perm_id@16 on LP64, 12 bytes with ts@4/
     // perm_id@8 on ILP32.  Pin the width's own numbers rather than the LP64
-    // ones (both vm.zig and topdown.zig declare this type; each pins itself).
+    // ones.
     const lp64 = @sizeOf(usize) == 8;
-    std.debug.assert(@sizeOf(vm_override) == (if (lp64) 24 else 12));
-    std.debug.assert(@offsetOf(vm_override, "body_idx") == 0);
-    std.debug.assert(@offsetOf(vm_override, "ts") == (if (lp64) 8 else 4));
-    std.debug.assert(@offsetOf(vm_override, "perm_id") == (if (lp64) 16 else 8));
+    std.debug.assert(@sizeOf(vm.vm_override) == (if (lp64) 24 else 12));
+    std.debug.assert(@offsetOf(vm.vm_override, "body_idx") == 0);
+    std.debug.assert(@offsetOf(vm.vm_override, "ts") == (if (lp64) 8 else 4));
+    std.debug.assert(@offsetOf(vm.vm_override, "perm_id") == (if (lp64) 16 else 8));
 }
 
 // ─── Constants ──────────────────────────────────────────────────────────────
@@ -247,11 +221,11 @@ fn buildVariants(cctx: *td_ctx, prog: *const magic.magic_program) c_int {
         }
         if (nb != v.nbound) return -1; // cross-check decls vs adorn
 
-        if (ts_init(&v.bound_set, v.nbound) != 0) return -1;
-        if (ts_init(&v.bound_new, v.nbound) != 0) return -1;
-        if (ts_init(&v.bound_late, v.nbound) != 0) return -1;
-        if (ts_init(&v.memo, v.arity) != 0) return -1;
-        if (ts_init(&v.delta, v.arity) != 0) return -1;
+        if (tupleset.ts_init(&v.bound_set, v.nbound) != 0) return -1;
+        if (tupleset.ts_init(&v.bound_new, v.nbound) != 0) return -1;
+        if (tupleset.ts_init(&v.bound_late, v.nbound) != 0) return -1;
+        if (tupleset.ts_init(&v.memo, v.arity) != 0) return -1;
+        if (tupleset.ts_init(&v.delta, v.arity) != 0) return -1;
         v.memo_sorted = 1;
     }
     return 0;
@@ -394,12 +368,12 @@ const collect_ctx = struct { ts: ?*tuple_set, err: c_int };
 fn collectCb(cols: [*c]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_int {
     const cx: *collect_ctx = @ptrCast(@alignCast(user orelse return 1));
     if (cx.ts.?.arity == 0) {
-        if (ts_init(cx.ts, arity) != 0) {
+        if (tupleset.ts_init(cx.ts, arity) != 0) {
             cx.err = 1;
             return 1;
         }
     }
-    if (ts_add(cx.ts, cols) < 0) {
+    if (tupleset.ts_add(cx.ts, cols) < 0) {
         cx.err = 1;
         return 1;
     }
@@ -411,7 +385,7 @@ fn collectCb(cols: [*c]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_i
 // path expects).  `out` must be zero-initialised.
 fn buildPermShadow(src: *const tuple_set, perm: [*c]const u8, arity: u8, out: *tuple_set) c_int {
     if (src.count == 0) return 0; // leave out empty (arity 0)
-    if (ts_init(out, arity) != 0) return -1;
+    if (tupleset.ts_init(out, arity) != 0) return -1;
     var row: [8]u32 = undefined;
     var i: c_long = 0;
     while (i < src.count) : (i += 1) {
@@ -420,12 +394,12 @@ fn buildPermShadow(src: *const tuple_set, perm: [*c]const u8, arity: u8, out: *t
         while (p < arity) : (p += 1) {
             row[@intCast(p)] = r[@as(usize, perm[@intCast(p)])];
         }
-        if (ts_add(out, &row) < 0) {
-            ts_free(out);
+        if (tupleset.ts_add(out, &row) < 0) {
+            tupleset.ts_free(out);
             return -1;
         }
     }
-    ts_sort(out);
+    tupleset.ts_sort(out);
     return 0;
 }
 
@@ -434,7 +408,7 @@ fn buildPermShadow(src: *const tuple_set, perm: [*c]const u8, arity: u8, out: *t
 fn fireRule(cctx: *td_ctx, ri: c_int, guard_ts: *const tuple_set, delta_body: c_int, delta_ts: ?*const tuple_set, out: *tuple_set) c_int {
     const m = &cctx.rmeta.?[@intCast(ri)];
     const cr = cctx.crules.?[@intCast(ri)];
-    var ov: [TD_MAX_OV]vm_override = undefined;
+    var ov: [TD_MAX_OV]vm.vm_override = undefined;
     var shadows: [TD_MAX_OV]tuple_set = undefined;
     var shadow_used: [TD_MAX_OV]c_int = undefined;
     var n_ov: c_int = 0;
@@ -467,7 +441,7 @@ fn fireRule(cctx: *td_ctx, ri: c_int, guard_ts: *const tuple_set, delta_body: c_
             if (buildPermShadow(src, perm, src.arity, sh) != 0) {
                 var t: c_int = 0;
                 while (t < n_ov) : (t += 1) {
-                    if (shadow_used[@intCast(t)] != 0) ts_free(&shadows[@intCast(t)]);
+                    if (shadow_used[@intCast(t)] != 0) tupleset.ts_free(&shadows[@intCast(t)]);
                 }
                 return -1;
             }
@@ -480,7 +454,7 @@ fn fireRule(cctx: *td_ctx, ri: c_int, guard_ts: *const tuple_set, delta_body: c_
             // OP_SCAN / OP_LOOKUP / OP_HASH_JOIN.  Only OP_LOOKUP reads via
             // ts_prefix and therefore needs the source SORTED.
             if (op == OP_LOOKUP and src == memo_ptr and cctx.variants.?[@intCast(Q)].memo_sorted == 0) {
-                ts_sort(&cctx.variants.?[@intCast(Q)].memo);
+                tupleset.ts_sort(&cctx.variants.?[@intCast(Q)].memo);
                 cctx.variants.?[@intCast(Q)].memo_sorted = 1;
             }
             ov[@intCast(n_ov)].body_idx = j;
@@ -490,11 +464,11 @@ fn fireRule(cctx: *td_ctx, ri: c_int, guard_ts: *const tuple_set, delta_body: c_
         }
     }
 
-    const rc = vm_exec_rule(cctx.edb, cr, &ov, n_ov, 1, collectCb, &cx);
+    const rc = vm.vm_exec_rule(cctx.edb, cr, &ov, n_ov, 1, collectCb, &cx);
 
     var t: c_int = 0;
     while (t < n_ov) : (t += 1) {
-        if (shadow_used[@intCast(t)] != 0) ts_free(&shadows[@intCast(t)]);
+        if (shadow_used[@intCast(t)] != 0) tupleset.ts_free(&shadows[@intCast(t)]);
     }
     if (cx.err != 0 or rc < 0) return -1;
     return 0;
@@ -509,11 +483,11 @@ fn mergeInto(cctx: *td_ctx, V: c_int, out: *const tuple_set) c_int {
     var i: c_long = 0;
     while (i < out.count) : (i += 1) {
         const t = out.data.? + @as(usize, @intCast(i)) * @as(usize, out.arity);
-        const r = ts_add(&var_.memo, t);
+        const r = tupleset.ts_add(&var_.memo, t);
         if (r < 0) return -1;
         if (r == 1) {
             added = 1;
-            if (ts_add(&var_.delta, t) < 0) return -1;
+            if (tupleset.ts_add(&var_.delta, t) < 0) return -1;
         }
     }
     if (added != 0) var_.memo_sorted = 0;
@@ -525,11 +499,11 @@ fn mergeInto(cctx: *td_ctx, V: c_int, out: *const tuple_set) c_int {
 
 fn addBound(cctx: *td_ctx, Q: c_int, t: [*]const u32) c_int {
     const var_ = &cctx.variants.?[@intCast(Q)];
-    const r = ts_add(&var_.bound_set, t);
+    const r = tupleset.ts_add(&var_.bound_set, t);
     if (r < 0) return -1;
     if (r == 1) {
-        if (ts_add(&var_.bound_new, t) < 0) return -1;
-        if (cctx.in_phase_b != 0 and ts_add(&var_.bound_late, t) < 0) return -1;
+        if (tupleset.ts_add(&var_.bound_new, t) < 0) return -1;
+        if (cctx.in_phase_b != 0 and tupleset.ts_add(&var_.bound_late, t) < 0) return -1;
         if (enqueueBound(cctx, Q) != 0) return -1;
     }
     return 0;
@@ -556,18 +530,18 @@ fn initVariant(cctx: *td_ctx, V: c_int) c_int {
         if (cctx.rmeta.?[@intCast(ri)].has_idb_body != 0) continue;
         var out = std.mem.zeroes(tuple_set);
         if (fireRule(cctx, ri, &nb, -1, null, &out) != 0) {
-            ts_free(&out);
-            ts_free(&nl);
-            ts_free(&nb);
+            tupleset.ts_free(&out);
+            tupleset.ts_free(&nl);
+            tupleset.ts_free(&nb);
             return -1;
         }
         if (mergeInto(cctx, V, &out) != 0) {
-            ts_free(&out);
-            ts_free(&nl);
-            ts_free(&nb);
+            tupleset.ts_free(&out);
+            tupleset.ts_free(&nl);
+            tupleset.ts_free(&nb);
             return -1;
         }
-        ts_free(&out);
+        tupleset.ts_free(&out);
     }
 
     // Late-join: bounds discovered during Phase B may have had their child
@@ -580,18 +554,18 @@ fn initVariant(cctx: *td_ctx, V: c_int) c_int {
             if (cctx.rmeta.?[@intCast(ri)].has_idb_body == 0) continue;
             var out = std.mem.zeroes(tuple_set);
             if (fireRule(cctx, ri, &nl, -1, null, &out) != 0) {
-                ts_free(&out);
-                ts_free(&nl);
-                ts_free(&nb);
+                tupleset.ts_free(&out);
+                tupleset.ts_free(&nl);
+                tupleset.ts_free(&nb);
                 return -1;
             }
             if (mergeInto(cctx, V, &out) != 0) {
-                ts_free(&out);
-                ts_free(&nl);
-                ts_free(&nb);
+                tupleset.ts_free(&out);
+                tupleset.ts_free(&nl);
+                tupleset.ts_free(&nb);
                 return -1;
             }
-            ts_free(&out);
+            tupleset.ts_free(&out);
         }
     }
 
@@ -602,26 +576,26 @@ fn initVariant(cctx: *td_ctx, V: c_int) c_int {
         const Q = cctx.rmeta.?[@intCast(ri)].head_variant;
         var out = std.mem.zeroes(tuple_set);
         if (fireRule(cctx, ri, &nb, -1, null, &out) != 0) {
-            ts_free(&out);
-            ts_free(&nl); // (oracle omits this — leak on error path; freed for hygiene)
-            ts_free(&nb);
+            tupleset.ts_free(&out);
+            tupleset.ts_free(&nl); // (oracle omits this — leak on error path; freed for hygiene)
+            tupleset.ts_free(&nb);
             return -1;
         }
         var i: c_long = 0;
         while (i < out.count) : (i += 1) {
             const t = out.data.? + @as(usize, @intCast(i)) * @as(usize, out.arity);
             if (addBound(cctx, Q, t) != 0) {
-                ts_free(&out);
-                ts_free(&nl);
-                ts_free(&nb);
+                tupleset.ts_free(&out);
+                tupleset.ts_free(&nl);
+                tupleset.ts_free(&nb);
                 return -1;
             }
         }
-        ts_free(&out);
+        tupleset.ts_free(&out);
     }
 
-    ts_free(&nl);
-    ts_free(&nb);
+    tupleset.ts_free(&nl);
+    tupleset.ts_free(&nb);
     return 0;
 }
 
@@ -634,7 +608,7 @@ fn propagateDelta(cctx: *td_ctx, V: c_int) c_int {
     var cur = var_.delta; // take ownership
     var_.delta = std.mem.zeroes(tuple_set);
     var_.delta.arity = var_.arity; // keep arity: ts_add re-allocs data
-    if (cur.arity > 0) ts_sort(&cur);
+    if (cur.arity > 0) tupleset.ts_sort(&cur);
 
     const cv = &cctx.consumers.?[@intCast(V)];
     var k: c_int = 0;
@@ -648,8 +622,8 @@ fn propagateDelta(cctx: *td_ctx, V: c_int) c_int {
 
         var out = std.mem.zeroes(tuple_set);
         if (fireRule(cctx, ri, &pvar.bound_set, body, &cur, &out) != 0) {
-            ts_free(&out);
-            ts_free(&cur);
+            tupleset.ts_free(&out);
+            tupleset.ts_free(&cur);
             return -1;
         }
 
@@ -659,22 +633,22 @@ fn propagateDelta(cctx: *td_ctx, V: c_int) c_int {
             while (i < out.count) : (i += 1) {
                 const t = out.data.? + @as(usize, @intCast(i)) * @as(usize, out.arity);
                 if (addBound(cctx, Q, t) != 0) {
-                    ts_free(&out);
-                    ts_free(&cur);
+                    tupleset.ts_free(&out);
+                    tupleset.ts_free(&cur);
                     return -1;
                 }
             }
         } else {
             if (mergeInto(cctx, parent, &out) != 0) {
-                ts_free(&out);
-                ts_free(&cur);
+                tupleset.ts_free(&out);
+                tupleset.ts_free(&cur);
                 return -1;
             }
         }
-        ts_free(&out);
+        tupleset.ts_free(&out);
     }
 
-    ts_free(&cur);
+    tupleset.ts_free(&cur);
 
     // self-recursion may have re-grown delta[V] during this pass
     if (var_.delta.count > 0) {
@@ -721,11 +695,11 @@ fn tdFree(cctx: *td_ctx) void {
             const v = &vars[@intCast(i)];
             c.free(@ptrCast(v.adorned_rules));
             c.free(@ptrCast(v.magic_rules));
-            ts_free(&v.bound_set);
-            ts_free(&v.bound_new);
-            ts_free(&v.bound_late);
-            ts_free(&v.memo);
-            ts_free(&v.delta);
+            tupleset.ts_free(&v.bound_set);
+            tupleset.ts_free(&v.bound_new);
+            tupleset.ts_free(&v.bound_late);
+            tupleset.ts_free(&v.memo);
+            tupleset.ts_free(&v.delta);
         }
         c.free(@ptrCast(vars));
     }
@@ -793,7 +767,7 @@ pub export fn td_eval(
     // bound; the per-position check is a defensive no-op)
     const gv = &cctx.variants.?[@intCast(goal_variant_id)];
     if (gv.memo_sorted == 0) {
-        ts_sort(&gv.memo);
+        tupleset.ts_sort(&gv.memo);
         gv.memo_sorted = 1;
     }
     result = 0;
@@ -850,9 +824,9 @@ fn testAddFacts(db: *dl.DlDb, rel: [*:0]const u8, cols: []const u32, ar: u8, n: 
 fn testCollectCb(cols: [*c]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_int {
     const ts: *tuple_set = @ptrCast(@alignCast(user orelse return 1));
     if (ts.arity == 0) {
-        if (ts_init(ts, arity) != 0) return 1;
+        if (tupleset.ts_init(ts, arity) != 0) return 1;
     }
-    if (ts_add(ts, cols) < 0) return 1;
+    if (tupleset.ts_add(ts, cols) < 0) return 1;
     return 0;
 }
 
@@ -872,13 +846,13 @@ test "td_eval: cyclic TC matches the full-fixpoint magic oracle" {
     const rc2 = dl.dl_query_magic_adorn(db, "tc", "bf", @ptrCast(&vals), 1, testCollectCb, &b);
     try testing.expect(rc1 > 0);
     try testing.expectEqual(rc2, rc1);
-    ts_sort(&a);
-    ts_sort(&b);
+    tupleset.ts_sort(&a);
+    tupleset.ts_sort(&b);
     try testing.expectEqual(@as(c_long, a.count), b.count);
     if (a.count > 0) {
         const n = @as(usize, @intCast(a.count)) * @as(usize, a.arity);
         try testing.expect(std.mem.eql(u32, a.data.?[0..n], b.data.?[0..n]));
     }
-    ts_free(&a);
-    ts_free(&b);
+    tupleset.ts_free(&a);
+    tupleset.ts_free(&b);
 }

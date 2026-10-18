@@ -18,12 +18,6 @@ const relation = @import("relation.zig");
 const tupleset = @import("tupleset.zig");
 const dl = @import("dl.zig");
 
-// ts_* are `export fn`s in tupleset.zig (C ABI); link against them directly.
-extern "c" fn ts_init(ts: ?*tupleset.tuple_set, arity: u8) c_int;
-extern "c" fn ts_free(ts: ?*tupleset.tuple_set) void;
-extern "c" fn ts_add(ts: ?*tupleset.tuple_set, cols: ?[*]const u32) c_int;
-extern "c" fn ts_sort(ts: ?*tupleset.tuple_set) void;
-
 /// Publish-gate helper: install `rev` as a freshly re-created perm-index
 /// Relation's rev counter (see the rev_carry comment in permindex_build).
 /// Callers pass the value the rebuilt object must carry; sites with NO
@@ -80,10 +74,10 @@ pub export fn permindex_build(db: ?*dl.DlDb, rel_id: c_int, perm_id: c_int) c_in
 
     // Collect base facts
     var ts: tupleset.tuple_set = undefined;
-    if (ts_init(&ts, ar) != 0) return -1;
+    if (tupleset.ts_init(&ts, ar) != 0) return -1;
 
     if (relation.rel_prefix(base_rel, null, 0, relation.ts_sink_cb, &ts) < 0) {
-        ts_free(&ts);
+        tupleset.ts_free(&ts);
         return -1;
     }
 
@@ -98,7 +92,7 @@ pub export fn permindex_build(db: ?*dl.DlDb, rel_id: c_int, perm_id: c_int) c_in
         // tcache reuses the freed chunk's address.
         pidxRevSeed(pe.*.pidx_rel, rev_carry +% 1);
         pe.*.dirty = 0;
-        ts_free(&ts);
+        tupleset.ts_free(&ts);
         return 0;
     }
 
@@ -106,8 +100,8 @@ pub export fn permindex_build(db: ?*dl.DlDb, rel_id: c_int, perm_id: c_int) c_in
     {
         var pts: tupleset.tuple_set = undefined;
 
-        if (ts_init(&pts, ar) != 0) {
-            ts_free(&ts);
+        if (tupleset.ts_init(&pts, ar) != 0) {
+            tupleset.ts_free(&ts);
             return -1;
         }
 
@@ -118,18 +112,18 @@ pub export fn permindex_build(db: ?*dl.DlDb, rel_id: c_int, perm_id: c_int) c_in
             var j: usize = 0;
             while (j < ar) : (j += 1)
                 prow[j] = row[pe.*.perm[j]];
-            _ = ts_add(&pts, &prow);
+            _ = tupleset.ts_add(&pts, &prow);
         }
 
         // Sort and bulk-build minimal DAFSA
-        ts_sort(&pts);
+        tupleset.ts_sort(&pts);
 
         if (pe.*.pidx_rel) |old| relation.rel_free(old);
 
         pe.*.pidx_rel = relation.rel_create(ar);
         if (pe.*.pidx_rel == null) {
-            ts_free(&pts);
-            ts_free(&ts);
+            tupleset.ts_free(&pts);
+            tupleset.ts_free(&ts);
             return -1;
         }
         // Seed BEFORE the build bump: final rev = rev_carry + 1 (build),
@@ -139,15 +133,15 @@ pub export fn permindex_build(db: ?*dl.DlDb, rel_id: c_int, perm_id: c_int) c_in
         if (relation.rel_build_from_tupleset(pe.*.pidx_rel, &pts) != 0) {
             relation.rel_free(pe.*.pidx_rel);
             pe.*.pidx_rel = null;
-            ts_free(&pts);
-            ts_free(&ts);
+            tupleset.ts_free(&pts);
+            tupleset.ts_free(&ts);
             return -1;
         }
 
-        ts_free(&pts);
+        tupleset.ts_free(&pts);
     }
 
-    ts_free(&ts);
+    tupleset.ts_free(&ts);
     pe.*.dirty = 0;
     return 0;
 }

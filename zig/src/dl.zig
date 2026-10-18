@@ -368,13 +368,6 @@ const SAVED_REV_NONE: u64 = std.math.maxInt(u64);
 // ─── Ported-module extern bindings (callees whose db type is a private ────
 // ─── @cImport'd dl_db, or whose module-private types are opaque) ────────────
 
-// tupleset.zig (export fn, not pub) — reached via raw extern like relation.zig.
-extern "c" fn ts_init(ts: ?*tupleset.tuple_set, arity: u8) c_int;
-extern "c" fn ts_free(ts: ?*tupleset.tuple_set) void;
-extern "c" fn ts_contains(ts: ?*const tupleset.tuple_set, cols: ?[*]const u32) c_int;
-extern "c" fn ts_add(ts: ?*tupleset.tuple_set, cols: ?[*]const u32) c_int;
-extern "c" fn ts_sort(ts: ?*tupleset.tuple_set) void;
-
 // intern.zig (Interner is module-private) — bind with anyopaque handles.
 extern "c" fn intern_free(ir: ?*anyopaque) void;
 extern "c" fn intern_str_find(ir: ?*anyopaque, str: [*c]const u8) u32;
@@ -1504,7 +1497,7 @@ fn dlLoadFactsVariadic(db: *DlDb, idx: usize, rel_name: [*c]const u8, csv_path: 
                     _ = c.fclose(f);
                     var aa: c_int = 1;
                     while (aa <= MAX_VAR_ARITY) : (aa += 1) {
-                        if (have[@intCast(aa)] != 0) ts_free(&ts[@intCast(aa)]);
+                        if (have[@intCast(aa)] != 0) tupleset.ts_free(&ts[@intCast(aa)]);
                     }
                     return rc;
                 }
@@ -1515,12 +1508,12 @@ fn dlLoadFactsVariadic(db: *DlDb, idx: usize, rel_name: [*c]const u8, csv_path: 
 
         if (have[@intCast(nf)] == 0) {
             const vr = vrelation.vrel_variant_or_null(e.vrel, @intCast(nf));
-            if (ts_init(&ts[@intCast(nf)], @intCast(nf)) != 0) break;
+            if (tupleset.ts_init(&ts[@intCast(nf)], @intCast(nf)) != 0) break;
             have[@intCast(nf)] = 1;
             if (vr != null and relation.rel_prefix_base(vr, null, 0, relation.ts_sink_cb, &ts[@intCast(nf)]) < 0) break;
         }
         {
-            const trc = ts_add(&ts[@intCast(nf)], &cols);
+            const trc = tupleset.ts_add(&ts[@intCast(nf)], &cols);
             if (trc < 0) break;
             if (trc == 1) n_new += 1;
         }
@@ -1538,7 +1531,7 @@ fn dlLoadFactsVariadic(db: *DlDb, idx: usize, rel_name: [*c]const u8, csv_path: 
                 _ = c.fclose(f);
                 var aa: c_int = 1;
                 while (aa <= MAX_VAR_ARITY) : (aa += 1) {
-                    if (have[@intCast(aa)] != 0) ts_free(&ts[@intCast(aa)]);
+                    if (have[@intCast(aa)] != 0) tupleset.ts_free(&ts[@intCast(aa)]);
                 }
                 return rc;
             }
@@ -1557,7 +1550,7 @@ fn dlLoadFactsVariadic(db: *DlDb, idx: usize, rel_name: [*c]const u8, csv_path: 
                 _ = c.fclose(f);
                 var aa: c_int = 1;
                 while (aa <= MAX_VAR_ARITY) : (aa += 1) {
-                    if (have[@intCast(aa)] != 0) ts_free(&ts[@intCast(aa)]);
+                    if (have[@intCast(aa)] != 0) tupleset.ts_free(&ts[@intCast(aa)]);
                 }
                 return rc;
             }
@@ -1573,7 +1566,7 @@ fn dlLoadFactsVariadic(db: *DlDb, idx: usize, rel_name: [*c]const u8, csv_path: 
         const vr = variadicOpenVariant(db, e, @intCast(a));
         if (vr == null) break;
 
-        ts_sort(&ts[@intCast(a)]);
+        tupleset.ts_sort(&ts[@intCast(a)]);
         if (relation.rel_build_base_from_tupleset(vr, &ts[@intCast(a)]) != 0) break;
         loaded += ts[@intCast(a)].count;
 
@@ -1600,7 +1593,7 @@ fn dlLoadFactsVariadic(db: *DlDb, idx: usize, rel_name: [*c]const u8, csv_path: 
     _ = c.fclose(f);
     a = 1;
     while (a <= MAX_VAR_ARITY) : (a += 1) {
-        if (have[@intCast(a)] != 0) ts_free(&ts[@intCast(a)]);
+        if (have[@intCast(a)] != 0) tupleset.ts_free(&ts[@intCast(a)]);
     }
     return rc;
 }
@@ -1620,13 +1613,13 @@ fn ivmCaptureDelta(db: *DlDb, rel_id: c_int, cols: [*c]const u32, arity: u8) c_i
     if (ts_p == null) {
         const m = c.malloc(@sizeOf(tupleset.tuple_set)) orelse return -1;
         ts_p = @ptrCast(@alignCast(m));
-        if (ts_init(ts_p, arity) != 0) {
+        if (tupleset.ts_init(ts_p, arity) != 0) {
             c.free(m);
             return -1;
         }
         db.delta_pending[@intCast(rel_id)] = ts_p;
     }
-    const rc = ts_add(ts_p, cols);
+    const rc = tupleset.ts_add(ts_p, cols);
     return if (rc < 0) -1 else 0;
 }
 
@@ -1636,13 +1629,13 @@ fn ivmCaptureDelete(db: *DlDb, rel_id: c_int, cols: [*c]const u32, arity: u8) c_
     if (ts_p == null) {
         const m = c.malloc(@sizeOf(tupleset.tuple_set)) orelse return -1;
         ts_p = @ptrCast(@alignCast(m));
-        if (ts_init(ts_p, arity) != 0) {
+        if (tupleset.ts_init(ts_p, arity) != 0) {
             c.free(m);
             return -1;
         }
         db.del_pending[@intCast(rel_id)] = ts_p;
     }
-    const rc = ts_add(ts_p, cols);
+    const rc = tupleset.ts_add(ts_p, cols);
     return if (rc < 0) -1 else 0;
 }
 
@@ -1664,20 +1657,20 @@ pub export fn dl_load_facts(db: ?*DlDb, rel_name: [*c]const u8, csv_path: [*c]co
 
     var ts: tupleset.tuple_set = undefined;
     var delta: tupleset.tuple_set = undefined;
-    if (ts_init(&ts, arity) != 0) {
+    if (tupleset.ts_init(&ts, arity) != 0) {
         _ = c.fclose(f);
         return -1;
     }
-    if (ts_init(&delta, arity) != 0) {
-        ts_free(&ts);
+    if (tupleset.ts_init(&delta, arity) != 0) {
+        tupleset.ts_free(&ts);
         _ = c.fclose(f);
         return -1;
     }
 
     // Union the relation's pre-existing BASE into ts.
     if (relation.rel_prefix_base(d.rels[@intCast(idx)].rel, null, 0, relation.ts_sink_cb, &ts) < 0) {
-        ts_free(&ts);
-        ts_free(&delta);
+        tupleset.ts_free(&ts);
+        tupleset.ts_free(&delta);
         _ = c.fclose(f);
         return -1;
     }
@@ -1738,8 +1731,8 @@ pub export fn dl_load_facts(db: ?*DlDb, rel_name: [*c]const u8, csv_path: [*c]co
                 if (kn < 0) {
                     dlErr("error: {s}:{d}: mixed int/symbol values in column {d} of {s}\n", .{ csv_path, lineno, i + 1, rel_name });
                     loadKindRollback(d, load_rel, &new_cols, arity, meta_dirty_before);
-                    ts_free(&ts);
-                    ts_free(&delta);
+                    tupleset.ts_free(&ts);
+                    tupleset.ts_free(&delta);
                     _ = c.fclose(f);
                     if (line) |lp| c.free(@ptrCast(lp));
                     return -1;
@@ -1749,8 +1742,8 @@ pub export fn dl_load_facts(db: ?*DlDb, rel_name: [*c]const u8, csv_path: [*c]co
                 const sym = intern_str(d.ir, fields[@intCast(i)]);
                 if (sym == 0) {
                     loadKindRollback(d, load_rel, &new_cols, arity, meta_dirty_before);
-                    ts_free(&ts);
-                    ts_free(&delta);
+                    tupleset.ts_free(&ts);
+                    tupleset.ts_free(&delta);
                     _ = c.fclose(f);
                     if (line) |lp| c.free(@ptrCast(lp));
                     return -1;
@@ -1760,8 +1753,8 @@ pub export fn dl_load_facts(db: ?*DlDb, rel_name: [*c]const u8, csv_path: [*c]co
                 if (kn < 0) {
                     dlErr("error: {s}:{d}: mixed int/symbol values in column {d} of {s}\n", .{ csv_path, lineno, i + 1, rel_name });
                     loadKindRollback(d, load_rel, &new_cols, arity, meta_dirty_before);
-                    ts_free(&ts);
-                    ts_free(&delta);
+                    tupleset.ts_free(&ts);
+                    tupleset.ts_free(&delta);
                     _ = c.fclose(f);
                     if (line) |lp| c.free(@ptrCast(lp));
                     return -1;
@@ -1771,18 +1764,18 @@ pub export fn dl_load_facts(db: ?*DlDb, rel_name: [*c]const u8, csv_path: [*c]co
         }
 
         {
-            const rc = ts_add(&ts, &cols);
+            const rc = tupleset.ts_add(&ts, &cols);
             if (rc < 0) {
                 loadKindRollback(d, load_rel, &new_cols, arity, meta_dirty_before);
-                ts_free(&ts);
-                ts_free(&delta);
+                tupleset.ts_free(&ts);
+                tupleset.ts_free(&delta);
                 _ = c.fclose(f);
                 if (line) |lp| c.free(@ptrCast(lp));
                 return -1;
             }
             if (rc == 1) {
                 n_new += 1;
-                if (delta_failed == 0 and ts_add(&delta, &cols) < 0)
+                if (delta_failed == 0 and tupleset.ts_add(&delta, &cols) < 0)
                     delta_failed = 1; // OOM: fall back to full re-eval
             }
         }
@@ -1806,21 +1799,21 @@ pub export fn dl_load_facts(db: ?*DlDb, rel_name: [*c]const u8, csv_path: [*c]co
             // partial kind.  The facts live only in the transient ts
             // (discarded); the base was never rebuilt.
             loadKindRollback(d, load_rel, &new_cols, arity, meta_dirty_before);
-            ts_free(&ts);
-            ts_free(&delta);
+            tupleset.ts_free(&ts);
+            tupleset.ts_free(&delta);
             return -1;
         }
     }
 
-    ts_sort(&ts);
+    tupleset.ts_sort(&ts);
     if (relation.rel_build_base_from_tupleset(d.rels[@intCast(idx)].rel, &ts) != 0) {
-        ts_free(&ts);
-        ts_free(&delta);
+        tupleset.ts_free(&ts);
+        tupleset.ts_free(&delta);
         return -1;
     }
 
     loaded = @intCast(ts.count);
-    ts_free(&ts);
+    tupleset.ts_free(&ts);
 
     // M7: save interner BEFORE relation save.
     {
@@ -1830,7 +1823,7 @@ pub export fn dl_load_facts(db: ?*DlDb, rel_name: [*c]const u8, csv_path: [*c]co
             if (intern_save(d.ir, fwd_path.?, rev_path.?) != 0) {
                 if (fwd_path) |x| c.free(@ptrCast(x));
                 if (rev_path) |x| c.free(@ptrCast(x));
-                ts_free(&delta);
+                tupleset.ts_free(&delta);
                 return -1;
             }
         }
@@ -1844,7 +1837,7 @@ pub export fn dl_load_facts(db: ?*DlDb, rel_name: [*c]const u8, csv_path: [*c]co
         if (tpath != null) {
             if (term_save(d.terms, tpath.?) != 0) {
                 c.free(@ptrCast(tpath.?));
-                ts_free(&delta);
+                tupleset.ts_free(&delta);
                 return -1;
             }
             c.free(@ptrCast(tpath.?));
@@ -1876,7 +1869,7 @@ pub export fn dl_load_facts(db: ?*DlDb, rel_name: [*c]const u8, csv_path: [*c]co
                 }
             }
         }
-        ts_free(&delta);
+        tupleset.ts_free(&delta);
 
         d.fixpoint_dirty = 1;
 
@@ -1887,7 +1880,7 @@ pub export fn dl_load_facts(db: ?*DlDb, rel_name: [*c]const u8, csv_path: [*c]co
                 d.perms[@intCast(pi)].dirty = 1;
         }
     } else {
-        ts_free(&delta);
+        tupleset.ts_free(&delta);
     }
 
     return loaded;
@@ -3610,22 +3603,22 @@ fn relDeepcopyView(src: ?*const relation.Relation) ?*relation.Relation {
     const ar = relation.rel_arity(s);
     const dst = relation.rel_create(ar) orelse return null;
     var ts: tupleset.tuple_set = undefined;
-    if (ts_init(&ts, ar) != 0) {
+    if (tupleset.ts_init(&ts, ar) != 0) {
         relation.rel_free(dst);
         return null;
     }
     if (relation.rel_prefix(s, null, 0, relation.ts_sink_cb, &ts) < 0) {
-        ts_free(&ts);
+        tupleset.ts_free(&ts);
         relation.rel_free(dst);
         return null;
     }
-    ts_sort(&ts);
+    tupleset.ts_sort(&ts);
     if (relation.rel_build_from_tupleset(dst, &ts) != 0) {
-        ts_free(&ts);
+        tupleset.ts_free(&ts);
         relation.rel_free(dst);
         return null;
     }
-    ts_free(&ts);
+    tupleset.ts_free(&ts);
     return dst;
 }
 
@@ -4185,7 +4178,7 @@ pub export fn dl_query_magic_adorn(db: ?*DlDb, goal_rel: [*c]const u8, adorn: [*
 
         if (exec_rc != 0) {
             dlErr("dl_query_magic: scoped fixpoint failed\n", .{});
-            ts_free(&goal_ts);
+            tupleset.ts_free(&goal_ts);
             magic.magic_program_free(&prog);
             evalDbFreeOwned(&edb, n_aliased, &ZERO_OWNED);
             return -1;
@@ -4206,7 +4199,7 @@ pub export fn dl_query_magic_adorn(db: ?*DlDb, goal_rel: [*c]const u8, adorn: [*
                 if (magicFilterCb(tt, goal_ts.arity, &ctx) != 0) break;
             }
             result = ctx.matched;
-            ts_free(&goal_ts);
+            tupleset.ts_free(&goal_ts);
         } else {
             if (relation.rel_prefix(edb.rels[@intCast(a_idx)].rel, null, 0, magicFilterCb, &ctx) < 0)
                 result = -1
@@ -4247,7 +4240,7 @@ fn tcBfsEdgeCb(cols: ?[*]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c
     const w = cols.?[1];
     var emit: [2]u32 = undefined;
 
-    if (ts_contains(ctx.visited, @ptrCast(&w)) != 0) return 0; // already reached
+    if (tupleset.ts_contains(ctx.visited, @ptrCast(&w)) != 0) return 0; // already reached
 
     emit[0] = ctx.seed;
     emit[1] = w;
@@ -4257,7 +4250,7 @@ fn tcBfsEdgeCb(cols: ?[*]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c
         return 1;
     }
 
-    if (ts_add(ctx.visited, @ptrCast(&w)) != 1) {
+    if (tupleset.ts_add(ctx.visited, @ptrCast(&w)) != 1) {
         ctx.stop = 1;
         return 1;
     }
@@ -4384,7 +4377,7 @@ fn tcRecognizeBf(db: *DlDb, goal_rel: [*c]const u8, adorn: [*c]const u8, vals: ?
         var qhead: c_long = 0;
         var visited: tupleset.tuple_set = undefined;
 
-        if (ts_init(&visited, 1) != 0) return -1;
+        if (tupleset.ts_init(&visited, 1) != 0) return -1;
         var ctx = TcBfsCtx{
             .db = db,
             .edge_idx = edge_idx,
@@ -4399,7 +4392,7 @@ fn tcRecognizeBf(db: *DlDb, goal_rel: [*c]const u8, adorn: [*c]const u8, vals: ?
             .stop = 0,
         };
         ctx.queue = @ptrCast(@alignCast(c.malloc(@as(usize, @intCast(ctx.qcap)) * @sizeOf(u32)) orelse {
-            ts_free(&visited);
+            tupleset.ts_free(&visited);
             return -1;
         }));
 
@@ -4413,12 +4406,12 @@ fn tcRecognizeBf(db: *DlDb, goal_rel: [*c]const u8, adorn: [*c]const u8, vals: ?
             const n = relation.rel_prefix(db.rels[@intCast(edge_idx)].rel, @ptrCast(&u), 1, tcBfsEdgeCb, &ctx);
             if (n < 0) {
                 c.free(@ptrCast(ctx.queue));
-                ts_free(&visited);
+                tupleset.ts_free(&visited);
                 return -1;
             }
         }
         c.free(@ptrCast(ctx.queue));
-        ts_free(&visited);
+        tupleset.ts_free(&visited);
         return ctx.count;
     }
 }
