@@ -33,6 +33,12 @@
 //! so a publish between the liveness scan and the vector scan can never
 //! produce an inconsistent candidate set within a single mode.
 //!
+//! dl_vector_search_gated / _gated_version add ONE more membership test to the
+//! same body: a caller-supplied sym gate (the hybrid path's lexical entity
+//! set).  The rank set is then the top-k OF THE INTERSECTION — exact, with no
+//! k*multiplier truncation — and the unfiltered forms are that same body with
+//! no gate (behaviour unchanged).
+//!
 //! Strangler-hybrid ABI: `struct dl_vec_corpus` is a CONCRETE extern struct
 //! still constructed/dereferenced by C (the retained dl_cli oracle and the
 //! vector test suites), so it is defined here byte-identical to vector.h and
@@ -161,6 +167,47 @@ fn fsContains(s: *const VecFilterSet, sym: u32) bool {
 fn fsFree(s: *VecFilterSet) void {
     c.free(@ptrCast(s.d));
     s.* = .{ .col = s.col };
+}
+
+// ─── Optional caller-supplied sym gate ────────────────────────────────────
+
+/// A SECOND membership test alongside liveness: the caller passes the sym set
+/// it wants ranked (the hybrid path passes the lexical entity set), and the
+/// scan ranks only the intersection.  Passing the gate this way is what lets
+/// the intersection be exact at any k — the caller no longer has to pre-truncate
+/// the scan to k*multiplier and intersect afterwards.
+///
+/// `active == false` (NULL syms) is the unfiltered search: identical semantics
+/// to dl_vector_search.  `active == true, n == 0` is an EMPTY gate -> zero
+/// results, which is deliberately distinct from "no gate".
+///
+/// The caller's array is copied and sort+deduped once here, so the input may be
+/// unsorted and may repeat syms (the CLI's lexical hits can do both); the
+/// per-entity cost is then the same bsearch the liveness test already pays.
+const VecGate = struct {
+    set: VecFilterSet = .{ .col = 0 },
+    active: bool = false,
+
+    fn deinit(g: *VecGate) void {
+        if (g.active) fsFree(&g.set);
+    }
+};
+
+/// Build the gate from a caller array.  `null` syms -> inactive gate.  Returns
+/// null on OOM (the caller reports the same error a scan failure would).
+fn gateBuild(syms: ?[*]const u32, n_syms: usize) ?VecGate {
+    var g = VecGate{};
+    if (syms == null) return g;
+    g.active = true;
+    if (n_syms == 0) return g;
+    const raw = c.malloc(n_syms * @sizeOf(u32)) orelse return null;
+    const d: [*]u32 = @ptrCast(@alignCast(raw));
+    @memcpy(d[0..n_syms], syms.?[0..n_syms]);
+    g.set.d = d;
+    g.set.n = n_syms;
+    g.set.cap = n_syms;
+    fsSortDedup(&g.set);
+    return g;
 }
 
 // ─── Mode dispatch read primitive ────────────────────────────────────────
@@ -295,13 +342,18 @@ const noopCb = struct {
 
 // ─── Shared search body (LIVE / VERSION differ only in the read primitive) ──
 
-fn vectorSearchImpl(rd: *const VecReader, corpus: *const DlVecCorpus, q_in: ?[*]const u32, k: c_int, cb: DlVecCb, user: ?*anyopaque) c_long {
+fn vectorSearchImpl(rd: *const VecReader, corpus: *const DlVecCorpus, q_in: ?[*]const u32, gate_syms: ?[*]const u32, n_gate: usize, k: c_int, cb: DlVecCb, user: ?*anyopaque) c_long {
     var err = false;
 
     if (rd.db == null or q_in == null or k <= 0 or cb == null) return -1;
 
     var q: [VEC_D]i32 = undefined;
     unpackQuery(q_in.?, &q);
+
+    // The gate is built BEFORE the scan so an OOM is reported like any other
+    // search failure rather than as a silently empty result.
+    var gate = gateBuild(gate_syms, n_gate) orelse return -1;
+    defer gate.deinit();
 
     // Relation-existence probe: a version (or a live store) WITHOUT the vec
     // relation is an error, not an empty result.  leading=[0] touches no row
@@ -340,6 +392,9 @@ fn vectorSearchImpl(rd: *const VecReader, corpus: *const DlVecCorpus, q_in: ?[*]
     var it = acc.iterator();
     while (it.next()) |e| {
         if (!fsContains(&live, e.key_ptr.*)) continue;
+        // Second membership test (only when the caller gated the search): the
+        // rank set is the INTERSECTION, so truncating the scan is unnecessary.
+        if (gate.active and !fsContains(&gate.set, e.key_ptr.*)) continue;
         const norm2 = e.value_ptr.norm2;
         rc[n_cand] = .{
             .sym = e.key_ptr.*,
@@ -366,13 +421,13 @@ fn vectorSearchImpl(rd: *const VecReader, corpus: *const DlVecCorpus, q_in: ?[*]
 
 pub export fn dl_vector_search_corpus(db: ?*dl.DlDb, corpus: ?*const DlVecCorpus, q_int8: ?[*]const u32, k: c_int, cb: DlVecCb, user: ?*anyopaque) c_long {
     const rd = VecReader{ .db = db, .version = 0, .use_version = false };
-    return vectorSearchImpl(&rd, corpus orelse return -1, q_int8, k, cb, user);
+    return vectorSearchImpl(&rd, corpus orelse return -1, q_int8, null, 0, k, cb, user);
 }
 
 pub export fn dl_vector_search_corpus_version(db: ?*dl.DlDb, version: u32, corpus: ?*const DlVecCorpus, q_int8: ?[*]const u32, k: c_int, cb: DlVecCb, user: ?*anyopaque) c_long {
     if (db == null or version == 0) return -1;
     const rd = VecReader{ .db = db, .version = version, .use_version = true };
-    return vectorSearchImpl(&rd, corpus orelse return -1, q_int8, k, cb, user);
+    return vectorSearchImpl(&rd, corpus orelse return -1, q_int8, null, 0, k, cb, user);
 }
 
 pub export fn dl_vector_search(db: ?*dl.DlDb, q_int8: ?[*]const u32, k: c_int, cb: DlVecCb, user: ?*anyopaque) c_long {
@@ -381,6 +436,37 @@ pub export fn dl_vector_search(db: ?*dl.DlDb, q_int8: ?[*]const u32, k: c_int, c
 
 pub export fn dl_vector_search_version(db: ?*dl.DlDb, version: u32, q_int8: ?[*]const u32, k: c_int, cb: DlVecCb, user: ?*anyopaque) c_long {
     return dl_vector_search_corpus_version(db, version, &DL_VEC_CORPUS_ENTITY, q_int8, k, cb, user);
+}
+
+// ─── Gated search (the hybrid path: lexical gate -> semantic rank) ────────
+//
+// Same ranking path as dl_vector_search, plus ONE extra membership test per
+// entity: a candidate must be in the caller's sym gate as well as live.  The
+// emitted set is therefore the top k OF THE INTERSECTION, exact at any k —
+// this is what removes vhybrid's k*multiplier truncation artifact (an entity
+// in both tiers could rank below the truncated scan and be missed).
+//
+// gate_syms is a SET, in any order (the engine copies, sorts and dedups it).
+// gate_syms == NULL is "no gate" and behaves exactly like dl_vector_search;
+// gate_syms != NULL with n_gate == 0 is the EMPTY intersection -> 0 results.
+
+pub export fn dl_vector_search_gated_corpus(db: ?*dl.DlDb, corpus: ?*const DlVecCorpus, q_int8: ?[*]const u32, gate_syms: ?[*]const u32, n_gate: usize, k: c_int, cb: DlVecCb, user: ?*anyopaque) c_long {
+    const rd = VecReader{ .db = db, .version = 0, .use_version = false };
+    return vectorSearchImpl(&rd, corpus orelse return -1, q_int8, gate_syms, n_gate, k, cb, user);
+}
+
+pub export fn dl_vector_search_gated_corpus_version(db: ?*dl.DlDb, version: u32, corpus: ?*const DlVecCorpus, q_int8: ?[*]const u32, gate_syms: ?[*]const u32, n_gate: usize, k: c_int, cb: DlVecCb, user: ?*anyopaque) c_long {
+    if (db == null or version == 0) return -1;
+    const rd = VecReader{ .db = db, .version = version, .use_version = true };
+    return vectorSearchImpl(&rd, corpus orelse return -1, q_int8, gate_syms, n_gate, k, cb, user);
+}
+
+pub export fn dl_vector_search_gated(db: ?*dl.DlDb, q_int8: ?[*]const u32, gate_syms: ?[*]const u32, n_gate: usize, k: c_int, cb: DlVecCb, user: ?*anyopaque) c_long {
+    return dl_vector_search_gated_corpus(db, &DL_VEC_CORPUS_ENTITY, q_int8, gate_syms, n_gate, k, cb, user);
+}
+
+pub export fn dl_vector_search_gated_version(db: ?*dl.DlDb, version: u32, q_int8: ?[*]const u32, gate_syms: ?[*]const u32, n_gate: usize, k: c_int, cb: DlVecCb, user: ?*anyopaque) c_long {
+    return dl_vector_search_gated_corpus_version(db, version, &DL_VEC_CORPUS_ENTITY, q_int8, gate_syms, n_gate, k, cb, user);
 }
 
 // ─── Rank an explicit candidate set (LIVE only) ──────────────────────────
@@ -575,6 +661,64 @@ test "dl_vector_search: ranking is cosine, not raw dot" {
     try testing.expectEqual(@as(c_long, 2), dl_vector_search(db, &q_int8, 10, collectSymCb, &got));
     try testing.expectEqual(@as(u64, 1), got.items[0] >> 32); // tie -> sym asc
     try testing.expectEqual(@as(u64, 2), got.items[1] >> 32);
+}
+
+test "dl_vector_search_gated: the rank set is the gate ∩ live" {
+    const path = "/tmp/datalog_zig_u14_vec_gated";
+    const db = testOpenDb(path);
+    defer testCloseDb(db, path);
+
+    try testing.expectEqual(@as(c_int, 0), dl.dl_declare_relation(db, "entity", 2));
+    try testing.expectEqual(@as(c_int, 0), dl.dl_declare_relation(db, "__vec_q__", 3));
+
+    // Four live entities 10..13 with v_i = [100, i-10, 0, ...]: cosine vs
+    // q = [+127, 0, ...] is 12700/(127*sqrt(100^2 + (i-10)^2)), strictly
+    // DECREASING in i — so the ranking is 10, 11, 12, 13 by construction.
+    var i: u32 = 10;
+    while (i < 14) : (i += 1) {
+        try testing.expectEqual(@as(c_int, 1), dl.dl_add_fact(db, "entity", &[_]u32{ i, 1 }, 2));
+        try testing.expectEqual(@as(c_int, 1), dl.dl_add_fact(db, "__vec_q__", &[_]u32{ i, 0, pack4(100, @intCast(i - 10), 0, 0) }, 3));
+    }
+    // 99 has a vector but is not live; 13 is live but rank 4.
+    try testing.expectEqual(@as(c_int, 1), dl.dl_add_fact(db, "__vec_q__", &[_]u32{ 99, 0, pack4(127, 0, 0, 0) }, 3));
+
+    var q_int8: [VEC_IVEC_WORDS]u32 = [_]u32{0} ** VEC_IVEC_WORDS;
+    q_int8[0] = pack4(127, 0, 0, 0);
+
+    // Unsorted, with a dead sym (99) and a duplicate (13 twice) in the gate.
+    const gate = [4]u32{ 13, 99, 11, 13 };
+
+    var got: std.ArrayList(u64) = .empty;
+    defer got.deinit(testing.allocator);
+    try testing.expectEqual(@as(c_long, 2), dl_vector_search_gated(db, &q_int8, &gate, gate.len, 10, collectSymCb, &got));
+    try testing.expectEqual(@as(u64, 11), got.items[0] >> 32); // higher cosine first
+    try testing.expectEqual(@as(u64, 13), got.items[1] >> 32);
+    try testing.expectEqual(@as(usize, 2), got.items.len); // duplicates deduped
+
+    // k caps the emission, still best-first.
+    var got_k: std.ArrayList(u64) = .empty;
+    defer got_k.deinit(testing.allocator);
+    try testing.expectEqual(@as(c_long, 1), dl_vector_search_gated(db, &q_int8, &gate, gate.len, 1, collectSymCb, &got_k));
+    try testing.expectEqual(@as(u64, 11), got_k.items[0] >> 32);
+
+    // An EMPTY gate is the empty intersection (0 results) — distinct from no
+    // gate, which must reproduce dl_vector_search exactly (4 live entities).
+    var got_empty: std.ArrayList(u64) = .empty;
+    defer got_empty.deinit(testing.allocator);
+    try testing.expectEqual(@as(c_long, 0), dl_vector_search_gated(db, &q_int8, &gate, 0, 10, collectSymCb, &got_empty));
+    var un: std.ArrayList(u64) = .empty;
+    defer un.deinit(testing.allocator);
+    try testing.expectEqual(@as(c_long, 4), dl_vector_search_gated(db, &q_int8, null, 0, 10, collectSymCb, &un));
+    try testing.expectEqual(@as(u64, 10), un.items[0] >> 32);
+
+    // Error contract (the dl_vector_search one, plus version 0).
+    var sink: std.ArrayList(u64) = .empty;
+    defer sink.deinit(testing.allocator);
+    try testing.expectEqual(@as(c_long, -1), dl_vector_search_gated(db, &q_int8, &gate, gate.len, 0, collectSymCb, &sink));
+    try testing.expectEqual(@as(c_long, -1), dl_vector_search_gated(null, &q_int8, &gate, gate.len, 10, collectSymCb, &sink));
+    try testing.expectEqual(@as(c_long, -1), dl_vector_search_gated(db, null, &gate, gate.len, 10, collectSymCb, &sink));
+    try testing.expectEqual(@as(c_long, -1), dl_vector_search_gated(db, &q_int8, &gate, gate.len, 10, null, &sink));
+    try testing.expectEqual(@as(c_long, -1), dl_vector_search_gated_version(db, 0, &q_int8, &gate, gate.len, 10, collectSymCb, &sink));
 }
 
 test "dl_vector_rerank: int8 cosine order via integer cross-multiply" {

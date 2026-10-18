@@ -78,6 +78,13 @@ Concretely:
 1. Ship the full-text postings DAFSA (`dl_search`, from full-text doc) — the symbolic half.
 2. Choose the vector tier storage (sidecar vs in-engine `vec` relation, from semantic doc).
 3. Add the lexical-gate pattern (DAFSA regex filter → vector cosine over candidates).
+   **PARTIALLY SHIPPED (2026-10-18)**, narrower than this line: the gate is the
+   postings-derived ENTITY SET, not a regex filter — `dl vhybrid` passes it into
+   the vector scan (`dl_vector_search_gated[_version]`, one extra membership
+   test alongside the liveness bsearch), so the emitted set is the top-k of the
+   intersection and the old k*10 pre-truncation (which silently dropped
+   both-tier documents) is gone.  A regex/prefix-filtered gate is still not
+   wired.
 4. Implement score fusion (symbolic + semantic) on shared doc-ids.
 5. Wire a combined query API.
 

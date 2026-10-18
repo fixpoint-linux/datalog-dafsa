@@ -58,14 +58,10 @@ extern "c" fn strrchr(s: [*c]const u8, ch: c_int) [*c]u8;
 extern "c" fn strtoul(nptr: [*c]const u8, endptr: [*c][*c]u8, base: c_int) c_ulong;
 extern "c" fn strtol(nptr: [*c]const u8, endptr: [*c][*c]u8, base: c_int) c_long;
 extern "c" fn __errno_location() *c_int;
-extern "c" fn qsort(base: ?*anyopaque, nmemb: usize, size: usize, compar: CmpU32) void;
-extern "c" fn bsearch(key: ?*const anyopaque, base: ?*const anyopaque, nmemb: usize, size: usize, compar: CmpU32) ?*const anyopaque;
 extern "c" fn strlen(s: [*c]const u8) usize;
 
 /// glibc's unbuffered stderr stream global (same symbol the C oracle uses).
 extern "c" var stderr: *std.c.FILE;
-
-const CmpU32 = ?*const fn (?*const anyopaque, ?*const anyopaque) callconv(.c) c_int;
 
 // ─── Constants (mirrors of the C oracle's / headers' values) ────────────────
 const PATH_MAX = 4096; // Linux PATH_MAX (src/dl_cli.c uses <limits.h>'s)
@@ -303,39 +299,39 @@ fn printVecCand(entity_sym: u32, score: c_int, user: ?*anyopaque) callconv(.c) c
     return 0;
 }
 
-/// Ascending u32 comparison (for qsort/bsearch on sym-id sets).
-fn cmpU32(pa: ?*const anyopaque, pb: ?*const anyopaque) callconv(.c) c_int {
-    const a = @as(*const u32, @ptrCast(@alignCast(pa.?))).*;
-    const b = @as(*const u32, @ptrCast(@alignCast(pb.?))).*;
-    return @as(c_int, @intFromBool(a > b)) - @as(c_int, @intFromBool(a < b));
-}
-
-/// Callback: capture the entity sym (col 0) of the observation row whose
-/// content (col 1) equals the target obs_id.
-const ObsEntityCtx = struct {
-    target: u32,
-    entity: u32,
+/// Callback: accumulate ONE observation(entity, content) row into a
+/// content-sym -> entity-sym map.  The hybrid path needs this mapping for every
+/// lexical hit; a single pass over the relation answers all of them, where the
+/// previous per-hit lookup re-enumerated the whole relation per hit.
+const ObsMapCtx = struct {
+    m: *std.AutoHashMap(u32, u32),
+    error_occurred: bool = false,
 };
 
-fn collectObsEntity(cols: [*c]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_int {
-    const cb: *ObsEntityCtx = @ptrCast(@alignCast(user.?));
-    _ = arity;
-    if (cb.target != 0 and cols[1] == cb.target) {
-        cb.entity = cols[0];
-        return 1; // stop: obs_id is unique in observation
-    }
+fn collectObsMap(cols: [*c]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_int {
+    const ctx: *ObsMapCtx = @ptrCast(@alignCast(user.?));
+    if (arity < 2) return 1; // malformed row: stop scan
+    ctx.m.put(cols[1], cols[0]) catch {
+        ctx.error_occurred = true;
+        return 1;
+    };
     return 0;
 }
 
-/// Map a lexical obs_id (content sym) to the entity sym that owns it, via the
-/// observation(entity, content) relation.  Returns 0 if the observation
-/// relation is absent or the obs_id has no row.
-fn obsToEntity(db: [*c]c.dl_db, obs_id: u32) u32 {
-    var ctx = ObsEntityCtx{ .target = obs_id, .entity = 0 };
-    const n = c.dl_prefix(db, "observation", null, 0, collectObsEntity, &ctx);
-    if (n < 0)
-        return 0;
-    return ctx.entity;
+/// Build obs_id (observation.content) -> owning entity sym in ONE relation pass.
+/// The read primitive is the one the rest of the query used — LIVE -> dl_prefix,
+/// VERSION -> dl_query_bound_version — so a --version read never consults live
+/// observation rows.  A missing relation (or a version without it) yields an
+/// EMPTY map, the same "no mapping" outcome the per-hit lookup had; it is not an
+/// error.  Returns false only on OOM.
+fn buildObsEntityMap(db: [*c]c.dl_db, version: c_ulong, m: *std.AutoHashMap(u32, u32)) bool {
+    var ctx = ObsMapCtx{ .m = m };
+    const n = if (version == 0)
+        c.dl_prefix(db, "observation", null, 0, collectObsMap, &ctx)
+    else
+        c.dl_query_bound_version(db, @intCast(version), "observation", null, 0, collectObsMap, &ctx);
+    if (n < 0) return true;
+    return !ctx.error_occurred;
 }
 
 // ─── Value / tuple printing (byte-exact reverse-mapping heuristics) ────────
@@ -1272,20 +1268,48 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
             return 1;
         }
 
-        // Get the scan-ranked vector results (already exact-cosine order).
-        const vec_syms = malloc(k * 10 * 4);
-        if (vec_syms == null) {
+        // Map the lexical obs ids to their owning entity syms in ONE pass over
+        // the observation relation (compacted IN PLACE into lex_ids), leaving
+        // ids[0..n_lex] as the GATE the vector scan filters on.
+        var obs_map = std.AutoHashMap(u32, u32).init(std.heap.c_allocator);
+        defer obs_map.deinit();
+        if (!buildObsEntityMap(db, version, &obs_map)) {
+            _ = fprintf(stderr, "dl: OOM\n");
             free(lex_ids);
             free(lex_scores);
             return 1;
         }
-        var vec_collector = VecCandCollector{ .syms = @ptrCast(@alignCast(vec_syms.?)), .capacity = cIntTrunc(k * 10), .count = 0 };
-        var n_vec: c_long = undefined;
-        if (version == 0) {
-            n_vec = c.dl_vector_search(db, &q_int8, cIntTrunc(k * 10), collectVecCand, &vec_collector);
-        } else {
-            n_vec = c.dl_vector_search_version(db, @intCast(version), &q_int8, cIntTrunc(k * 10), collectVecCand, &vec_collector);
+        const ids: [*]u32 = @ptrCast(@alignCast(lex_ids.?));
+        {
+            var n_lex_ent: c_int = 0;
+            for (0..@intCast(n_lex)) |i| {
+                const e = obs_map.get(ids[i]) orelse 0;
+                if (e != 0) {
+                    ids[@intCast(n_lex_ent)] = e;
+                    n_lex_ent += 1;
+                }
+            }
+            n_lex = n_lex_ent;
         }
+
+        // Gated vector scan: the top k OF THE INTERSECTION (lexical entities ∩
+        // live ∩ vector tier) in exact cosine order.  The gate is a second
+        // membership test INSIDE the scan, so no k*multiplier truncation is
+        // needed — a document in both tiers that ranks below such a cut is no
+        // longer silently dropped.  LIVE/VERSION discipline is unchanged (the
+        // _version form reads the vec + liveness relations version-bound).
+        const vec_syms = malloc(@as(usize, @intCast(k)) * 4);
+        if (vec_syms == null) {
+            _ = fprintf(stderr, "dl: OOM\n");
+            free(lex_ids);
+            free(lex_scores);
+            return 1;
+        }
+        var vec_collector = VecCandCollector{ .syms = @ptrCast(@alignCast(vec_syms.?)), .capacity = cIntTrunc(k), .count = 0 };
+        const n_vec: c_long = if (version == 0)
+            c.dl_vector_search_gated(db, &q_int8, ids, @intCast(n_lex), cIntTrunc(k), collectVecCand, &vec_collector)
+        else
+            c.dl_vector_search_gated_version(db, @intCast(version), &q_int8, ids, @intCast(n_lex), cIntTrunc(k), collectVecCand, &vec_collector);
         if (n_vec < 0) {
             _ = fprintf(stderr, "dl: vector search failed\n");
             free(vec_syms);
@@ -1294,55 +1318,16 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
             return 1;
         }
 
-        // INTERSECT: build a sorted set of ENTITY sym-ids from the lexical
-        // results (dl_search_top returns obs/content sym-ids; map each to its
-        // owning entity via the observation relation), then keep the vector
-        // results that are also lexical hits — IN THE SEARCH'S RANKED ORDER,
-        // which is already exact cosine order (no second ranking pass, so no
-        // LIVE rerank can leak into a version read).
-        const inter = malloc(@as(usize, @intCast(vec_collector.count)) * 4);
-        if (inter == null) {
-            _ = fprintf(stderr, "dl: OOM\n");
-            free(vec_syms);
-            free(lex_ids);
-            free(lex_scores);
-            return 1;
-        }
-        const ids: [*]u32 = @ptrCast(@alignCast(lex_ids.?));
-        const vsyms: [*]u32 = @ptrCast(@alignCast(vec_syms.?));
-        const isyms: [*]u32 = @ptrCast(@alignCast(inter.?));
-        {
-            var n_lex_ent: c_int = 0;
-            for (0..@intCast(n_lex)) |i| {
-                const e = obsToEntity(db, ids[i]);
-                if (e != 0) {
-                    ids[@intCast(n_lex_ent)] = e;
-                    n_lex_ent += 1;
-                }
-            }
-            n_lex = n_lex_ent;
-        }
-        var n_inter: usize = 0;
-        qsort(lex_ids, @intCast(n_lex), 4, cmpU32);
-        for (0..@intCast(vec_collector.count)) |i| {
-            if (bsearch(@ptrCast(&vsyms[i]), lex_ids, @intCast(n_lex), 4, cmpU32) != null) {
-                isyms[n_inter] = vsyms[i];
-                n_inter += 1;
-            }
-        }
-
-        if (n_inter > 0) {
-            const limit: usize = if (@as(usize, @intCast(k)) < n_inter) @intCast(k) else n_inter;
-            var p: usize = 0;
-            while (p < limit) : (p += 1) {
-                printValue(db, isyms[p], 0);
+        if (vec_collector.count > 0) {
+            const vsyms: [*]u32 = @ptrCast(@alignCast(vec_syms.?));
+            for (0..@intCast(vec_collector.count)) |p| {
+                printValue(db, vsyms[p], 0);
                 _ = printf("\n");
             }
         } else {
             _ = printf("(no results)\n");
         }
 
-        free(inter);
         free(vec_syms);
         free(lex_ids);
         free(lex_scores);

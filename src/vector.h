@@ -113,6 +113,44 @@ long dl_vector_search_corpus_version(dl_db *db, uint32_t version,
                                      const uint32_t *q_int8, int k,
                                      dl_vec_cb cb, void *user);
 
+/* ─── Gated search (hybrid: lexical gate -> semantic rank) ────────────────
+ *
+ * Same ranking path as dl_vector_search, plus ONE extra membership test per
+ * entity: a candidate must be in `gate_syms` AS WELL AS live.  The emitted set
+ * is therefore the top k OF THE INTERSECTION — exact at any k, so a caller
+ * holding a candidate set never has to pre-truncate the scan (a k*multiplier
+ * truncation would silently drop an entity that ranks below it).
+ *
+ * `gate_syms` is a SET, in any order: the engine copies, sorts and dedups it
+ * once per call, so the per-entity cost is a bsearch exactly like the liveness
+ * test (marginal cost ~0 on top of the scan).  Contract:
+ *   - gate_syms == NULL            -> NO gate; identical to dl_vector_search.
+ *   - gate_syms != NULL, n == 0    -> EMPTY intersection; returns 0 results.
+ *   - gate_syms != NULL, n > 0     -> rank only gate ∩ live.
+ * Liveness filtering still applies (the gate is a second test, not a
+ * replacement), and the LIVE/VERSION discipline is unchanged: the _version
+ * form reads BOTH the vec and the liveness relation via
+ * dl_query_bound_version.  Returns the number emitted, or -1 on error (the
+ * dl_vector_search contract, plus OOM building the gate). */
+long dl_vector_search_gated(dl_db *db, const uint32_t *q_int8,
+                            const uint32_t *gate_syms, size_t n_gate,
+                            int k, dl_vec_cb cb, void *user);
+long dl_vector_search_gated_version(dl_db *db, uint32_t version,
+                                    const uint32_t *q_int8,
+                                    const uint32_t *gate_syms, size_t n_gate,
+                                    int k, dl_vec_cb cb, void *user);
+long dl_vector_search_gated_corpus(dl_db *db,
+                                   const struct dl_vec_corpus *corpus,
+                                   const uint32_t *q_int8,
+                                   const uint32_t *gate_syms, size_t n_gate,
+                                   int k, dl_vec_cb cb, void *user);
+long dl_vector_search_gated_corpus_version(dl_db *db, uint32_t version,
+                                           const struct dl_vec_corpus *corpus,
+                                           const uint32_t *q_int8,
+                                           const uint32_t *gate_syms,
+                                           size_t n_gate,
+                                           int k, dl_vec_cb cb, void *user);
+
 /* Exact ranking of an EXPLICIT candidate set over the LIVE __vec_q__ relation.
  * q_int8 is the pre-quantized int8 query vector (VEC_IVEC_WORDS u32, 4 int8
  * packed little-endian).  cand_syms[0..n_cand-1] are entity sym-ids.  For each

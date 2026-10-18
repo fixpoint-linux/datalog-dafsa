@@ -272,6 +272,7 @@ pub extern "c" fn dl_load_rules(db: [*c]dl_db, dl_source: [*c]const u8) c_int;
 pub extern "c" fn dl_compile(db: [*c]dl_db) c_int;
 pub extern "c" fn dl_query(db: [*c]dl_db, goal_rel: [*c]const u8, cb: dl_tuple_cb, user: ?*anyopaque) c_long;
 pub extern "c" fn dl_query_bound(db: [*c]dl_db, goal_rel: [*c]const u8, leading: [*c]const u32, k: u8, cb: dl_tuple_cb, user: ?*anyopaque) c_long;
+pub extern "c" fn dl_query_bound_version(db: [*c]dl_db, version: u32, goal_rel: [*c]const u8, leading: [*c]const u32, k: u8, cb: dl_tuple_cb, user: ?*anyopaque) c_long;
 pub extern "c" fn dl_pattern(db: [*c]dl_db, rel_name: [*c]const u8, col: u8, dfa: [*c]const regex_dfa, cb: dl_tuple_cb, user: ?*anyopaque) c_long;
 pub extern "c" fn dl_publish_snapshot(db: [*c]dl_db) c_int;
 pub extern "c" fn dl_snapshot_versions(db: [*c]const dl_db, out: [*c]u32, cap: usize) c_long;
@@ -286,6 +287,10 @@ pub extern "c" fn dl_term_car(db: [*c]const dl_db, h: u32) u32;
 pub extern "c" fn dl_term_cdr(db: [*c]const dl_db, h: u32) u32;
 pub extern "c" fn dl_vector_search(db: [*c]dl_db, q_int8: [*c]const u32, k: c_int, cb: dl_vec_cb, user: ?*anyopaque) c_long;
 pub extern "c" fn dl_vector_search_version(db: [*c]dl_db, version: u32, q_int8: [*c]const u32, k: c_int, cb: dl_vec_cb, user: ?*anyopaque) c_long;
+// Gated search (vhybrid's lexical gate -> semantic rank): the rank set is the
+// top-k of the gate ∩ live, so the caller need not pre-truncate the scan.
+pub extern "c" fn dl_vector_search_gated(db: [*c]dl_db, q_int8: [*c]const u32, gate_syms: [*c]const u32, n_gate: usize, k: c_int, cb: dl_vec_cb, user: ?*anyopaque) c_long;
+pub extern "c" fn dl_vector_search_gated_version(db: [*c]dl_db, version: u32, q_int8: [*c]const u32, gate_syms: [*c]const u32, n_gate: usize, k: c_int, cb: dl_vec_cb, user: ?*anyopaque) c_long;
 pub extern "c" fn dl_vector_rerank(db: [*c]dl_db, q_int8: [*c]const u32, cand_syms: [*c]const u32, n_cand: c_int, k: c_int, cb: dl_vec_cb, user: ?*anyopaque) c_long;
 
 // ─── dl_internal.h dispatch helpers ──────────────────────────────────────

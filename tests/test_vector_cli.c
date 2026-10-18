@@ -539,6 +539,123 @@ static void t_vhybrid_cli(void)
     PASS();
 }
 
+/* ─── Test 3b: recall BEYOND the old vector-scan cut ────────────────────── */
+/*
+ * THE ASYMMETRY THIS ASSERTS: a document present in BOTH tiers but ranking
+ * outside the vector top-(k*10) must still be returned.
+ *
+ * Construction (all exact by hand — nothing is blessed):
+ *   24 live entities n0..n23, each with ONE vector chunk
+ *       v_i = [100, i, 0, 0, ...]      (chunk 0 = pack4(100, i, 0, 0))
+ *   query q = [127, 0, ...] -> cosine = 12700 / (127 * sqrt(100^2+i^2)),
+ *   strictly DECREASING in i, so the semantic rank is i = 0,1,...,23 and the
+ *   LAST entity (n23) is rank 24 of 24.
+ *   Lexical tier: observations on n0 and n23 only, both containing "red".
+ *
+ * With --k 2 the old code scanned the vector tier truncated to k*10 = 20, i.e.
+ * n0..n19; intersecting that with {n0, n23} yields n0 ONLY — n23 is silently
+ * missed.  The gated path ranks the top k OF THE INTERSECTION, so it emits
+ * n0 then n23.  Asserting n23's presence is the recall fix; asserting n1's
+ * ABSENCE keeps it honest (a gate, not a dump of every vector), and the
+ * first-line check keeps the order = exact cosine order.
+ */
+static void t_vhybrid_recall_beyond_scan_cut(void)
+{
+    char dir[512];
+    dl_db *db = fresh_db(dir, sizeof(dir), "t_vhybrid_recall");
+    char ivec[VEC_IVEC_WORDS * 8 + 1];
+    char out[65536];
+    char *argv[16];
+    char names[24][8];
+    uint32_t q_ivec[VEC_IVEC_WORDS];
+    int i;
+
+    TEST("vhybrid CLI: recall survives a rank below the old k*10 cut");
+
+    declare_vector_rels(db);
+    for (i = 0; i < 24; i++) {
+        uint32_t c[3];
+        snprintf(names[i], sizeof(names[i]), "n%d", i);
+        c[0] = dl_intern_str(db, names[i]);
+        c[1] = dl_intern_str(db, "doc");
+        if (dl_add_fact(db, VEC_ENTITY_REL, c, 2) != 1) { FAIL("add entity"); dl_close(db); return; }
+        c[1] = 0;                       /* chunk 0 */
+        c[2] = pack4(100, (int8_t)i, 0, 0);
+        if (dl_add_fact(db, "__vec_q__", c, 3) != 1) { FAIL("add vector"); dl_close(db); return; }
+    }
+
+    /* Lexical tier: only the FIRST and the LAST entity own a "red" observation
+     * (so the lexical hit set is {n0, n23} and nothing else). */
+    dl_declare_relation(db, "observation", 2);
+    {
+        uint32_t c[2];
+        uint32_t t0 = dl_intern_str(db, "red first"), t23 = dl_intern_str(db, "red last");
+        c[0] = dl_intern_str(db, names[0]);  c[1] = t0;
+        if (dl_add_fact(db, "observation", c, 2) != 1) { FAIL("add obs 0"); dl_close(db); return; }
+        c[0] = dl_intern_str(db, names[23]); c[1] = t23;
+        if (dl_add_fact(db, "observation", c, 2) != 1) { FAIL("add obs 23"); dl_close(db); return; }
+    }
+    aux_index_ensure_postings(db);
+    {
+        uint32_t term = dl_intern_str(db, "red");
+        aux_index_add_posting(db, term, dl_intern_str(db, "red first"));
+        aux_index_add_posting(db, term, dl_intern_str(db, "red last"));
+    }
+
+    /* q = [+127, 0, ...] — parallel-ish to every v_i, so the ranking is pure
+     * cosine and strictly ordered by i. */
+    for (i = 0; i < VEC_IVEC_WORDS; i++) q_ivec[i] = 0;
+    q_ivec[0] = pack4(127, 0, 0, 0);
+    ivec_hex_str(q_ivec, ivec);
+    dl_close(db);
+
+    i = 0;
+    argv[i++] = "dl";
+    argv[i++] = "-d";
+    argv[i++] = (char *)dir;
+    argv[i++] = "vhybrid";
+    argv[i++] = "red";
+    argv[i++] = "dummy";
+    argv[i++] = "--ivec";
+    argv[i++] = ivec;
+    argv[i++] = "--k";
+    argv[i++] = "2";
+    argv[i++] = NULL;
+
+    if (run_cli(dir, argv, out, sizeof(out)) != 0) {
+        FAIL("subprocess failed");
+        return;
+    }
+    /* Rank 24 of 24: outside the old k*10 = 20 cut, inside both tiers. */
+    if (!cli_has(out, names[23])) {
+        printf("  (got: %s)", out);
+        FAIL("vhybrid dropped an entity that is in BOTH tiers (rank below the k*10 cut)");
+        return;
+    }
+    /* The intersection's best is still the true cosine best, printed first. */
+    {
+        char first[64];
+        size_t k = 0;
+        while (out[k] != '\n' && out[k] != '\0' && k + 1 < sizeof first) {
+            first[k] = out[k];
+            k++;
+        }
+        first[k] = '\0';
+        if (strcmp(first, names[0]) != 0) {
+            printf("  (got first line: %s)", first);
+            FAIL("gated vhybrid is not in exact cosine order");
+            return;
+        }
+    }
+    /* The gate still binds: a vector-only entity must never appear. */
+    if (cli_has(out, names[1]) || cli_has(out, names[20])) {
+        printf("  (got: %s)", out);
+        FAIL("vhybrid leaked a vector-only (non-lexical) entity");
+        return;
+    }
+    PASS();
+}
+
 /* ─── Test 4: C API path directly ───────────────────────────────────────── */
 static void t_api_path(void)
 {
@@ -586,6 +703,7 @@ int main(void)
     t_vsearch_removed_flags();
     t_vsearch_cand_only();
     t_vhybrid_cli();
+    t_vhybrid_recall_beyond_scan_cut();
     t_api_path();
 
     printf("\n");
