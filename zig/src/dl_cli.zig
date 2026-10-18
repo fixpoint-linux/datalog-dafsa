@@ -242,6 +242,200 @@ fn usage(prog: [*:0]const u8) noreturn {
     exit(1);
 }
 
+// ─── Argument-shape helpers ─────────────────────────────────────────────────
+//
+// The command arms share three shapes: "require a positional", "consume a
+// `--flag <u32-in-range>`", and "reject a leftover argument".  These carry the
+// SHAPE only — every user-visible message stays at its own call site, because
+// each one is pinned byte-for-byte by the goldens (zig/tests/golden/).
+
+/// Require one positional argument: bounds check + usage() on absence, else
+/// consume it (the C's `if (argp >= argc) usage()` + take-next shape).
+fn requirePositional(argv: []const [:0]const u8, argp: *usize) [:0]const u8 {
+    if (argp.* >= argv.len) usage(argv[0].ptr);
+    const a = argv[argp.*];
+    argp.* += 1;
+    return a;
+}
+
+/// Parse a `--flag <u32-in-range>` value: step over the flag name, then
+/// require one token that parseU32Strict accepts inside [min, max].  Returns
+/// null WITHOUT printing (having consumed nothing on failure) so the caller
+/// can emit its own pinned message and return 1.  `max == null` = unbounded
+/// above (still bounded by parseU32Strict's u32 cap).
+fn parseFlagU32(argv: []const [:0]const u8, argp: *usize, min: c_ulong, max: ?c_ulong) ?c_ulong {
+    argp.* += 1; // step over the flag name
+    if (argp.* >= argv.len) return null;
+    var v: c_ulong = undefined;
+    if (!parseU32Strict(argv[argp.*].ptr, &v)) return null;
+    if (v < min or (max != null and v > max.?)) return null;
+    argp.* += 1;
+    return v;
+}
+
+/// Reject a leftover argument with the shared `dl: unexpected argument '%s'`
+/// message.  Returns true (having printed) iff there was one, so callers read
+/// `if (rejectExtra(argv, argp)) return 1;`.
+fn rejectExtra(argv: []const [:0]const u8, argp: usize) bool {
+    if (argp >= argv.len) return false;
+    _ = fprintf(stderr, "dl: unexpected argument '%s'\n", argv[argp].ptr);
+    return true;
+}
+
+// ─── search: option parsing + evaluation ───────────────────────────────────
+//
+// `search` used to be one arm doing four things at once (flag parsing, the
+// --min-terms/--version rejection, tokenization, and the three-way engine
+// dispatch).  The options now live in SearchParams and the evaluation in
+// runSearch, leaving the command arm as: take the terms, parse the flags,
+// call runSearch.
+
+/// Parsed `dl search` options (the defaults ARE the documented semantics).
+const SearchParams = struct {
+    top_n: c_ulong = 10, // --top: max results, 1..2147483647
+    version: c_ulong = 0, // --version: 0 = live (current snapshot)
+    min_terms: c_ulong = 0, // --min-terms: 0 = AND (dl_search_top)
+
+    /// Parse the optional flags, in any order.  Returns null after printing
+    /// the offending flag's own pinned message.
+    fn parse(argv: []const [:0]const u8, argp: *usize) ?SearchParams {
+        var p: SearchParams = .{};
+        while (argp.* < argv.len) {
+            if (eq(argv[argp.*], "--top")) {
+                p.top_n = parseFlagU32(argv, argp, 1, 0x7FFFFFFF) orelse {
+                    _ = fprintf(stderr, "dl: invalid --top value (must be 1..2147483647)\n");
+                    return null;
+                };
+            } else if (eq(argv[argp.*], "--version")) {
+                p.version = parseFlagU32(argv, argp, 0, null) orelse {
+                    _ = fprintf(stderr, "dl: invalid --version value\n");
+                    return null;
+                };
+            } else if (eq(argv[argp.*], "--min-terms")) {
+                // Partial-match (OR) retrieval: a document is a result iff it
+                // matches at least N of the query terms, ranked by matched-term
+                // count.  Absent flag = today's AND semantics, unchanged.
+                p.min_terms = parseFlagU32(argv, argp, 1, 0x7FFFFFFF) orelse {
+                    _ = fprintf(stderr, "dl: invalid --min-terms value (must be 1..2147483647)\n");
+                    return null;
+                };
+            } else {
+                if (rejectExtra(argv, argp.*)) return null;
+            }
+        }
+
+        // dl_search_ranked has no version-aware form (a partial-match query
+        // as-of a snapshot would need the per-term collectors' version path
+        // wired through it); reject the combination rather than silently
+        // ignoring one of the two flags.
+        if (p.min_terms != 0 and p.version != 0) {
+            _ = fprintf(stderr, "dl: --min-terms cannot be combined with --version\n");
+            return null;
+        }
+        return p;
+    }
+};
+
+/// Evaluate a `dl search`: tokenize + intern the terms, ensure the postings
+/// relation exists, dispatch to the engine, print the hits.  Returns the
+/// process exit code (all output and codes are unchanged from the C oracle).
+fn runSearch(db: [*c]c.dl_db, terms_str: [:0]const u8, opts: SearchParams) c_int {
+    const top_n = opts.top_n;
+    const version = opts.version;
+    const min_terms = opts.min_terms;
+
+    // Tokenize the search terms
+    const tokens = c.tokenize(terms_str.ptr, null);
+    if (tokens == null) {
+        _ = fprintf(stderr, "dl: tokenization failed\n");
+        return 1;
+    }
+
+    // Count tokens
+    var n_tokens: usize = 0;
+    while (tokens[n_tokens] != null) n_tokens += 1;
+
+    if (n_tokens == 0) {
+        _ = fprintf(stderr, "dl: no valid terms in search query\n");
+        c.token_free(tokens);
+        return 1;
+    }
+
+    // Intern all tokens
+    const term_syms = malloc(n_tokens * 4);
+    if (term_syms == null) {
+        c.token_free(tokens);
+        return 1;
+    }
+    const syms: [*]u32 = @ptrCast(@alignCast(term_syms.?));
+    for (0..n_tokens) |i| {
+        syms[i] = c.dl_intern_str(db, tokens[i]);
+        if (syms[i] == 0) {
+            _ = fprintf(stderr, "dl: intern failed for term '%s'\n", tokens[i]);
+            free(term_syms);
+            c.token_free(tokens);
+            return 1;
+        }
+    }
+    c.token_free(tokens);
+
+    // Ensure postings relation exists
+    if (c.aux_index_ensure_postings(db) != 0) {
+        _ = fprintf(stderr, "dl: cannot ensure postings relation\n");
+        free(term_syms);
+        return 1;
+    }
+
+    // Collect results
+    const obs_ids = malloc(top_n * 4);
+    const scores = malloc(top_n * 4);
+    if (obs_ids == null or scores == null) {
+        free(obs_ids);
+        free(scores);
+        free(term_syms);
+        return 1;
+    }
+
+    var n_results: c_int = undefined;
+    if (min_terms != 0) {
+        // Partial-match path: reject a threshold above the term count here
+        // with a specific message (the engine also rejects it with -1).
+        if (min_terms > n_tokens) {
+            _ = fprintf(stderr, "dl: --min-terms %lu exceeds the %lu query terms\n", min_terms, n_tokens);
+            free(term_syms);
+            free(obs_ids);
+            free(scores);
+            return 1;
+        }
+        n_results = c.dl_search_ranked_top(db, syms, @intCast(n_tokens), @intCast(min_terms), @ptrCast(@alignCast(obs_ids.?)), @ptrCast(@alignCast(scores.?)), @intCast(top_n));
+    } else if (version == 0) {
+        n_results = c.dl_search_top(db, syms, @intCast(n_tokens), @ptrCast(@alignCast(obs_ids.?)), @ptrCast(@alignCast(scores.?)), @intCast(top_n));
+    } else {
+        n_results = c.dl_search_top_version(db, @intCast(version), syms, @intCast(n_tokens), @ptrCast(@alignCast(obs_ids.?)), @ptrCast(@alignCast(scores.?)), @intCast(top_n));
+    }
+    free(term_syms);
+
+    if (n_results < 0) {
+        _ = fprintf(stderr, "dl: search failed\n");
+        free(obs_ids);
+        free(scores);
+        return 1;
+    }
+
+    // Print results
+    const ids: [*]u32 = @ptrCast(@alignCast(obs_ids.?));
+    const scs: [*]c_int = @ptrCast(@alignCast(scores.?));
+    for (0..@intCast(n_results)) |i| {
+        _ = printf("%u (score=%d)\n", ids[i], scs[i]);
+    }
+    if (n_results == 0)
+        _ = printf("(no results)\n");
+
+    free(obs_ids);
+    free(scores);
+    return 0;
+}
+
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 pub fn main(init: std.process.Init) void {
@@ -259,14 +453,10 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
     // Parse -d <dir>
     if (argp < argv.len and eq(argv[argp], "-d")) {
         argp += 1;
-        if (argp >= argv.len) usage(argv[0].ptr);
-        db_dir = argv[argp].ptr;
-        argp += 1;
+        db_dir = requirePositional(argv, &argp).ptr;
     }
 
-    if (argp >= argv.len) usage(argv[0].ptr);
-    const cmd = argv[argp];
-    argp += 1;
+    const cmd = requirePositional(argv, &argp);
 
     const db = c.dl_open(db_dir);
     if (db == null) {
@@ -277,9 +467,7 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
     if (eq(cmd, "load")) {
         var rel_name: ?[*:0]const u8 = null;
 
-        if (argp >= argv.len) usage(argv[0].ptr);
-        const csv_path = argv[argp];
-        argp += 1;
+        const csv_path = requirePositional(argv, &argp);
 
         while (argp < argv.len) {
             if (eq(argv[argp], "--rel") and argp + 1 < argv.len) {
@@ -370,9 +558,7 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
         var cols: [8]u32 = undefined;
         var arity: u8 = 0;
 
-        if (argp >= argv.len) usage(argv[0].ptr);
-        const rel_name = argv[argp];
-        argp += 1;
+        const rel_name = requirePositional(argv, &argp);
 
         while (argp < argv.len and arity < 8) {
             cols[arity] = cliParseValue(db, argv[argp].ptr);
@@ -392,9 +578,7 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
         var k: u8 = 0;
         var raw = false;
 
-        if (argp >= argv.len) usage(argv[0].ptr);
-        const rel_name = argv[argp];
-        argp += 1;
+        const rel_name = requirePositional(argv, &argp);
 
         if (argp < argv.len and eq(argv[argp], "--raw")) {
             raw = true;
@@ -418,13 +602,8 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
     }
 
     if (eq(cmd, "query")) {
-        if (argp >= argv.len) usage(argv[0].ptr);
-        var source: [*c]const u8 = argv[argp].ptr;
-        argp += 1;
-
-        if (argp >= argv.len) usage(argv[0].ptr);
-        const goal_rel = argv[argp];
-        argp += 1;
+        var source: [*c]const u8 = requirePositional(argv, &argp).ptr;
+        const goal_rel = requirePositional(argv, &argp);
 
         // Check if source is a file path
         var source_buf: ?*anyopaque = null;
@@ -495,9 +674,7 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
         var leading: [8]u32 = undefined;
         var k: u8 = 0;
 
-        if (argp >= argv.len) usage(argv[0].ptr);
-        const rel_name = argv[argp];
-        argp += 1;
+        const rel_name = requirePositional(argv, &argp);
 
         while (argp < argv.len and k < 8) {
             leading[k] = cliParseValue(db, argv[argp].ptr);
@@ -518,9 +695,7 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
     if (eq(cmd, "pattern")) {
         var col: u8 = 0;
 
-        if (argp >= argv.len) usage(argv[0].ptr);
-        const rel_name = argv[argp];
-        argp += 1;
+        const rel_name = requirePositional(argv, &argp);
 
         // Optional column argument
         if (argp < argv.len) {
@@ -532,9 +707,7 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
             }
         }
 
-        if (argp >= argv.len) usage(argv[0].ptr);
-        const pattern = argv[argp];
-        argp += 1;
+        const pattern = requirePositional(argv, &argp);
 
         const dfa = c.regex_compile(pattern.ptr);
         if (dfa.*.errmsg != null) {
@@ -555,9 +728,7 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
     }
 
     if (eq(cmd, "rev")) {
-        if (argp >= argv.len) usage(argv[0].ptr);
-        const entity = argv[argp];
-        argp += 1;
+        const entity = requirePositional(argv, &argp);
 
         var r: u32 = undefined;
         if (c.dl_rev_get(db, entity.ptr, &r) != 0) {
@@ -569,13 +740,9 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
     }
 
     if (eq(cmd, "cas")) {
-        if (argp + 2 >= argv.len) usage(argv[0].ptr);
-        const entity = argv[argp];
-        argp += 1;
-        const exp_s = argv[argp];
-        argp += 1;
-        const new_s = argv[argp];
-        argp += 1;
+        const entity = requirePositional(argv, &argp);
+        const exp_s = requirePositional(argv, &argp);
+        const new_s = requirePositional(argv, &argp);
 
         // Strict unsigned-32 parsing: reject non-numeric input and overflow
         // instead of silently truncating via strtoul (which parses garbage as
@@ -639,9 +806,7 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
         var depth: c_int = 1;
         var max_nodes: c_ulong = 1000;
 
-        if (argp >= argv.len) usage(argv[0].ptr);
-        const start = argv[argp];
-        argp += 1;
+        const start = requirePositional(argv, &argp);
 
         // Optional [depth] then optional [--max-nodes N].  A malformed
         // numeric arg is an error, not a silent fallback to depth 1.
@@ -661,20 +826,12 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
             argp += 1;
         }
         if (argp < argv.len and eq(argv[argp], "--max-nodes")) {
-            if (argp + 1 >= argv.len) {
+            max_nodes = parseFlagU32(argv, &argp, 1, null) orelse {
                 _ = fprintf(stderr, "dl: invalid --max-nodes value\n");
                 return 1;
-            }
-            if (!parseU32Strict(argv[argp + 1].ptr, &max_nodes) or max_nodes < 1) {
-                _ = fprintf(stderr, "dl: invalid --max-nodes value\n");
-                return 1;
-            }
-            argp += 2;
+            };
         }
-        if (argp < argv.len) {
-            _ = fprintf(stderr, "dl: unexpected argument '%s'\n", argv[argp].ptr);
-            return 1;
-        }
+        if (rejectExtra(argv, argp)) return 1;
 
         const n = c.dl_traverse(db, start.ptr, depth, cIntTrunc(max_nodes), traversePrintCb, db);
         if (n < 0) {
@@ -689,25 +846,15 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
     if (eq(cmd, "obs")) {
         var max_obs: c_ulong = 100;
 
-        if (argp >= argv.len) usage(argv[0].ptr);
-        const node = argv[argp];
-        argp += 1;
+        const node = requirePositional(argv, &argp);
 
         if (argp < argv.len and eq(argv[argp], "--max-obs")) {
-            if (argp + 1 >= argv.len) {
+            max_obs = parseFlagU32(argv, &argp, 1, null) orelse {
                 _ = fprintf(stderr, "dl: invalid --max-obs value\n");
                 return 1;
-            }
-            if (!parseU32Strict(argv[argp + 1].ptr, &max_obs) or max_obs < 1) {
-                _ = fprintf(stderr, "dl: invalid --max-obs value\n");
-                return 1;
-            }
-            argp += 2;
+            };
         }
-        if (argp < argv.len) {
-            _ = fprintf(stderr, "dl: unexpected argument '%s'\n", argv[argp].ptr);
-            return 1;
-        }
+        if (rejectExtra(argv, argp)) return 1;
 
         const n = c.dl_node_observations(db, node.ptr, cIntTrunc(max_obs), obsPrintCb, null);
         if (n < 0) {
@@ -720,10 +867,7 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
     }
 
     if (eq(cmd, "index")) {
-        if (argp < argv.len) {
-            _ = fprintf(stderr, "dl: unexpected argument '%s'\n", argv[argp].ptr);
-            return 1;
-        }
+        if (rejectExtra(argv, argp)) return 1;
 
         const n = c.dl_index_observations(db);
         if (n < 0) {
@@ -735,149 +879,9 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
     }
 
     if (eq(cmd, "search")) {
-        if (argp >= argv.len) usage(argv[0].ptr);
-        const terms_str = argv[argp];
-        argp += 1;
-
-        var top_n: c_ulong = 10;
-        var version: c_ulong = 0; // 0 means live (current)
-        var min_terms: c_ulong = 0; // 0 means AND (dl_search_top)
-
-        // Parse optional flags in any order
-        while (argp < argv.len) {
-            if (eq(argv[argp], "--top")) {
-                argp += 1;
-                if (argp >= argv.len or !parseU32Strict(argv[argp].ptr, &top_n) or top_n < 1 or
-                    top_n > 0x7FFFFFFF)
-                {
-                    _ = fprintf(stderr, "dl: invalid --top value (must be 1..2147483647)\n");
-                    return 1;
-                }
-                argp += 1;
-            } else if (eq(argv[argp], "--version")) {
-                argp += 1;
-                if (argp >= argv.len or !parseU32Strict(argv[argp].ptr, &version)) {
-                    _ = fprintf(stderr, "dl: invalid --version value\n");
-                    return 1;
-                }
-                argp += 1;
-            } else if (eq(argv[argp], "--min-terms")) {
-                // Partial-match (OR) retrieval: a document is a result iff it
-                // matches at least N of the query terms, ranked by matched-term
-                // count.  Absent flag = today's AND semantics, unchanged.
-                argp += 1;
-                if (argp >= argv.len or !parseU32Strict(argv[argp].ptr, &min_terms) or min_terms < 1 or
-                    min_terms > 0x7FFFFFFF)
-                {
-                    _ = fprintf(stderr, "dl: invalid --min-terms value (must be 1..2147483647)\n");
-                    return 1;
-                }
-                argp += 1;
-            } else {
-                _ = fprintf(stderr, "dl: unexpected argument '%s'\n", argv[argp].ptr);
-                return 1;
-            }
-        }
-
-        // dl_search_ranked has no version-aware form (a partial-match query
-        // as-of a snapshot would need the per-term collectors' version path
-        // wired through it); reject the combination rather than silently
-        // ignoring one of the two flags.
-        if (min_terms != 0 and version != 0) {
-            _ = fprintf(stderr, "dl: --min-terms cannot be combined with --version\n");
-            return 1;
-        }
-
-        // Tokenize the search terms
-        const tokens = c.tokenize(terms_str.ptr, null);
-        if (tokens == null) {
-            _ = fprintf(stderr, "dl: tokenization failed\n");
-            return 1;
-        }
-
-        // Count tokens
-        var n_tokens: usize = 0;
-        while (tokens[n_tokens] != null) n_tokens += 1;
-
-        if (n_tokens == 0) {
-            _ = fprintf(stderr, "dl: no valid terms in search query\n");
-            c.token_free(tokens);
-            return 1;
-        }
-
-        // Intern all tokens
-        const term_syms = malloc(n_tokens * 4);
-        if (term_syms == null) {
-            c.token_free(tokens);
-            return 1;
-        }
-        const syms: [*]u32 = @ptrCast(@alignCast(term_syms.?));
-        for (0..n_tokens) |i| {
-            syms[i] = c.dl_intern_str(db, tokens[i]);
-            if (syms[i] == 0) {
-                _ = fprintf(stderr, "dl: intern failed for term '%s'\n", tokens[i]);
-                free(term_syms);
-                c.token_free(tokens);
-                return 1;
-            }
-        }
-        c.token_free(tokens);
-
-        // Ensure postings relation exists
-        if (c.aux_index_ensure_postings(db) != 0) {
-            _ = fprintf(stderr, "dl: cannot ensure postings relation\n");
-            free(term_syms);
-            return 1;
-        }
-
-        // Collect results
-        const obs_ids = malloc(top_n * 4);
-        const scores = malloc(top_n * 4);
-        if (obs_ids == null or scores == null) {
-            free(obs_ids);
-            free(scores);
-            free(term_syms);
-            return 1;
-        }
-
-        var n_results: c_int = undefined;
-        if (min_terms != 0) {
-            // Partial-match path: reject a threshold above the term count here
-            // with a specific message (the engine also rejects it with -1).
-            if (min_terms > n_tokens) {
-                _ = fprintf(stderr, "dl: --min-terms %lu exceeds the %lu query terms\n", min_terms, n_tokens);
-                free(term_syms);
-                free(obs_ids);
-                free(scores);
-                return 1;
-            }
-            n_results = c.dl_search_ranked_top(db, syms, @intCast(n_tokens), @intCast(min_terms), @ptrCast(@alignCast(obs_ids.?)), @ptrCast(@alignCast(scores.?)), @intCast(top_n));
-        } else if (version == 0) {
-            n_results = c.dl_search_top(db, syms, @intCast(n_tokens), @ptrCast(@alignCast(obs_ids.?)), @ptrCast(@alignCast(scores.?)), @intCast(top_n));
-        } else {
-            n_results = c.dl_search_top_version(db, @intCast(version), syms, @intCast(n_tokens), @ptrCast(@alignCast(obs_ids.?)), @ptrCast(@alignCast(scores.?)), @intCast(top_n));
-        }
-        free(term_syms);
-
-        if (n_results < 0) {
-            _ = fprintf(stderr, "dl: search failed\n");
-            free(obs_ids);
-            free(scores);
-            return 1;
-        }
-
-        // Print results
-        const ids: [*]u32 = @ptrCast(@alignCast(obs_ids.?));
-        const scs: [*]c_int = @ptrCast(@alignCast(scores.?));
-        for (0..@intCast(n_results)) |i| {
-            _ = printf("%u (score=%d)\n", ids[i], scs[i]);
-        }
-        if (n_results == 0)
-            _ = printf("(no results)\n");
-
-        free(obs_ids);
-        free(scores);
-        return 0;
+        const terms_str = requirePositional(argv, &argp);
+        const opts = SearchParams.parse(argv, &argp) orelse return 1;
+        return runSearch(db, terms_str, opts);
     }
 
     if (eq(cmd, "similar")) {
@@ -885,9 +889,7 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
         // Zero index storage: the edit-distance automaton is compiled per call
         // and walked product-wise over the symbol DAFSA.  BYTE distance (ASCII
         // exact; a non-ASCII codepoint costs one edit per UTF-8 byte).
-        if (argp >= argv.len) usage(argv[0].ptr);
-        const needle = argv[argp];
-        argp += 1;
+        const needle = requirePositional(argv, &argp);
 
         var k: u32 = 1;
         if (argp < argv.len) {
@@ -925,10 +927,7 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
     }
 
     if (eq(cmd, "versions")) {
-        if (argp < argv.len) {
-            _ = fprintf(stderr, "dl: unexpected argument '%s'\n", argv[argp].ptr);
-            return 1;
-        }
+        if (rejectExtra(argv, argp)) return 1;
 
         var versions: [256]u32 = undefined;
         const n = c.dl_snapshot_versions(db, &versions, 256);
