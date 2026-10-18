@@ -20,8 +20,8 @@
 //!
 //! Because dl_typecheck_rules is called by dl_load_rules which knows no source
 //! filename, the default "file" component of every diagnostic is the literal
-//! `<input>` — the dlp tool overrides it with the real rules-file path via the
-//! `srcname` parameter.
+//! `<input>` — a caller that knows the rules-file path passes it via the
+//! `srcname` parameter (dl_load_rules passes NULL).
 //!
 //! Oracle: src/typecheck.c (never modified).
 

@@ -1,5 +1,14 @@
 # Dhall-typed schema & Datalog rule typechecking
 
+> **NOT SHIPPED — dlp was removed 2026-10-18.** The `dlp` typed-database-project
+> tool (`zig/src/dlp.zig` plus the pre-port `dlp/*.c` sources it was ported from),
+> its `dhall_c` module link in `zig/build.zig`, its docs page, and its build
+> artifacts are deleted; `zig-out/bin` holds only `dl`. This document is kept
+> unchanged below as the design of record for what was built — read every
+> "shipped"/"implemented" statement as historical. One part outlived the tool:
+> the schema-based rule typechecker (`dl_schema`, `dl_attach_schema`,
+> `dl_typecheck_rules`) is still in the engine and runs from `dl_load_rules`.
+
 _Design note. Status: **implemented** (2026-08-17). S0–S6 landed as a series of
 commits (08dd2ef, f284602, 83b3e70, 0eefc34, 02821ed, ff31a1d, 78954b5, d4d8b3e);
 this doc now describes the shipped `dlp` tool as built. The gcc core (306 tests)

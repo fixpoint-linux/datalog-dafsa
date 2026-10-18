@@ -47,7 +47,7 @@ const intern_mod = @import("intern.zig");
 // view_cache_slot/perm_index_entry (DlDb/RelEntry/Txn/TxnOp/ViewCacheSlot/
 // PermIndexEntry below) and the dl.h/db_* public entry points.  The C-shaped
 // mirror in dl_abi.zig exists ONLY for the out-of-library executables
-// (dl_cli.zig/dlp.zig) and the abi_witness comptime oracle — the in-library
+// (dl_cli.zig) and the abi_witness comptime oracle — the in-library
 // modules name these owner types and call these functions directly.
 
 // dafsa_internal.h: struct dafsa/dafsa_view + dafsa_save/dafsa_view_open/
@@ -3369,7 +3369,7 @@ pub export fn dl_load_rules(db: ?*DlDb, dl_source: [*c]const u8) c_int {
         return -1;
     }
 
-    // Dhall schema hook (S2/S3).
+    // schema typecheck hook (S2/S3).
     if (d.schema != null) {
         var errbuf: [256]u8 = undefined;
         if (dl_typecheck_rules(d.schema, @ptrCast(rules), n_rules, null, &errbuf, errbuf.len) != 0) {

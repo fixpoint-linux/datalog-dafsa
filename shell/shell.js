@@ -10,7 +10,6 @@
 //   '/datalog-dafsa/time-travel' → template 'dafsa-time-travel'
 //   '/datalog-dafsa/vector-search' → template 'dafsa-vector-search'
 //   '/datalog-dafsa/order-statistics' → template 'dafsa-order-statistics'
-//   '/datalog-dafsa/typed-projects' → template 'dafsa-typed-projects'
 //   '/datalog-dafsa/playground' → template 'dafsa-playground'
 //
 // Matching the main site means a data-mfe-route like '/datalog-dafsa' or '/'
@@ -38,7 +37,6 @@ const app = await createApp({
     { path: '/datalog-dafsa/time-travel', template: 'dafsa-time-travel', name: 'dafsa-time-travel' },
     { path: '/datalog-dafsa/vector-search', template: 'dafsa-vector-search', name: 'dafsa-vector-search' },
     { path: '/datalog-dafsa/order-statistics', template: 'dafsa-order-statistics', name: 'dafsa-order-statistics' },
-    { path: '/datalog-dafsa/typed-projects', template: 'dafsa-typed-projects', name: 'dafsa-typed-projects' },
     { path: '/datalog-dafsa/playground', template: 'dafsa-playground', name: 'dafsa-playground' },
   ],
   basePath: '/',

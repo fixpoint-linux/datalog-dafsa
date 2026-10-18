@@ -95,7 +95,6 @@ in  { targets =
                   , "shell/templates/dafsa-time-travel.html"
                   , "shell/templates/dafsa-vector-search.html"
                   , "shell/templates/dafsa-order-statistics.html"
-                  , "shell/templates/dafsa-typed-projects.html"
                   , "shell/templates/dafsa-playground.html"
                   , "shell/mfe/dafsa-page.js"
                   , "shell/mfe/dafsa-playground.js"

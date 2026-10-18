@@ -1,9 +1,9 @@
 /*
- * schema.h — Typed relation schema for the Dhall-driven rule typechecker
+ * schema.h — Typed relation schema for the rule typechecker
  *
  * A `dl_schema` is a set of relation definitions (arity + per-column type)
- * used by the `dlp` tool to typecheck Datalog rules against a Dhall schema
- * before they are compiled.  This header is SELF-CONTAINED: it does NOT
+ * used to typecheck Datalog rules against a declared relation schema before
+ * they are compiled.  This header is SELF-CONTAINED: it does NOT
  * include dl_internal.h (which is an internal header, not a public one).
  *
  * S2 scope: schema structs + builder + lookup + the guarded dl_typecheck_rules
@@ -111,8 +111,8 @@ const dl_reldef *dl_schema_find(const dl_schema *s, const char *name);
  * parser.h).  Returns 0 if the rules typecheck against `schema`, -1 on
  * failure with a human-readable diagnostic written into errbuf (errcap bytes).
  * `srcname` names the source file in diagnostics (NULL => the literal
- * `<input>`); the dlp tool passes the real rules-file path so errors show the
- * actual file.
+ * `<input>`); a caller that knows the rules-file path passes it so errors show
+ * the actual file (dl_load_rules passes NULL).
  *
  * Implemented in src/typecheck.c (S3). */
 int dl_typecheck_rules(const dl_schema *schema, void *rules, int n_rules,

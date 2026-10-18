@@ -119,33 +119,9 @@ pub fn build(b: *std.Build) void {
     emod.addRPathSpecial("$ORIGIN/../lib");
     b.installArtifact(exe);
 
-    // ─── dlp (dl-project) CLI — Dhall-driven schema tool over the .so ──────
-    // Ported from dlp/*.c (the last first-party C): main/init/schema_load/
-    // schema_check/csv_load/json_load/workflow + coerce.h.  The engine
-    // surface resolves from the .so (like dl); the Dhall evaluation compiles
-    // the vendored dhall-c Zig core natively as the `dhall_c` module
-    // (single-module facade dhall_mod.zig; same pattern as dafsa_abi).
-    const dhall_c = b.createModule(.{
-        .root_source_file = b.path("../vendor/dhake/vendor/dhall-c/zig/src/dhall_mod.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    const dlp = b.addExecutable(.{
-        .name = "dlp",
-        .root_module = b.createModule(.{
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-            .root_source_file = b.path("src/dlp.zig"),
-        }),
-    });
-    const dmod = dlp.root_module;
-    dmod.addImport("dhall_c", dhall_c);
-    dmod.addIncludePath(b.path("../src"));
-    dmod.linkLibrary(lib);
-    dmod.addRPathSpecial("$ORIGIN/../lib");
-    b.installArtifact(dlp);
+    // (The dlp typed-database-project tool that used to sit here — and its
+    // `dhall_c` module link into the vendored dhall-c Zig core — was removed;
+    // the kept scope is the engine + the `dl` CLI.)
 
     // ─── Unit tests for the ported Zig modules (`zig build test`) ─────────
     // Runs every inline `test` decl of the ported modules (zig/src/tests.zig

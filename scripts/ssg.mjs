@@ -52,7 +52,7 @@ const ELM_BUNDLE = join(DIST, 'elm.js');
 const DOCS_DIR = join(ROOT, 'docs');
 
 // The import map is shared by every generated page. All paths are ABSOLUTE
-// (/datalog-dafsa/...) because the 10 pages live at different URL depths.
+// (/datalog-dafsa/...) because the 9 pages live at different URL depths.
 const IMPORT_MAP = `{
   "imports": {
     "@mfe/core": "/vendor/@mfe/core/index.js",
@@ -65,7 +65,6 @@ const IMPORT_MAP = `{
     "dafsa-time-travel": "/datalog-dafsa/shell/mfe/dafsa-page.js",
     "dafsa-vector-search": "/datalog-dafsa/shell/mfe/dafsa-page.js",
     "dafsa-order-statistics": "/datalog-dafsa/shell/mfe/dafsa-page.js",
-    "dafsa-typed-projects": "/datalog-dafsa/shell/mfe/dafsa-page.js",
     "dafsa-playground": "/datalog-dafsa/shell/mfe/dafsa-page.js",
     "fixpoint-landing": "/shell/mfe/fixpoint-landing.js"
   }

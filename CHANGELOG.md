@@ -3,6 +3,38 @@
 All notable changes to this project are documented in this file.
 
 ## [Unreleased]
+- **The `dlp` typed-database-project tool DELETED** (2026-10-18): it is outside
+  the kept scope (store + rules + fixpoint + WFS + the `dl` CLI + regex + the
+  search tiers) — a separate Dhall-driven project tool layered on the engine —
+  so it is gone rather than kept as unbuildable dead weight:
+  - removed `zig/src/dlp.zig` (2687 lines, zero inline tests) and the whole
+    pre-port `dlp/` directory (9 files, 2680 lines of C: `main.c`, `init.c`,
+    `schema_load.c`, `schema_check.c`, `csv_load.c`, `json_load.c`,
+    `workflow.c`, `coerce.h`, `dlp.h`). Nothing had built the C sources since
+    the `Makefile` was deleted; they were referenced only from comments in
+    `zig/src/dlp.zig`;
+  - `zig/build.zig` lost the `dlp` executable target, its
+    `addImport("dhall_c", ...)`, the `dhall_c` `createModule` block and the
+    `installArtifact`; `zig-out/bin` now holds only `dl`. The
+    `[submodule "vendor/dhake"]` stanza and the `vendor/dhake` checkout stay —
+    the docs-site build (`Dhakefile.dhall`) still uses them;
+  - docs: `docs/typed-projects.html` deleted with its nav entry in all nine
+    `docs/*.html` pages, the landing headline card (cards renumbered) and the
+    reference list in `docs/index.html`; the Elm docs site lost the page too
+    (`src/Main.elm` `TypedProjects` variant + view, `shell/pages.js` entry,
+    `shell/templates/dafsa-typed-projects.html`, the `shell/{shell.js,index.html}`
+    route/import-map entries and the `scripts/ssg.mjs` import-map line);
+    `README.md` lost its "dlp — typed database projects" section;
+  - `tests/dlp_golden.sh` (the golden test that drove the deleted binary) is
+    deleted; `.gitignore` lost `/dlp/dlp` and `/dlp_schema_check`;
+  - comments that named the tool were corrected, not the code: `src/dl.h`,
+    `src/schema.h`, `src/dl_internal.h`, `zig/src/{dl,dl_abi,schema,typecheck}.zig`,
+    `zig/abi_audit.sh`, `zig/tests/final_audit.sh`;
+  - `design/datalog-dafsa-dhall-schema.md` is unchanged except for a
+    "NOT SHIPPED — dlp was removed 2026-10-18" note at the top: it stays the
+    design of record. The schema-based rule typechecker it introduced
+    (`dl_schema`, `dl_attach_schema`, `dl_typecheck_rules`, run from
+    `dl_load_rules`) survives in the engine, as does `src/schema.h`/`src/typecheck.h`.
 - **The C++ embedding sidecar DELETED — the repository is Zig-only** (2026-08-11):
   the engine never embedded (the search tiers take a pre-quantized int8 vector
   and a pre-encoded ITQ signature), so the ggml/bge machinery that produced

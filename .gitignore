@@ -7,8 +7,6 @@ build-tmp
 # binaries
 /dl
 /dl-lsp
-/dlp/dlp
-/dlp_schema_check
 
 # cosmocc/APE build artifacts
 .ape-*

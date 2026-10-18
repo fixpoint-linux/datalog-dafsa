@@ -104,89 +104,6 @@ stop loses the current cycle's appends, everything before the last boundary repl
 saved durably (and ordered *before* WAL records so crash recovery can decode symbol ids).
 WAL compaction triggers at 25% of the relation size.
 
-## dlp — typed database projects
-
-[`dlp`](design/datalog-dafsa-dhall-schema.md) is a typed database-project workflow
-layered on the engine. A `schema.dhall` file defines the typed relations
-(typechecked + normalized in-process by the dhall-c interpreter); data files are
-validated against it on load; and `.datalog` rules are typechecked against the
-schema *before* compilation. It catches int/text mixing at authoring time — e.g.
-`tc(A,W):-weight(A,W).` is rejected because `weight.w` is Natural while `tc.dst` is
-Text.
-
-```text
-mydb/
-  schema.dhall      # the typed contract (: Schema-annotated)
-  data/*.csv|json   # validated on load (file stem = relation)
-  rules/*.datalog   # concatenated; typechecked against the schema
-  .build/           # dlp-owned: build snapshot, schema.json echo
-```
-
-**Schema DSL (Optional-payload union).** The schema is Dhall-as-data — self-contained
-`let`s with a `: Schema` annotation. The column-type universe spans **flat scalars**
-(raw u32: `Natural`, `Text`/interned symbol, `Bool`, `Char`, `Date`=yyyymmdd,
-`Timestamp`=epoch seconds, `Signed`=i32 zigzag) and **parameterized** types
-(`List`/`Optional` of a flat element type, and `Enum` with a fixed value set).
-Flat scalars carry an **Optional constraint payload** — `min`/`max` for
-Natural/Char/Date/Timestamp/Signed and a `regex` for Text — enforced at data
-load (`dlp check`/`build`); `None` (or `{=}` for Bool and List/Optional
-elements) means unconstrained:
-
-```dhall
-let Elem = < Natural : {=} | Text : {=} | Bool : {=} | Char : {=} |
-             Date : {=} | Timestamp : {=} | Signed : {=} >
-let NC = { min = None Natural, max = None Natural }   -- unconstrained Natural
-let TC = { regex = None Text }                         -- unconstrained Text
-let SC = { min = None Integer, max = None Integer }    -- unconstrained Signed
-let ColumnType = < Natural : { min : Optional Natural, max : Optional Natural } |
-                   Text : { regex : Optional Text } | Bool : {=} |
-                   Char : { min : Optional Natural, max : Optional Natural } |
-                   Date : { min : Optional Natural, max : Optional Natural } |
-                   Timestamp : { min : Optional Natural, max : Optional Natural } |
-                   Signed : { min : Optional Integer, max : Optional Integer } |
-                   List : { elem : Elem } | Optional : { elem : Elem } |
-                   Enum : { values : List Text } >
-let Column = { name : Text, type : ColumnType }
-let Relation = { name : Text, columns : List Column }
-let Schema = { relations : List Relation }
-in { relations =
-     [ { name = "node", columns = [ { name = "id", type = < Text = TC > },
-                                    { name = "score", type = < Natural = { min = Some 0, max = Some 150 } > },
-                                    { name = "tags", type = < List = { elem = < Text = {=} > } > },
-                                    { name = "nick", type = < Optional = { elem = < Text = {=} > } > },
-                                    { name = "color", type = < Enum = { values = [ "red", "green" ] } > } ] } ]
-   } : Schema
-```
-
-Notes: `Signed` bounds are `Integer` literals and REQUIRE an explicit sign —
-`Some -10` / `Some +10` (bare `10` is `Natural`). Text `regex` uses full-key
-matching (implicit `^...$` — do not write `^`/`$` anchors).
-
-**Commands** (the new `dlp` binary; the low-level `dl` CLI is unchanged):
-
-- `dlp init [dir]` — scaffold a project template (incl. an example).
-- `dlp schema [dir]` — dhall-typecheck + normalize the schema.
-- `dlp check [dir]` — schema + dry-run data validation + parse/typecheck rules.
-  The CI command; **no writes**.
-- `dlp build [dir]` — check + declare relations + load+validate data + compile +
-  publish a snapshot into `.build/`.
-- `dlp query [dir] 'goal'` — build then evaluate a goal and print the rows.
-
-**Data validation.** CSV headers are matched to columns **by name** in any order;
-JSON is strict (array of objects, keys = column names). Coercion is per-type:
-`Text`/`Enum` verbatim or interned, `Natural` = `^[0-9]+$` ≤ `4294967295`,
-`Bool` = `true/false/0/1` (CSV) or JSON boolean, `Char` = one Unicode codepoint,
-`Date` = `yyyy-mm-dd`, `Timestamp` = unix-seconds integer, `Signed` = signed i32,
-`List` = JSON array or a bracketed quoted CSV cell `[a,b,c]`, `Optional` = JSON
-`null` or empty CSV cell. Mismatched data is rejected with `path:line:col`.
-
-**Closed world.** Rules are closed-world: relations appearing as rule heads are
-IDB, so loading data into a rule-defined relation is an error, and undeclared
-relations are rejected.
-
-**Build.** `dlp` is a deferred cosmocc tool (its C dependencies — the engine and the
-dhall-c core — are both removed; it is not built by the canonical Zig build).
-
 ## Python bindings — `python/`
 
 [`python/dlb`](python/README.md) is an in-process Python binding over
@@ -256,9 +173,9 @@ see [`docs/README.md`](docs/README.md) for how to enable Pages.
   storage thesis, encoding linchpin (§0–§1), and system design.
 - [`design/datalog-dafsa-implementation-plan.md`](design/datalog-dafsa-implementation-plan.md)
   — milestone-by-milestone plan with implementation status.
-- [`design/datalog-dafsa-dhall-schema.md`](design/datalog-dafsa-dhall-schema.md) — the
-  `dlp` typed database-project workflow (Dhall schema, typed CSV/JSON loaders, rule
-  typechecking).
+- [`design/datalog-dafsa-dhall-schema.md`](design/datalog-dafsa-dhall-schema.md) — design
+  of record for the `dlp` typed database-project tool, **NOT SHIPPED** (the tool was
+  removed; kept for the record).
 - [`docs/datalog-dafsa-cas.md`](docs/datalog-dafsa-cas.md) — CAS / optimistic-concurrency
   transactions for the write path (`rev()`, `dl_cas_revision`, the `dl_txn_*` API, txn-WAL
   crash recovery).

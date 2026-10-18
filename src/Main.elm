@@ -31,7 +31,7 @@ main =
 
 type alias Flags = { pathname : String }
 
-type Page = Landing | Language | Cli | Api | Architecture | TimeTravel | VectorSearch | OrderStatistics | TypedProjects | Playground
+type Page = Landing | Language | Cli | Api | Architecture | TimeTravel | VectorSearch | OrderStatistics | Playground
 
 type alias Model = Page
 
@@ -76,7 +76,6 @@ parsePage path =
         "time-travel" -> TimeTravel
         "vector-search" -> VectorSearch
         "order-statistics" -> OrderStatistics
-        "typed-projects" -> TypedProjects
         "playground" -> Playground
         _ -> Landing
 
@@ -107,7 +106,6 @@ navView =
             , a [ href "https://fixpointlinux.org/datalog-dafsa/time-travel/", attribute "data-mfe-route" "/datalog-dafsa/time-travel" ] [ text "Time Travel" ]
             , a [ href "https://fixpointlinux.org/datalog-dafsa/vector-search/", attribute "data-mfe-route" "/datalog-dafsa/vector-search" ] [ text "Vector Search" ]
             , a [ href "https://fixpointlinux.org/datalog-dafsa/order-statistics/", attribute "data-mfe-route" "/datalog-dafsa/order-statistics" ] [ text "Order Stats" ]
-            , a [ href "https://fixpointlinux.org/datalog-dafsa/typed-projects/", attribute "data-mfe-route" "/datalog-dafsa/typed-projects" ] [ text "Typed Projects" ]
             ]
         , extra =
             [ a [ class "home", href "https://fixpointlinux.org/datalog-dafsa/playground/", attribute "data-mfe-route" "/datalog-dafsa/playground" ] [ text "Playground" ]
@@ -128,7 +126,6 @@ pageView model =
         TimeTravel -> timeTravelView
         VectorSearch -> vectorSearchView
         OrderStatistics -> orderStatisticsView
-        TypedProjects -> typedProjectsView
         Playground -> playgroundView
 
 
@@ -237,7 +234,7 @@ landingView =
         , Fixpoint.Section.view
             { id = "highlights"
             , title = "What else stands out"
-            , hint = "// compact · typed · search · order-stats"
+            , hint = "// compact · search · order-stats · time-travel"
             , children =
                 [ Fixpoint.Headline.view
                     [ Fixpoint.Headline.card
@@ -258,24 +255,6 @@ landingView =
                         }
                     , Fixpoint.Headline.card
                         { n = "02"
-                        , title = [ text "Typed projects — schema, validated data, typechecked rules" ]
-                        , body =
-                            [ p []
-                                [ text "The "
-                                , Fixpoint.Code.inline "dlp"
-                                , text " tool defines the schema in Dhall ("
-                                , Fixpoint.Code.inline "schema.dhall"
-                                , text "), validates and coerces CSV/JSON data against it, and "
-                                , strong [] [ text "typechecks every rule" ]
-                                , text " before compilation. Mixed-type rules are rejected with "
-                                , Fixpoint.Code.inline "file:line:col"
-                                , text " diagnostics — type errors surface early instead of mis-evaluating."
-                                ]
-                            , p [] [ a [ href "https://fixpointlinux.org/datalog-dafsa/typed-projects/", attribute "data-mfe-route" "/datalog-dafsa/typed-projects" ] [ text "The typed project workflow →" ] ]
-                            ]
-                        }
-                    , Fixpoint.Headline.card
-                        { n = "03"
                         , title = [ text "Search — full-text ", em [] [ text "and" ], text " semantic, both versioned" ]
                         , body =
                             [ p []
@@ -292,7 +271,7 @@ landingView =
                             ]
                         }
                     , Fixpoint.Headline.card
-                        { n = "04"
+                        { n = "03"
                         , title = [ text "Order statistics — rank, select, range, count" ]
                         , body =
                             [ p []
@@ -453,7 +432,7 @@ landingView =
         , Fixpoint.Section.view
             { id = "reference"
             , title = "Reference pages"
-            , hint = "// language · cli · api · architecture · time-travel · vector-search · order-statistics · typed-projects"
+            , hint = "// language · cli · api · architecture · time-travel · vector-search · order-statistics"
             , children =
                 [ ul []
                     [ li [] [ a [ href "https://fixpointlinux.org/datalog-dafsa/language/", attribute "data-mfe-route" "/datalog-dafsa/language" ] [ text "Language Reference" ], text " — the complete rule language." ]
@@ -463,7 +442,6 @@ landingView =
                     , li [] [ a [ href "https://fixpointlinux.org/datalog-dafsa/time-travel/", attribute "data-mfe-route" "/datalog-dafsa/time-travel" ] [ text "Time Travel" ], text " — versioned snapshots and as-of queries." ]
                     , li [] [ a [ href "https://fixpointlinux.org/datalog-dafsa/vector-search/", attribute "data-mfe-route" "/datalog-dafsa/vector-search" ] [ text "Vector Search" ], text " — semantic ", Fixpoint.Code.inline "dl vsearch", text "/", Fixpoint.Code.inline "dl vhybrid", text " over pre-quantized bge-small vectors." ]
                     , li [] [ a [ href "https://fixpointlinux.org/datalog-dafsa/order-statistics/", attribute "data-mfe-route" "/datalog-dafsa/order-statistics" ] [ text "Order Statistics" ], text " — rank / select / range / count and the sorted iterator." ]
-                    , li [] [ a [ href "https://fixpointlinux.org/datalog-dafsa/typed-projects/", attribute "data-mfe-route" "/datalog-dafsa/typed-projects" ] [ text "Typed Projects" ], text " — schema.dhall + validated data + typechecked rules." ]
                     ]
                 ]
             }
@@ -2407,284 +2385,6 @@ orderStatisticsView =
         ]
 
 
-typedProjectsView : Html Msg
-typedProjectsView =
-    div []
-        [ Fixpoint.Hero.view
-            { prompt =
-                [ Fixpoint.Hero.hash
-                , text " datalog-dafsa "
-                , Fixpoint.Hero.dollar
-                , text " dlp check ."
-                , Fixpoint.Hero.blink
-                ]
-            , title = [ text "Typed Projects (", Fixpoint.Code.inline "dlp", text ")" ]
-            , tagline = []
-            }
-        , Fixpoint.Section.view
-            { id = "why"
-            , title = "Why typed schemas?"
-            , hint = "// typed, project-based workflow on top of the engine"
-            , children =
-                [ p []
-                    [ Fixpoint.Code.inline "dlp"
-                    , text " (“dl-project”) is a "
-                    , strong [] [ text "typed, project-based workflow" ]
-                    , text " layered on top of the engine. Instead of loading untyped facts and rules directly, you define a database "
-                    , em [] [ text "schema" ]
-                    , text " in Dhall, load data validated against it, and write Datalog rules whose relations are "
-                    , strong [] [ text "typechecked against the schema before they compile" ]
-                    , text ". This turns silent type errors into clear, early diagnostics."
-                    ]
-                , Fixpoint.Callout.note
-                    [ Fixpoint.Code.inline "dlp"
-                    , text " is a separate binary from the low-level "
-                    , Fixpoint.Code.inline "dl"
-                    , text " CLI. It links the engine together with the "
-                    , a [ href "https://github.com/jmars/dhall-c" ] [ text "dhall-c" ]
-                    , text " interpreter in-process, so the schema is typechecked and normalized without any on-disk intermediate. The gcc core build is untouched — "
-                    , Fixpoint.Code.inline "dlp"
-                    , text " is opt-in via "
-                    , Fixpoint.Code.inline "make dlp DHALLC=<path-to-dhall-c>"
-                    , text "."
-                    ]
-                , p []
-                    [ text "Every engine value is a "
-                    , Fixpoint.Code.inline "u32"
-                    , text " — either a raw integer or an interned symbol id. Without column types, an int column and a symbol column are indistinguishable, and a rule can silently mix them (a real correctness trap). The typed workflow closes that gap:"
-                    ]
-                , ul []
-                    [ li []
-                        [ strong [] [ text "Closed world" ]
-                        , text " — every relation is declared in "
-                        , Fixpoint.Code.inline "schema.dhall"
-                        , text "; using an undeclared relation is an error that points at the schema."
-                        ]
-                    , li []
-                        [ strong [] [ text "Per-column types" ]
-                        , text " — eight built-in types spanning flat scalars (Natural, Text, Bool, Char, Date, Timestamp, Signed) and parameterized (List, Optional, Enum), checked on both data and rules."
-                        ]
-                    , li []
-                        [ strong [] [ text "Rule typechecking" ]
-                        , text " — every rule is checked for "
-                        , em [] [ text "occurrence consistency" ]
-                        , text " (a variable can’t be Natural in one atom and Text in another), with "
-                        , Fixpoint.Code.inline "file:line:col"
-                        , text " diagnostics."
-                        ]
-                    , li []
-                        [ strong [] [ text "Typed data loading" ]
-                        , text " — CSV/JSON rows are validated and coerced per column before they enter the store."
-                        ]
-                    ]
-                , p []
-                    [ text "For example, the rule "
-                    , Fixpoint.Code.inline "tc(A, W) :- weight(A, W)."
-                    , text " is rejected: "
-                    , Fixpoint.Code.inline "W"
-                    , text " is "
-                    , Fixpoint.Code.inline "Natural"
-                    , text " in "
-                    , Fixpoint.Code.inline "weight.w"
-                    , text " but "
-                    , Fixpoint.Code.inline "Text"
-                    , text " in "
-                    , Fixpoint.Code.inline "tc.dst"
-                    , text " — a bug the untyped engine would silently mis-evaluate."
-                    ]
-                ]
-            }
-        , Fixpoint.Section.view
-            { id = "layout"
-            , title = "Project layout"
-            , hint = "// a directory with a few conventional subdirectories"
-            , children =
-                [ p [] [ text "A database project is a directory with a few conventional subdirectories:" ]
-                , Fixpoint.Code.block
-                    [ text "mydb/\n"
-                    , text "  schema.dhall      # the typed schema (the contract)\n"
-                    , text "  data/             # EDB CSV/JSON inputs, file stem = relation name\n"
-                    , text "  rules/            # .datalog rule files (concatenated, sorted)\n"
-                    , text "  .build/           # dlp-owned: build snapshot, schema.json echo"
-                    ]
-                ]
-            }
-        , Fixpoint.Section.view
-            { id = "schema"
-            , title = "The schema DSL"
-            , hint = "// Dhall-as-data: self-contained lets with a final : Schema"
-            , children =
-                [ p []
-                    [ text "The schema is "
-                    , strong [] [ text "Dhall-as-data" ]
-                    , text ": self-contained "
-                    , Fixpoint.Code.inline "let"
-                    , text "s with a final "
-                    , Fixpoint.Code.inline ": Schema"
-                    , text " annotation. Each relation declares its name, arity, and per-column type. The column-type union spans "
-                    , strong [] [ text "flat scalars" ]
-                    , text " (all raw u32: "
-                    , Fixpoint.Code.inline "Natural"
-                    , text ", "
-                    , Fixpoint.Code.inline "Text"
-                    , text " / interned symbol, "
-                    , Fixpoint.Code.inline "Bool"
-                    , text ", "
-                    , Fixpoint.Code.inline "Char"
-                    , text ", "
-                    , Fixpoint.Code.inline "Date"
-                    , text " =yyyymmdd, "
-                    , Fixpoint.Code.inline "Timestamp"
-                    , text " =epoch seconds, "
-                    , Fixpoint.Code.inline "Signed"
-                    , text " =i32 zigzag) and "
-                    , strong [] [ text "parameterized" ]
-                    , text " types ("
-                    , Fixpoint.Code.inline "List"
-                    , text " / "
-                    , Fixpoint.Code.inline "Optional"
-                    , text " of a flat element type, and "
-                    , Fixpoint.Code.inline "Enum"
-                    , text " with a fixed value set). The column-type union uses an "
-                    , em [] [ text "empty-record payload" ]
-                    , text " to tag a flat type, and a payload record to carry a parameterized type’s element type / value set:"
-                    ]
-                , Fixpoint.Code.block
-                    [ text "let Elem = < Natural : {=} | Text : {=} | Bool : {=} | Char : {=} |\n"
-                    , text "             Date : {=} | Timestamp : {=} | Signed : {=} >\n"
-                    , text "let ColumnType = < Natural : {=} | Text : {=} | Bool : {=} | Char : {=} |\n"
-                    , text "                   Date : {=} | Timestamp : {=} | Signed : {=} |\n"
-                    , text "                   List : { elem : Elem } | Optional : { elem : Elem } |\n"
-                    , text "                   Enum : { values : List Text } >\n"
-                    , text "let Column = { name : Text, type : ColumnType }\n"
-                    , text "let Relation = { name : Text, columns : List Column }\n"
-                    , text "let Schema = { relations : List Relation }\n"
-                    , text "in { relations =\n"
-                    , text "     [ { name = \"node\", columns = [ { name = \"id\", type = < Text = {=} > },\n"
-                    , text "                                    { name = \"tags\", type = < List = { elem = < Text = {=} > } > },\n"
-                    , text "                                    { name = \"nick\", type = < Optional = { elem = < Text = {=} > } > },\n"
-                    , text "                                    { name = \"color\", type = < Enum = { values = [ \"red\", \"green\" ] } > } ] } ]\n"
-                    , text "   } : Schema"
-                    ]
-                , p []
-                    [ text "Coercion is per-type on load: "
-                    , Fixpoint.Code.inline "Text"
-                    , text "/"
-                    , Fixpoint.Code.inline "Enum"
-                    , text " interned, "
-                    , Fixpoint.Code.inline "Natural"
-                    , text " "
-                    , Fixpoint.Code.inline "^[0-9]+$"
-                    , text " ≤ 4294967295, "
-                    , Fixpoint.Code.inline "Bool"
-                    , text " "
-                    , Fixpoint.Code.inline "true/false/0/1"
-                    , text " (CSV) or a JSON boolean, "
-                    , Fixpoint.Code.inline "Char"
-                    , text " one Unicode codepoint, "
-                    , Fixpoint.Code.inline "Date"
-                    , text " "
-                    , Fixpoint.Code.inline "yyyy-mm-dd"
-                    , text ", "
-                    , Fixpoint.Code.inline "Timestamp"
-                    , text " unix-seconds integer, "
-                    , Fixpoint.Code.inline "Signed"
-                    , text " signed i32, "
-                    , Fixpoint.Code.inline "List"
-                    , text " a JSON array or a bracketed quoted CSV cell "
-                    , Fixpoint.Code.inline "[a,b,c]"
-                    , text ", "
-                    , Fixpoint.Code.inline "Optional"
-                    , text " JSON "
-                    , Fixpoint.Code.inline "null"
-                    , text " or an empty CSV cell."
-                    ]
-                , p []
-                    [ text "Arity is the length of "
-                    , Fixpoint.Code.inline "columns"
-                    , text " (1–8, enforced by the tool). Relations that appear as rule "
-                    , em [] [ text "heads" ]
-                    , text " are IDB (derived); loading data into them is an error."
-                    ]
-                ]
-            }
-        , Fixpoint.Section.view
-            { id = "commands"
-            , title = "Commands"
-            , hint = "// init, schema, check, build, query"
-            , children =
-                [ table []
-                    [ tr [] [ th [] [ text "Command" ], th [] [ text "Does" ] ]
-                    , tr [] [ td [] [ Fixpoint.Code.inline "dlp init [dir]" ], td [] [ text "Scaffold a project directory with an example schema." ] ]
-                    , tr [] [ td [] [ Fixpoint.Code.inline "dlp schema [dir]" ], td [] [ text "Dhall-typecheck + normalize ", Fixpoint.Code.inline "schema.dhall", text " and print the typed relations." ] ]
-                    , tr [] [ td [] [ Fixpoint.Code.inline "dlp check [dir]" ], td [] [ text "Validate schema + typecheck rules + dry-run data. ", strong [] [ text "No writes" ], text " — the CI command." ] ]
-                    , tr [] [ td [] [ Fixpoint.Code.inline "dlp build [dir]" ], td [] [ text "Check, then build a snapshot under ", Fixpoint.Code.inline ".build/", text " (declare EDB, load data, compile, publish)." ] ]
-                    , tr [] [ td [] [ Fixpoint.Code.inline "dlp query [dir] 'goal'" ], td [] [ text "Build in-process and evaluate a goal, e.g. ", Fixpoint.Code.inline "'tc(alice, X)'", text "." ] ]
-                    ]
-                , p []
-                    [ text "Data files are matched to schema columns "
-                    , strong [] [ text "by name" ]
-                    , text " ("
-                    , em [] [ text "any order" ]
-                    , text "): CSV headers map to columns; JSON is an array of objects. CSV is text-typed ("
-                    , Fixpoint.Code.inline "Text"
-                    , text " takes any cell verbatim; "
-                    , Fixpoint.Code.inline "Natural"
-                    , text " requires "
-                    , Fixpoint.Code.inline "^[0-9]+$"
-                    , text " ≤ 4294967295). JSON is strict (number → "
-                    , Fixpoint.Code.inline "Natural"
-                    , text ", string → "
-                    , Fixpoint.Code.inline "Text"
-                    , text ")."
-                    ]
-                ]
-            }
-        , Fixpoint.Section.view
-            { id = "errors"
-            , title = "Catching the bug"
-            , hint = "// mixed-type rules fail check/build with precise diagnostics"
-            , children =
-                [ p []
-                    [ text "A mixed-type rule fails "
-                    , Fixpoint.Code.inline "dlp check"
-                    , text " and "
-                    , Fixpoint.Code.inline "dlp build"
-                    , text " with a precise diagnostic (here "
-                    , Fixpoint.Code.inline "<input>"
-                    , text " is the rule file):"
-                    ]
-                , Fixpoint.Code.block
-                    [ text "$ dlp check .\n"
-                    , text "rules/reach.datalog: <input>:1:19: variable W is Natural here (weight) but Text at <input>:1:6 (tc)"
-                    ]
-                , p []
-                    [ text "Data validation reports the exact row and column, e.g. "
-                    , Fixpoint.Code.inline "weight.csv:3:2: column 'w' expects Natural, got \"heavy\""
-                    , text "."
-                    ]
-                ]
-            }
-        , Fixpoint.Section.view
-            { id = "build"
-            , title = "Building dlp"
-            , hint = "// opt-in cosmocc build; the default gcc make never touches it"
-            , children =
-                [ p []
-                    [ Fixpoint.Code.inline "dlp"
-                    , text " is an opt-in cosmocc build (the default gcc "
-                    , Fixpoint.Code.inline "make"
-                    , text " / "
-                    , Fixpoint.Code.inline "make test"
-                    , text " never touch it or dhall-c). With dhall-c as a sibling repo:"
-                    ]
-                , Fixpoint.Code.block
-                    [ text "make dlp DHALLC=../dhall-c        # builds dlp/dlp\n"
-                    , text "make dlp-golden                   # end-to-end golden test (check/build/query)"
-                    ]
-                ]
-            }
-        ]
 playgroundView : Html Msg
 playgroundView =
     div []

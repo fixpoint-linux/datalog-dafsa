@@ -22,7 +22,6 @@
       <a href="time-travel.html">Time Travel</a>
       <a href="vector-search.html">Vector Search</a>
       <a href="order-statistics.html">Order Stats</a>
-      <a href="typed-projects.html">Typed Projects</a>
       <a class="ext" href="https://fixpointlinux.org/">fixpoint-linux &rarr;</a>
     </nav>
   </div>
@@ -88,17 +87,6 @@
     </div>
     <div class="headline-card">
       <span class="n">02</span>
-      <h3>Typed projects — schema, validated data, typechecked rules</h3>
-      <p>
-        The <code>dlp</code> tool defines the schema in Dhall (<code>schema.dhall</code>),
-        validates and coerces CSV/JSON data against it, and <strong>typechecks every rule</strong>
-        before compilation. Mixed-type rules are rejected with <code>file:line:col</code>
-        diagnostics — type errors surface early instead of mis-evaluating.
-      </p>
-      <p><a href="typed-projects.html">The typed project workflow &rarr;</a></p>
-    </div>
-    <div class="headline-card">
-      <span class="n">03</span>
       <h3>Search — full-text <em>and</em> semantic, both versioned</h3>
       <p>
         <code>dl search</code> is AND-intersect full-text over a postings index. The vector
@@ -111,7 +99,7 @@
       <p><a href="vector-search.html">The vector-search tier &rarr;</a></p>
     </div>
     <div class="headline-card">
-      <span class="n">04</span>
+      <span class="n">03</span>
       <h3>Order statistics — rank, select, range, count</h3>
       <p>
         The big-endian encoding means the <strong>extreme prefix is the extreme key</strong>, so
@@ -219,7 +207,6 @@ bash zig/run_zig_suites.sh                                   # the C test suites
     <li><a href="time-travel.html">Time Travel</a> — versioned snapshots and as-of queries.</li>
     <li><a href="vector-search.html">Vector Search</a> — semantic <code>dl vsearch</code>/<code>dl vhybrid</code> over pre-quantized bge-small vectors.</li>
     <li><a href="order-statistics.html">Order Statistics</a> — rank / select / range / count and the sorted iterator.</li>
-    <li><a href="typed-projects.html">Typed Projects</a> — schema.dhall + validated data + typechecked rules.</li>
   </ul>
 </main>
 

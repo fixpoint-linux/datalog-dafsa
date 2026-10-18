@@ -1,7 +1,7 @@
 //! schema.zig — port of src/schema.c (dl_schema builder + lookup).
 //!
 //! Strangler-hybrid ABI: dl_schema / dl_reldef / dl_colspec / dl_coltype are
-//! EXPOSED types (tests, dlp and other C TUs declare and dereference them)
+//! EXPOSED types (tests and other TUs declare and dereference them)
 //! and must stay byte-identical to src/schema.h; dl_schema_add /
 //! dl_schema_find are `export fn`s with the exact C names/signatures.
 //! dl_colspec_eq is static-inline in schema.h (each C TU inlines its own

@@ -15,9 +15,8 @@
 #
 # The pre-removal consumer TUs this audit used to compile — src/dl_cli.c
 # (the CLI oracle, now zig/src/dl_cli.zig), dl-lsp (src/lsp.c + src/json.c,
-# retired with the C engine), the still-C .so TUs src/index.c + src/vector.c
-# (ported to Zig in U14), and the dlp cosmocc tool (deferred; its engine +
-# dhall-c C dependencies are both removed) — are gone.  The retained C
+# retired with the C engine), and the still-C .so TUs src/index.c + src/vector.c
+# (ported to Zig in U14) — are gone.  The retained C
 # consumers are the 42 test suites, so their re-link IS the ABI contract.
 #
 # Additionally asserts the engine DATA globals C consumers reference are

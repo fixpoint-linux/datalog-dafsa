@@ -7,7 +7,7 @@
 //! tuple_set, regexwalk.regex_dfa/sym_set, relation.Relation, …) and calls the
 //! owner functions directly.  The C-shaped structs and `extern "c" fn`
 //! declarations below exist only for the executables that link libdatalog.so
-//! as a separate binary (dl_cli.zig, dlp.zig) and cannot @import dl.zig
+//! as a separate binary (dl_cli.zig) and cannot @import dl.zig
 //! without compiling the whole engine into the exe, plus the comptime
 //! drift oracle in abi_witness.zig.  Do not add an in-library reference here;
 //! the witness pins every owner type against these mirrors so the two can

@@ -56,7 +56,7 @@ ALLOWED_MISSING="dafsa_check_invariants reg_lookup_no_count"
 # only dafsa.h is audited above.  The C engine happened to leak these internal
 # helpers as dynamic exports (they were non-static), but they are NOT part of
 # the public dafsa.h surface and are referenced by NO datalog consumer (tests,
-# dl_cli, dl-lsp, dlp, index/vector — final_audit.sh proves that).  abi.zig
+# dl_cli, dl-lsp, index/vector — final_audit.sh proves that).  abi.zig
 # deliberately encapsulates them, so they are absent from the Zig .so by
 # design — not a migration regression.  (The internal helpers datalog
 # DOES use — trans_find, view_trans_find, view_edge_next, view_enum_dfs,

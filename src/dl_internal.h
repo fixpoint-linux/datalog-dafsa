@@ -102,7 +102,7 @@ struct dl_db {
     txn       *txn;        /* CAS Slice 2: active transaction buffer, or NULL
                               (NULL = no transaction open) */
 
-    /* Dhall typed schema (dl_attach_schema).  Borrowed pointer, never owned;
+    /* Typed schema (dl_attach_schema).  Borrowed pointer, never owned;
      * the caller retains the dl_schema.  NULL = no schema attached (the
      * default, since dl_open2 calloc's the struct).  When non-NULL,
      * dl_load_rules typechecks parsed rules against it before compiling. */

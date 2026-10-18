@@ -24,7 +24,7 @@ extern "C" {
 
 typedef struct dl_db dl_db;
 
-/* Typed schema for the Dhall rule typechecker (full definition in schema.h,
+/* Typed schema for the rule typechecker (full definition in schema.h,
  * self-contained).  Forward-declared here so dl_attach_schema below can take
  * a pointer without dragging schema.h into this public header. */
 typedef struct dl_schema dl_schema;
@@ -376,7 +376,7 @@ uint64_t dl_range_count_perm(dl_db *db, const char *rel, int perm_id,
  * db->n_perms).  Useful for tests of automatic perm-index selection. */
 int dl_db_perm_count(const dl_db *db);
 
-/* ─── Schema attach (Dhall typechecker) ────────────────────────────────── */
+/* ─── Schema attach (rule typechecker) ─────────────────────────────────── */
 
 /* Attach (or detach) a typed schema for rule typechecking.  A non-NULL
  * schema is consulted by dl_load_rules BEFORE compilation; if the rules fail
@@ -639,8 +639,8 @@ long dl_node_observations(dl_db *db, const char *node,
 /* ─── List term-store access (v2 lists, public wrappers) ─────────────────── */
 /* A List column VALUE is a hash-consed list handle in the reserved high range
  * [TERM_BASE, ...) (TERM_BASE = the empty list NIL).  These thin wrappers
- * forward to the db's term store so dlp loaders/printers can build and walk
- * list values through the PUBLIC API (matching dl_intern_str).  Each returns
+ * forward to the db's term store so callers can build and walk list values
+ * through the PUBLIC API (matching dl_intern_str).  Each returns
  * 0 (or 0/NULL) on a NULL db / absent term store / invalid operand. */
 
 /* Intern the cons cell (head, tail); tail MUST be a list.  Returns the

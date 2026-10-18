@@ -12,7 +12,6 @@
 //   '/datalog-dafsa/time-travel'  → template 'dafsa-time-travel'
 //   '/datalog-dafsa/vector-search' → template 'dafsa-vector-search'
 //   '/datalog-dafsa/order-statistics' → template 'dafsa-order-statistics'
-//   '/datalog-dafsa/typed-projects' → template 'dafsa-typed-projects'
 //   '/datalog-dafsa/playground'  → template 'dafsa-playground'
 //
 // SLOT NAME == TEMPLATE NAME for all dafsa pages.
@@ -93,15 +92,6 @@ export const PAGES = [
     template: 'dafsa-order-statistics',
     dir: 'order-statistics',
     title: 'Order Statistics — datalog-dafsa',
-    type: 'content',
-  },
-  {
-    slug: 'typed-projects',
-    path: '/datalog-dafsa/typed-projects',
-    slot: 'dafsa-typed-projects',
-    template: 'dafsa-typed-projects',
-    dir: 'typed-projects',
-    title: 'Typed Projects — datalog-dafsa',
     type: 'content',
   },
   {
