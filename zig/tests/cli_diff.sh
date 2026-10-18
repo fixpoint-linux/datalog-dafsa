@@ -258,8 +258,8 @@ build_corpus() {
     run_cmd "$out" c94 "$db" search
     run_cmd "$out" c95 "$db" versions extra
     run_cmd "$out" c96 "$db" frobnicate
-    # encode-helper path (fork+execv of ./dl-embed): no ITQ basis in this db,
-    # so the helper fails fast and identically for both binaries
+    # encode-helper path (fork+execv of ./dl-embed): no encoder is installed in
+    # this repo any more, so dl reports the missing encoder and exits 1
     run_cmd "$out" c97 "$db" vsearch "test query"
     run_cmd "$out" c98 "$db" vhybrid "red" "test query"
 }

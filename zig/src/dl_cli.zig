@@ -109,10 +109,12 @@ fn eqFirst11(a: [:0]const u8, b: *const [11:0]u8) bool {
     return a.len >= 11 and std.mem.eql(u8, a[0..11], b);
 }
 
-// ─── Program directory (for the dl-embed helper lookup) ─────────────────────
+// ─── Program directory (for the external query-encoder lookup) ──────────────
 
-/// Directory of this binary (set in main): used to locate ./dl-embed for the
-/// query-encode path, so vsearch works regardless of the caller's cwd.
+/// Directory of this binary (set in main): used to locate the query encoder
+/// for the vsearch encode path, so it resolves regardless of the caller's cwd.
+/// The encoder is NOT part of this repo — see `runEncodeHelper` for the
+/// contract it must satisfy.
 var g_prog_dir: [PATH_MAX]u8 = @splat(0); // C init "."; set in main
 
 // ─── Strict u32 parsing (C parse_u32_strict, 1:1 via libc strtoul) ─────────
@@ -176,10 +178,12 @@ fn parseHexWords(hex_str: [*c]const u8, words: [*]u32, n_words: usize) isize {
     return @intCast(n_words);
 }
 
-/// Run the dl-embed encode helper: fork + execv (NO shell — the query is
-/// passed as a single argv element, so no shell-quoting/injection surface
-/// exists by construction).  Fills q_sig (VEC_SIG_WORDS) and q_int8
-/// (VEC_IVEC_WORDS) from the helper's "sig_hex ivec_hex" stdout line.
+/// Run the external query-encoder helper: fork + execv (NO shell — the query
+/// is passed as a single argv element, so no shell-quoting/injection surface
+/// exists by construction).  The engine does not embed text, so the encoder is
+/// a separate program: it must answer `<encoder> encode --db DIR QRY` with a
+/// "sig_hex ivec_hex" stdout line (pre-quantized ITQ signature + int8 vector).
+/// Fills q_sig (VEC_SIG_WORDS) and q_int8 (VEC_IVEC_WORDS) from that line.
 /// Returns 0 on success, -1 on any failure (message printed).
 fn runEncodeHelper(db_dir: [*c]const u8, query: [*c]const u8, q_sig: *[VEC_SIG_WORDS]u32, q_int8: *[VEC_IVEC_WORDS]u32) c_int {
     var helper: [PATH_MAX + 16]u8 = undefined;
@@ -190,7 +194,7 @@ fn runEncodeHelper(db_dir: [*c]const u8, query: [*c]const u8, q_sig: *[VEC_SIG_W
     if (access(&helper, X_OK) != 0) {
         _ = snprintf(&helper, helper.len, "./dl-embed");
         if (access(&helper, X_OK) != 0) {
-            _ = fprintf(stderr, "dl: dl-embed not found (build it: make dl-embed)\n");
+            _ = fprintf(stderr, "dl: query encoder not found (no in-tree embedder; pass --sig/--ivec, or install an encoder as ./dl-embed)\n");
             return -1;
         }
     }
@@ -451,7 +455,7 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
 
     if (argc < 2) usage(argv[0].ptr);
 
-    // record this binary's directory for the dl-embed helper lookup
+    // record this binary's directory for the query-encoder lookup
     {
         const prog0 = argv[0];
         var n = prog0.len;
@@ -1134,8 +1138,8 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
             _ = fprintf(stderr, "dl: provide both --sig and --ivec, or neither\n");
             return 1;
         } else {
-            // Encode the query via ./dl-embed (fork+execv — no shell, so
-            // the user-controlled query can never inject commands).
+            // Encode the query via the external encoder (fork+execv — no
+            // shell, so the user-controlled query can never inject commands).
             if (runEncodeHelper(db_dir, query_str.ptr, &q_sig, &q_int8) != 0) {
                 return 1;
             }
@@ -1261,8 +1265,8 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
             _ = fprintf(stderr, "dl: provide both --sig and --ivec, or neither\n");
             return 1;
         } else {
-            // Encode the query via ./dl-embed (fork+execv — no shell, so
-            // the user-controlled query can never inject commands).
+            // Encode the query via the external encoder (fork+execv — no
+            // shell, so the user-controlled query can never inject commands).
             if (runEncodeHelper(db_dir, query_str.ptr, &q_sig, &q_int8) != 0) {
                 return 1;
             }

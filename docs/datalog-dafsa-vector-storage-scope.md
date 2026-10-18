@@ -2,6 +2,8 @@
 
 **Status:** Scoping (2026-08-20), **refined 2026-08-20 by consultant + advisor** (both planner passes; corrections F1–F7 / C1–C3 folded in below). Operationalizes the design of record — `docs/datalog-dafsa-vector-search.md` (MIH over ITQ bit-codes as per-band DAFSA postings) + `docs/datalog-dafsa-vector-search-no-sidecar.md` (int8 re-rank vectors in-store, killing the `.npy` sidecar) — down to concrete relations, encodings, lifecycle, and slices. **This doc is about STORAGE** (the durable relations); the query path (`dl_vector_search`), embed pipeline, and hybrid composition are scoped here too but as downstream slices.
 
+**Embed-step status (current fact):** the encoder is external and out of tree. Neither the originally scoped `scripts/embed.py` nor the later C++ `dl-embed` sidecar ships any more; the engine ingests pre-quantized `__sig{j}__` / `__vec_q__` / `__itq_basis__` facts from whatever encoder you run, and the slices below that name `embed.py` are the historical plan, not a shipped tool.
+
 **Relationship to the roadmap:** this is the common prerequisite behind stack Ideas 3 (one embed pass → all auxiliaries), 4 (search-as-Datalog), and the hybrid-search lexical-gate pattern. The full-text tier (`__postings__` + `dl_search`, Ideas 1 + this session's version-aware search) is the symbolic half and is done; this is the semantic half.
 
 ## Grounding facts (verified against the engine)
@@ -45,12 +47,12 @@
 - Unit-normalized embedding → int8 (`v / (max|v|+1e-12) * 127`), packed 4 int8 per u32 (little-endian: `b0|b1<<8|b2<<16|b3<<24`).
 - Read back: unpack each u32 to 4 int8, re-normalize, int8-cosine **re-rank in C as pure integer math** (F5) — int32 dot (max |dot| = 384·127² = 6.2e6 < 2³¹, exact), **int64 cross-multiply rank** (`dot_a²·|b|²` vs `dot_b²·|a|²`, since dot² up to 3.8e13 > 2³¹), **int8 sign-extend via `(int8_t)(w & 0xFF)`** (bytes are two's-complement int8). No float, no sqrt → respects the "no float/embedding code in C" boundary. No Python FFI needed (`pydl/` is empty).
 - Precision: preserves cosine ~3 decimals; int8 re-rank top-10 agreement with float-exact must be **≥99%** (oracle gate).
-- `dl_vector_search` takes a **pre-encoded c-bit signature** (`q_sig` as 8 u32 words) + pre-quantized int8 query vector — **C never embeds**. Embedding + ITQ encode stay in Python.
+- `dl_vector_search` takes a **pre-encoded c-bit signature** (`q_sig` as 8 u32 words) + pre-quantized int8 query vector — **C never embeds**. Embedding + ITQ encode happen outside the engine, in an external encoder: the two in-tree attempts (`scripts/embed.py`, then the C++ `dl-embed` sidecar) have both been removed, so the engine's input is pre-quantized vectors only.
 
 ### itq_basis (ITQ encode matrix)
 - Combined encode matrix D×c = 384×256 = 98,304 float32, stored as u32 bit-patterns (`float32_bits_u32`). ~393 KB.
 - Pinned to the same snapshot as vectors (`dl_publish_snapshot` atomic) → basis↔embedding drift impossible. **Never read by the C query path** — stored for snapshot-pinning only.
-- Basis is **fit in Python** (PCA 384→256 + orthogonal rotation during embed); only storage moves in-store.
+- Basis is **fit outside the engine** by the external encoder (PCA 384→256 + orthogonal rotation during embed); only storage moves in-store.
 
 ## DECISION — `sig_j` naming: `m` fixed arity-2 relations `__sig0__`..`__sig<M-1>__`
 
@@ -63,7 +65,7 @@
 ## Data flow / lifecycle
 
 ```
-embed.py (new):
+external encoder (formerly embed.py, then dl-embed — the emission contract below):
   fit:  ITQ basis B (D×c = 384×256) via PCA(384→256) + orthogonal rotation
   for each entity name → content:
     v = embed(name/content)              # bge-small, D=384

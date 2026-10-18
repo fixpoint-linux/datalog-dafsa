@@ -10,10 +10,8 @@
 #   - ./dl at the repo root is the CLI under test (test_m4_review popen()s it,
 #     test_vector_cli execv()s it, smoke.sh runs it) — the repo-root ./dl is
 #     shadowed by the Zig-linked one for the duration and restored afterwards
-#   - test_embed_math: standalone C++ (no engine link) — built with g++ like
-#     the Makefile rule
-#   - dl-embed: C++/ggml, run only if the binary exists, else skip (same as
-#     run_all.sh)
+#   - test_embed is standalone (header-only src/embed/vec_bits.h, no engine
+#     link); the C++ embed/ggml suites are gone with the C++ embed sidecar
 # Exit status is non-zero if any suite fails to LINK or run.
 set -u
 
@@ -144,8 +142,6 @@ test_vector_cli
 test_vector_search_content
 test_embed
 "
-# Standalone C++ (no engine link) — Makefile g++ rule, kept out of the .so link.
-CPP_SUITES="test_embed_math"
 
 TOTAL=0
 PASSED=0
@@ -184,28 +180,6 @@ for t in $C_SUITES; do
     fi
     LD_LIBRARY_PATH="$LIBDIR" run_one "$t" "$TMP/z$t"
 done
-
-# ─── Standalone C++ suite (no engine link, Makefile g++ rule) ──────────────
-for t in $CPP_SUITES; do
-    if ! g++ -O2 -Wall -Wextra -Werror -std=c++17 -Isrc \
-            "tests/$t.cpp" src/embed/itq.cpp src/embed/tokenizer.cpp \
-            -o "$TMP/z$t" -lm 2> "$TMP/z$t.linklog"; then
-        echo "=== LINK FAIL: $t ==="
-        sed -n '1,15p' "$TMP/z$t.linklog"
-        FAILED="$FAILED $t(LINK)"
-        TOTAL=$((TOTAL + 1))
-        continue
-    fi
-    run_one "$t" "$TMP/z$t"
-done
-
-# ─── dl-embed: C++/ggml, conditional exactly like run_all.sh ───────────────
-if [ -x ./dl-embed ]; then
-    run_one "dl-embed" ./dl-embed self-test
-else
-    echo "=== dl-embed not built (needs vendor/ggml + model) — skipping ==="
-    TOTAL=$((TOTAL + 1)); PASSED=$((PASSED + 1))
-fi
 
 # ─── CLI smoke against the Zig-linked dl ───────────────────────────────────
 run_one "smoke" sh tests/smoke.sh

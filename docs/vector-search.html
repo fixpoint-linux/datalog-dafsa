@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Vector Search — datalog-dafsa</title>
-<meta name="description" content="Semantic vector search in datalog-dafsa: bge-small embeddings via dl-embed, MIH-over-ITQ candidate retrieval, in-store int8 re-rank. dl vsearch / dl vhybrid.">
+<meta name="description" content="Semantic vector search in datalog-dafsa: pre-quantized bge-small vectors from an external encoder, MIH-over-ITQ candidate retrieval, in-store int8 re-rank. dl vsearch / dl vhybrid.">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -31,34 +31,36 @@
 
   <h1>Semantic <span class="fx">vector search</span></h1>
   <p>
-    Meaning-aware retrieval on top of the full-text index. The engine embeds text with a real
-    bge-small model (via the <code>dl-embed</code> C++ tool), retrieves candidates with
-    <strong>multi-index hashing (MIH) over ITQ bit-codes</strong>, and re-ranks by exact
-    int8 cosine — all stored in-relation and <strong>snapshot-versioned</strong> like
-    everything else.
+    Meaning-aware retrieval on top of the full-text index. The engine does <strong>not</strong>
+    embed: it takes a pre-encoded 256-bit ITQ signature plus a pre-quantized int8 query vector,
+    retrieves candidates with <strong>multi-index hashing (MIH) over ITQ bit-codes</strong>, and
+    re-ranks by exact int8 cosine — all stored in-relation and
+    <strong>snapshot-versioned</strong> like everything else. The embeddings themselves come
+    from an encoder you run outside the engine and are ingested as ordinary relations.
   </p>
 
   <h2>Quickstart</h2>
   <p>
-    The vector tier is opt-in and adds a vendored <a href="https://github.com/ggml-org/ggml">ggml</a>
-    submodule (v0.20.2) plus the model:
+    No embedding model and no ggml ship in this repository. You produce the vectors with your
+    own encoder, write them out as the relations below, and load them like any other facts; the
+    engine supplies the retrieval tier on top.
   </p>
-  <pre class="code"><code><span class="c"># One-time: materialize ggml + the bge-small model (git-lfs tracked).</span>
-<span class="k">$</span> <span class="g">git submodule update --init vendor/ggml</span>
-<span class="k">$</span> <span class="g">git lfs pull</span>             <span class="c"># models/bge-small-en-v1.5-f16.gguf (67 MB)</span>
-<span class="k">$</span> <span class="g">make dl-embed</span>           <span class="c"># build ./dl-embed (needs cmake)</span>
-<span class="k">$</span> <span class="g">./dl-embed self-test</span>   <span class="c"># golden-embedding gate (cosine &gt;= 0.9999 vs reference)</span>
+  <pre class="code"><code><span class="c"># 1. Encode the corpus OUTSIDE the engine (any bge-small-class model) and emit the
+#    relations: __sig{0..15}__, __vec_q__, __itq_basis__.</span>
+<span class="k">$</span> <span class="g">&lt;your-encoder&gt; --db /tmp/db</span>
 
-<span class="c"># Embed the corpus into the vector index (18 relations + one publish).</span>
-<span class="k">$</span> <span class="g">./dl-embed pipeline --db /tmp/db</span>
+<span class="c"># 2. Load each relation (18 loads) + one atomic publish.</span>
+<span class="k">$</span> <span class="g">./dl -d /tmp/db load vec/__sig0__.csv --rel __sig0__   # ... __sig15__, __vec_q__</span>
+<span class="k">$</span> <span class="g">./dl -d /tmp/db publish</span>
 
-<span class="c"># Query it.</span>
-<span class="k">$</span> <span class="g">./dl -d /tmp/db vsearch 'affordable GPU rental' --k 10</span>
-<span class="k">$</span> <span class="g">./dl -d /tmp/db vhybrid 'gpu rental' 'affordable GPU rental' --k 10</span></code></pre>
+<span class="c"># 3. Query it with a pre-encoded query (see "The CLI" below).</span>
+<span class="k">$</span> <span class="g">./dl -d /tmp/db vsearch 'affordable GPU rental' --sig &lt;64-hex&gt; --ivec &lt;768-hex&gt; --k 10</span>
+<span class="k">$</span> <span class="g">./dl -d /tmp/db vhybrid 'gpu rental' 'affordable GPU rental' --sig &lt;64-hex&gt; --ivec &lt;768-hex&gt;</span></code></pre>
 
   <h2>How it works</h2>
   <p>
-    Each entity is embedded and <strong>binarized to a 256-bit ITQ signature</strong>. The
+    Each entity is embedded (externally) and <strong>binarized to a 256-bit ITQ
+    signature</strong>. The
     signature is split into <code>m=16</code> <strong>bands</strong>; for band <code>j</code> the
     store keeps a fixed-arity relation <code>__sig{j}__(band_u32, entity_sym_id)</code> — a
     postings index from bit-substring to entity sym-id, the same shape as the full-text postings.
@@ -67,7 +69,7 @@
 __vec_q__            (arity 3)  entity_sym_id, chunk_idx, packed_4x_int8_u32   re-rank vectors
 __itq_basis__        (arity 3)  dim_i, dim_j, float32_bits_u32   ITQ encode matrix (pinned)</code></pre>
   <p>
-    A query embeds the text with the same model, ITQ-encodes it, then for each band enumerates the
+    A query is encoded by the same external encoder, then for each band the engine enumerates the
     query&rsquo;s substring variants within the pigeonhole budget <code>&lfloor;r/m&rfloor;</code>,
     probes each via <code>dl_prefix</code> over <code>__sig{j}__</code>, unions the candidates
     across bands, <strong>filters to live entities</strong>, and re-ranks by exact integer int8
@@ -83,9 +85,9 @@ __itq_basis__        (arity 3)  dim_i, dim_j, float32_bits_u32   ITQ encode matr
   <pre class="code"><code>dl [-d &lt;dir&gt;] vsearch '&lt;query&gt;' [--k N] [--radius R] [--version V]
                                   [--sig &lt;hex64&gt;] [--ivec &lt;hex768&gt;]</code></pre>
   <p>
-    <code>--version V</code> queries as-of a published snapshot (0 = live). For a programmatic
-    path with no model, pass the pre-encoded query as <code>--sig</code> (8 u32 = 64 hex) and
-    <code>--ivec</code> (96 u32 = 768 hex).
+    <code>--version V</code> queries as-of a published snapshot (0 = live). The query is always
+    passed pre-encoded: <code>--sig</code> (8 u32 = 64 hex, the ITQ signature) and
+    <code>--ivec</code> (96 u32 = 768 hex, the int8 vector).
   </p>
 
   <h3>vhybrid</h3>
@@ -98,25 +100,27 @@ __itq_basis__        (arity 3)  dim_i, dim_j, float32_bits_u32   ITQ encode matr
   co-occurrence. <code>--version N</code> queries as-of a snapshot.</p>
   <pre class="code"><code>dl [-d &lt;dir&gt;] search '&lt;terms&gt;' [--top N] [--version N]</code></pre>
 
-  <h2>dl-embed</h2>
-  <p>The C++ embedding tool (ggml-based). It runs the real <strong>bge-small-en-v1.5</strong>
-  model in-process — the weights are the actual pretrained model (git-lfs tracked under
-  <code>models/</code>), not a re-implementation. The C++ provides the inference runtime:
-  GGUF load + BERT forward pass + CLS pooling + L2 normalization, a WordPiece tokenizer that
-  auto-detects the llama.cpp WPM vocab convention, and the ITQ fit/encode + int8 quantization.</p>
-  <pre class="code"><code>dl-embed pipeline --db DIR     embed corpus + emit vector relations + publish
-dl-embed encode --db DIR QRY   print 'sig_hex ivec_hex' for a query (CLI consumes this)
-dl-embed embed QRY             print the raw 384-float embedding
-dl-embed tokenize QRY          print token ids + strings (debug)
-dl-embed self-test             math/tokenizer checks (+ golden-embedding gate if model present)
-dl-embed dump-tensors [PATH]   list GGUF tensors
-dl-embed fetch-model           download the bge-small GGUF to models/</code></pre>
+  <h2>Producing embeddings (external encoder)</h2>
   <p>
-    The <code>dl vsearch</code>/<code>vhybrid</code> commands <code>fork/execve</code>
-    <code>dl-embed encode</code> to embed the query (no shell, no Python). The golden gate
-    (<code>./dl-embed self-test</code>) embeds reference strings and asserts cosine &ge; 0.9999
-    against the reference model — the numeric proof that the C++ forward pass is correct.
+    Embedding is out of scope for this engine and out of tree. The former C++/ggml
+    <code>dl-embed</code> sidecar, its <code>ggml</code> submodule and the git-lfs GGUF model
+    are removed; what remains is the two-part contract any encoder must meet:
   </p>
+  <ol>
+    <li><strong>Corpus.</strong> Emit the vector relations as CSVs and load them with
+      <code>dl load</code>: <code>__sig{0..15}__</code> (band &rarr; entity sym-id),
+      <code>__vec_q__</code> (entity sym-id, chunk, packed int8), <code>__itq_basis__</code>
+      (the ITQ encode matrix, pinned by snapshot). Band layout is MSB-first and must match the
+      engine's read formula exactly — see
+      <a href="datalog-dafsa-vector-storage-scope.md">the storage scope doc</a>.</li>
+    <li><strong>Query.</strong> Produce the same 8-word signature + 96-word int8 vector for the
+      query text and pass them as <code>--sig</code>/<code>--ivec</code>. Given a bare text
+      query the CLI instead <code>fork/execve</code>s a program named <code>dl-embed</code>
+      (next to the <code>dl</code> binary, else <code>./dl-embed</code>), calling
+      <code>dl-embed encode --db DIR QRY</code> and reading one
+      <code>sig_hex ivec_hex</code> stdout line. Nothing ships to fill that slot, so a bare
+      text query fails until you install one.</li>
+  </ol>
 
   <h2>Design</h2>
   <p>

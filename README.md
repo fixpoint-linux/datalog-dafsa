@@ -11,9 +11,6 @@ zig build -Drelease -p zig-out --build-file zig/build.zig   # build libdatalog.s
 bash zig/run_zig_suites.sh                                   # run the 42 C test suites (oracle)
 ```
 
-(The deferred C++ embed/ggml opt-in targets are `make dl-embed` / `make libembed.so` /
-`make fetch-model` — see `make help`.)
-
 Use the `dl` CLI to load facts and query them:
 
 ```sh
@@ -44,26 +41,30 @@ in-relation and snapshot-versioned:
 # Full-text (lexical) — AND-intersect + rank, version-aware.
 ./dl -d /tmp/db search 'gpu rental' --top 10
 
-# Semantic vector search — bge-small embedding + MIH retrieval + int8 re-rank.
-./dl -d /tmp/db vsearch 'affordable GPU rental' --k 10
+# Semantic vector search — MIH retrieval + int8 re-rank over a PRE-ENCODED query.
+./dl -d /tmp/db vsearch 'a query' --sig <64-hex> --ivec <768-hex> --k 10
 
 # Hybrid — lexical ∩ semantic, then re-rank.
-./dl -d /tmp/db vhybrid 'gpu rental' 'affordable GPU rental' --k 10
+./dl -d /tmp/db vhybrid 'gpu rental' 'a query' --sig <64-hex> --ivec <768-hex> --k 10
 ```
 
-Semantic embedding is provided by the `dl-embed` companion tool (C++, ggml-based):
+**The engine never embeds.** `dl_vector_search` takes a pre-quantized int8 query vector
+and a pre-encoded 256-bit ITQ signature; it does no model inference. Embeddings are
+produced *outside* the engine by whatever encoder you run (anything that can run a
+bge-small-class model) and ingested as ordinary relations — `__sig0__`…`__sig15__`,
+`__vec_q__`, `__itq_basis__` — with `dl load` plus one atomic `dl publish`. No encoder,
+no model and no ggml ship in this repository: the former C++/ggml `dl-embed` sidecar,
+its `ggml` submodule and the git-lfs GGUF model were removed, and the engine is a
+100%-Zig build.
 
-```sh
-make dl-embed          # build ./dl-embed (needs cmake + the vendored ggml submodule)
-make fetch-model       # ensure the bge-small GGUF is present under models/
-./dl-embed self-test   # golden-embedding gate (cosine >= 0.9999 vs the reference model)
-./dl-embed pipeline --db /tmp/db   # embed the entity corpus into the vector index
-```
+Query-time text encoding is likewise external. `dl vsearch`/`dl vhybrid` accept the
+encoded query directly (`--sig`, `--ivec`); given a bare text query they fork/exec a
+program named `dl-embed` next to the `dl` binary (falling back to `./dl-embed`), call
+`dl-embed encode --db <dir> <query>`, and read one `sig_hex ivec_hex` stdout line — the
+contract an external encoder must satisfy. Such a program does not ship here, so a text
+query fails until you install one.
 
-The model (`models/bge-small-en-v1.5-f16.gguf`, ~67 MB) is tracked with **git-lfs**;
-a fresh clone materializes it with `git lfs pull` (or `make fetch-model`). `dl-embed`
-resolves the model from the repo-local `models/` first, then the per-user cache. See
-[`docs/datalog-dafsa-vector-search.md`](docs/datalog-dafsa-vector-search.md) for the
+See [`docs/datalog-dafsa-vector-search.md`](docs/datalog-dafsa-vector-search.md) for the
 full design (MIH over ITQ, in-store int8 re-rank, snapshot consistency).
 
 ## How It Works
@@ -270,11 +271,10 @@ The engine is built with Zig (canonical; see [zig/build.zig](zig/build.zig)):
 zig build -Drelease -p zig-out --build-file zig/build.zig   # libdatalog.so + dl CLI
 ```
 
-The deferred C++ embed/ggml machinery is the only remaining `make` target set
-(`make dl-embed` / `make libembed.so` / `make fetch-model`; needs `gcc`/`g++` +
-`cmake` + the vendored `ggml` submodule, v0.20.2) — see `make help`. The C test
-suites (the behavioral oracle) re-link against the Zig-built `libdatalog.so`
-via `bash zig/run_zig_suites.sh` (needs `gcc` and POSIX headers,
+Zig is the only build system: there is no Makefile and no C/C++ build of the
+engine (the C++ embed/ggml sidecar was removed). The C test suites (the
+behavioral oracle) re-link against the Zig-built `libdatalog.so` via
+`bash zig/run_zig_suites.sh` (needs `gcc` and POSIX headers,
 `-D_POSIX_C_SOURCE=200809L`, targeting `c11`). No third-party dependencies for
 the engine itself — the DAFSA engine is vendored under `vendor/`.
 

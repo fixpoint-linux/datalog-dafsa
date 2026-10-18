@@ -148,12 +148,15 @@ Snapshot published.</code></pre>
 $ ./dl -d /tmp/db search 'gpu rental' --top 10 --version 3</code></pre>
 
   <h2 id="vsearch">vsearch</h2>
-  <p>Semantic vector search: embed the query with the bge-small model
-  (via the <code>dl-embed</code> tool), retrieve MIH candidates from the
-  <code>__sig*__</code> postings, and re-rank by in-store int8 cosine.
-  Accepts <code>--sig</code>/<code>--ivec</code> hex for a programmatic path
-  that needs no model, and <code>--version V</code> to search as-of a snapshot.</p>
-  <pre class="code"><code>$ ./dl -d /tmp/db vsearch 'affordable GPU rental' --k 10</code></pre>
+  <p>Semantic vector search: retrieve MIH candidates from the
+  <code>__sig*__</code> postings for a pre-encoded query, and re-rank by
+  in-store int8 cosine. The engine does not embed — pass the encoded query as
+  <code>--sig</code> (64 hex) and <code>--ivec</code> (768 hex), produced by any
+  external bge-small-class encoder. Given a bare text query, <code>dl</code> will
+  fork/exec a <code>dl-embed</code> encoder found next to the binary and read its
+  <code>sig_hex ivec_hex</code> line; no such encoder ships in this repository.
+  <code>--version V</code> searches as-of a snapshot.</p>
+  <pre class="code"><code>$ ./dl -d /tmp/db vsearch 'affordable GPU rental' --sig &lt;64-hex&gt; --ivec &lt;768-hex&gt; --k 10</code></pre>
   <p>See <a href="vector-search.html">the vector-search page</a> for the full semantic tier.</p>
 
   <h2 id="vhybrid">vhybrid</h2>
@@ -167,9 +170,9 @@ $ ./dl -d /tmp/db search 'gpu rental' --top 10 --version 3</code></pre>
 
   <h2 id="scope">What is <em>not</em> in the CLI</h2>
   <p>
-    Order-statistics (rank / select / range / count) are C-API only. The
-    semantic search tier relies on the <code>dl-embed</code> companion tool
-    (built with <code>make dl-embed</code>) for query-time embedding.
+    Order-statistics (rank / select / range / count) are C-API only. There is
+    no embedder in the CLI either: query encoding is external (see
+    <a href="vector-search.html">the vector-search page</a>).
   </p>
 
 </main>

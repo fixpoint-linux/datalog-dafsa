@@ -140,7 +140,7 @@ the binding exposes the corpus-parameterized forms.
 
 | step | cost |
 |---|---|
-| `dl_embed_encode_query` (libembed.so, bge-small, warm) | 27–33 ms |
+| ~~`dl_embed_encode_query` (libembed.so, bge-small, warm)~~ | 27–33 ms (HISTORICAL — libembed.so was removed with the C++ embed sidecar; an external encoder now does this) |
 | vector_search r=8 | 34 ms |
 | vector_search r=16 | 457 ms |
 | vector_search r=24 | 379 ms |
@@ -184,13 +184,14 @@ canonical build; 6.7 MB, exports all 86 `dl_*` symbols used).
    (query_rules_ro), 66 µs bound-query after one-time compile, growing
    quadratically with derived tuples; far above 10 µs except nothing here
    is a per-step op.
-4. **Is dl-embed needed at runtime?** For QUERY encoding: yes, one
-   `libembed.so` call (`dl_embed_encode_query`, ~30 ms warm) produces
-   (q_sig, q_int8) — then `dl_vector_search`+`dl_vector_rerank` run against
-   the pre-built in-store index. The agent does NOT need the `dl-embed`
-   CLI; the in-process encoder + the corpus-parameterized query path
-   suffice. For INDEXING new content (offline, ITQ fit + bulk emit), the
-   dl-embed/embed.py pipeline remains the tool.
+4. **Is an embedder needed at runtime?** For QUERY encoding, something must
+   produce (q_sig, q_int8) — the engine does not embed. That used to be one
+   ~30 ms in-process `libembed.so` call (`dl_embed_encode_query`); both the
+   library and the `dl-embed` CLI are now gone with the C++ embed sidecar, so
+   the encoder is an external program and its cost is outside this envelope.
+   After encoding, `dl_vector_search`+`dl_vector_rerank` run against the
+   pre-built in-store index unchanged. INDEXING new content (offline, ITQ fit +
+   bulk emit) is likewise the external encoder's job.
 5. **Own directory vs shared memory store:** they can share the same store
    FORMAT, but not the same directory concurrently: the memory store's
    writer (fx-agent-memory) excludes all other handles while open. If the

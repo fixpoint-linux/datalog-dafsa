@@ -11,7 +11,7 @@
 //     -> zig-out/bin/dl              (CLI linked against that .so)
 const std = @import("std");
 
-// Engine library objects — mirrors Makefile LIB_OBJS.
+// Engine library objects (the retired Makefile's LIB_OBJS list, now Zig-only).
 // U2: util.c, tupleset.c, termstore.c and schema.c are now ported to Zig
 // (zig/src/{util,tupleset,termstore,schema}.zig, referenced by hybrid.zig).
 // U3: intern.c is ported to zig/src/intern.zig the same way.

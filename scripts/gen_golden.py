@@ -2,10 +2,12 @@
 """
 gen_golden.py — one-time generator for tests/data/bge_golden.txt.
 
-Embeds a few fixed strings with the REFERENCE bge-small-en-v1.5 model via
-fastembed (ONNX) and writes them as the golden fixture consumed by
-`dl-embed self-test` (cosine >= 0.9999 gate).  Run ONCE on a host with
-network + fastembed installed (the project venv: build-tmp/venv):
+Embeds a few fixed strings with a REFERENCE bge-small-en-v1.5 model via
+fastembed (ONNX) and writes them as a golden fixture.  Its original in-tree
+consumer, the C++ `dl-embed self-test` gate, has been removed together with the
+whole embed sidecar, so this is now a REFERENCE FILE: use it to check any
+external encoder's numbers (cosine >= 0.9999 against these vectors).  Run ONCE
+on a host with network + fastembed installed (the project venv: build-tmp/venv):
 
     pip install fastembed
     python3 scripts/gen_golden.py

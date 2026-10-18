@@ -23,14 +23,13 @@ The submodule provides the split engine: `dafsa.{c,h}`, `dafsa_internal.h`,
 `dafsa_wal.c`, `dafsa_crc32.c`, `dafsa_build.c` (`dafsa_build_sorted`),
 `dafsa_rank.c`, `dafsa_view_rank.c`.
 
-## Exception: `vendor/ggml` (git submodule, upstream library)
+## Removed: `vendor/ggml` (was a git submodule)
 
-`vendor/ggml` is an **upstream library dependency**, pinned via a git
-submodule — see the top-level Makefile for the pin details (tag `v0.20.2`,
-commit `8c63e7098...`).
+`vendor/ggml` is **no longer tracked**: the gitlink left the index and the
+`[submodule "vendor/ggml"]` stanza left `.gitmodules` when the C++ embed
+sidecar was deleted. Nothing in this repository builds, links or vendors ggml
+any more — the engine (`libdatalog.so`, `dl`) never did.
 
-- **Materialize:** `git submodule update --init vendor/ggml`
-- **Build:** top-level Makefile runs cmake on it (CPU-only backends) into
-  `build-tmp/ggml` static libs. The project `-Werror` never applies to it.
-- **Consumers:** `src/embed/*` (the `dl-embed` vector-tier tool) only. The
-  engine (`libdatalog.so`, `dl`) never links ggml.
+An old clone may still have the ggml *working tree* on disk at `vendor/ggml`;
+it is ignored (`.gitignore`) and safe to delete, but this repo neither
+delivers nor requires it.

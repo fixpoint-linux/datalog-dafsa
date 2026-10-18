@@ -1,9 +1,8 @@
 #!/bin/sh
 # run_all.sh — parallel test harness for the datalog-dafsa suite.
 #
-# Runs every binary that the Makefile 'test:' target runs serially, in
-# parallel with a concurrency cap of MAXJOBS, then prints a pass/fail
-# summary.  A single failing job must not kill the others.
+# Runs every test binary in parallel with a concurrency cap of MAXJOBS, then
+# prints a pass/fail summary.  A single failing job must not kill the others.
 #
 # Exit status is non-zero if any test failed.
 
@@ -14,9 +13,11 @@ cd "$(dirname "$0")/.." || { echo "run_all.sh: cannot cd to repo root" >&2; exit
 
 MAXJOBS=4
 
-# Binary names, in the exact order the Makefile 'test:' target runs them.
-# test_embed_math and test_embed are standalone (run without LD_LIBRARY_PATH);
-# dl-embed and smoke are conditional/special steps (see launch_one).
+# Binary names, in the order the suites run.  There is no Makefile any more
+# (the engine builds with `zig build`; zig/run_zig_suites.sh is the oracle).
+# test_embed is standalone (run without LD_LIBRARY_PATH); smoke is a special
+# step (see launch_one).  The C++ embed/ggml suites are gone with the C++
+# embed sidecar.
 TESTS="
 test_m0
 test_m1
@@ -54,9 +55,7 @@ test_search
 test_vector_storage
 test_vector_cli
 test_vector_search_content
-test_embed_math
 test_embed
-dl-embed
 smoke
 "
 
@@ -72,22 +71,12 @@ launch_one() {
     idx=$2
 
     case "$name" in
-        dl-embed)
-            echo "=== Running dl-embed self-test ==="
-            if [ -x ./dl-embed ]; then
-                ./dl-embed self-test
-                rc=$?
-            else
-                echo "=== dl-embed not built (needs vendor/ggml + model: see make dl-embed) — skipping ==="
-                rc=0
-            fi
-            ;;
         smoke)
             echo "=== Running CLI smoke test ==="
             sh tests/smoke.sh
             rc=$?
             ;;
-        test_embed_math|test_embed)
+        test_embed)
             # standalone binaries: no LD_LIBRARY_PATH needed
             echo "=== Running $name ==="
             ./tests/$name

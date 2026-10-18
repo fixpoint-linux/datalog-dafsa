@@ -4,6 +4,11 @@
 
 > ⚠ **Read the Critique & corrections section first.** Two of the four "improvements" below (#1 best-first walk, #2 whitened PCA) were found **substantially wrong** on review — #1 is correct but *slower than a scan*; #2 breaks the very LSH math it relies on. The corrected recommendation is **multi-index hashing + ITQ**, not the walk/PCA-sign framing below. The body of this doc records the original (flawed) design so the critique has something to correct; don't implement from it directly.
 
+> **Embeddings are external (current fact, 2026-08-11).** Everything below assumes you already
+> have embedding vectors. The engine ingests them pre-quantized and never runs a model itself;
+> the encoder is outside this repository (the originally scoped `scripts/embed.py` and the later
+> C++ `dl-embed` sidecar are both gone).
+
 ## TL;DR
 
 Cosine similarity can be preserved as **Hamming distance on fixed-length bit-strings** (random-projection LSH / simhash family). Those bit-strings are just strings — so index them in a DAFSA/trie, where near-identical vectors share long signature prefixes (the DAFSA's core strength). Search = a **bounded-mismatch automaton walk** over the DAFSA collecting all signatures within Hamming radius `r` of the query, unioned across an **LSH forest** (K independent projections) for recall, then **re-ranked by exact cosine** over the small candidate set. This is "approximate candidate generation + exact re-ranking," and it reuses the automaton-walk machinery the engine already has.

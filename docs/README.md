@@ -15,8 +15,8 @@ This directory is a static, dependency-free documentation site for the
   variants, pull-iterator + merge-join, lazy range generator.
 - `time-travel.html` — versioned snapshots, as-of queries, retention.
 - `vector-search.html` — the semantic vector-search tier (MIH-over-ITQ,
-  `dl vsearch`/`dl vhybrid`, the `dl-embed` bge-small tool, in-store int8
-  re-rank).
+  `dl vsearch`/`dl vhybrid`, pre-quantized vectors from an external encoder,
+  in-store int8 re-rank).
 - `playground.html` — an interactive in-browser evaluator (WebAssembly).
 - `playground-ui.js` — the committed page glue + wasm bridge (loaded by
   `playground.html` after the factory).

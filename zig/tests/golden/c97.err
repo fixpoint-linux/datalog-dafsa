@@ -1,2 +1,1 @@
-dl-embed: no ITQ basis: run 'dl-embed pipeline --db' first
-dl: encode helper failed
+dl: query encoder not found (no in-tree embedder; pass --sig/--ivec, or install an encoder as ./dl-embed)

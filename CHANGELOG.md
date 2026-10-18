@@ -3,6 +3,41 @@
 All notable changes to this project are documented in this file.
 
 ## [Unreleased]
+- **The C++ embedding sidecar DELETED — the repository is Zig-only** (2026-08-11):
+  the engine never embedded (the search tiers take a pre-quantized int8 vector
+  and a pre-encoded ITQ signature), so the ggml/bge machinery that produced
+  those inputs is gone rather than kept as unbuilt dead weight:
+  - removed all of `src/embed/` except the header-only `vec_bits.h` (kept:
+    `tests/test_embed.c` includes it and it is the emit-formula gate for what
+    the engine consumes) — `bert.cpp/.h`, `csv_emit.cpp/.h`, `dl-embed.cpp`,
+    `dl_driver.cpp/.h`, `embed_api.cpp/.h`, `itq.cpp/.h`, `remote_embed.cpp/.h`,
+    `tokenizer.cpp/.h`; plus `tests/test_embed_math.cpp` and
+    `tests/test_bert_load.cpp`;
+  - `Makefile` deleted — it held only the embed targets (46 references, zero
+    engine targets), so the last non-Zig build surface is gone;
+    `vendor/http_client/` (used only by `remote_embed`) and the git-lfs
+    `models/bge-small-en-v1.5-f16.gguf` pointer are deleted with it;
+  - `vendor/ggml` is no longer a submodule: its gitlink is out of the index and
+    the `[submodule "vendor/ggml"]` stanza is out of `.gitmodules`. The
+    working directory on disk is intentionally left in place (not deinited,
+    nothing deleted); `.gitignore` keeps it out of the index;
+  - `test_embed_math` and `dl-embed` left `zig/run_zig_suites.sh` (its
+    `CPP_SUITES` block and the conditional `dl-embed self-test` step are gone)
+    and `tests/run_all.sh`; `tests/test_embed` and the four `test_vector_*`
+    suites are unchanged;
+  - `dl vsearch`/`vhybrid` keep working exactly as before, but the query-encode
+    helper is no longer in-tree: given a bare text query they still fork/exec a
+    program named `dl-embed` next to the binary and read its `sig_hex ivec_hex`
+    line (an external encoder may fill that slot). The not-found message no
+    longer points at `make dl-embed`, and the `c97`/`c98` CLI goldens were
+    updated to the helperless output;
+  - docs (`README`, `docs/{README,index,api,cli,vector-search}.html`, the
+    vector-storage-scope and bit-signature-index notes) now state the current
+    fact: embeddings are produced by an external encoder and ingested as
+    pre-quantized vectors. The design docs were not rewritten.
+  The vector tiers themselves (`zig/src/vector.zig`, `zig/src/index.zig`,
+  `src/vector.h`, `src/index.h`, `tests/test_embed.c`, `tests/test_vector_*.c`,
+  `tests/test_search.c`) are untouched.
 - **Reactive fired-event facility and the in-memory analyze ingest DELETED**
   (2026-08-11): both were alternate surfaces over machinery the fixpoint and
   the ordinary `dl_open`/`dl_add_fact` path already provide, and neither is in

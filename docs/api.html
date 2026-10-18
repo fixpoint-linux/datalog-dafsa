@@ -150,8 +150,10 @@
       <tr><td><code>long dl_vector_rerank(dl_db *db, const uint32_t *q_int8, const uint32_t *cand_syms, int n_cand, int k, dl_vec_cb cb, void *user)</code></td><td>Exact int8-cosine re-rank of a candidate set over <code>__vec_q__</code>, by signed int64 cross-multiply (no float). Emits exact-cosine order via <code>dl_vec_cb</code>.</td></tr>
     </tbody>
   </table>
-  <p>The semantic tier is documented on the <a href="vector-search.html">Vector Search</a> page;
-      embedding is done by the <code>dl-embed</code> tool (bge-small via ggml), not the C API.</p>
+  <p>The semantic tier is documented on the <a href="vector-search.html">Vector Search</a> page.
+      The C API never embeds: it consumes a pre-encoded ITQ signature and a pre-quantized int8
+      query vector, so the embedding model (bge-small or any other) runs outside the engine and
+      its output is ingested as ordinary relations.</p>
 
   <h2 id="hooks">Fault-injection hooks (test-only)</h2>
   <table class="api">

@@ -103,9 +103,10 @@
       <p>
         <code>dl search</code> is AND-intersect full-text over a postings index. The vector
         tier adds <strong>semantic</strong> retrieval (<code>dl vsearch</code> /
-        <code>dl vhybrid</code>): bge-small embeddings via the <code>dl-embed</code> tool,
-        MIH-over-ITQ candidate retrieval, and in-store int8 re-rank — all stored in-relation
-        and snapshot-versioned like everything else.
+        <code>dl vhybrid</code>): externally-produced bge-small embeddings, ingested as
+        pre-quantized int8 vectors, MIH-over-ITQ candidate retrieval, and in-store int8
+        re-rank — all stored in-relation and snapshot-versioned like everything else. The
+        engine never embeds; the encoder lives outside it.
       </p>
       <p><a href="vector-search.html">The vector-search tier &rarr;</a></p>
     </div>
@@ -124,9 +125,8 @@
   </div>
 
   <h2>Quickstart</h2>
-  <pre class="code"><code>make                 # build libdatalog.so, dl CLI, test binaries
-make test            # run the full test suite
-make bench           # run the demonstration benchmark</code></pre>
+  <pre class="code"><code>zig build -Drelease -p zig-out --build-file zig/build.zig   # libdatalog.so + dl CLI
+bash zig/run_zig_suites.sh                                   # the C test suites (oracle)</code></pre>
 
   <p>
     The <code>dl</code> CLI loads facts and answers queries. The database directory
@@ -204,7 +204,7 @@ make bench           # run the demonstration benchmark</code></pre>
       </tr>
       <tr>
         <td class="name">Search</td>
-        <td>Full-text <code>dl search</code> + semantic <code>dl vsearch</code>/<code>dl vhybrid</code> (bge-small via <code>dl-embed</code>, MIH-over-ITQ, in-store int8 re-rank), all versioned</td>
+        <td>Full-text <code>dl search</code> + semantic <code>dl vsearch</code>/<code>dl vhybrid</code> (pre-quantized bge-small int8 vectors from an external encoder, MIH-over-ITQ, in-store int8 re-rank), all versioned</td>
         <td><a href="vector-search.html">Vector Search</a></td>
       </tr>
     </tbody>
@@ -217,7 +217,7 @@ make bench           # run the demonstration benchmark</code></pre>
     <li><a href="api.html">C API Reference</a> — the full <code>dl.h</code> surface.</li>
     <li><a href="architecture.html">Architecture</a> — storage thesis, lifecycle, join &amp; evaluation strategies.</li>
     <li><a href="time-travel.html">Time Travel</a> — versioned snapshots and as-of queries.</li>
-    <li><a href="vector-search.html">Vector Search</a> — semantic <code>dl vsearch</code>/<code>dl vhybrid</code>, bge-small via <code>dl-embed</code>.</li>
+    <li><a href="vector-search.html">Vector Search</a> — semantic <code>dl vsearch</code>/<code>dl vhybrid</code> over pre-quantized bge-small vectors.</li>
     <li><a href="order-statistics.html">Order Statistics</a> — rank / select / range / count and the sorted iterator.</li>
     <li><a href="typed-projects.html">Typed Projects</a> — schema.dhall + validated data + typechecked rules.</li>
   </ul>

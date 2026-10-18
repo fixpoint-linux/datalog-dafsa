@@ -63,12 +63,17 @@ dl-test-*/
 # emscripten cache
 .cache/
 
-# embed tool binaries
-/dl-embed
+# test binaries
 /tests/test_embed
-/tests/test_embed_math
-/tests/test_bert_load
-# NOTE: tests/data/bge_golden.txt is a SOURCE artifact — commit it, never ignore it.
+# An external query encoder dropped in as ./dl-embed (the vsearch encode path;
+# none ships in this repo — see src/embed/vec_bits.h for what does).
+/dl-embed
+# NOTE: tests/data/bge_golden.txt is a SOURCE artifact — commit it, never ignore it
+# (reference bge-small embeddings, scripts/gen_golden.py).
+
+# leftover working tree of the removed ggml submodule: no longer tracked,
+# nothing builds it, safe to delete
+/vendor/ggml/
 
 # Elm + MFE build artifacts
 node_modules/

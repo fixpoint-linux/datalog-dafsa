@@ -286,9 +286,7 @@ landingView =
                                 , Fixpoint.Code.inline "dl vsearch"
                                 , text " / "
                                 , Fixpoint.Code.inline "dl vhybrid"
-                                , text "): bge-small embeddings via the "
-                                , Fixpoint.Code.inline "dl-embed"
-                                , text " tool, MIH-over-ITQ candidate retrieval, and in-store int8 re-rank — all stored in-relation and snapshot-versioned like everything else."
+                                , text "): externally-encoded bge-small vectors (the engine never embeds), MIH-over-ITQ candidate retrieval, and in-store int8 re-rank — all stored in-relation and snapshot-versioned like everything else."
                                 ]
                             , p [] [ a [ href "https://fixpointlinux.org/datalog-dafsa/vector-search/", attribute "data-mfe-route" "/datalog-dafsa/vector-search" ] [ text "The vector-search tier →" ] ]
                             ]
@@ -444,9 +442,7 @@ landingView =
                                 , Fixpoint.Code.inline "dl vsearch"
                                 , text "/"
                                 , Fixpoint.Code.inline "dl vhybrid"
-                                , text " (bge-small via "
-                                , Fixpoint.Code.inline "dl-embed"
-                                , text ", MIH-over-ITQ, in-store int8 re-rank), all versioned"
+                                , text " (pre-quantized bge-small vectors from an external encoder, MIH-over-ITQ, in-store int8 re-rank), all versioned"
                                 ]
                             , td [] [ a [ href "https://fixpointlinux.org/datalog-dafsa/vector-search/", attribute "data-mfe-route" "/datalog-dafsa/vector-search" ] [ text "Vector Search" ] ]
                             ]
@@ -465,7 +461,7 @@ landingView =
                     , li [] [ a [ href "https://fixpointlinux.org/datalog-dafsa/api/", attribute "data-mfe-route" "/datalog-dafsa/api" ] [ text "C API Reference" ], text " — the full ", Fixpoint.Code.inline "dl.h", text " surface." ]
                     , li [] [ a [ href "https://fixpointlinux.org/datalog-dafsa/architecture/", attribute "data-mfe-route" "/datalog-dafsa/architecture" ] [ text "Architecture" ], text " — storage thesis, lifecycle, join & evaluation strategies." ]
                     , li [] [ a [ href "https://fixpointlinux.org/datalog-dafsa/time-travel/", attribute "data-mfe-route" "/datalog-dafsa/time-travel" ] [ text "Time Travel" ], text " — versioned snapshots and as-of queries." ]
-                    , li [] [ a [ href "https://fixpointlinux.org/datalog-dafsa/vector-search/", attribute "data-mfe-route" "/datalog-dafsa/vector-search" ] [ text "Vector Search" ], text " — semantic ", Fixpoint.Code.inline "dl vsearch", text "/", Fixpoint.Code.inline "dl vhybrid", text ", bge-small via ", Fixpoint.Code.inline "dl-embed", text "." ]
+                    , li [] [ a [ href "https://fixpointlinux.org/datalog-dafsa/vector-search/", attribute "data-mfe-route" "/datalog-dafsa/vector-search" ] [ text "Vector Search" ], text " — semantic ", Fixpoint.Code.inline "dl vsearch", text "/", Fixpoint.Code.inline "dl vhybrid", text " over pre-quantized bge-small vectors." ]
                     , li [] [ a [ href "https://fixpointlinux.org/datalog-dafsa/order-statistics/", attribute "data-mfe-route" "/datalog-dafsa/order-statistics" ] [ text "Order Statistics" ], text " — rank / select / range / count and the sorted iterator." ]
                     , li [] [ a [ href "https://fixpointlinux.org/datalog-dafsa/typed-projects/", attribute "data-mfe-route" "/datalog-dafsa/typed-projects" ] [ text "Typed Projects" ], text " — schema.dhall + validated data + typechecked rules." ]
                     ]
@@ -1274,20 +1270,22 @@ cliView =
             , hint = "// semantic vector search: MIH over ITQ + int8 re-rank"
             , children =
                 [ p []
-                    [ text "Semantic vector search: embed the query with the bge-small model (via the "
-                    , Fixpoint.Code.inline "dl-embed"
-                    , text " tool), retrieve MIH candidates from the "
+                    [ text "Semantic vector search: retrieve MIH candidates from the "
                     , Fixpoint.Code.inline "__sig*__"
-                    , text " postings, and re-rank by in-store int8 cosine. Accepts "
+                    , text " postings for a pre-encoded query, and re-rank by in-store int8 cosine. The engine never embeds — pass the encoded query as "
                     , Fixpoint.Code.inline "--sig"
-                    , text "/"
+                    , text " (64 hex) and "
                     , Fixpoint.Code.inline "--ivec"
-                    , text " hex for a programmatic path that needs no model, and "
+                    , text " (768 hex), produced by any external bge-small-class encoder. Given a bare text query, "
+                    , Fixpoint.Code.inline "dl"
+                    , text " will fork/exec a "
+                    , Fixpoint.Code.inline "dl-embed"
+                    , text " encoder found next to the binary and read its sig/ivec line; none ships in this repo. "
                     , Fixpoint.Code.inline "--version V"
-                    , text " to search as-of a snapshot."
+                    , text " searches as-of a snapshot."
                     ]
                 , Fixpoint.Code.block
-                    [ text "$ ./dl -d /tmp/db vsearch 'affordable GPU rental' --k 10"
+                    [ text "$ ./dl -d /tmp/db vsearch 'affordable GPU rental' --sig <64-hex> --ivec <768-hex> --k 10"
                     ]
                 , p [] [ text "See ", a [ href "https://fixpointlinux.org/datalog-dafsa/vector-search/", attribute "data-mfe-route" "/datalog-dafsa/vector-search" ] [ text "the vector-search page" ], text " for the full semantic tier." ]
                 ]
@@ -1320,11 +1318,7 @@ cliView =
             , hint = "// order-statistics are C-API only"
             , children =
                 [ p []
-                    [ text "Order-statistics (rank / select / range / count) are C-API only. The semantic search tier relies on the "
-                    , Fixpoint.Code.inline "dl-embed"
-                    , text " companion tool (built with "
-                    , Fixpoint.Code.inline "make dl-embed"
-                    , text ") for query-time embedding."
+                    [ text "Order-statistics (rank / select / range / count) are C-API only. There is no embedder in the CLI either: query encoding is external — the engine takes a pre-quantized vector, and the former in-tree C++ embedder is gone."
                     ]
                 ]
             }
@@ -1526,9 +1520,7 @@ apiView =
                 , p []
                     [ text "The semantic tier is documented on the "
                     , a [ href "https://fixpointlinux.org/datalog-dafsa/vector-search/", attribute "data-mfe-route" "/datalog-dafsa/vector-search" ] [ text "Vector Search" ]
-                    , text " page; embedding is done by the "
-                    , Fixpoint.Code.inline "dl-embed"
-                    , text " tool (bge-small via ggml), not the C API."
+                    , text " page. The C API never embeds: it consumes a pre-encoded ITQ signature and a pre-quantized int8 query vector, so the model runs outside the engine and its output is ingested as ordinary relations."
                     ]
                 ]
             }
@@ -2016,62 +2008,48 @@ vectorSearchView =
         , Fixpoint.Section.view
             { id = "quickstart"
             , title = "Quickstart"
-            , hint = "// opt-in vector tier: ggml submodule + bge-small model"
+            , hint = "// no model in-tree: pre-quantized vectors from an external encoder"
             , children =
                 [ p []
-                    [ text "Meaning-aware retrieval on top of the full-text index. The engine embeds text with a real bge-small model (via the "
-                    , Fixpoint.Code.inline "dl-embed"
-                    , text " C++ tool), retrieves candidates with "
+                    [ text "Meaning-aware retrieval on top of the full-text index. The engine does "
+                    , strong [] [ text "not" ]
+                    , text " embed: it takes a pre-encoded ITQ signature plus a pre-quantized int8 query vector, retrieves candidates with "
                     , strong [] [ text "multi-index hashing (MIH) over ITQ bit-codes" ]
                     , text ", and re-ranks by exact int8 cosine — all stored in-relation and "
                     , strong [] [ text "snapshot-versioned" ]
-                    , text " like everything else."
+                    , text " like everything else. The embeddings come from an encoder you run outside the engine."
                     ]
                 , p []
-                    [ text "The vector tier is opt-in and adds a vendored "
-                    , a [ href "https://github.com/ggml-org/ggml" ] [ text "ggml" ]
-                    , text " submodule (v0.20.2) plus the model:"
+                    [ text "No embedding model and no ggml ship in this repository. Encode the corpus yourself, ingest the resulting relations as ordinary facts, and the engine supplies the retrieval tier on top:"
                     ]
                 , Fixpoint.Code.block
-                    [ Fixpoint.Code.c "# One-time: materialize ggml + the bge-small model (git-lfs tracked)."
+                    [ Fixpoint.Code.c "# 1. Encode the corpus OUTSIDE the engine and emit the relations"
+                    , text "\n"
+                    , Fixpoint.Code.c "#    __sig{0..15}__, __vec_q__, __itq_basis__."
                     , text "\n"
                     , Fixpoint.Code.k "$"
                     , text " "
-                    , Fixpoint.Code.g "git submodule update --init vendor/ggml"
-                    , text "\n"
-                    , Fixpoint.Code.k "$"
-                    , text " "
-                    , Fixpoint.Code.g "git lfs pull"
-                    , text "             "
-                    , Fixpoint.Code.c "# models/bge-small-en-v1.5-f16.gguf (67 MB)"
-                    , text "\n"
-                    , Fixpoint.Code.k "$"
-                    , text " "
-                    , Fixpoint.Code.g "make dl-embed"
-                    , text "           "
-                    , Fixpoint.Code.c "# build ./dl-embed (needs cmake)"
-                    , text "\n"
-                    , Fixpoint.Code.k "$"
-                    , text " "
-                    , Fixpoint.Code.g "./dl-embed self-test"
-                    , text "   "
-                    , Fixpoint.Code.c "# golden-embedding gate (cosine >= 0.9999 vs reference)"
+                    , Fixpoint.Code.g "<your-encoder> --db /tmp/db"
                     , text "\n\n"
-                    , Fixpoint.Code.c "# Embed the corpus into the vector index (18 relations + one publish)."
+                    , Fixpoint.Code.c "# 2. Load each relation + one atomic publish."
                     , text "\n"
                     , Fixpoint.Code.k "$"
                     , text " "
-                    , Fixpoint.Code.g "./dl-embed pipeline --db /tmp/db"
+                    , Fixpoint.Code.g "./dl -d /tmp/db load vec/__sig0__.csv --rel __sig0__"
+                    , text "\n"
+                    , Fixpoint.Code.k "$"
+                    , text " "
+                    , Fixpoint.Code.g "./dl -d /tmp/db publish"
                     , text "\n\n"
-                    , Fixpoint.Code.c "# Query it."
+                    , Fixpoint.Code.c "# 3. Query with a pre-encoded query: --sig (64 hex) + --ivec (768 hex)."
                     , text "\n"
                     , Fixpoint.Code.k "$"
                     , text " "
-                    , Fixpoint.Code.g "./dl -d /tmp/db vsearch 'affordable GPU rental' --k 10"
+                    , Fixpoint.Code.g "./dl -d /tmp/db vsearch 'a query' --sig <64-hex> --ivec <768-hex> --k 10"
                     , text "\n"
                     , Fixpoint.Code.k "$"
                     , text " "
-                    , Fixpoint.Code.g "./dl -d /tmp/db vhybrid 'gpu rental' 'affordable GPU rental' --k 10"
+                    , Fixpoint.Code.g "./dl -d /tmp/db vhybrid 'gpu rental' 'a query' --sig <64-hex> --ivec <768-hex>"
                     ]
                 ]
             }
@@ -2156,38 +2134,48 @@ vectorSearchView =
                 ]
             }
         , Fixpoint.Section.view
-            { id = "dl-embed"
-            , title = "dl-embed"
-            , hint = "// the C++ embedding tool (ggml-based, real bge-small weights)"
+            { id = "encoder"
+            , title = "Producing embeddings (external encoder)"
+            , hint = "// the engine ingests pre-quantized vectors; the encoder is out of tree"
             , children =
                 [ p []
-                    [ text "The C++ embedding tool (ggml-based). It runs the real "
-                    , strong [] [ text "bge-small-en-v1.5" ]
-                    , text " model in-process — the weights are the actual pretrained model (git-lfs tracked under "
-                    , Fixpoint.Code.inline "models/"
-                    , text "), not a re-implementation. The C++ provides the inference runtime: GGUF load + BERT forward pass + CLS pooling + L2 normalization, a WordPiece tokenizer that auto-detects the llama.cpp WPM vocab convention, and the ITQ fit/encode + int8 quantization."
-                    ]
-                , Fixpoint.Code.block
-                    [ text "dl-embed pipeline --db DIR     embed corpus + emit vector relations + publish\n"
-                    , text "dl-embed encode --db DIR QRY   print 'sig_hex ivec_hex' for a query (CLI consumes this)\n"
-                    , text "dl-embed embed QRY             print the raw 384-float embedding\n"
-                    , text "dl-embed tokenize QRY          print token ids + strings (debug)\n"
-                    , text "dl-embed self-test             math/tokenizer checks (+ golden-embedding gate if model present)\n"
-                    , text "dl-embed dump-tensors [PATH]   list GGUF tensors\n"
-                    , text "dl-embed fetch-model           download the bge-small GGUF to models/"
+                    [ text "Embedding is out of scope for this engine and out of tree. The former C++/ggml "
+                    , Fixpoint.Code.inline "dl-embed"
+                    , text " sidecar, its "
+                    , Fixpoint.Code.inline "ggml"
+                    , text " submodule and the git-lfs GGUF model are removed; what remains is the two-part contract any encoder must meet."
                     ]
                 , p []
-                    [ text "The "
-                    , Fixpoint.Code.inline "dl vsearch"
+                    [ strong [] [ text "Corpus." ]
+                    , text " Emit the vector relations as CSVs and load them with "
+                    , Fixpoint.Code.inline "dl load"
+                    , text ": "
+                    , Fixpoint.Code.inline "__sig{0..15}__"
+                    , text " (band to entity sym-id), "
+                    , Fixpoint.Code.inline "__vec_q__"
+                    , text " (entity sym-id, chunk, packed int8), "
+                    , Fixpoint.Code.inline "__itq_basis__"
+                    , text " (the ITQ encode matrix, pinned by snapshot). The band layout is MSB-first and must match the engine's read formula exactly, or the bands scramble silently."
+                    ]
+                , p []
+                    [ strong [] [ text "Query." ]
+                    , text " Produce the same 8-word signature plus the 96-word int8 vector for the query text and pass them as "
+                    , Fixpoint.Code.inline "--sig"
                     , text "/"
-                    , Fixpoint.Code.inline "vhybrid"
-                    , text " commands "
+                    , Fixpoint.Code.inline "--ivec"
+                    , text ". Given a bare text query the CLI instead "
                     , em [] [ text "fork/execve" ]
-                    , text " "
-                    , Fixpoint.Code.inline "dl-embed encode"
-                    , text " to embed the query (no shell, no Python). The golden gate ("
-                    , Fixpoint.Code.inline "./dl-embed self-test"
-                    , text ") embeds reference strings and asserts cosine ≥ 0.9999 against the reference model — the numeric proof that the C++ forward pass is correct."
+                    , text "s a program named "
+                    , Fixpoint.Code.inline "dl-embed"
+                    , text " (next to the "
+                    , Fixpoint.Code.inline "dl"
+                    , text " binary, else "
+                    , Fixpoint.Code.inline "./dl-embed"
+                    , text "), calling its "
+                    , Fixpoint.Code.inline "encode --db DIR QRY"
+                    , text " and reading one "
+                    , Fixpoint.Code.inline "sig_hex ivec_hex"
+                    , text " stdout line. Nothing ships to fill that slot, so a bare text query fails until you install one."
                     ]
                 ]
             }

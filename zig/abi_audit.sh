@@ -2,7 +2,7 @@
 # abi_audit.sh — U1 ABI-completeness audit.
 #
 # Checks the dynamic exports of the Zig-built hybrid libdatalog.so against
-#   (a) the gcc-built reference ./libdatalog.so (ABI regression check), and
+#   (a) the gcc-built reference ./libdatalog.so, when one is present, and
 #   (b) the union of extern C functions declared in the engine headers
 #       (src/*.h of every TU in the .so + vendor/dafsa/*.h).
 # FAILS if a reference export is missing from the Zig .so, or if a
@@ -15,10 +15,11 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd) || exit 1
 cd "$ROOT" || exit 1
 
 SO=zig-out/lib/libdatalog.so
-REF_SO=libdatalog.so   # gcc-built reference from `make`
+REF_SO=libdatalog.so   # gcc-built reference, if a host still has one
 
 # Headers of every TU linked into the .so.  (No iter.h exists; json.h is the
-# LSP-only TU; embed headers are the dl-embed tier — none are in this .so.)
+# LSP-only TU.)  src/embed/ is header-only emit math for tests/test_embed.c —
+# no embed TU is linked into this .so.
 HEADERS="
 src/dl.h
 src/dl_internal.h
