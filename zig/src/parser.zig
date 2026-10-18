@@ -76,6 +76,10 @@ pub const TOK_TILDE2: token_kind = 28; // ~~  (fuzzy/edit-distance pattern atom)
 //   bit 24      PATTERN_FUZZY — the pattern is an edit-distance term
 pub const PATTERN_COL_MASK: c_int = 0xFF;
 pub const PATTERN_FUZZY: c_int = 1 << 24;
+/// Largest edit distance `~~` accepts: regexwalk.LEV_MAX_K (k>=3 is refused by
+/// lev_compile for state explosion).  Repeated here because the parser has no
+/// dependency on the walker; compiler.zig asserts the two agree at comptime.
+pub const PATTERN_EDIT_MAX: c_int = 2;
 
 pub inline fn patternColGet(v: c_int) c_int {
     return v & PATTERN_COL_MASK;
@@ -1376,10 +1380,29 @@ fn parseBodyAtom(p: *parser) ?*atom {
                 // EDIT DISTANCE for `~~` (which may then take a column too).
                 tt = peek(p);
                 if (tt != null and tt.?.kind == TOK_INT) {
-                    if (fuzzy) edit = @intCast(tt.?.ival) else col = @intCast(tt.?.ival);
+                    if (fuzzy) {
+                        // Range-check BEFORE the cast and before patternColEncode:
+                        // the k is packed into bits 8..15, so an unchecked value
+                        // >= 256 wraps mod 256 and silently degrades the match
+                        // (`~~ 256` became k=0, i.e. EXACT).  lev_compile refuses
+                        // k>=3 too — this rejects it where the user can see it.
+                        if (tt.?.ival > @as(c_uint, @intCast(PATTERN_EDIT_MAX))) {
+                            perr(p, tt.?.off, "parser: fuzzy edit distance must be 0..{d} after '~~'\n", .{PATTERN_EDIT_MAX});
+                            atomFree(a);
+                            return null;
+                        }
+                        edit = @intCast(tt.?.ival);
+                    } else col = @intCast(tt.?.ival);
                     _ = advance(p);
                     tt = peek(p);
                     if (fuzzy and tt != null and tt.?.kind == TOK_INT) {
+                        // The column occupies the low 8 bits: a larger value
+                        // would wrap to a different column silently.
+                        if (tt.?.ival > @as(c_uint, @intCast(PATTERN_COL_MASK))) {
+                            perr(p, tt.?.off, "parser: pattern column out of range for '~~' (max {d})\n", .{PATTERN_COL_MASK});
+                            atomFree(a);
+                            return null;
+                        }
                         col = @intCast(tt.?.ival);
                         _ = advance(p);
                         tt = peek(p);

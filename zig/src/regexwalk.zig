@@ -63,7 +63,7 @@ const MAX_WORD_LEN: usize = 65536; // dafsa_internal.h MAX_WORD_LEN
 /// lev_compile's hard limits.  k >= 3 is REFUSED (loudly, with an errmsg) —
 /// the DP-row determinisation explodes there: the row alphabet is k+2 wide per
 /// pattern position, so state count grows like m^(k+1).
-const LEV_MAX_K: u32 = 2;
+pub const LEV_MAX_K: u32 = 2;
 const LEV_PATTERN_MAX: usize = 512;
 const FNV_OFFSET: u64 = 14695981039346656037;
 const FNV_PRIME: u64 = 1099511628211;
@@ -1317,15 +1317,20 @@ pub export fn lev_compile(pattern: [*c]const u8, k: u32) ?*regex_dfa {
     }
 
     // ── state storage (grown by doubling) ──
+    //
+    // Every buffer is allocated into a local that starts NULL and the defer is
+    // registered BEFORE the first allocation, so an OOM on any one of them still
+    // frees the ones already taken.  (Each `orelse return makeErrDfa(...)` used
+    // to sit in front of the defer: a failure at cls/queue/map.hash/map.slot
+    // leaked rows/accept/... — makeErrDfa may itself return NULL, so nothing
+    // else owns them.)
     var cap_states: usize = 64;
-    var rows: ?[*]u8 = @ptrCast(@alignCast(c.calloc(cap_states * rowlen, 1) orelse return makeErrDfa("lev: OOM")));
-    var accept: ?[*]u8 = @ptrCast(@alignCast(c.calloc(cap_states, 1) orelse return makeErrDfa("lev: OOM")));
-    var cls: ?[*]u32 = @ptrCast(@alignCast(c.malloc(cap_states * nclass * @sizeOf(u32)) orelse return makeErrDfa("lev: OOM")));
-    var queue: ?[*]u32 = @ptrCast(@alignCast(c.malloc(cap_states * @sizeOf(u32)) orelse return makeErrDfa("lev: OOM")));
+    var rows: ?[*]u8 = null;
+    var accept: ?[*]u8 = null;
+    var cls: ?[*]u32 = null;
+    var queue: ?[*]u32 = null;
     var map = std.mem.zeroes(LevMap);
     map.cap = 256;
-    map.hash = @ptrCast(@alignCast(c.calloc(map.cap, @sizeOf(u64)) orelse return makeErrDfa("lev: OOM")));
-    map.slot = @ptrCast(@alignCast(c.calloc(map.cap, @sizeOf(u32)) orelse return makeErrDfa("lev: OOM")));
     defer {
         if (rows) |p| c.free(@ptrCast(p));
         if (accept) |p| c.free(@ptrCast(p));
@@ -1334,6 +1339,13 @@ pub export fn lev_compile(pattern: [*c]const u8, k: u32) ?*regex_dfa {
         if (map.hash) |p| c.free(@ptrCast(p));
         if (map.slot) |p| c.free(@ptrCast(p));
     }
+
+    rows = @ptrCast(@alignCast(c.calloc(cap_states * rowlen, 1) orelse return makeErrDfa("lev: OOM")));
+    accept = @ptrCast(@alignCast(c.calloc(cap_states, 1) orelse return makeErrDfa("lev: OOM")));
+    cls = @ptrCast(@alignCast(c.malloc(cap_states * nclass * @sizeOf(u32)) orelse return makeErrDfa("lev: OOM")));
+    queue = @ptrCast(@alignCast(c.malloc(cap_states * @sizeOf(u32)) orelse return makeErrDfa("lev: OOM")));
+    map.hash = @ptrCast(@alignCast(c.calloc(map.cap, @sizeOf(u64)) orelse return makeErrDfa("lev: OOM")));
+    map.slot = @ptrCast(@alignCast(c.calloc(map.cap, @sizeOf(u32)) orelse return makeErrDfa("lev: OOM")));
 
     // ── start state: dp row of the empty text prefix vs every term prefix ──
     {

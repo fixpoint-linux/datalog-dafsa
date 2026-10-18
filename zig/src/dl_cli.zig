@@ -1400,8 +1400,11 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
         var k: u32 = 1;
         if (argp < argv.len) {
             if (argv.len - argp == 2 and eq(argv[argp], "--k")) {
-                const kv = strtoul(argv[argp + 1].ptr, null, 10);
-                if (kv > 2) {
+                // Strict: a non-numeric or trailing-garbage value (`--k foo`,
+                // `--k 2x`) is a usage error, not a silent k=0 / k=2.
+                var kv: c_ulong = undefined;
+                if (!parseU32Strict(argv[argp + 1].ptr, &kv)) usage(argv[0].ptr);
+                if (kv > 2) { // regexwalk.LEV_MAX_K
                     _ = fprintf(stderr, "dl: --k must be 0..2 (k>=3 refused: state explosion)\n");
                     return 1;
                 }

@@ -34,6 +34,13 @@
  *                                           errmsg with n_states == 0 and no
  *                                           trans/accept to free, and a compile+
  *                                           free loop shows no arena growth.
+ *   8. the state-map GROWTH path (levMapGrow + its rehash, which only fires at
+ *                                           192 states) is executed and stays
+ *                                           oracle-correct — 15/20/26-byte terms
+ *                                           at k=2 give 218/298/394 states, and
+ *                                           shortening a term fails the n_states
+ *                                           assertion, so the case cannot pass
+ *                                           without crossing the threshold.
  */
 
 #include "dl.h"
@@ -314,6 +321,143 @@ static void test_brute_force_oracle(void)
     }
 
     dafsa_free(d);
+    PASS();
+}
+
+/* ─── (4b) growth path: the state MAP grows and rehashes ────────────────── */
+
+/* lev_compile's state map starts at cap 256 and only grows at
+ * used*4 >= cap*3 (192 states), so every other fixture in this file leaves
+ * levMapGrow and its rehash UNEXECUTED (the longest terms here are 8 bytes =
+ * 106 states).  The terms below cross that threshold — MEASURED n_states at
+ * k=2: "abcdefghijklmno" 15B = 218 (one grow), "abcdefghijklmnopqrst" 20B =
+ * 298 (grow + rehash), "abcdefghijklmnopqrstuvwxyz" 26B = 394 (two grows) —
+ * and the n_states assertion is what makes the case FAIL if a term is
+ * shortened and the growth stops firing (otherwise this would be a test that
+ * cannot fail).  Every candidate is then checked against the brute-force
+ * oracle, so a rehash that loses or duplicates states shows up as a missing
+ * or extra match. */
+
+static void mut_del(char *out, const char *term, size_t pos)
+{
+    size_t n = strlen(term);
+    memcpy(out, term, pos);
+    memcpy(out + pos, term + pos + 1, n - pos); /* includes the NUL */
+}
+
+static void mut_subst(char *out, const char *term, size_t pos, char by)
+{
+    strcpy(out, term);
+    out[pos] = by;
+}
+
+static void mut_ins(char *out, const char *term, size_t pos, char by)
+{
+    size_t n = strlen(term);
+    memcpy(out, term, pos);
+    out[pos] = by;
+    memcpy(out + pos + 1, term + pos, n - pos + 1);
+}
+
+static void mut_transpose(char *out, const char *term, size_t pos)
+{
+    strcpy(out, term);
+    out[pos] = term[pos + 1];
+    out[pos + 1] = term[pos];
+}
+
+static void test_levmap_growth(void)
+{
+    TEST("state-map growth + rehash is exercised and stays oracle-correct");
+
+    const char *terms[] = {
+        "abcdefghijklmno",
+        "abcdefghijklmnopqrst",
+        "abcdefghijklmnopqrstuvwxyz",
+    };
+    /* A byte that appears in no term, so a substitution/insertion with it is
+     * exactly one edit. */
+    const char X = '~';
+
+    for (int ti = 0; ti < 3; ti++) {
+        const char *term = terms[ti];
+        const size_t m = strlen(term);
+        const size_t mid = m / 2;
+
+        /* Candidates at distance 0..3 from the term, plus an unrelated name. */
+        char c0[512], c1[512], c2[512], c3[512], c4[512], c5[512], c6[512];
+        strcpy(c0, term);                          /* d=0 exact */
+        mut_del(c1, term, mid);                    /* d=1 */
+        mut_subst(c2, term, mid, X);               /* d=1 */
+        mut_ins(c3, term, mid, X);                 /* d=1 */
+        mut_transpose(c4, term, mid);              /* d=2 (Levenshtein) */
+        mut_subst(c5, term, mid, X);               /* d=2: two substitutions */
+        c5[mid + 1] = X;
+        mut_subst(c6, term, 0, X);                 /* d=3 */
+        c6[mid] = X;
+        c6[mid + 1] = X;
+
+        const char *names[] = { c0, c1, c2, c3, c4, c5, c6, "bob" };
+        const uint32_t ids[] = { 300, 301, 302, 303, 304, 305, 306, 307 };
+        const int n_names = 8;
+        /* Distances the fixture claims; the oracle re-checks each one below. */
+        const int want_dist[] = { 0, 1, 1, 1, 2, 2, 3, -1 };
+
+        dafsa *d = build_sym_dafsa(names, ids, n_names);
+        CHECK(d, "build dafsa");
+
+        regex_dfa *dfa = lev_compile(term, 2);
+        CHECK(dfa, "lev_compile NULL");
+        CHECK(!dfa->errmsg, dfa->errmsg);
+        if (dfa->n_states < 193) {
+            printf("\n    term '%s' produced only %d states: the state map never "
+                   "grew (needs > 192)\n", term, dfa->n_states);
+            FAIL("case does not cross the map-growth threshold");
+            regex_dfa_free(dfa);
+            dafsa_free(d);
+            return;
+        }
+        printf("['%s': %d states] ", term, dfa->n_states);
+
+        id_set got = id_set_new();
+        (void)symbols_dfa_walk(d, dfa, id_collect_cb, &got);
+        CHECK(!got.overflow, "id_set overflow");
+
+        for (int i = 0; i < n_names; i++) {
+            int dist = ref_edit_distance(term, names[i]);
+            if (want_dist[i] >= 0 && dist != want_dist[i]) {
+                printf("\n    FIXTURE: dist('%s','%s')=%d, expected %d\n",
+                       term, names[i], dist, want_dist[i]);
+                FAIL("fixture distance is wrong");
+                regex_dfa_free(dfa);
+                dafsa_free(d);
+                return;
+            }
+            int want = (dist <= 2);
+            int have = id_set_has(&got, ids[i]);
+            if (want != have) {
+                printf("\n    MISMATCH term='%s' k=2 name='%s' dist=%d "
+                       "brute_force=%s walk=%s\n", term, names[i], dist,
+                       want ? "match" : "absent", have ? "match" : "absent");
+                FAIL("grown automaton disagrees with brute force");
+                regex_dfa_free(dfa);
+                dafsa_free(d);
+                return;
+            }
+        }
+        /* d=0, 1, 1, 1, 2, 2 match; d=3 and 'bob' do not. */
+        if (got.n != 6) {
+            printf("\n    COUNT MISMATCH term='%s' expected=6 got=%d\n", term, got.n);
+            FAIL("match count disagrees with brute force");
+            regex_dfa_free(dfa);
+            dafsa_free(d);
+            return;
+        }
+
+        regex_dfa_free(dfa);
+        dafsa_free(d);
+    }
+
     PASS();
 }
 
@@ -661,6 +805,7 @@ int main(void)
     test_distractor_k_plus_1();
     test_transposition_is_not_one();
     test_brute_force_oracle();
+    test_levmap_growth();
     test_vm_operator();
     test_non_ascii_byte_distance();
     test_dl_fuzzy_lookup();

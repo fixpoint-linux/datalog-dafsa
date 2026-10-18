@@ -36,6 +36,14 @@ const dl = @import("dl.zig");
 // glibc strdup (not re-exported by std.c; parser.zig declares its own too).
 extern "c" fn strdup(s: [*c]const u8) ?[*:0]u8;
 
+comptime {
+    // The parser rejects a `~~` edit distance above its own limit before the
+    // value is packed into bits 8..15; that limit must not drift from the
+    // walker's (k>=3 is refused by lev_compile).
+    std.debug.assert(parser.PATTERN_EDIT_MAX == @as(c_int, @intCast(regexwalk.LEV_MAX_K)));
+    std.debug.assert(parser.PATTERN_COL_MASK == 0xFF);
+}
+
 // ─── Constants (mirror src/compiler.h / src/parser.h) ─────────────────────
 
 const MAX_VARS = 64;
@@ -1985,9 +1993,11 @@ fn compile_one(db: *dl.DlDb, r: *parser.rule, rel_strata: ?[*]const c_int, recur
             return null;
         }
         // `~~` (fuzzy) carries its edit distance in the spare high bits of
-        // pattern_col; the column itself is the low byte either way.
+        // pattern_col; the column itself is the low byte either way.  A plain
+        // `~` atom stores the RAW column (no masking), so an out-of-range
+        // column still hits the range check below instead of wrapping to 0.
         const fuzzy = parser.patternIsFuzzy(ba.pattern_col);
-        const col: c_int = parser.patternColGet(ba.pattern_col);
+        const col: c_int = if (fuzzy) parser.patternColGet(ba.pattern_col) else ba.pattern_col;
         if (col < 0 or col >= ba.nargs) {
             cerr(r.off, "compile error: pattern column out of range for atom", .{});
             return null;
