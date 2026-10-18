@@ -16,8 +16,9 @@
 # The pre-removal consumer TUs this audit used to compile — src/dl_cli.c
 # (the CLI oracle, now zig/src/dl_cli.zig), dl-lsp (src/lsp.c + src/json.c,
 # retired with the C engine), and the still-C .so TUs src/index.c + src/vector.c
-# (ported to Zig in U14) — are gone.  The retained C
-# consumers are the 42 test suites, so their re-link IS the ABI contract.
+# (ported to Zig in U14; src/vector.c and the vector tier were then removed
+# entirely on 2026-08-11) — are gone.  The retained C
+# consumers are the 37 test suites, so their re-link IS the ABI contract.
 #
 # Additionally asserts the engine DATA globals C consumers reference are
 # exported as OBJECTS from the Zig .so (g_bushy/g_reorder are set by

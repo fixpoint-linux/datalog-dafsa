@@ -20,7 +20,7 @@ per-step budget are reported, not tuned away.**
 | query_magic (chain 40, bound) — path DELETED, see note | 0.74 ms | **MISS by 74×** — off per-step path |
 | query_rules_ro (chain 40) | 1.8 ms | **MISS by 180×** |
 | query_rules_ro (chain 1000) | 1.23 s | **MISS by 123 000×** |
-| vector_search (production obs index, r=8) | 34 ms | **MISS** — semantic recall, not per-step |
+| ~~vector_search (production obs index, r=8)~~ | 34 ms | **MISS** — semantic recall, not per-step. **REMOVED** with the tier, 2026-08-11 |
 
 `query_magic` rows are kept as measured, but that path no longer exists: the
 magic-sets / top-down regimes were deleted on 2026-08-11 (see `CHANGELOG.md`).
@@ -131,17 +131,26 @@ work, not per-step reads.
   serializes handle use with an RLock; single-threaded use is the contract.**
   A lock-free reader would need an engine-side guarantee we do not have.
 
-## 6. Vector tier (production memory store, OBSERVATION_CONTENT corpus)
+## 6. Vector tier — REMOVED (2026-08-11) (production memory store, OBSERVATION_CONTENT corpus)
 
+> 🛑 **REMOVED (2026-08-11) — the whole vector tier was deleted from the engine
+> and the binding.** `vector_search` / `vector_search_version` / `vector_rerank`
+> no longer exist, and neither do `DlVecCorpus`, `VEC_D` or `VEC_IVEC_WORDS`.
+> Reason: agents author the handoff data and query it with the **same words**, so
+> retrieval is lexical; the embeddings did not earn their machinery. The store
+> data was NOT deleted (`__vec_q__`, `__vec_obs__`, `__obssig*__`,
+> `__itq_basis__`, `.npy` sidecar) — the engine simply stops reading it, so
+> nothing below is a live path. §6 is kept as a dated measurement record.
+>
+> Before the removal the section already carried this note:
 > ⚠ **SUPERSEDED (2026-08-11, unit U9) — the numbers below were measured on the
-> old MIH mechanism.** Vector search is now a scan-and-rank over `__vec_q__`
+> old MIH mechanism.** Vector search was then a scan-and-rank over `__vec_q__`
 > (integer dot + norm per live vector, exact-cosine top-k, 100% recall), so
 > there is no `r` (radius) knob at all: `dl_vector_search` takes only the query
 > vector and `k`, and the cost is O(N·D) int8 multiply-accumulates for N live
 > vectors — no `r=8/16/24/32/48` variants exist any more, and the per-band
 > `__obssig0..15__` / `__itq_basis__` relations named here are no longer read.
-> Treat the table as a dated record of the MIH design, not as current
-> latency.
+> Treat the table as a dated record of the MIH design, not as latency.
 
 The production store (~/.config/hax/memory.dl, 37 679 observations) indexes
 observation CONTENT (`__obssig0..15__`, `__vec_obs__`, `__itq_basis__`),
@@ -194,7 +203,10 @@ canonical build; 6.7 MB, exports all 86 `dl_*` symbols used).
    (query_rules_ro), 66 µs bound-query after one-time compile, growing
    quadratically with derived tuples; far above 10 µs except nothing here
    is a per-step op.
-4. **Is an embedder needed at runtime?** For QUERY encoding, something must
+4. **Is an embedder needed at runtime?** *(Moot since 2026-08-11: the vector
+   tier and its encoder lookup were REMOVED — retrieval is lexical only. Kept as
+   the record of why the encoder was external while the tier existed.)* For
+   QUERY encoding, something had to
    produce (q_sig, q_int8) — the engine does not embed. That used to be one
    ~30 ms in-process `libembed.so` call (`dl_embed_encode_query`); both the
    library and the `dl-embed` CLI are now gone with the C++ embed sidecar, so
@@ -214,8 +226,9 @@ canonical build; 6.7 MB, exports all 86 `dl_*` symbols used).
 ## Negatives (explicit)
 
 - Recursive queries (unscoped) blow the per-step budget by 10²–10⁵×.
-- vector_search r≥16 costs 0.4–2.2 s on the production index; only r=8
-  (~34 ms) is even in the tens-of-ms class.
+- ~~vector_search r≥16 costs 0.4–2.2 s on the production index; only r=8
+  (~34 ms) is even in the tens-of-ms class.~~ The vector tier was REMOVED on
+  2026-08-11, so this is history, not a constraint any more.
 - `dl_open_ro` on the production store costs ~650 ms — every handle
   acquisition, not just the first, after a writer cycle.
 - No coexistence of reader and writer, cross-process (single big lock) —
@@ -235,7 +248,7 @@ canonical build; 6.7 MB, exports all 86 `dl_*` symbols used).
 
 ```sh
 cd ~/thing/dlb
-python3 tests/test_binding.py          # 42 correctness tests
+python3 tests/test_binding.py          # 37 correctness tests
 python3 tests/bench_envelope.py        # this envelope (~6 min: the 5000-chain
                                        # recursive query dominates the wall time)
 ```

@@ -6,7 +6,10 @@ Embeds a few fixed strings with a REFERENCE bge-small-en-v1.5 model via
 fastembed (ONNX) and writes them as a golden fixture.  Its original in-tree
 consumer, the C++ `dl-embed self-test` gate, has been removed together with the
 whole embed sidecar, so this is now a REFERENCE FILE: use it to check any
-external encoder's numbers (cosine >= 0.9999 against these vectors).  Run ONCE
+external encoder's numbers (cosine >= 0.9999 against these vectors).  The
+vector/embedding tier itself was REMOVED from the engine on 2026-08-11 (agents
+query with the words they wrote, so retrieval is lexical), so nothing in-tree
+consumes this fixture any more — it is kept purely as reference data.  Run ONCE
 on a host with network + fastembed installed (the project venv: build-tmp/venv):
 
     pip install fastembed

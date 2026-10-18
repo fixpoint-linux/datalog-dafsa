@@ -26,7 +26,6 @@ test {
     _ = @import("wfs.zig");
     _ = @import("dl.zig");
     _ = @import("index.zig"); // U14: src/index.c
-    _ = @import("vector.zig"); // U14: src/vector.c
     // U1: dl_abi.zig comptime witness — one @cImport("dl_internal.h") pins
     // the hand-declared C-layout structs field-for-field (test-only, never
     // in the lib/exe graphs).

@@ -7,15 +7,14 @@
 //! PRINT FIDELITY is the whole point: every stdout/stderr byte must match the
 //! C oracle, so all output goes through the SAME libc printf/fprintf calls
 //! with the SAME format strings, all numeric parsing through the SAME
-//! strtoul/strtol/sscanf semantics (including their whitespace/sign quirks),
+//! strtoul/strtol semantics (including their whitespace/sign quirks),
 //! all allocation through libc malloc/free (so huge --top/--k OOMs print the
-//! same nothing), and process control through fork/execv/exit (libc exit
-//! flushes stdio exactly like `return` from C main).  Engine calls resolve to
+//! same nothing), and termination through libc exit (it flushes stdio exactly
+//! like `return` from C main).  Engine calls resolve to
 //! the libdatalog.so exports at link time: dl_* from the ported dl.zig,
 //! regex_compile/regex_dfa_free from regexwalk.zig, intern_*/term_* from
-//! intern.zig/termstore.zig — while tokenize/aux_index_ensure_postings/
-//! dl_index_observations/dl_search_top*/dl_vector_* still come from the C
-//! index.c/vector.c in the .so (deferred to U14).
+//! intern.zig/termstore.zig, and tokenize/aux_index_ensure_postings/
+//! dl_index_observations/dl_search_top* from the ported index.zig.
 //!
 //! The dl_db layout is reached through the shared internal module
 //! (@import of dl_internal.zig) exactly like the C CLI — db->ir and db->terms
@@ -33,61 +32,28 @@ const c = @import("dl_abi.zig");
 // ─── libc decls — byte fidelity to the C oracle means using libc itself ────
 extern "c" fn printf(fmt: [*:0]const u8, ...) c_int;
 extern "c" fn fprintf(stream: *std.c.FILE, fmt: [*:0]const u8, ...) c_int;
-extern "c" fn sscanf(str: [*c]const u8, fmt: [*:0]const u8, ...) c_int;
-extern "c" fn fscanf(stream: *std.c.FILE, fmt: [*:0]const u8, ...) c_int;
-extern "c" fn snprintf(buf: [*c]u8, size: usize, fmt: [*:0]const u8, ...) c_int;
 extern "c" fn fopen(path: [*c]const u8, mode: [*:0]const u8) ?*std.c.FILE;
 extern "c" fn fclose(stream: *std.c.FILE) c_int;
 extern "c" fn fread(ptr: [*c]u8, size: usize, nmemb: usize, stream: *std.c.FILE) usize;
 extern "c" fn fseek(stream: *std.c.FILE, off: c_long, whence: c_int) c_int;
 extern "c" fn ftell(stream: *std.c.FILE) c_long;
-extern "c" fn fdopen(fd: c_int, mode: [*:0]const u8) ?*std.c.FILE;
 extern "c" fn getline(lineptr: *?[*]u8, n: *usize, stream: *std.c.FILE) isize;
 extern "c" fn malloc(size: usize) ?*anyopaque;
 extern "c" fn free(ptr: ?*anyopaque) void;
 extern "c" fn exit(status: c_int) noreturn;
-extern "c" fn _exit(status: c_int) noreturn;
-extern "c" fn pipe(fds: *[2]c_int) c_int;
-extern "c" fn fork() c_int;
-extern "c" fn dup2(oldfd: c_int, newfd: c_int) c_int;
-extern "c" fn close(fd: c_int) c_int;
-extern "c" fn execv(path: [*c]const u8, argv: [*c]const [*c]u8) c_int;
-extern "c" fn waitpid(pid: c_int, status: *c_int, options: c_int) c_int;
-extern "c" fn access(path: [*c]const u8, mode: c_int) c_int;
-extern "c" fn strrchr(s: [*c]const u8, ch: c_int) [*c]u8;
 extern "c" fn strtoul(nptr: [*c]const u8, endptr: [*c][*c]u8, base: c_int) c_ulong;
 extern "c" fn strtol(nptr: [*c]const u8, endptr: [*c][*c]u8, base: c_int) c_long;
 extern "c" fn __errno_location() *c_int;
-extern "c" fn strlen(s: [*c]const u8) usize;
 
 /// glibc's unbuffered stderr stream global (same symbol the C oracle uses).
 extern "c" var stderr: *std.c.FILE;
 
 // ─── Constants (mirrors of the C oracle's / headers' values) ────────────────
-const PATH_MAX = 4096; // Linux PATH_MAX (src/dl_cli.c uses <limits.h>'s)
 const ERANGE = 34;
 const SEEK_SET = 0;
 const SEEK_END = 2;
-const X_OK = 1;
-const STDOUT_FILENO = 1;
 const DL_E_CONFLICT = 2; // dl.h
 
-/// vector.h layout constants (shared verbatim with the external encoder).
-/// Defined here rather than read from the cImport because translate-c cannot
-/// always fold the division macros; the comptime gate below pins them to the
-/// header when it did.
-const VEC_IVEC_WORDS = 96; // VEC_D(384)/4 — 4 int8 packed per u32
-
-comptime {
-    if (@hasDecl(c, "VEC_IVEC_WORDS")) std.debug.assert(VEC_IVEC_WORDS == c.VEC_IVEC_WORDS);
-}
-
-inline fn wifexited(status: c_int) bool {
-    return (status & 0x7f) == 0;
-}
-inline fn wexitstatus(status: c_int) c_int {
-    return (status >> 8) & 0xff;
-}
 /// C's (int)some_unsigned_long — truncate to the low 32 bits, reinterpreted.
 inline fn cIntTrunc(v: c_ulong) c_int {
     return @bitCast(@as(u32, @truncate(v)));
@@ -102,14 +68,6 @@ fn eq(a: []const u8, b: []const u8) bool {
 fn eqFirst11(a: [:0]const u8, b: *const [11:0]u8) bool {
     return a.len >= 11 and std.mem.eql(u8, a[0..11], b);
 }
-
-// ─── Program directory (for the external query-encoder lookup) ──────────────
-
-/// Directory of this binary (set in main): used to locate the query encoder
-/// for the vsearch encode path, so it resolves regardless of the caller's cwd.
-/// The encoder is NOT part of this repo — see `runEncodeHelper` for the
-/// contract it must satisfy.
-var g_prog_dir: [PATH_MAX]u8 = @splat(0); // C init "."; set in main
 
 // ─── Strict u32 parsing (C parse_u32_strict, 1:1 via libc strtoul) ─────────
 
@@ -151,187 +109,6 @@ fn cliParseValue(db: [*c]c.dl_db, s: [*c]const u8) u32 {
         return @intCast(v);
     }
     return c.intern_str(ir, s);
-}
-
-/// Parse a concatenated hex string into an array of u32 values (no spaces,
-/// no 0x prefix; each u32 is 8 hex digits).  Returns n_words, or -1.
-fn parseHexWords(hex_str: [*c]const u8, words: [*]u32, n_words: usize) isize {
-    const hex_len = strlen(hex_str);
-    if (hex_len != n_words * 8) {
-        return -1; // each u32 is 8 hex digits
-    }
-    var i: usize = 0;
-    while (i < n_words) : (i += 1) {
-        var buf: [9]u8 = undefined;
-        @memcpy(buf[0..8], hex_str[i * 8 ..][0..8]);
-        buf[8] = 0;
-        if (sscanf(&buf, "%8x", &words[i]) != 1) {
-            return -1;
-        }
-    }
-    return @intCast(n_words);
-}
-
-/// Run the external query-encoder helper: fork + execv (NO shell — the query
-/// is passed as a single argv element, so no shell-quoting/injection surface
-/// exists by construction).  The engine does not embed text, so the encoder is
-/// a separate program: it must answer `<encoder> encode --db DIR QRY` with ONE
-/// stdout token, the 768-hex-character int8 vector (the same 96 packed chunks
-/// stored in __vec_q__).  Fills q_int8 (VEC_IVEC_WORDS) from it.
-/// (Since U9 the encoder emits no signature: the query path reads no band
-/// postings — see docs/datalog-dafsa-vector-search.md.)
-/// Returns 0 on success, -1 on any failure (message printed).
-fn runEncodeHelper(db_dir: [*c]const u8, query: [*c]const u8, q_int8: *[VEC_IVEC_WORDS]u32) c_int {
-    var helper: [PATH_MAX + 16]u8 = undefined;
-    var fds: [2]c_int = undefined;
-
-    // resolve dl-embed next to this binary, then ./dl-embed
-    _ = snprintf(&helper, helper.len, "%s/dl-embed", &g_prog_dir);
-    if (access(&helper, X_OK) != 0) {
-        _ = snprintf(&helper, helper.len, "./dl-embed");
-        if (access(&helper, X_OK) != 0) {
-            _ = fprintf(stderr, "dl: query encoder not found (no in-tree embedder; pass --ivec, or install an encoder as ./dl-embed)\n");
-            return -1;
-        }
-    }
-
-    if (pipe(&fds) != 0) {
-        _ = fprintf(stderr, "dl: pipe failed\n");
-        return -1;
-    }
-    const pid = fork();
-    if (pid < 0) {
-        _ = close(fds[0]);
-        _ = close(fds[1]);
-        _ = fprintf(stderr, "dl: fork failed\n");
-        return -1;
-    }
-    if (pid == 0) {
-        var cargv: [6][*c]u8 = .{
-            @constCast("dl-embed"),
-            @constCast("encode"),
-            @constCast("--db"),
-            @constCast(db_dir),
-            @constCast(query),
-            null,
-        };
-        if (dup2(fds[1], STDOUT_FILENO) < 0) _exit(126);
-        _ = close(fds[0]);
-        _ = close(fds[1]);
-        _ = execv(&helper, &cargv);
-        _exit(127);
-    }
-    _ = close(fds[1]);
-    {
-        var ivec_buf: [769]u8 = undefined;
-        const fp = fdopen(fds[0], "r");
-        var status: c_int = 0;
-        var ok = false;
-        if (fp == null) {
-            _ = close(fds[0]);
-            _ = waitpid(pid, &status, 0);
-            _ = fprintf(stderr, "dl: fdopen failed\n");
-            return -1;
-        }
-        if (fscanf(fp.?, "%768s", &ivec_buf) == 1) {
-            if (parseHexWords(&ivec_buf, q_int8, VEC_IVEC_WORDS) == VEC_IVEC_WORDS)
-                ok = true;
-        }
-        _ = fclose(fp.?);
-        if (waitpid(pid, &status, 0) < 0 or
-            !wifexited(status) or wexitstatus(status) != 0)
-        {
-            ok = false;
-        }
-        if (!ok) {
-            _ = fprintf(stderr, "dl: encode helper failed\n");
-            return -1;
-        }
-    }
-    return 0;
-}
-
-// ─── Vector-search collectors / printers (C structs + callbacks) ────────────
-
-/// Callback to collect candidate sym-ids from vector search.
-const VecCandCollector = struct {
-    syms: ?[*]u32,
-    capacity: c_int,
-    count: c_int,
-};
-
-fn collectVecCand(entity_sym: u32, score: c_int, user: ?*anyopaque) callconv(.c) c_int {
-    const col: *VecCandCollector = @ptrCast(@alignCast(user.?));
-    _ = score;
-    if (col.count < col.capacity) {
-        col.syms.?[@intCast(col.count)] = entity_sym;
-        col.count += 1;
-    }
-    return 0;
-}
-
-/// Callback to print ranked results from search/rerank.
-const VecResultPrinter = struct {
-    db: [*c]c.dl_db,
-    printed: c_int,
-};
-
-fn printVecResult(entity_sym: u32, score: c_int, user: ?*anyopaque) callconv(.c) c_int {
-    const p: *VecResultPrinter = @ptrCast(@alignCast(user.?));
-    _ = score;
-    printValue(p.db.?, entity_sym, 0);
-    _ = printf("\n");
-    p.printed += 1;
-    return 0;
-}
-
-/// Callback to print raw ranked sym-ids (vsearch --cand-only): the score is
-/// already reflected in the emitted order, so only the sym-id is printed.
-const VecCandPrinter = struct {
-    printed: c_int = 0,
-};
-
-fn printVecCand(entity_sym: u32, score: c_int, user: ?*anyopaque) callconv(.c) c_int {
-    const p: *VecCandPrinter = @ptrCast(@alignCast(user.?));
-    _ = score;
-    _ = printf("%u\n", entity_sym);
-    p.printed += 1;
-    return 0;
-}
-
-/// Callback: accumulate ONE observation(entity, content) row into a
-/// content-sym -> entity-sym map.  The hybrid path needs this mapping for every
-/// lexical hit; a single pass over the relation answers all of them, where the
-/// previous per-hit lookup re-enumerated the whole relation per hit.
-const ObsMapCtx = struct {
-    m: *std.AutoHashMap(u32, u32),
-    error_occurred: bool = false,
-};
-
-fn collectObsMap(cols: [*c]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_int {
-    const ctx: *ObsMapCtx = @ptrCast(@alignCast(user.?));
-    if (arity < 2) return 1; // malformed row: stop scan
-    ctx.m.put(cols[1], cols[0]) catch {
-        ctx.error_occurred = true;
-        return 1;
-    };
-    return 0;
-}
-
-/// Build obs_id (observation.content) -> owning entity sym in ONE relation pass.
-/// The read primitive is the one the rest of the query used — LIVE -> dl_prefix,
-/// VERSION -> dl_query_bound_version — so a --version read never consults live
-/// observation rows.  A missing relation (or a version without it) yields an
-/// EMPTY map, the same "no mapping" outcome the per-hit lookup had; it is not an
-/// error.  Returns false only on OOM.
-fn buildObsEntityMap(db: [*c]c.dl_db, version: c_ulong, m: *std.AutoHashMap(u32, u32)) bool {
-    var ctx = ObsMapCtx{ .m = m };
-    const n = if (version == 0)
-        c.dl_prefix(db, "observation", null, 0, collectObsMap, &ctx)
-    else
-        c.dl_query_bound_version(db, @intCast(version), "observation", null, 0, collectObsMap, &ctx);
-    if (n < 0) return true;
-    return !ctx.error_occurred;
 }
 
 // ─── Value / tuple printing (byte-exact reverse-mapping heuristics) ────────
@@ -384,8 +161,8 @@ fn printTuple(cols: [*c]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_
 }
 
 /// Callback for dl_prefix --raw: print one tuple as raw u32 columns (no
-/// symbol reverse-mapping).  Machine-consumable (used by the S4 oracle/embed
-/// parsers which need the exact packed ints).
+/// symbol reverse-mapping).  Machine-consumable: the exact packed ints, with
+/// no reverse-mapping heuristic in the way.
 fn printTupleRaw(cols: [*c]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_int {
     _ = user;
     var i: u8 = 0;
@@ -458,13 +235,10 @@ fn usage(prog: [*:0]const u8) noreturn {
         \\  %s [-d <dir>] obs <node> [--max-obs N]
         \\  %s [-d <dir>] index
         \\  %s [-d <dir>] search '<terms>' [--top N] [--version N] [--min-terms N] (--version 0 = current)
-        \\  %s [-d <dir>] vsearch '<query>' [--k N] [--version V] [--ivec <hex768>]
-        \\  %s [-d <dir>] vhybrid '<terms>' '<query>' [--k N] [--version V] [--ivec <hex768>]
         \\  %s [-d <dir>] versions
         \\Values: bare integer -> raw u32; anything else -> interned string
-        \\Hex args: concatenated hex digits (no spaces, no 0x prefix)
         \\
-    , prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
+    , prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
     exit(1);
 }
 
@@ -481,21 +255,6 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
     var argp: usize = 1;
 
     if (argc < 2) usage(argv[0].ptr);
-
-    // record this binary's directory for the query-encoder lookup
-    {
-        const prog0 = argv[0];
-        var n = prog0.len;
-        if (n >= g_prog_dir.len) n = g_prog_dir.len - 1;
-        @memcpy(g_prog_dir[0..n], prog0[0..n]);
-        g_prog_dir[n] = 0;
-        const slash = strrchr(&g_prog_dir, '/');
-        if (slash != null) {
-            slash[0] = 0;
-        } else {
-            _ = snprintf(&g_prog_dir, g_prog_dir.len, ".");
-        }
-    }
 
     // Parse -d <dir>
     if (argp < argv.len and eq(argv[argp], "-d")) {
@@ -1118,273 +877,6 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
 
         free(obs_ids);
         free(scores);
-        return 0;
-    }
-
-    if (eq(cmd, "vsearch")) {
-        if (argp >= argv.len) usage(argv[0].ptr);
-        const query_str = argv[argp];
-        argp += 1;
-
-        var k: c_ulong = 10;
-        var version: c_ulong = 0;
-        var ivec_hex: ?[*:0]const u8 = null;
-        var cand_only = false;
-
-        while (argp < argv.len) {
-            if (eq(argv[argp], "--k")) {
-                argp += 1;
-                if (argp >= argv.len or !parseU32Strict(argv[argp].ptr, &k) or k < 1 or k > 0x7FFFFFFF) {
-                    _ = fprintf(stderr, "dl: invalid --k value\n");
-                    return 1;
-                }
-                argp += 1;
-            } else if (eq(argv[argp], "--version")) {
-                argp += 1;
-                if (argp >= argv.len or !parseU32Strict(argv[argp].ptr, &version)) {
-                    _ = fprintf(stderr, "dl: invalid --version value\n");
-                    return 1;
-                }
-                argp += 1;
-            } else if (eq(argv[argp], "--ivec")) {
-                argp += 1;
-                if (argp >= argv.len) {
-                    _ = fprintf(stderr, "dl: --ivec requires a hex string\n");
-                    return 1;
-                }
-                ivec_hex = argv[argp];
-                argp += 1;
-            } else if (eq(argv[argp], "--cand-only")) {
-                argp += 1;
-                cand_only = true;
-            } else {
-                _ = fprintf(stderr, "dl: unexpected argument '%s'\n", argv[argp].ptr);
-                return 1;
-            }
-        }
-
-        // Parse or encode the pre-quantized int8 query vector.
-        var q_int8: [VEC_IVEC_WORDS]u32 = undefined;
-        if (ivec_hex != null) {
-            // Programmatic path: use the provided hex.
-            if (parseHexWords(ivec_hex.?, &q_int8, VEC_IVEC_WORDS) != VEC_IVEC_WORDS) {
-                _ = fprintf(stderr, "dl: invalid --ivec (need 768 hex chars = 96 u32)\n");
-                return 1;
-            }
-        } else {
-            // Encode the query via the external encoder (fork+execv — no
-            // shell, so the user-controlled query can never inject commands).
-            if (runEncodeHelper(db_dir, query_str.ptr, &q_int8) != 0) {
-                return 1;
-            }
-        }
-
-        // Score-and-rank.  The search itself emits the top k in exact cosine
-        // order; it reads LIVE rows via dl_prefix or the snapshot via
-        // dl_query_bound_version (never both), so version reads stay inside
-        // the snapshot.
-        var n_results: c_long = undefined;
-        if (cand_only) {
-            // The ranked sym-ids, unadorned (machine-consumable).
-            var cand_printer = VecCandPrinter{};
-            if (version == 0) {
-                n_results = c.dl_vector_search(db, &q_int8, cIntTrunc(k), printVecCand, &cand_printer);
-            } else {
-                n_results = c.dl_vector_search_version(db, @intCast(version), &q_int8, cIntTrunc(k), printVecCand, &cand_printer);
-            }
-            if (n_results < 0) {
-                _ = fprintf(stderr, "dl: vector search failed\n");
-                return 1;
-            }
-        } else {
-            var printer = VecResultPrinter{ .db = db, .printed = 0 };
-            if (version == 0) {
-                n_results = c.dl_vector_search(db, &q_int8, cIntTrunc(k), printVecResult, &printer);
-            } else {
-                n_results = c.dl_vector_search_version(db, @intCast(version), &q_int8, cIntTrunc(k), printVecResult, &printer);
-            }
-            if (n_results < 0) {
-                _ = fprintf(stderr, "dl: vector search failed\n");
-                return 1;
-            }
-            if (printer.printed == 0)
-                _ = printf("(no results)\n");
-        }
-        return 0;
-    }
-
-    if (eq(cmd, "vhybrid")) {
-        if (argp + 1 >= argv.len) usage(argv[0].ptr);
-        const terms_str = argv[argp];
-        argp += 1;
-        const query_str = argv[argp];
-        argp += 1;
-
-        var k: c_ulong = 10;
-        var version: c_ulong = 0;
-        var ivec_hex: ?[*:0]const u8 = null;
-
-        while (argp < argv.len) {
-            if (eq(argv[argp], "--k")) {
-                argp += 1;
-                if (argp >= argv.len or !parseU32Strict(argv[argp].ptr, &k) or k < 1 or k > 0x7FFFFFFF) {
-                    _ = fprintf(stderr, "dl: invalid --k value\n");
-                    return 1;
-                }
-                argp += 1;
-            } else if (eq(argv[argp], "--version")) {
-                argp += 1;
-                if (argp >= argv.len or !parseU32Strict(argv[argp].ptr, &version)) {
-                    _ = fprintf(stderr, "dl: invalid --version value\n");
-                    return 1;
-                }
-                argp += 1;
-            } else if (eq(argv[argp], "--ivec")) {
-                argp += 1;
-                if (argp >= argv.len) {
-                    _ = fprintf(stderr, "dl: --ivec requires a hex string\n");
-                    return 1;
-                }
-                ivec_hex = argv[argp];
-                argp += 1;
-            } else {
-                _ = fprintf(stderr, "dl: unexpected argument '%s'\n", argv[argp].ptr);
-                return 1;
-            }
-        }
-
-        // Parse or encode the pre-quantized int8 query vector.
-        var q_int8: [VEC_IVEC_WORDS]u32 = undefined;
-        if (ivec_hex != null) {
-            if (parseHexWords(ivec_hex.?, &q_int8, VEC_IVEC_WORDS) != VEC_IVEC_WORDS) {
-                _ = fprintf(stderr, "dl: invalid --ivec (need 768 hex chars = 96 u32)\n");
-                return 1;
-            }
-        } else {
-            // Encode the query via the external encoder (fork+execv — no
-            // shell, so the user-controlled query can never inject commands).
-            if (runEncodeHelper(db_dir, query_str.ptr, &q_int8) != 0) {
-                return 1;
-            }
-        }
-
-        // Get lexical candidates
-        const tokens = c.tokenize(terms_str.ptr, null);
-        if (tokens == null) {
-            _ = fprintf(stderr, "dl: tokenization failed\n");
-            return 1;
-        }
-        var n_tokens: usize = 0;
-        while (tokens[n_tokens] != null) n_tokens += 1;
-        if (n_tokens == 0) {
-            _ = fprintf(stderr, "dl: no valid terms\n");
-            c.token_free(tokens);
-            return 1;
-        }
-
-        const term_syms = malloc(n_tokens * 4);
-        if (term_syms == null) {
-            c.token_free(tokens);
-            return 1;
-        }
-        const syms: [*]u32 = @ptrCast(@alignCast(term_syms.?));
-        for (0..n_tokens) |i| {
-            syms[i] = c.dl_intern_str(db, tokens[i]);
-            if (syms[i] == 0) {
-                _ = fprintf(stderr, "dl: intern failed for '%s'\n", tokens[i]);
-                free(term_syms);
-                c.token_free(tokens);
-                return 1;
-            }
-        }
-        c.token_free(tokens);
-
-        const lex_ids = malloc(k * 10 * 4);
-        const lex_scores = malloc(k * 10 * 4);
-        if (lex_ids == null or lex_scores == null) {
-            free(lex_ids);
-            free(lex_scores);
-            free(term_syms);
-            return 1;
-        }
-
-        var n_lex: c_int = undefined;
-        if (version == 0) {
-            n_lex = c.dl_search_top(db, syms, @intCast(n_tokens), @ptrCast(@alignCast(lex_ids.?)), @ptrCast(@alignCast(lex_scores.?)), cIntTrunc(k * 10));
-        } else {
-            n_lex = c.dl_search_top_version(db, @intCast(version), syms, @intCast(n_tokens), @ptrCast(@alignCast(lex_ids.?)), @ptrCast(@alignCast(lex_scores.?)), cIntTrunc(k * 10));
-        }
-        free(term_syms);
-        if (n_lex < 0) {
-            _ = fprintf(stderr, "dl: lexical search failed\n");
-            free(lex_ids);
-            free(lex_scores);
-            return 1;
-        }
-
-        // Map the lexical obs ids to their owning entity syms in ONE pass over
-        // the observation relation (compacted IN PLACE into lex_ids), leaving
-        // ids[0..n_lex] as the GATE the vector scan filters on.
-        var obs_map = std.AutoHashMap(u32, u32).init(std.heap.c_allocator);
-        defer obs_map.deinit();
-        if (!buildObsEntityMap(db, version, &obs_map)) {
-            _ = fprintf(stderr, "dl: OOM\n");
-            free(lex_ids);
-            free(lex_scores);
-            return 1;
-        }
-        const ids: [*]u32 = @ptrCast(@alignCast(lex_ids.?));
-        {
-            var n_lex_ent: c_int = 0;
-            for (0..@intCast(n_lex)) |i| {
-                const e = obs_map.get(ids[i]) orelse 0;
-                if (e != 0) {
-                    ids[@intCast(n_lex_ent)] = e;
-                    n_lex_ent += 1;
-                }
-            }
-            n_lex = n_lex_ent;
-        }
-
-        // Gated vector scan: the top k OF THE INTERSECTION (lexical entities ∩
-        // live ∩ vector tier) in exact cosine order.  The gate is a second
-        // membership test INSIDE the scan, so no k*multiplier truncation is
-        // needed — a document in both tiers that ranks below such a cut is no
-        // longer silently dropped.  LIVE/VERSION discipline is unchanged (the
-        // _version form reads the vec + liveness relations version-bound).
-        const vec_syms = malloc(@as(usize, @intCast(k)) * 4);
-        if (vec_syms == null) {
-            _ = fprintf(stderr, "dl: OOM\n");
-            free(lex_ids);
-            free(lex_scores);
-            return 1;
-        }
-        var vec_collector = VecCandCollector{ .syms = @ptrCast(@alignCast(vec_syms.?)), .capacity = cIntTrunc(k), .count = 0 };
-        const n_vec: c_long = if (version == 0)
-            c.dl_vector_search_gated(db, &q_int8, ids, @intCast(n_lex), cIntTrunc(k), collectVecCand, &vec_collector)
-        else
-            c.dl_vector_search_gated_version(db, @intCast(version), &q_int8, ids, @intCast(n_lex), cIntTrunc(k), collectVecCand, &vec_collector);
-        if (n_vec < 0) {
-            _ = fprintf(stderr, "dl: vector search failed\n");
-            free(vec_syms);
-            free(lex_ids);
-            free(lex_scores);
-            return 1;
-        }
-
-        if (vec_collector.count > 0) {
-            const vsyms: [*]u32 = @ptrCast(@alignCast(vec_syms.?));
-            for (0..@intCast(vec_collector.count)) |p| {
-                printValue(db, vsyms[p], 0);
-                _ = printf("\n");
-            }
-        } else {
-            _ = printf("(no results)\n");
-        }
-
-        free(vec_syms);
-        free(lex_ids);
-        free(lex_scores);
         return 0;
     }
 

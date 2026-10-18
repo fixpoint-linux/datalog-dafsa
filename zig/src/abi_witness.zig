@@ -17,7 +17,6 @@ const dl = @import("dl.zig");
 const compiler = @import("compiler.zig");
 const parser = @import("parser.zig");
 const regexwalk = @import("regexwalk.zig");
-const vector = @import("vector.zig");
 
 const ch = @cImport({
     @cInclude("dl_internal.h");
@@ -108,7 +107,6 @@ comptime {
     checkStruct(abi.struct_expr, ch.struct_expr);
     checkStruct(abi.struct_regex_dfa, ch.struct_regex_dfa);
     checkStruct(abi.struct_sym_set, ch.struct_sym_set);
-    checkStruct(abi.struct_dl_vec_corpus, ch.struct_dl_vec_corpus);
 }
 
 // ─── Owner-vs-mirror: the mirror must equal the REAL in-library type ───────
@@ -168,5 +166,4 @@ comptime {
     checkOwnerFull(parser.rule, abi.rule);
     checkOwnerFull(regexwalk.regex_dfa, abi.struct_regex_dfa);
     checkOwnerFull(regexwalk.sym_set, abi.struct_sym_set);
-    checkOwnerFull(vector.DlVecCorpus, abi.struct_dl_vec_corpus);
 }

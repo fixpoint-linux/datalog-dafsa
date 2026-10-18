@@ -8,10 +8,8 @@
 #   - cwd = repo root (suites use relative "build-tmp/..." paths)
 #   - build-tmp/ exists (symlink to a tmpfs scratch root — see "Scratch root")
 #   - ./dl at the repo root is the CLI under test (test_m4_review popen()s it,
-#     test_vector_cli execv()s it, smoke.sh runs it) — the repo-root ./dl is
-#     shadowed by the Zig-linked one for the duration and restored afterwards
-#   - test_embed is standalone (header-only src/embed/vec_bits.h, no engine
-#     link); the C++ embed/ggml suites are gone with the C++ embed sidecar
+#     smoke.sh runs it) — the repo-root ./dl is shadowed by the Zig-linked one
+#     for the duration and restored afterwards
 # Exit status is non-zero if any suite fails to LINK or run.
 set -u
 
@@ -138,10 +136,6 @@ test_search
 test_wfs
 test_homog
 test_negsegv
-test_vector_storage
-test_vector_cli
-test_vector_search_content
-test_embed
 "
 
 TOTAL=0
@@ -163,16 +157,12 @@ run_one() {  # run_one <name> <run-cmd...>
 
 # ─── Re-link + run the C suites against the Zig hybrid .so ─────────────────
 for t in $C_SUITES; do
-    extra=""
-    case "$t" in
-        test_vector_search|test_vector_cli|test_embed) extra="-lm" ;;
-    esac
     # The link is the ABI-completeness check: an unexported/missing symbol
     # fails HERE, before the suite ever runs.
     if ! gcc -O2 -Wall -Wextra -Werror -std=c11 -D_POSIX_C_SOURCE=200809L \
             -Isrc -Ivendor/dafsa "tests/$t.c" \
             -L "$LIBDIR" -ldatalog -Wl,-rpath,"$LIBDIR" \
-            -o "$TMP/z$t" $extra 2> "$TMP/z$t.linklog"; then
+            -o "$TMP/z$t" 2> "$TMP/z$t.linklog"; then
         echo "=== LINK FAIL: $t ==="
         sed -n '1,15p' "$TMP/z$t.linklog"
         FAILED="$FAILED $t(LINK)"

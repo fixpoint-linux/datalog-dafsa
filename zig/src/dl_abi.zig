@@ -19,7 +19,7 @@
 //! @cImport; the layouts below are transcribed from the authoritative C
 //! headers (src/dl_internal.h and the headers it includes: dl.h, intern.h,
 //! relation.h, vrelation.h, snapshot.h, permindex.h, termstore.h, compiler.h
-//! → parser.h, regexwalk.h, and dl.h → vector.h).
+//! → parser.h, regexwalk.h).
 //!
 //! The layouts are comptime-witnessed against ONE @cImport("dl_internal.h")
 //! in zig/src/abi_witness.zig (imported only from tests.zig) so every field's
@@ -40,7 +40,6 @@ pub const RELK_FIXED: c_int = 0; // dl_internal.h
 pub const RELK_VARIADIC: c_int = 1; // dl_internal.h
 pub const TERM_NIL: u32 = 0x80000000; // termstore.h TERM_BASE
 pub const DL_VIEW_CACHE_SZ: c_int = 8; // snapshot.h
-pub const VEC_IVEC_WORDS: c_int = 96; // vector.h VEC_D/4
 
 // ─── Opaque handle types ─────────────────────────────────────────────────
 pub const interner = opaque {}; // intern.h
@@ -200,14 +199,6 @@ pub const rel_entry = extern struct {
     vrel: ?*vrelation,
 };
 
-/// vector.h (via dl.h): struct dl_vec_corpus
-pub const struct_dl_vec_corpus = extern struct {
-    filter_rel: [*c]const u8,
-    filter_col: u8,
-    vec_rel: [*c]const u8,
-};
-pub const dl_vec_corpus = struct_dl_vec_corpus;
-
 /// dl_internal.h: struct dl_db — authoritative layout; must not grow.
 pub const struct_dl_db = extern struct {
     dir: [*c]u8,
@@ -245,7 +236,6 @@ pub const dl_join_cb = ?*const fn (l: [*c]const u32, la: u8, r: [*c]const u32, r
 pub const dl_relation_cb = ?*const fn (name: [*c]const u8, arity: u8, idb: c_int, user: ?*anyopaque) callconv(.c) c_int;
 pub const dl_str_cb = ?*const fn (s: [*c]const u8, user: ?*anyopaque) callconv(.c) c_int;
 pub const dl_traverse_cb = ?*const fn (node_sym: u32, depth: u8, user: ?*anyopaque) callconv(.c) c_int;
-pub const dl_vec_cb = ?*const fn (entity_sym: u32, score: c_int, user: ?*anyopaque) callconv(.c) c_int;
 pub const rel_enum_cb = ?*const fn (cols: [*c]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_int;
 pub const sym_walk_cb = ?*const fn (sym_id: u32, user: ?*anyopaque) callconv(.c) c_int;
 
@@ -287,13 +277,6 @@ pub extern "c" fn dl_term_cons(db: [*c]dl_db, head: u32, tail: u32) u32;
 pub extern "c" fn dl_term_is_list(db: [*c]const dl_db, v: u32) c_int;
 pub extern "c" fn dl_term_car(db: [*c]const dl_db, h: u32) u32;
 pub extern "c" fn dl_term_cdr(db: [*c]const dl_db, h: u32) u32;
-pub extern "c" fn dl_vector_search(db: [*c]dl_db, q_int8: [*c]const u32, k: c_int, cb: dl_vec_cb, user: ?*anyopaque) c_long;
-pub extern "c" fn dl_vector_search_version(db: [*c]dl_db, version: u32, q_int8: [*c]const u32, k: c_int, cb: dl_vec_cb, user: ?*anyopaque) c_long;
-// Gated search (vhybrid's lexical gate -> semantic rank): the rank set is the
-// top-k of the gate ∩ live, so the caller need not pre-truncate the scan.
-pub extern "c" fn dl_vector_search_gated(db: [*c]dl_db, q_int8: [*c]const u32, gate_syms: [*c]const u32, n_gate: usize, k: c_int, cb: dl_vec_cb, user: ?*anyopaque) c_long;
-pub extern "c" fn dl_vector_search_gated_version(db: [*c]dl_db, version: u32, q_int8: [*c]const u32, gate_syms: [*c]const u32, n_gate: usize, k: c_int, cb: dl_vec_cb, user: ?*anyopaque) c_long;
-pub extern "c" fn dl_vector_rerank(db: [*c]dl_db, q_int8: [*c]const u32, cand_syms: [*c]const u32, n_cand: c_int, k: c_int, cb: dl_vec_cb, user: ?*anyopaque) c_long;
 
 // ─── dl_internal.h dispatch helpers ──────────────────────────────────────
 pub extern "c" fn db_has_variadic(db: [*c]const dl_db) c_int;

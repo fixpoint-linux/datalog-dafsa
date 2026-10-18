@@ -12,8 +12,8 @@
 //! dl_internal.h there).  dl_prefix / dl_query_bound_version / dl_lookup /
 //! dl_add_fact / dl_declare_relation / dl_intern_* / dl_txn_* come from
 //! dl.zig; the relation store through the same RelEnumCb as dl.zig.
-//! LIVE vs VERSION read discipline mirrors vector.c: dl_prefix is LIVE-only,
-//! version reads MUST use dl_query_bound_version.
+//! LIVE vs VERSION read discipline: dl_prefix is LIVE-only, version reads
+//! MUST use dl_query_bound_version.
 //!
 //! Oracle: src/index.c (never modified).  All allocation goes through raw
 //! libc like the C oracle.
@@ -451,8 +451,8 @@ fn topSearchCb(obs_id: u32, score: c_int, user: ?*anyopaque) callconv(.c) c_int 
 
 /// Shared AND-intersect/rank/emit body of dl_search / dl_search_version —
 /// the two C entry points are byte-identical except for the collect call,
-/// so the shared impl branches ONLY on the read primitive (the same
-/// read-discipline structure as vector.c's vector_search_impl).
+/// so the shared impl branches ONLY on the read primitive (one body, one
+/// LIVE/VERSION switch).
 fn searchImpl(
     db: ?*dl.DlDb,
     version: u32,

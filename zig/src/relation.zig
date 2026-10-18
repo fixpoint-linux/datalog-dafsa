@@ -89,16 +89,6 @@ pub const Relation = struct {
     // along into the clones that check them; a dl_db-tail field would be
     // invisible to wfs.zig's dl.DlDb clone.
     col_kind: [MAX_ARITY]u8 = @splat(0),
-    // ─── derived-reader cache slot (vector.zig's rev-gated search arena) ───
-    // A LAZY materialisation of this relation's rows, owned by the reader that
-    // built it (vector.zig).  The relation carries only the slot and releases
-    // it at teardown through `cache_free` — it never reads the payload, so the
-    // reader stays the only code that knows the layout, and relation.zig needs
-    // no import back into vector.zig.  Staleness is gated on `rev` by the
-    // OWNER (the reader stores the rev it built at); a reader MUST re-check
-    // `rev` before every use.  Same non-C tail pattern as ov/rev/col_kind.
-    cache: ?*anyopaque = null,
-    cache_free: ?*const fn (?*anyopaque) void = null,
 };
 
 /// Bump the content revision (every mutation site that sets dirty=1 calls
@@ -414,7 +404,6 @@ pub export fn rel_save_base(rel: ?*const Relation, path: [*c]const u8) c_int {
 /// void rel_free(relation *rel)
 pub export fn rel_free(rel: ?*Relation) void {
     const r = rel orelse return;
-    if (r.cache_free) |f| f(r.cache);
     ovFree(r);
     if (r.base != r.d) dc.dafsa_free(r.base);
     dc.dafsa_free(r.d);

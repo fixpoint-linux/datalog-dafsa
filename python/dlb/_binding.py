@@ -1,8 +1,9 @@
 """_binding.py — raw ctypes layer over libdatalog.so (datalog-dafsa).
 
 Every function used gets exact argtypes/restype. Error codes are mapped to
-exceptions — nothing silently returns 0. Callbacks (dl_tuple_cb, dl_vec_cb,
-dl_join_cb) are wrapped so a Python callable can be passed as `user` directly.
+exceptions — nothing silently returns 0. Callbacks (dl_tuple_cb, dl_join_cb,
+dl_traverse_cb, dl_str_cb, dl_relation_cb) are wrapped so a Python callable can
+be passed as `user` directly.
 
 Library resolution order (first hit wins, overridable via DLBLIB env var):
   1. $DLBLIB
@@ -51,14 +52,6 @@ DL_E_CONFLICT = 2  # CAS: expected revision != current revision
 # The C ABI version this binding is written against (dafsa_abi_version()).
 SUPPORTED_ABI = 1
 
-# Vector-tier layout constants (src/vector.h) — the Python side must match.
-# Since U9 the query path is a scan-and-rank over __vec_q__, so the only query
-# input is the pre-quantized int8 vector; the 256-bit ITQ signature
-# (VEC_C/VEC_M/VEC_SIG_WORDS) is gone with the MIH band postings.
-VEC_D = 384          # embedding dim (bge-small)
-VEC_IVEC_WORDS = 96  # int8 query vector, 4 int8 packed per u32
-
-
 class DlError(Exception):
     """Base error for the binding. `code` is the C error code where meaningful."""
 
@@ -86,8 +79,6 @@ TUPLE_CB = CFUNCTYPE(c_int, POINTER(c_uint32), c_uint8, c_void_p)
 # typedef int (*dl_join_cb)(const uint32_t *l, uint8_t la,
 #                           const uint32_t *r, uint8_t ra, void *user);
 JOIN_CB = CFUNCTYPE(c_int, POINTER(c_uint32), c_uint8, POINTER(c_uint32), c_uint8, c_void_p)
-# typedef int (*dl_vec_cb)(uint32_t entity_sym, int score, void *user);
-VEC_CB = CFUNCTYPE(c_int, c_uint32, c_int, c_void_p)
 # typedef int (*dl_traverse_cb)(uint32_t node_sym, uint8_t depth, void *user);
 TRAVERSE_CB = CFUNCTYPE(c_int, c_uint32, c_uint8, c_void_p)
 # typedef int (*dl_str_cb)(const char *s, void *user);
@@ -117,21 +108,6 @@ def make_tuple_cb(py_cb):
 
     return tramp
 
-
-def make_vec_cb(py_cb):
-    """Wrap callable(entity_sym: int, score: int) -> truthy-stop as dl_vec_cb."""
-    stop = [0]
-
-    @VEC_CB
-    def tramp(entity_sym, score, user):
-        if stop[0]:
-            return 1
-        if py_cb(entity_sym, score):
-            stop[0] = 1
-            return 1
-        return 0
-
-    return tramp
 
 
 def make_str_cb(py_cb):
@@ -297,54 +273,6 @@ class DlRaw:
         lib.dl_intern_str_of.argtypes = [c_void_p, c_uint32]
         lib.dl_intern_str_of.restype = c_char_p
 
-        # ── vector tier ────────────────────────────────────────────
-        # struct dl_vec_corpus (vector.h): corpus-parameterized search.
-        # The production memory store indexes OBSERVATION CONTENT
-        # (__vec_obs__/observation), not entity names, so the plain
-        # dl_vector_search (hardcoded ENTITY corpus) returns -1 there.
-        class DlVecCorpus(ctypes.Structure):
-            _fields_ = [
-                ("filter_rel", c_char_p),      # liveness relation
-                ("filter_col", c_uint8),       # which col holds the sym
-                ("vec_rel", c_char_p),         # "__vec_q__" / "__vec_obs__"
-            ]
-
-        self.DlVecCorpus = DlVecCorpus
-        self.CORPUS_ENTITY = DlVecCorpus(
-            filter_rel=b"entity", filter_col=0, vec_rel=b"__vec_q__",
-        )
-        self.CORPUS_OBSERVATION_CONTENT = DlVecCorpus(
-            filter_rel=b"observation", filter_col=1, vec_rel=b"__vec_obs__",
-        )
-
-        lib.dl_vector_search.argtypes = [
-            c_void_p, POINTER(c_uint32), c_int, VEC_CB, c_void_p,
-        ]
-        lib.dl_vector_search.restype = c_long
-        lib.dl_vector_search_corpus.argtypes = [
-            c_void_p, ctypes.POINTER(DlVecCorpus), POINTER(c_uint32),
-            c_int, VEC_CB, c_void_p,
-        ]
-        lib.dl_vector_search_corpus.restype = c_long
-        lib.dl_vector_search_version.argtypes = [
-            c_void_p, c_uint32, POINTER(c_uint32), c_int, VEC_CB, c_void_p,
-        ]
-        lib.dl_vector_search_version.restype = c_long
-        lib.dl_vector_search_corpus_version.argtypes = [
-            c_void_p, c_uint32, ctypes.POINTER(DlVecCorpus), POINTER(c_uint32),
-            c_int, VEC_CB, c_void_p,
-        ]
-        lib.dl_vector_search_corpus_version.restype = c_long
-        lib.dl_vector_rerank.argtypes = [
-            c_void_p, POINTER(c_uint32), POINTER(c_uint32), c_int, c_int, VEC_CB, c_void_p,
-        ]
-        lib.dl_vector_rerank.restype = c_long
-        lib.dl_vector_rerank_corpus.argtypes = [
-            c_void_p, ctypes.POINTER(DlVecCorpus), POINTER(c_uint32),
-            POINTER(c_uint32), c_int, c_int, VEC_CB, c_void_p,
-        ]
-        lib.dl_vector_rerank_corpus.restype = c_long
-
         # Expose prototypes for direct use by the ergonomic layer.
         self.dl_open = lib.dl_open
         self.dl_open2 = lib.dl_open2
@@ -360,10 +288,7 @@ class DlRaw:
             "dl_query_rules_ro dl_query_bound "
             "dl_publish_snapshot dl_snapshot_versions "
             "dl_query_version dl_query_bound_version dl_intern_str "
-            "dl_intern_str_find dl_intern_str_of dl_vector_search "
-            "dl_vector_search_corpus dl_vector_search_version "
-            "dl_vector_search_corpus_version "
-            "dl_vector_rerank dl_vector_rerank_corpus"
+            "dl_intern_str_find dl_intern_str_of"
         ).split():
             setattr(self, nm, getattr(lib, nm))
 

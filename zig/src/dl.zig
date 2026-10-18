@@ -499,8 +499,8 @@ fn findRel(db: *const DlDb, name: [*c]const u8) c_int {
 }
 
 /// Resolve a FIXED-arity relation by name — the read path's own lookup, exposed
-/// to in-engine readers that need relation-level metadata (vector.zig gates its
-/// arena on the relation's content revision) rather than a row enumeration.
+/// to in-engine readers that need relation-level metadata (e.g. the content
+/// revision) rather than a row enumeration.
 /// Null when the name is absent, or names a VARIADIC relation (the caller's
 /// contract is one flat tuple set).  In-engine only: not part of the C ABI.
 pub fn relFixedByName(db: ?*const DlDb, rel_name: [*c]const u8) ?*relation.Relation {

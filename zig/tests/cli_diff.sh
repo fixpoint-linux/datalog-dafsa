@@ -90,43 +90,6 @@ EOF
 # empty file: exercises the "could not determine arity" (empty-CSV) load path
 : > "$DATA/empty.csv"
 
-# Vector fixtures: deterministic entity/__vec_q__ corpora + a query ivec hex
-# string (mirrors tests/test_vector_cli.c storage layout).  Since U9 the query
-# path reads ONLY __vec_q__ + a liveness relation, so there is no signature
-# fixture and no --sig/--radius case: the encoder contract is one int8 vector.
-# Python writes the CSVs and emits the hex string on stdout.
-python3 - "$DATA" > "$WORK/vhex.env" <<'PYEOF'
-import sys, os
-data = sys.argv[1]
-def pack4(b0,b1,b2,b3):
-    return (b0 & 0xFF) | ((b1 & 0xFF) << 8) | ((b2 & 0xFF) << 16) | ((b3 & 0xFF) << 24)
-def ivec_close(seed):
-    v = []
-    x = seed
-    for i in range(96):
-        x = (x * 1103515245 + 12345) & 0x7FFFFFFF
-        base = (x % 60) - 30
-        v.append([max(-128, min(127, base)), max(-128, min(127, base + 1)),
-                  max(-128, min(127, base - 1)), max(-128, min(127, base + 2))])
-    return v
-q_ivec = ivec_close(7)
-ent_ivec = [ivec_close(101), ivec_close(202), ivec_close(303)]
-
-with open(os.path.join(data, "vec_entity.csv"), "w") as f:
-    for k in range(3):
-        f.write("%d,%d\n" % (k + 1, 4))          # (name_sym, type_sym) raw ints
-with open(os.path.join(data, "vec_q.csv"), "w") as f:
-    for k in range(3):
-        for c in range(96):
-            f.write("%d,%d,%d\n" % (k + 1, c, pack4(*ent_ivec[k][c])))
-
-q_ivec_words = [pack4(*q_ivec[c]) for c in range(96)]
-ivec_hex = "".join("%08x" % (w & 0xFFFFFFFF) for w in q_ivec_words)
-print("QIVEC=%s" % ivec_hex)
-PYEOF
-QIVEC=$(sed -n 's/^QIVEC=//p' "$WORK/vhex.env")
-[ -n "$QIVEC" ] || { note "vector fixture generation failed"; exit 1; }
-
 # ─── Corpus drivers ─────────────────────────────────────────────────────────
 # run_cmd <outdir> <tag> <dbdir> <args...>: one command, capture
 # stdout/stderr/rc under <outdir>/<tag>.
@@ -144,7 +107,7 @@ build_corpus() {
     mkdir -p "$out"
 
     # versions/publish/query/bound/pattern/rev/cas/txn/traverse/obs/
-    # index/search/vsearch/vhybrid + load/lookup/prefix
+    # index/search + load/lookup/prefix
     run_cmd "$out" c01 "$db" versions
     run_cmd "$out" c02 "$db" load "$DATA/edge.csv" --rel edge
     run_cmd "$out" c03 "$db" lookup edge 1 2
@@ -213,40 +176,14 @@ build_corpus() {
     run_cmd "$out" c71 "$db" load "$DATA/missing.csv" --rel r9
     run_cmd "$out" c72 "$db" load "$DATA/arity9.csv" --rel r9
     run_cmd "$out" c73 "$db" load "$DATA/empty.csv" --rel r9
-    # vector tier: entity names interned in a fixed order (sym ids 5..7),
-    # then raw-int CSV loads for entity/__vec_q__
-    run_cmd "$out" c74 "$db" lookup entity ent0 doc
-    run_cmd "$out" c75 "$db" lookup entity ent1 doc
-    run_cmd "$out" c76 "$db" lookup entity ent2 doc
-    run_cmd "$out" c77 "$db" load "$DATA/vec_entity.csv" --rel entity
-    run_cmd "$out" c79 "$db" load "$DATA/vec_q.csv" --rel __vec_q__
-    run_cmd "$out" c80 "$db" vsearch "q" --ivec "$QIVEC" --k 10
-    run_cmd "$out" c81 "$db" vsearch "q" --ivec "$QIVEC" --k 1
-    run_cmd "$out" c82 "$db" vsearch "q" --ivec "$QIVEC" --cand-only
-    run_cmd "$out" c83 "$db" vsearch "q" --ivec "$QIVEC" --k 2
-    run_cmd "$out" c84 "$db" vsearch "q"
-    run_cmd "$out" c85 "$db" vsearch "q" --ivec "zz"
-    run_cmd "$out" c86 "$db" vsearch "q" --ivec "$QIVEC" --cand-only --k 1
-    run_cmd "$out" c87 "$db" vsearch "q" --k 0
-    run_cmd "$out" c88 "$db" vsearch "q" --ivec "$QIVEC" --version 1
-    run_cmd "$out" c89 "$db" vhybrid "red" "q" --ivec "$QIVEC"
-    run_cmd "$out" c90 "$db" vhybrid "zzz" "q" --ivec "$QIVEC"
-    run_cmd "$out" c91 "$db" vhybrid "red" "q" --ivec "$QIVEC" --version 1
-    run_cmd "$out" c92 "$db" vhybrid "red"
-    # error paths (the removed --sig/--radius flags must be rejected)
-    run_cmd "$out" c93 "$db" vsearch "q" --ivec "$QIVEC" --radius 16
     run_cmd "$out" c94 "$db" search
     run_cmd "$out" c95 "$db" versions extra
     run_cmd "$out" c96 "$db" frobnicate
-    # encode-helper path (fork+execv of ./dl-embed): no encoder is installed in
-    # this repo any more, so dl reports the missing encoder and exits 1
-    run_cmd "$out" c97 "$db" vsearch "test query"
-    run_cmd "$out" c98 "$db" vhybrid "red" "test query"
 }
 
 # read_corpus <dbdir> <outdir> — the read-only persistence corpus (queries
-# only: lookup/prefix/query/bound/pattern/traverse/obs/search/vsearch/
-# vhybrid/versions/rev/txn).  Run against a COPY of the fully-built db so the
+# only: lookup/prefix/query/bound/pattern/traverse/obs/search/
+# versions/rev/txn).  Run against a COPY of the fully-built db so the
 # on-disk format is re-opened and re-read from scratch.
 read_corpus() {
     local db=$1 out=$2
@@ -266,8 +203,6 @@ read_corpus() {
     run_cmd "$out" r13 "$db" query "tc(X,Y):-edge(X,Y)." tc
     run_cmd "$out" r14 "$db" bound tc 1
     run_cmd "$out" r17 "$db" pattern edge "^[12]$"
-    run_cmd "$out" r18 "$db" vsearch "q" --ivec "$QIVEC" --k 10
-    run_cmd "$out" r19 "$db" vhybrid "red" "q" --ivec "$QIVEC"
     run_cmd "$out" r20 "$db" txn
 }
 

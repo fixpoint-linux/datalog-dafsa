@@ -1,1 +1,0 @@
-dl: query encoder not found (no in-tree embedder; pass --ivec, or install an encoder as ./dl-embed)

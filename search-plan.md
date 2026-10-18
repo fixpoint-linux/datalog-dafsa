@@ -1,19 +1,25 @@
 # Search: how to improve it
 
-**Status: items 1–4 BUILT and verified; item 5 NOT BUILT (gated).** Written
+**Status: items 1–4 BUILT and verified; item 5 BUILT then REMOVED with its tier
+(2026-08-11).** The vector/embedding tier was deleted outright — agents author
+the handoff data and query it with the SAME words, so retrieval is lexical and
+the embeddings did not earn their machinery. Rows 2 and 5 below therefore
+describe work on a tier that no longer exists; the measured outcomes are kept as
+the record. Written
 2026-08-11 against `ef7e0e4`; the plan was executed in order and the results are
 folded in below (each ranked item states its measured outcome). Current HEAD:
 `fb04704`, engine 100% Zig, 42 C oracle suites green in ~26 s, one submodule
-(`vendor/dafsa`).
+(`vendor/dafsa`). Since the 2026-08-11 removal the runner has 37 C suites +
+the smoke step (the four vector/embed suites left with the tier).
 
 | # | item | status | measured result |
 |---|---|---|---|
 | 1 | full-text `IntSet` → O(1) membership | **DONE** `4416161` | 20k × 3 terms **306 → 3.74 ms**; linear, not quadratic |
-| 2 | hybrid hot loop + lexical gate | **DONE** `e08ee86` | `dl_prefix` calls **100 → 1**; recall hole closed via `dl_vector_search_gated` |
+| 2 | hybrid hot loop + lexical gate | **DONE** `e08ee86`, **REMOVED** 2026-08-11 (tier deleted) | `dl_prefix` calls **100 → 1**; recall hole closed via `dl_vector_search_gated` — the whole `vhybrid` path is gone now |
 | 3 | `lev_compile` Levenshtein over symbols | **DONE** `07127a4` | k=1 10–28 µs end-to-end; k=2 58–145 µs; zero storage |
 | 3b | review fixes (5 findings) | **DONE** `fb04704` | 2 measured defects incl. a regression; OOM leak proved closed with an interposer |
 | 4 | `dl_search_ranked` (OR / `min_terms`) | **DONE** `f23899f` | score now varies with matched-term count |
-| 5 | rev-gated columnar vector arena | **DONE** `$(git rev-parse --short HEAD)` | repeated queries **76.47 → 4.09 ms** at 10k (19×); +3.9 MB |
+| 5 | rev-gated columnar vector arena | **REMOVED** 2026-08-11 (arena deleted with the tier) | repeated queries **76.47 → 4.09 ms** at 10k (19×); +3.9 MB — measured, then moot: `vector.zig` and its arena are gone |
 
 **Provenance.** Synthesised by the orchestrator from the planner pass recorded in
 the memory node `handoff-search-plan` (rev 18), whose numbers come from throwaway
@@ -140,7 +146,10 @@ explosion).
 
 ## 3. Direction 2 — vector enumeration (premise refuted)
 
-**OUTCOME (built and superseded):** this direction was NOT built — the premise
+**OUTCOME (moot — the arena was REMOVED with the tier on 2026-08-11):** the
+arena described at the end of this section was built on 2026-10-18 and then
+deleted with the whole vector tier; `vector.zig` no longer exists, so none of the
+numbers below describe a live path. This direction was NOT built — the premise
 was refuted, and the measured 2.4x did not justify a cross-repo encoder-contract
 change. The vector tier stays scan-and-rank. Kept below as the record of why. The cost is not the row count; it is **DAFSA key bytes
 walked** (~8–9 bytes/row today, ~28 for arity-8). All three layouts below store
@@ -237,7 +246,7 @@ top-k·10 — old code returns nothing, gated code returns it.
 | 2 | hybrid: one-shot obs→entity map + lexical gate inside the vector scan | ~1 h | ~66 ms at 10k obs; **fixes a recall hole** |
 | 3 | `lev_compile` — Levenshtein over `symbols.dafsa` (owner's ask) | 1–2 days | exact typo-tolerant lookup, zero storage, sub-ms; **retires the trigram tier** |
 | 4 | `OR`/ranked full-text entry point (after 1) | ½ day | makes the dead ranking live; IDF becomes meaningful |
-| 5 | rev-gated columnar vector arena | ~1 day | **DONE** — 19–23× measured on repeated queries (workload confirmed: agent handoff lookups) |
+| 5 | rev-gated columnar vector arena | ~1 day | **REMOVED** 2026-08-11 — the arena was built (19–23× measured on repeated queries) and then deleted with the tier: agents query with the words they wrote, so retrieval is lexical |
 
 **Order rationale:** 1 and 2 are strictly cheaper than 3 and each removes a
 measured quadratic or hot-loop defect; 3 is the only one that adds a *new*

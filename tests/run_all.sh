@@ -15,9 +15,7 @@ MAXJOBS=4
 
 # Binary names, in the order the suites run.  There is no Makefile any more
 # (the engine builds with `zig build`; zig/run_zig_suites.sh is the oracle).
-# test_embed is standalone (run without LD_LIBRARY_PATH); smoke is a special
-# step (see launch_one).  The C++ embed/ggml suites are gone with the C++
-# embed sidecar.
+# smoke is a special step (see launch_one).
 TESTS="
 test_m0
 test_m1
@@ -53,10 +51,6 @@ test_schema
 test_typecheck
 test_traverse
 test_search
-test_vector_storage
-test_vector_cli
-test_vector_search_content
-test_embed
 smoke
 "
 
@@ -75,12 +69,6 @@ launch_one() {
         smoke)
             echo "=== Running CLI smoke test ==="
             sh tests/smoke.sh
-            rc=$?
-            ;;
-        test_embed)
-            # standalone binaries: no LD_LIBRARY_PATH needed
-            echo "=== Running $name ==="
-            ./tests/$name
             rc=$?
             ;;
         *)

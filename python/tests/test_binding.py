@@ -14,7 +14,6 @@ from dlb import (
     DlConflictError,
     DlError,
     DlLockedError,
-    VEC_IVEC_WORDS,
 )
 
 TEST_DB = os.path.join(tempfile.gettempdir(), "dlb-test-db")
@@ -416,104 +415,6 @@ class TestLocking(unittest.TestCase):
         # once the reader is gone the writer may open
         with dlb.Db.open(d) as w2:
             self.assertTrue(w2.lookup("edge", (1, 2)))
-
-
-class TestVectorTier(unittest.TestCase):
-    """End-to-end vector test against the scan-and-rank query path.
-
-    The engine never embeds: it consumes a PRE-QUANTIZED int8 query vector
-    (96 u32, 4 int8 packed little-endian) and ranks every live entity's stored
-    vector by exact cosine.  SUPERSEDED (2026-08-11): this fixture used to
-    build a 256-bit ITQ signature per entity (random +/-1 projections) and
-    write 16 __sig{j}__ band postings, then assert MIH recall.  The signature
-    and the postings relations are gone with the MIH mechanism; recall is now
-    100% by construction, so the assertions are ordering/exactness ones.
-    """
-
-    D, N = 384, 5
-
-    def pack4(self, b0, b1, b2, b3):
-        m = lambda x: x & 0xFF
-        return m(b0) | (m(b1) << 8) | (m(b2) << 16) | (m(b3) << 24)
-
-    def _rng(self):
-        state = 0x5EED1234
-        while True:
-            state ^= (state << 13) & 0xFFFFFFFF
-            state ^= state >> 17
-            state ^= (state << 5) & 0xFFFFFFFF
-            yield state
-
-    def setUp(self):
-        self.dir = fresh_dir() + "-vec"
-        self.db = db = dlb.Db.open(self.dir)
-        db.declare_relation("entity", 2)
-        db.declare_relation("__vec_q__", 3)
-        rng = self._rng()
-        self.ents = {}
-        for name in ("alpha", "beta", "gamma", "delta", "epsilon"):
-            vec = [int(next(rng) % 201) - 100 for _ in range(self.D)]
-            sym = db.intern(name)
-            typ = db.intern("doc")
-            db.add_fact("entity", (sym, typ))
-            ivec = [self.pack4(*vec[c * 4:c * 4 + 4]) for c in range(96)]
-            for c, w in enumerate(ivec):
-                db.add_fact("__vec_q__", (sym, c, w))
-            self.ents[name] = (sym, vec, ivec)
-
-    def tearDown(self):
-        self.db.close()
-
-    def _perturbed(self, vec):
-        rng = self._rng()
-        return [max(-128, min(127, v + int(next(rng) % 7) - 3)) for v in vec]
-
-    def test_vector_search_ranks_the_source_first(self):
-        sym, vec, _ = self.ents["alpha"]
-        qvec = self._perturbed(vec)
-        qivec = [self.pack4(*qvec[c * 4:c * 4 + 4]) for c in range(96)]
-        out = self.db.vector_search(qivec, k=self.N)
-        self.assertEqual(len(out), self.N, "scan-and-rank must recall every live vector")
-        self.assertEqual(out[0][0], sym, "perturbed source must rank first")
-        self.assertEqual({s for s, _ in out},
-                         {e[0] for e in self.ents.values()},
-                         "every live entity with a vector must be a candidate")
-
-    def test_vector_search_version_matches_live(self):
-        _, vec, _ = self.ents["beta"]
-        qvec = self._perturbed(vec)
-        qivec = [self.pack4(*qvec[c * 4:c * 4 + 4]) for c in range(96)]
-        self.db.publish_snapshot()
-        vs = self.db.snapshot_versions()
-        out_live = self.db.vector_search(qivec, k=self.N)
-        out_ver = self.db.vector_search_version(vs[-1], qivec, k=self.N)
-        self.assertEqual([s for s, _ in out_live], [s for s, _ in out_ver],
-                         "live and version reads must rank the same data the same way")
-
-    def test_vector_search_filters_dead_entities(self):
-        sym, vec, _ = self.ents["gamma"]
-        qivec = [self.pack4(*vec[c * 4:c * 4 + 4]) for c in range(96)]
-        self.db.delete_fact("entity", (sym, self.db.intern("doc")))
-        syms = [s for s, _ in self.db.vector_search(qivec, k=self.N)]
-        self.assertNotIn(sym, syms, "a dead entity must not be ranked")
-        self.assertEqual(len(syms), self.N - 1)
-
-    def test_vector_rerank_orders_by_cosine(self):
-        sym, vec, _ = self.ents["beta"]
-        qvec = self._perturbed(vec)
-        qivec = [self.pack4(*qvec[c * 4:c * 4 + 4]) for c in range(96)]
-        cands = [e[0] for e in self.ents.values()]
-        out = self.db.vector_rerank(qivec, cands, k=self.N)
-        self.assertTrue(out)
-        # the perturbed source must rank first (highest cosine)
-        self.assertEqual(out[0][0], sym)
-        # scores are signed int dot products; descending
-        scores = [s for _, s in out]
-        self.assertEqual(scores, sorted(scores, reverse=True))
-
-    def test_vector_search_bad_arity_rejected(self):
-        with self.assertRaises(DlError):
-            self.db.vector_search([0] * 7, k=5)
 
 
 class TestSnapshot(unittest.TestCase):

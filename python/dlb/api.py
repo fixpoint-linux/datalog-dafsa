@@ -19,7 +19,6 @@ e.g. "tc(X,Y) :- edge(X,Y).\\ntc(X,Y) :- edge(X,Z), tc(Z,Y)."
 from __future__ import annotations
 
 import os
-import ctypes
 import threading
 from ctypes import (
     POINTER,
@@ -40,14 +39,12 @@ from ._binding import (
     DlConflictError,
     DlError,
     DlLockedError,
-    VEC_IVEC_WORDS,
     load_library,
     make_join_cb,
     make_tuple_cb,
-    make_vec_cb,
 )
 
-__all__ = ["Db", "Iter", "Transaction", "VEC_IVEC_WORDS"]
+__all__ = ["Db", "Iter", "Transaction"]
 
 _U32P = POINTER(c_uint32)
 _MAX_ARITY = 8
@@ -554,100 +551,3 @@ class Db:
             raise DlError(f"query_bound_version({version},{goal_rel}) failed", n)
         return rows
 
-    # ─── vector tier ───────────────────────────────────────────
-
-    def vector_search(self, q_int8, k: int, *, corpus=None) -> list:
-        """Scan-and-rank semantic search over LIVE relations.  q_int8 is the
-        PRE-QUANTIZED int8 query vector as VEC_IVEC_WORDS (96) u32, 4 int8
-        packed little-endian.  Every live entity's stored vector is scored and
-        the top k are emitted in exact cosine order (100% recall; no MIH
-        pre-filter — see the SUPERSEDED note in docs).
-        corpus: None -> ENTITY (dl_vector_search), "obs" -> OBSERVATION_CONTENT
-        (dl_vector_search_corpus; the production memory store's index).
-        Returns [(entity_sym, integer_dot), ...] best-first."""
-        q = tuple(q_int8)
-        if len(q) != VEC_IVEC_WORDS:
-            raise DlError(f"vector_search: q_int8 needs {VEC_IVEC_WORDS} u32 values")
-        out: list = []
-
-        def sink(sym, score):
-            out.append((sym, score))
-            return None
-
-        trap = make_vec_cb(sink)
-        arr = (c_uint32 * VEC_IVEC_WORDS)(*q)
-        if corpus is None:
-            n = self._call(self._raw.dl_vector_search, arr, k, trap, c_void_p(0))
-        else:
-            c = self._raw.CORPUS_OBSERVATION_CONTENT if corpus == "obs" else corpus
-            if not isinstance(c, self._raw.DlVecCorpus):
-                raise DlError("vector_search: corpus must be None, 'obs', or a DlVecCorpus")
-            n = self._call(self._raw.dl_vector_search_corpus, ctypes.byref(c), arr,
-                           k, trap, c_void_p(0))
-        if n < 0:
-            raise DlError("vector_search failed", n)
-        return out
-
-    def vector_search_version(self, version: int, q_int8, k: int, *, corpus=None) -> list:
-        """Same, as-of a published snapshot version (reads __vec_q__ + the
-        liveness relation through dl_query_bound_version)."""
-        q = tuple(q_int8)
-        if len(q) != VEC_IVEC_WORDS:
-            raise DlError(f"vector_search_version: q_int8 needs {VEC_IVEC_WORDS} u32")
-        out: list = []
-
-        def sink(sym, score):
-            out.append((sym, score))
-            return None
-
-        trap = make_vec_cb(sink)
-        arr = (c_uint32 * VEC_IVEC_WORDS)(*q)
-        if corpus is None:
-            n = self._call(
-                self._raw.dl_vector_search_version, version, arr, k, trap, c_void_p(0)
-            )
-        else:
-            c = self._raw.CORPUS_OBSERVATION_CONTENT if corpus == "obs" else corpus
-            if not isinstance(c, self._raw.DlVecCorpus):
-                raise DlError("vector_search_version: corpus must be None, 'obs', or DlVecCorpus")
-            n = self._call(
-                self._raw.dl_vector_search_corpus_version, version, ctypes.byref(c),
-                arr, k, trap, c_void_p(0),
-            )
-        if n < 0:
-            raise DlError("vector_search_version failed", n)
-        return out
-
-    def vector_rerank(self, q_int8, cand_syms, k: int, *, corpus=None) -> list:
-        """Exact int8-cosine re-rank. q_int8: 96 u32 (4 packed int8 each).
-        corpus: None -> __vec_q__ (entity), "obs" -> __vec_obs__."""
-        q = tuple(q_int8)
-        if len(q) != 96:
-            raise DlError("vector_rerank: q_int8 needs 96 u32 values")
-        cands = tuple(cand_syms)
-        if not cands:
-            return []
-        qa = (c_uint32 * 96)(*q)
-        ca = (c_uint32 * len(cands))(*cands)
-        out: list = []
-
-        def sink(sym, score):
-            out.append((sym, score))
-            return None
-
-        trap = make_vec_cb(sink)
-        if corpus is None:
-            n = self._call(
-                self._raw.dl_vector_rerank, qa, ca, len(cands), k, trap, c_void_p(0)
-            )
-        else:
-            c = self._raw.CORPUS_OBSERVATION_CONTENT if corpus == "obs" else corpus
-            if not isinstance(c, self._raw.DlVecCorpus):
-                raise DlError("vector_rerank: corpus must be None, 'obs', or a DlVecCorpus")
-            n = self._call(
-                self._raw.dl_vector_rerank_corpus, ctypes.byref(c), qa, ca,
-                len(cands), k, trap, c_void_p(0),
-            )
-        if n < 0:
-            raise DlError("vector_rerank failed", n)
-        return out

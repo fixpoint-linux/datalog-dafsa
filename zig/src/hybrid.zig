@@ -25,7 +25,6 @@ comptime {
     _ = @import("wfs.zig"); // WFS: well-founded-semantics driver (dl_query_wfs_ro)
     _ = @import("dl.zig"); // U11: src/dl.c
     _ = @import("index.zig"); // U14: src/index.c
-    _ = @import("vector.zig"); // U14: src/vector.c
     // U15: dafsa Zig engine — abi.zig supplies the dafsa_*/view_*/wal_*/
     // rank/select/range_count + trans_find/view_trans_find/view_edge_next/
     // view_enum_dfs C-ABI exports (replacing the vendored vendor/dafsa/*.c).

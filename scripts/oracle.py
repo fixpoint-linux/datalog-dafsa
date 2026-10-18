@@ -2,35 +2,44 @@
 """
 oracle.py — S4 int8-vs-float re-rank precision gate
 
-SUPERSEDED (2026-08-11, unit U9): this gate compares float-exact cosine with
-int8 cosine over MIH candidate sets fetched via `dl vsearch --sig ... --radius
-... --cand-only`. The engine no longer has a MIH candidate stage and no longer
-accepts --sig/--radius — ranking is an exhaustive scan-and-rank over
-__vec_q__ — so this script's premise (measuring recall lost to the pre-filter)
-is gone and the invocations below FAIL against current builds. Kept as the
-record of the int8-vs-float measurement; `dl vsearch --ivec ... --cand-only`
-still exists and returns the ranked ids if you want to re-run the comparison.
+REMOVED TIER (2026-08-11): the vector/embedding tier is gone from the engine —
+`dl vsearch`/`vhybrid`, dl_vector_*, VEC_* and the external query encoder were
+deleted, because agents author the handoff data and query it with the SAME
+words, so retrieval is lexical and the embeddings did not earn their machinery.
+This script therefore cannot run against current builds (`dl vsearch` no longer
+exists).  It is kept as the design/measurement record, not as a live gate.
+
+Prior state (also superseded, 2026-08-11, unit U9): the gate compared
+float-exact cosine with int8 cosine over MIH candidate sets fetched via
+`dl vsearch --sig ... --radius ... --cand-only`; the engine had already
+dropped the MIH candidate stage and the --sig/--radius flags, ranking became an
+exhaustive scan-and-rank over __vec_q__, so the premise (measuring recall lost
+to the pre-filter) was gone before the tier itself was removed.
 
 Implements the precision_gate from handoff-no-sidecar-artifact-1:
 On REAL bge-small embeddings, feed REAL MIH candidates (from dl_vector_search
 via `dl vsearch --cand-only`), compute top-10 by float-exact cosine vs by
 int8 cosine over n sampled queries, assert agreement >= 99% (seed-fixed).
 
-Design (what makes it a REAL gate, not a proxy):
-  * float_exact side uses the actual bge-small embeddings of the entity names
+Design (what made it a REAL gate, not a proxy):
+  * float_exact side used the actual bge-small embeddings of the entity names
     (re-embedded here; S3 does not persist raw float vectors).
   * int8 side uses the vectors actually stored in __vec_q__ (read back from
-    the store, same bytes the C re-rank reads).
-  * candidate sets come from the REAL MIH implementation (dl_vector_search in
-    C, surfaced via `dl vsearch --sig ... --ivec ... --cand-only`), NOT a
-    top-k proxy.
-  * the query is embedded and ITQ-encoded with the same basis/scale the corpus
-    was emitted with (qscale from vector_metadata.txt), so int8 scores are
+    the store, same bytes the re-rank read).
+  * candidate sets came from the REAL MIH implementation (dl_vector_search),
+    NOT a top-k proxy.
+  * the query was embedded and ITQ-encoded with the same basis/scale the corpus
+    was emitted with (qscale from vector_metadata.txt), so int8 scores were
     directly comparable across the candidate set.
 
-If the gate fails, the S3 quantization must use a GLOBAL corpus-wide int8 scale
-(F2).  embed.py already does this (quantize_int8_global + qscale metadata); a
-corpus emitted before that fix will fail here and that is the intended signal.
+If the gate failed, the S3 quantization was to use a GLOBAL corpus-wide int8
+scale (F2).  embed.py already does this (quantize_int8_global + qscale
+metadata); a corpus emitted before that fix fails here and that was the
+intended signal.
+
+The store data itself (__vec_q__, __vec_obs__, __obssig*__, __itq_basis__, the
+.npy sidecars) is untouched user data — the engine stopped reading it; nobody
+deleted it.
 
 Usage (real data — requires fastembed + the bge-small model):
     python3 scripts/oracle.py --db <dbdir> [--n-queries 10000] [--k 10] [--seed 0]

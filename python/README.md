@@ -12,12 +12,13 @@ the load-bearing deliverable.**
 
 Layout (all paths relative to this directory, which is the import root):
 - `dlb/_binding.py` — raw ctypes layer: exact argtypes/restype for every
-  function used (~50 symbols incl. the corpus-parameterized vector tier),
+  function used (~45 symbols; the corpus-parameterized vector tier is gone),
   error mapping (no silent zero-returns), callback trampolines.
 - `dlb/api.py` — thin ergonomic API (`Db`, `Iter`, `Transaction`).
-- `tests/test_binding.py` — 42 correctness tests (unittest; stdlib only).
+- `tests/test_binding.py` — 37 correctness tests (unittest; stdlib only).
 - `tests/bench_envelope.py` — the measured envelope (open cost, per-call
-  latency, recursive query cost, locking, thread safety, vector tier).
+  latency, recursive query cost, locking, thread safety; the vector tier was
+  removed on 2026-08-11 and is kept in §6 as a dated record).
 - `ENVELOPE.md` — the recorded measurements.
 
 Run them:

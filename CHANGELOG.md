@@ -3,8 +3,41 @@
 All notable changes to this project are documented in this file.
 
 ## [Unreleased]
+- **Vector/embedding tier REMOVED** (2026-08-11): the semantic half of the
+  search stack is deleted, not superseded.
+  - The decision: agents author the handoff data and query it with the SAME
+    words, so retrieval is lexical; embeddings were not earning their machinery
+    (an external encoder contract, 96 packed int8 chunks per entity, a second
+    query path plus its own LIVE/VERSION discipline, and a store full of
+    relations nothing read).
+  - Deleted: `zig/src/vector.zig` (1250 lines, incl. the rev-gated columnar
+    arena), `src/vector.h`, `src/embed/vec_bits.h` (pack4/band emit helpers —
+    nothing else included it), `tests/test_vector_storage.c`,
+    `tests/test_vector_search.c`, `tests/test_vector_search_content.c`,
+    `tests/test_vector_cli.c`, `tests/test_embed.c`.
+  - CLI: `dl vsearch` / `dl vhybrid` are gone, together with their usage lines,
+    the `--ivec` / `--cand-only` flags, the hex-vector parser and the
+    `dl-embed` fork/exec encoder lookup. C ABI: `dl_vector_search*`,
+    `dl_vector_rerank*`, `dl_vec_cb`, `struct dl_vec_corpus` and the `VEC_*`
+    layout constants are gone from `dl.h` / `dl_abi.zig`. Python:
+    `vector_search`, `vector_search_version`, `vector_rerank`, `DlVecCorpus`,
+    `make_vec_cb`, `VEC_D` and `VEC_IVEC_WORDS` are gone.
+  - Suites: `zig/run_zig_suites.sh` C list 41 → 37 (runner entries 42 → 38 with
+    the smoke step) and `tests/run_all.sh` matches; the `-lm` case that only
+    those four suites needed is gone with them.
+  - **NOT deleted: the store data.** `__vec_q__`, `__vec_obs__`, `__obssig*__`,
+    `__itq_basis__` and the `.npy` sidecar stay on disk untouched — that is the
+    user's data, not the engine's. The engine simply stops reading it, so an
+    older database opens and answers queries exactly as before, with the vector
+    relations as inert rows.
+  - Docs are marked REMOVED with the reason rather than rewritten: the design
+    record (`docs/datalog-dafsa-{vector-search,vector-search-no-sidecar,
+    vector-storage-scope,bit-signature-index,hybrid-search,search-stack,
+    semantic-sidecar}.md`, `search-plan.md`) is kept, history intact.
 - **Rev-gated columnar vector arena** (2026-10-18, `search-plan.md` §3 / §6
   item 5): a repeated-query loop stops re-paying DAFSA row materialisation.
+  *(Historical: the tier this arena accelerated was removed on 2026-08-11 —
+  `search-plan.md` §3/§6 item 5 now records the removal.)*
   - The finding: a LIVE vector search spends 70–90% of its time walking
     `__vec_q__`'s 960k rows at 10k vectors (**MEASURED** 97–140 ms/query here),
     while the int8 arithmetic is free — and a loop that re-queries pays it every

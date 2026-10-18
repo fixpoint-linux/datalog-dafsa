@@ -1,5 +1,8 @@
 # Semantic embeddings sidecar
 
+> 🛑 **REMOVED (2026-08-11) — the vector/embedding tier no longer exists.** `dl vsearch` / `dl vhybrid`, `dl_vector_*`, the `VEC_*` layout constants, the `dl-embed` encoder lookup and `zig/src/vector.zig` + `src/vector.h` were **deleted**. The reason: agents author the handoff data and query it with the **same words**, so retrieval is lexical — the embeddings never earned their machinery (an external encoder contract, 96 packed int8 chunks per entity, a second query path with its own LIVE/VERSION discipline, and a store full of relations nothing read). The **store data was NOT deleted**: `__vec_q__`, `__vec_obs__`, `__obssig*__`, `__itq_basis__` and the `.npy` sidecar stay on disk untouched — it is the user's data; the engine simply stops reading it. This doc is kept as the **design record**, not as a description of shipped behaviour.
+>
+
 **Status:** Design/plan — not yet implemented. Tier-2 gap (#6) for the jing-memory use case. `search_semantic` / `rebuild_semantic_index` use bge-small embeddings + cosine; datalog-dafsa is a C fact store with no vector capability. This plan defines the **boundary** — embeddings stay a sidecar, and defines how vectors rejoin the graph. **This is the *semantic half* of hybrid retrieval — see `docs/datalog-dafsa-hybrid-search.md`. For the scale path (1e5–1e6+), see the design of record `docs/datalog-dafsa-vector-search.md` (MIH over ITQ bit-codes as per-band DAFSA postings). This doc's `.npy` sidecar is the build-path step 1 of that design.**
 
 ## TL;DR

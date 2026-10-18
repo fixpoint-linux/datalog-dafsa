@@ -2,7 +2,7 @@
 //
 // The pre-migration C engine (src/*.c + vendor/dafsa/*.c) is REMOVED; every
 // source below is a Zig port (zig/src/*.zig) or the vendored dafsa Zig engine
-// (abi.zig).  The 42 C test suites re-linked against the resulting .so are
+// (abi.zig).  The 37 C test suites re-linked against the resulting .so are
 // the oracle (their re-link is the ABI-completeness check; their asserts are
 // the behavioral oracle).
 //
@@ -24,9 +24,8 @@ const std = @import("std");
 // zig/src/{snapshot,permindex,iter}.zig the same way.
 // U8: compiler.c is ported to zig/src/compiler.zig the same way.
 // U11: dl.c is ported to zig/src/dl.zig the same way.
-// U14: index.c and vector.c are ported to
-// zig/src/{index,vector}.zig — the datalog engine is now 100% Zig
-// (the migration completes; the C oracle sources are removed).
+// U14: index.c is ported to zig/src/index.zig — the datalog engine is now
+// 100% Zig (the migration completes; the C oracle sources are removed).
 
 // The vendored DAFSA engine is no longer compiled from C (vendor/dafsa/*.c).
 // Since U15 it comes from the dafsa ZIG engine (vendor/dafsa/zig/src/*.zig),
@@ -96,13 +95,13 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(static_lib);
 
     // ─── dl CLI, dynamically linked against the 100%-Zig .so ─────────────
-    // (test_m4_review popen()s ./dl and test_vector_cli execv()s it; the
-    // smoke suite drives it too — all relinked/pointed at the Zig build.)
+    // (test_m4_review popen()s ./dl; the smoke suite drives it too — all
+    // relinked/pointed at the Zig build.)
     // U12: the exe is the ported zig/src/dl_cli.zig (src/dl_cli.c is removed
     // with the C oracle).  It resolves every engine
     // symbol from the .so exports at link time — dl_*/regex_*/intern_* from
-    // the ported Zig modules and, since U14, tokenize/dl_search_top/
-    // dl_vector_* from the ported index.zig/vector.zig.
+    // the ported Zig modules and, since U14, tokenize/dl_search_top from the
+    // ported index.zig.
     const exe = b.addExecutable(.{
         .name = "dl",
         .root_module = b.createModule(.{
@@ -129,7 +128,7 @@ pub fn build(b: *std.Build) void {
     // the vendored DAFSA engine stays C), so the binary links the vendored
     // DAFSA engine.  Since U14 the engine itself is 100% Zig — lib_srcs is
     // EMPTY and only vendor_srcs is compiled as C for the test link (all
-    // dl_*/index/vector symbols now come from the ported modules).
+    // dl_*/index symbols now come from the ported modules).
     // Since U15 the dafsa engine is also Zig: tests.zig references dafsa_abi
     // so the dafsa_*/crc32_*/trans_find symbols come from abi.zig's exports.
     const unit_tests = b.addTest(.{
