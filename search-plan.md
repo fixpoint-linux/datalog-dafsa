@@ -1,8 +1,19 @@
-# Search: how to improve it (plan, not implemented)
+# Search: how to improve it
 
-**Status: PLAN — nothing in this document is built.** Written 2026-08-11 against
-`ef7e0e4` (engine 100% Zig, `zig/src` 30,190 lines, 41 C oracle suites green in
-~26 s, one submodule: `vendor/dafsa`).
+**Status: items 1–4 BUILT and verified; item 5 NOT BUILT (gated).** Written
+2026-08-11 against `ef7e0e4`; the plan was executed in order and the results are
+folded in below (each ranked item states its measured outcome). Current HEAD:
+`fb04704`, engine 100% Zig, 42 C oracle suites green in ~26 s, one submodule
+(`vendor/dafsa`).
+
+| # | item | status | measured result |
+|---|---|---|---|
+| 1 | full-text `IntSet` → O(1) membership | **DONE** `4416161` | 20k × 3 terms **306 → 3.74 ms**; linear, not quadratic |
+| 2 | hybrid hot loop + lexical gate | **DONE** `e08ee86` | `dl_prefix` calls **100 → 1**; recall hole closed via `dl_vector_search_gated` |
+| 3 | `lev_compile` Levenshtein over symbols | **DONE** `07127a4` | k=1 10–28 µs end-to-end; k=2 58–145 µs; zero storage |
+| 3b | review fixes (5 findings) | **DONE** `fb04704` | 2 measured defects incl. a regression; OOM leak proved closed with an interposer |
+| 4 | `dl_search_ranked` (OR / `min_terms`) | **DONE** `f23899f` | score now varies with matched-term count |
+| 5 | rev-gated columnar vector arena | **NOT BUILT** | gated on a confirmed repeated-query workload — see §6 |
 
 **Provenance.** Synthesised by the orchestrator from the planner pass recorded in
 the memory node `handoff-search-plan` (rev 18), whose numbers come from throwaway
@@ -129,7 +140,9 @@ explosion).
 
 ## 3. Direction 2 — vector enumeration (premise refuted)
 
-**The premise was wrong.** The cost is not the row count; it is **DAFSA key bytes
+**OUTCOME (built and superseded):** this direction was NOT built — the premise
+was refuted, and the measured 2.4x did not justify a cross-repo encoder-contract
+change. The vector tier stays scan-and-rank. Kept below as the record of why. The cost is not the row count; it is **DAFSA key bytes
 walked** (~8–9 bytes/row today, ~28 for arity-8). All three layouts below store
 the same 384 int8 lanes, **MEASURED** at 10k vectors:
 
