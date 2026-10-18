@@ -88,7 +88,7 @@ permissive (G1/G2/G3, 2026-09-29; see the result nodes for the asymmetries):
   `head column p/0 holds integers in rule 1 and symbols in rule 2`.
 - **G3 — builtin result kinds.** The RESULT var of `length`/`concat`/
   `lower`/`upper`/`cdr`/`cons`/`append`/`range` now carries a kind
-  (documented in `docs/language.html`), so the R1 join and R2
+  (documented in the docs-site Language Reference, page since removed), so the R1 join and R2
   ordered-comparison checks see it. MEASURED: `N=concat(S,S),N>2` -> rc=-1
   (ordered cmp over a symbol result); `N=length(S),f(N)` with f sym -> rc=-1
   (join); the controls `N=length(S),N>2` and `N=length(S),M=N+1` still load.
@@ -100,7 +100,7 @@ permissive (G1/G2/G3, 2026-09-29; see the result nodes for the asymmetries):
 What deliberately stays permissive (each MEASURED against the shipped code):
 
 - **`X != foo` on an int column** — collision-prone BY DOCUMENTED CONTRACT
-  (`docs/language.html` comparisons section, suite-pinned `test_m9_arith`
+  (Language Reference comparisons section, page since removed; suite-pinned `test_m9_arith`
   T8d): the symbol constant is interned and its id compared against raw
   ints, so a small id can equal a raw value. Order-dependent by design.
 - **variadic relations** — kind-untracked: the variadic add path

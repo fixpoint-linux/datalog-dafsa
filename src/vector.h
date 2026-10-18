@@ -12,7 +12,7 @@
  * retrieval over 16 per-band postings __sig0__..__sig15__ plus a __itq_basis__
  * relation that was stored but never read.  Those relations are no longer
  * part of the read path — see the dated SUPERSEDED notes in
- * docs/datalog-dafsa-vector-search.md and docs/vector-search.html.  The
+ * docs/datalog-dafsa-vector-search.md.  The
  * on-disk facts are untouched history; the engine simply stops consulting
  * them.
  *

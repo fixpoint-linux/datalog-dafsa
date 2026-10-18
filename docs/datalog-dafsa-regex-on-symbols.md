@@ -114,7 +114,7 @@ The set `S` is an open-addressing u32 hash set (`symset_init` / `symset_add` /
 | 8 | `src/dl.h` + `src/dl.c` `dl_pattern` (~3507) | Add `uint8_t col` param. Snapshot path opens `<sdir>/symbols.dafsa` view + `symbols_dfa_walk_view` → set → `view_filter_col` per (variadic) variant; in-memory path `symbols_dfa_walk(db->ir->fwd)` → set → `rel_filter_col`/`vrel_filter_col`. |
 | 9 | `src/dl_cli.c` `dl pattern` (~439) + usage (~123) | Optional `col` arg — `dl pattern <rel> [<col>] '<regex>'`. |
 | 10 | `src/magic.c` `atom_copy` (~294) | Also copy `src->pattern_col`. (Moot: the magic-sets transform was deleted 2026-08-11.) |
-| 11 | `docs/language.html` regex section (~293-304) + `CHANGELOG.md` (~440-444) | Rewrite the regex operator description for column string-content semantics. |
+| 11 | the docs-site Language Reference (regex section, ~293-304; page since removed) + `CHANGELOG.md` (~440-444) | Rewrite the regex operator description for column string-content semantics. |
 
 ## Test / verification plan
 
@@ -170,4 +170,4 @@ Cross-check every emitted sym_id against `intern_str_of(db->ir, sym_id)` in a te
 - `src/vm.c` `OP_WALK` (~619), `src/compiler.c` OP_WALK emission (~1704/2654/2748)
   + `pat_idx` plumbing (~1435/1951).
 - `src/dl_cli.c` `dl pattern` (~439) + usage (~123).
-- `docs/language.html` §Regex (~293-304).
+- the docs-site Language Reference §Regex (~293-304; page since removed).

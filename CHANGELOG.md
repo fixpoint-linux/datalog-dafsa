@@ -3,6 +3,35 @@
 All notable changes to this project are documented in this file.
 
 ## [Unreleased]
+- **The docs site and its whole build pipeline DELETED** (2026-10-18, U10,
+  user-approved): the generated HTML under `docs/` was built by an Elm SSG
+  (`src/Main.elm` → `scripts/ssg.mjs`) driven by `Dhakefile.dhall` and
+  deployed by GitHub Actions. None of it can be built on this host (there is
+  no `elm`), and the last artifact that could not be verified here is gone
+  with it — `src/Main.elm` had been edited uncompiled three times. The design
+  records under `docs/*.md` and `design/*.md` are the design of record, not
+  the site, and are untouched:
+  - deleted the site source and build: `src/Main.elm` (2405 lines, the only
+    `.elm` in `src/`), `elm.json`, `package.json`, `package-lock.json`,
+    `Dhakefile.dhall` (107), `scripts/ssg.mjs` (251) and
+    `.github/workflows/deploy.yml` (76);
+  - deleted the MFE shell (`shell/`, 16 files, 383 lines): `index.html`,
+    `pages.js`, `shell.js`, `mfe/dafsa-page.js` and the nine route templates;
+  - deleted the generated pages and their assets: `docs/{index,api,
+    architecture,cli,language,order-statistics,time-travel,vector-search}.html`,
+    `docs/style.css`, `docs/vendor/` (the CodeMirror files) and
+    `docs/README.md` (it documented the site);
+  - `.gitmodules` lost the `vendor/design`, `vendor/mfe-framework` and
+    `vendor/dhake` stanzas and their gitlinks — they existed only for the
+    site (referenced by `elm.json`, `Dhakefile.dhall` and `deploy.yml` and
+    nothing else). `[submodule "vendor/dafsa"]` — the engine core — stays.
+    Their working directories remain on disk, untracked and now gitignored
+    (same arrangement as the removed `vendor/ggml`);
+  - dangling references dropped or turned into plain text: README's
+    "Documentation site" section, and the `docs/language.html` pointers in
+    `deferred.md`, `docs/datalog-dafsa-regex-on-symbols.md`, `src/vector.h`
+    and (comments only) `tests/test_homog.c` and `zig/src/compiler.zig`. The
+    `.gitignore` "Elm + MFE build artifacts" block went with the build.
 - **Vector search is now SCAN-AND-RANK; the MIH-over-ITQ stage DELETED**
   (2026-08-11, U9, user-approved): the engine never embeds, so `dl_vector_search`
   took a pre-quantized int8 vector anyway — yet it first ran a *candidate

@@ -73,11 +73,12 @@ dl-test-*/
 # nothing builds it, safe to delete
 /vendor/ggml/
 
-# Elm + MFE build artifacts
-node_modules/
-elm-stuff/
-dist/
-/vendor/@mfe/
+# leftover working trees of the removed docs-site submodules (the Elm SSG's
+# design package, the build driver and the MFE framework): no longer tracked,
+# nothing builds them, safe to delete
+/vendor/design/
+/vendor/mfe-framework/
+/vendor/dhake/
 
 # zig strangler-hybrid harness build artifacts
 zig-out/

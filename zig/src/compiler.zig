@@ -3422,7 +3422,7 @@ fn exprSymVar(e: ?*const parser.expr, names: []const ?[*c]const u8, kinds: []con
 ///       both loud (MEASURED ARITHOP/D2).
 ///   R5  != var-var: occurrence-consistency only, exactly like R3 — the
 ///       symbol-CONST rhs of `X != foo` is DOCUMENTED-valid
-///       (language.html comparison section, suite-pinned test_m9_arith
+///       (Language Reference comparison section, suite-pinned test_m9_arith
 ///       T8d) and is never looked at here (MEASURED NEQ2 is silently
 ///       wrong: 2 rows where the standard keeps 4).
 /// Str/list/range builtins stay out of scope (plan slice 4); negated
@@ -3543,7 +3543,7 @@ fn checkRuleVarKinds(db: *dl.DlDb, cache: [*][HOMOG_MAX_ARITY]u8, r: *parser.rul
             // G3: range(X, Rel, Lo, Hi) — X's kind is DATA-DEPENDENT (the
             // leading column of the named relation); resolve it where
             // possible, else UNKNOWN (range over a fresh/unknown relation
-            // stays permissive, as T32's control and language.html:307).
+            // stays permissive, as T32's control and the reference's L307).
             if (ba.nargs == 4 and ba.args.?[0] != null and ba.args.?[0].?.kind == parser.TOK_VAR and ba.args.?[1] != null and ba.args.?[1].?.kind == parser.TOK_IDENT) {
                 const rri = db_find_rel(db, cs(ba.args.?[1].?.text));
                 if (rri >= 0) {

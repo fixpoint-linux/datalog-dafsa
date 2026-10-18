@@ -1353,7 +1353,7 @@ static void test_join_same_kind_controls(void)
      * rc=0, p=2 rows; with non-colliding ids e={100,200} p correctly
      * holds 4 — the bug is the id-collision dedup, the same root defect
      * as the S3a join).  Nothing but this self-imposed control pinned
-     * mixed-head permissiveness: docs/language.html never mentions it
+     * mixed-head permissiveness: the Language Reference never mentioned it
      * (rg 'mixed' = empty) and no other suite derives a mixed head. */
     setup();
     e_rows[0] = 1; e_rows[1] = 2;
@@ -1754,7 +1754,7 @@ static void test_arith_sym_loud(void)
 }
 
 /* ─── T28: != controls — the documented allows keep loading ───────────── */
-/* X != foo on an INT column is DOCUMENTED-valid (language.html comparison
+/* X != foo on an INT column is DOCUMENTED-valid (Language Reference comparison
  * section: "!= additionally accepts a symbol constant on the right (it
  * interns the symbol and compares symbol ids)") and SUITE-PINNED
  * (test_m9_arith T8d, values high so ids never collide).  X != a on a SYM
