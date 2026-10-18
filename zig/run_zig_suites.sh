@@ -138,7 +138,6 @@ test_traverse
 test_search
 test_wfs
 test_homog
-test_reactive
 test_negsegv
 test_vector_storage
 test_vector_cli

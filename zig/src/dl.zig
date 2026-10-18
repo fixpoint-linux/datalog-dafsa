@@ -41,7 +41,6 @@ const compiler = @import("compiler.zig");
 const regexwalk = @import("regexwalk.zig");
 const schema_mod = @import("schema.zig");
 const wfs = @import("wfs.zig");
-const reactive = @import("reactive.zig");
 const intern_mod = @import("intern.zig");
 
 // dl.zig OWNS the authoritative Zig layouts of dl_db/rel_entry/txn/txn_op/
@@ -977,10 +976,6 @@ pub export fn dl_close(db: ?*DlDb) void {
 
     // M4: close all cached snapshot views
     vcache_invalidate(&d.vcache);
-
-    // Reactive (Capability 2 R1): drop any open observation session so the
-    // freed db pointer is never left keyed.
-    reactive.reactiveForget(@ptrCast(d));
 
     // M6: free permutation indices
     permindex_free_all(d);
@@ -4267,23 +4262,10 @@ fn sumRelWalAppended(d: *DlDb) u64 {
 /// (that is materializeSnapshot, gated by the budget trigger in
 /// dl_consolidate and unconditional in dl_publish_snapshot).
 fn consolidate(d: *DlDb) c_int {
-    return consolidateInner(d, null);
+    return consolidateInner(d);
 }
 
-/// Observation hook for reactive steps (zig/src/reactive.zig): when non-null,
-/// the SAME cascade (prologue + dispatch + epilogue — never a second copy)
-/// additionally reports which dispatch branch ran.  `null` is the ordinary
-/// path; the hook must not change any decision the cascade makes.
-pub const CascadeWatch = struct {
-    /// Set when the branch that ran was one of the vm_execute FULL
-    /// RE-EVALUATION branches (program outside the incremental class —
-    /// pending full re-eval, ineligible aggregate, delete vs DRed-ineligible,
-    /// insert vs neither, IVM-ineligible with nothing pending): the reported
-    /// diff is still correct, but it was NOT produced incrementally.
-    fallback: bool = false,
-};
-
-fn consolidateInner(d: *DlDb, watch: ?*CascadeWatch) c_int {
+fn consolidateInner(d: *DlDb) c_int {
     const t_mark: u64 = if (pub_timers_on) nowNs() else 0;
     {
         syncAllWals(d);
@@ -4324,7 +4306,6 @@ fn consolidateInner(d: *DlDb, watch: ?*CascadeWatch) c_int {
             }
         }
         if (d.full_reeval_pending != 0) {
-            if (watch) |w| w.fallback = true;
             if (vm_execute(d, d.crules, d.n_crules) != 0)
                 return -1;
             vm_clear_deltas(d);
@@ -4336,20 +4317,17 @@ fn consolidateInner(d: *DlDb, watch: ?*CascadeWatch) c_int {
                     return -1;
                 }
             } else {
-                if (watch) |w| w.fallback = true;
-                if (vm_execute(d, d.crules, d.n_crules) != 0)
+                    if (vm_execute(d, d.crules, d.n_crules) != 0)
                     return -1;
                 vm_clear_deltas(d);
                 vm_clear_deletes(d);
             }
         } else if (has_del != 0 and vm_dred_eligible(d) == 0) {
-            if (watch) |w| w.fallback = true;
             if (vm_execute(d, d.crules, d.n_crules) != 0)
                 return -1;
             vm_clear_deltas(d);
             vm_clear_deletes(d);
         } else if (has_ins != 0 and vm_ivm_eligible(d) == 0 and vm_dred_eligible(d) == 0) {
-            if (watch) |w| w.fallback = true;
             if (vm_execute(d, d.crules, d.n_crules) != 0)
                 return -1;
             vm_clear_deltas(d);
@@ -4360,7 +4338,6 @@ fn consolidateInner(d: *DlDb, watch: ?*CascadeWatch) c_int {
                 return -1;
             }
         } else if (vm_ivm_eligible(d) == 0) {
-            if (watch) |w| w.fallback = true;
             if (vm_execute(d, d.crules, d.n_crules) != 0)
                 return -1;
             vm_clear_deltas(d);
@@ -4383,17 +4360,6 @@ fn consolidateInner(d: *DlDb, watch: ?*CascadeWatch) c_int {
         pub_timers.t_ivm_ns += nowNs() - t_mark;
     }
     return 0;
-}
-
-/// One reactive step's maintenance barrier: the SAME consolidateInner
-/// cascade (prologue + dispatch + epilogue — dl.zig's single copy) with the
-/// observation hook armed.  Returns 0 on success, -1 on a maintenance error,
-/// -2 when the branch that ran was a full re-evaluation FALLBACK (the
-/// reported diff is still correct, but the step was not incremental).
-pub fn consolidateForReactive(d: *DlDb, w: *CascadeWatch) c_int {
-    const rc = consolidateInner(d, w);
-    if (rc != 0) return rc;
-    return if (w.fallback) -2 else 0;
 }
 
 /// Snapshot materialization: serialize the consolidated state into a NEW
@@ -4707,66 +4673,6 @@ pub export fn dl_set_snapshot_budget(db: ?*DlDb, bytes: u64) c_int {
     d.snapshot_budget_bytes = bytes;
     return 0;
 }
-
-// ─── Reactive fired-event facility (Capability 2, slice R1) ─────────────────
-//
-// reactive.zig observes derived head relations across one dispatch of the
-// maintenance machinery.  The step mechanism is DIFF-CAPTURE around the
-// EXISTING cascade: dl_fired_step runs the SAME consolidateInner cascade
-// (via consolidateForReactive — prologue, dispatch and epilogue live ONLY
-// here, never copied), then reports the watched relations' added/removed
-// tuples.  ZERO vm.zig/compiler.zig behaviour is
-// touched; with no observation session open (the default) nothing here runs
-// at all.
-
-/// int dl_set_reactive(dl_db *db, const char *rel_name, int on)
-///
-/// Mark a rule-head relation as watched for the CURRENT observation session
-/// (see dl_fired_init): `on` != 0 arms it, `on` == 0 disarms it.  Refuses
-/// (-1, stderr diagnostic) a relation that is neither a derived view nor the
-/// head of a loaded rule — fired events are rule-derived head changes, and a
-/// diff over a directly-written EDB relation would conflate direct writes
-/// with derived tuples.
-pub export fn dl_set_reactive(db: ?*DlDb, rel: [*c]const u8, on: c_int) c_int {
-    return reactive.dlSetReactive(if (db) |d| @ptrCast(d) else null, rel, on);
-}
-
-/// long dl_fired_init(dl_db *db)
-///
-/// Open an observation session on `db` (0 on success; DL_REACTIVE_ERR_* on
-/// error, a negative result distinct from any tuple count).  While the
-/// session is open, dl_set_reactive may arm rule-head relations and
-/// dl_fired_step runs the maintenance machinery, reporting exactly the
-/// watched heads' newly-true tuples.  Nothing about the session changes any
-/// evaluation: default-off, engine bit-identical until init.
-pub export fn dl_fired_init(db: ?*DlDb) c_long {
-    return reactive.dlFiredInit(if (db) |d| @ptrCast(d) else null);
-}
-
-/// long dl_fired_step(dl_db *db, dl_fired_cb cb, void *user)
-///
-/// Run the EXISTING delta-dispatch chain (dl_consolidate's cascade — never a
-/// strategy re-decision) and stream the watched heads' newly-true tuples to
-/// `cb` as DL_REACTIVE_ADDED events, then tuples removed by the same step as
-/// DL_REACTIVE_REMOVED (the R1 diff boundary; first-class retraction firing
-/// is slice R2).  DL_REACTIVE_FALLBACK is OR-ed into the returned count when
-/// the cascade took its full-re-evaluation branch (program outside the
-/// incremental class, e.g. a regex-walk rule) — the diff is still correct,
-/// but it was NOT produced incrementally.  Returns the number of fired
-/// tuples, or a negative DL_REACTIVE_ERR_*.
-pub export fn dl_fired_step(db: ?*DlDb, cb: reactive.FiredCb, user: ?*anyopaque) c_long {
-    return reactive.dlFiredStep(if (db) |d| @ptrCast(d) else null, cb, user);
-}
-
-/// long dl_fired_clear(dl_db *db)
-///
-/// Close the observation session, releasing all watch state.  After clear
-/// the engine is bit-identical to a db that never observed (state is
-/// session-scoped only).  Returns 0, or DL_REACTIVE_ERR_ARGS / _NOT_INIT.
-pub export fn dl_fired_clear(db: ?*DlDb) c_long {
-    return reactive.dlFiredClear(if (db) |d| @ptrCast(d) else null);
-}
-
 
 /// Best-effort publish failure cleanup: rm_rf(tmp) and, if renamed, rm_rf(new).
 fn dlPublishFail(tmp_dir: [*c]const u8, new_dir: [*c]const u8, renamed: c_int) c_int {

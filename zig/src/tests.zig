@@ -24,11 +24,9 @@ test {
     _ = @import("compiler.zig");
     _ = @import("vm.zig");
     _ = @import("wfs.zig");
-    _ = @import("reactive.zig");
     _ = @import("dl.zig");
     _ = @import("index.zig"); // U14: src/index.c
     _ = @import("vector.zig"); // U14: src/vector.c
-    _ = @import("analyze.zig"); // U14: src/analyze.c
     // U1: dl_abi.zig comptime witness — one @cImport("dl_internal.h") pins
     // the hand-declared C-layout structs field-for-field (test-only, never
     // in the lib/exe graphs).

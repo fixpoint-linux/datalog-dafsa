@@ -3,6 +3,34 @@
 All notable changes to this project are documented in this file.
 
 ## [Unreleased]
+- **Reactive fired-event facility and the in-memory analyze ingest DELETED**
+  (2026-08-11): both were alternate surfaces over machinery the fixpoint and
+  the ordinary `dl_open`/`dl_add_fact` path already provide, and neither is in
+  the project's scope any more, so they are gone rather than kept as dead
+  weight:
+  - removed `zig/src/reactive.zig` (587 lines: the fired-event observation
+    session, diff capture and watch state) and `zig/src/analyze.zig`
+    (512 lines: `analyze_program` / `analyze_db_free` and the `analyze_error`
+    struct), plus the C suite that gated reactive (`tests/test_reactive.c`,
+    1440 lines);
+  - the `dl_fired_init` / `dl_fired_step` / `dl_fired_clear` /
+    `dl_set_reactive` entry points and the `analyze_program` /
+    `analyze_db_free` symbols no longer exist — they are not stubs and do not
+    return errors. The `dl_fired_*` wrappers left `zig/src/dl.zig` with the
+    reactive observation hook they needed: `CascadeWatch`,
+    `consolidateForReactive`, and the `watch` parameter of `consolidateInner`
+    (the cascade keeps its single copy, now with no hook);
+  - `src/dl.h` lost the whole `DL_REACTIVE_*` block (event codes, the
+    `FALLBACK` flag, the six `DL_REACTIVE_ERR_*` codes, the `dl_fired_cb`
+    typedef and the four declarations); `src/analyze.h` is deleted (nothing
+    included it; its `HEADERS` entry left `zig/abi_audit.sh` with it, since a
+    header declaring removed exports would make that audit fail);
+  - `tests/test_reactive` left the `zig/run_zig_suites.sh` C list (44 → 43
+    steps); `tests/run_all.sh` never listed it (`MEASURED`);
+  - `zig/src/{hybrid,tests}.zig` dropped both imports and `zig/build.zig`'s
+    ported-file comments no longer name `analyze.c`/`analyze.zig`.
+  The semi-naive fixpoint, stratified negation, WFS, IVM/DRed, the CLI, the
+  Python binding and `dl_open`/`dl_add_fact`/`dl_consolidate` are unchanged.
 - **Magic-sets and top-down/QSQ evaluation DELETED** (2026-08-11): both were
   alternate routes to answers the semi-naive fixpoint already computes, and
   neither beat publish-once + `dl_query_bound` on the measured workloads, so
