@@ -23,8 +23,6 @@ test {
     _ = @import("iter.zig");
     _ = @import("compiler.zig");
     _ = @import("vm.zig");
-    _ = @import("magic.zig");
-    _ = @import("topdown.zig");
     _ = @import("wfs.zig");
     _ = @import("reactive.zig");
     _ = @import("dl.zig");

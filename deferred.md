@@ -47,8 +47,12 @@ Deferred from the initial implementation. See `docs/datalog-dafsa-fulltext.md`.
   not tractable in the least-fixpoint semi-naive engine. Not a bug; parked by
   design.
 - **Trace / JIT** — rejected; the interpreter is not the bottleneck.
-- **Top-down / QSQ magic** — deferred pending workload signal; architecture
-  of record only (`design/datalog-dafsa-topdown-magic.md`).
+- **Magic-sets / top-down (QSQ) query evaluation** — built (M8 + `dl_query_topdown`),
+  then DELETED on 2026-08-11: both were alternate routes to answers the
+  semi-naive fixpoint already computes, and neither beat publish-once +
+  `dl_query_bound` on the measured workloads. The semi-naive VM is now the
+  only evaluation route. Design record only
+  (`design/datalog-dafsa-topdown-magic.md`).
 - **IVM / DRed fallback gaps** — not planned except recursion+deletion via
   DRed-over-recursion (low value for the current workload).
 

@@ -22,8 +22,7 @@
 #
 # Additionally asserts the engine DATA globals C consumers reference are
 # exported as OBJECTS from the Zig .so (g_bushy/g_reorder are set by
-# test_bushy; vm_nomaterialize/vm_export_relid/vm_export_ts by dl.c, now
-# dl.zig — pinned here so the U9 copy-relocation contract stays explicit).
+# test_bushy) — pinned here so the U9 copy-relocation contract stays explicit.
 set -u
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd) || exit 1
@@ -93,7 +92,7 @@ else
 fi
 
 # ─── DATA globals (copy-relocation contract, U9/U12) ───────────────────────
-for g in g_bushy g_reorder vm_nomaterialize vm_export_relid vm_export_ts; do
+for g in g_bushy g_reorder; do
     if nm -D --defined-only "$SO" | awk '$3 == "'"$g"'" && $2 ~ /^[BDR]$/ {found=1} END {exit !found}'; then
         note "DATA global exported: $g ($(nm -D --defined-only "$SO" | awk '$3 == "'"$g"'" {print $2}')"
     else

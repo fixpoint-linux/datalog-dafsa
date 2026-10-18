@@ -4,7 +4,7 @@
 //! literals and [X|Xs] patterns).
 //!
 //! Strangler-hybrid ABI: the AST node types (token/expr/atom/rule) are
-//! CONCRETE C structs — compiler.c/magic.c/dl.c/analyze.c/lsp.c dereference
+//! CONCRETE C structs — compiler.c/dl.c/analyze.c dereference
 //! them across the .so boundary — so they are `extern struct`s that MUST stay
 //! byte-for-byte identical to src/parser.h (same field names/types/order;
 //! C `int` -> c_int, `uint32_t` -> c_uint, self-referential `token**` ->

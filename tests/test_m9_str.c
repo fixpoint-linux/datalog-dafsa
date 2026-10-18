@@ -13,7 +13,7 @@
  *       ungrounded filter, INT operand to filter, malformed arity)
  *   T6  edge cases (empty-string concat, >4096-byte concat backtrack,
  *       non-ASCII byte length, length of a raw-int operand -> no tuple,
- *       string builtin in a recursive rule, magic == full-materialize)
+ *       string builtin in a recursive rule)
  *   T7  property — seeded random string EDB vs a C reference
  *
  * Regression: full `make test` (M0-M9 + this suite) must stay green.
@@ -458,7 +458,7 @@ static void test_t6_edge_cases(void)
 {
     dl_db *db;
 
-    TEST("T6: empty concat, >4096 backtrack, non-ASCII, int operand, recursion, magic");
+    TEST("T6: empty concat, >4096 backtrack, non-ASCII, int operand, recursion");
 
     /* 6a: empty-string concat */
     {
@@ -551,58 +551,6 @@ static void test_t6_edge_cases(void)
         teardown_db(db, "t6e");
     }
 
-    /* 6f: magic (dl_query_magic_adorn) == full-materialize filter */
-    {
-        char csv_path[256];
-        FILE *f;
-        setup_db(&db, "t6f");
-        assert(dl_declare_relation(db, "edge", 2) == 0);
-        snprintf(csv_path, sizeof(csv_path), "build-tmp/m9strcsv_t6f_edge.csv");
-        f = fopen(csv_path, "w");
-        assert(f);
-        fprintf(f, "1,\"a\"\n1,\"b\"\n2,\"c\"\n");
-        fclose(f);
-        assert(dl_load_facts(db, "edge", csv_path) == 3);
-
-        assert(dl_load_rules(db, "next(X,Y):-edge(X,Z),Y=concat(Z,\"s\").\n") == 0);
-        assert(dl_compile(db) == 0);
-
-        {
-            uint32_t vals[1] = { 1 };
-            tuple_set full = {0}, ground = {0}, rm = {0};
-            long nq, nm;
-
-            nq = dl_query(db, "next", tset_cb, &full);
-            assert(nq >= 0);
-            ground.arity = 2;
-            {
-                long i;
-                for (i = 0; i < full.count; i++) {
-                    const uint32_t *row = full.data + (size_t)i * 2;
-                    if (row[0] == vals[0]) tset_push_unique(&ground, row);
-                }
-            }
-            nm = dl_query_magic_adorn(db, "next", "bf", vals, 1, tset_cb, &rm);
-            if (nm < 0) {
-                FAIL("magic transform rejected string program");
-                tset_free(&full); tset_free(&ground); tset_free(&rm);
-                teardown_db(db, "t6f"); return;
-            }
-            if ((long)ground.count != nm || !tset_sorted_eq(&ground, &rm)) {
-                FAIL("magic string != full-materialize filter");
-                tset_free(&full); tset_free(&ground); tset_free(&rm);
-                teardown_db(db, "t6f"); return;
-            }
-            /* next(1,*) = {concat("a","s"), concat("b","s")} = {"as","bs"} */
-            if (nm != 2) {
-                FAIL("expected 2 rows for next(1,*)");
-                tset_free(&full); tset_free(&ground); tset_free(&rm);
-                teardown_db(db, "t6f"); return;
-            }
-            tset_free(&full); tset_free(&ground); tset_free(&rm);
-        }
-        teardown_db(db, "t6f");
-    }
     PASS();
 }
 

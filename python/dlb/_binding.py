@@ -274,18 +274,6 @@ class DlRaw:
             c_void_p, c_char_p, POINTER(c_uint32), c_uint8, TUPLE_CB, c_void_p,
         ]
         lib.dl_query_bound.restype = c_long
-        lib.dl_query_magic.argtypes = [
-            c_void_p, c_char_p, POINTER(c_uint32), c_uint8, TUPLE_CB, c_void_p,
-        ]
-        lib.dl_query_magic.restype = c_long
-        lib.dl_query_magic_adorn.argtypes = [
-            c_void_p, c_char_p, c_char_p, POINTER(c_uint32), c_uint8, TUPLE_CB, c_void_p,
-        ]
-        lib.dl_query_magic_adorn.restype = c_long
-        lib.dl_query_topdown.argtypes = [
-            c_void_p, c_char_p, POINTER(c_uint32), c_uint8, TUPLE_CB, c_void_p,
-        ]
-        lib.dl_query_topdown.restype = c_long
 
         # ── snapshot ───────────────────────────────────────────────
         lib.dl_publish_snapshot.argtypes = [c_void_p]
@@ -374,8 +362,8 @@ class DlRaw:
             "dl_txn_rollback dl_lookup dl_prefix dl_iter_open dl_iter_seek "
             "dl_iter_next dl_iter_arity dl_iter_close dl_merge_join dl_rank "
             "dl_select dl_range_count dl_count dl_load_rules dl_compile dl_query "
-            "dl_query_rules_ro dl_query_bound dl_query_magic dl_query_magic_adorn "
-            "dl_query_topdown dl_publish_snapshot dl_snapshot_versions "
+            "dl_query_rules_ro dl_query_bound "
+            "dl_publish_snapshot dl_snapshot_versions "
             "dl_query_version dl_query_bound_version dl_intern_str "
             "dl_intern_str_find dl_intern_str_of dl_vector_search "
             "dl_vector_search_corpus dl_vector_search_version "

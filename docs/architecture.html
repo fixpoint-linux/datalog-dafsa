@@ -157,17 +157,6 @@
     building. See <a href="order-statistics.html#perm">Order Statistics</a>.
   </p>
 
-  <h3>Magic-sets / QSQ top-down</h3>
-  <p>
-    The <code>dl_query_magic</code> family re-evaluates a <em>scoped</em>
-    fixpoint seeded by the bound goal arguments, materializing only the reachable
-    IDB slice — the result is byte-identical to a bound query over the fully
-    materialized relation. The top-down / QSQ path evaluates the same adorned +
-    magic program but schedules it demand-driven (an SLG worklist over subqueries)
-    instead of as a forward fixpoint. Both are opt-in per-query paths and are
-    available through the C API only.
-  </p>
-
   <h3>Incremental view maintenance (IVM)</h3>
   <p>
     After rules are compiled and a snapshot is published, subsequent fact

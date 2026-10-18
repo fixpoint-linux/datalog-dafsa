@@ -3,7 +3,6 @@ Usage:
   @PROG@ [-d <dir>] lookup <rel> <val> [<val> ...]
   @PROG@ [-d <dir>] prefix <rel> [<val> ...]
   @PROG@ [-d <dir>] query '<rule>' | <file.dl> <goal-rel>
-  @PROG@ [-d <dir>] qmagic '<rule>' | <file.dl> <goal-rel> [-a <adorn>] <val> [<val> ...]
   @PROG@ [-d <dir>] publish [--keep N]
   @PROG@ [-d <dir>] bound <rel> <val> [<val> ...]
   @PROG@ [-d <dir>] pattern <rel> [<col>] '<regex>'

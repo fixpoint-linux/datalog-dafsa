@@ -504,24 +504,6 @@ class Db:
             raise DlError(f"query_bound({goal_rel}) failed", n)
         return rows if collect else n
 
-    def query_magic(self, goal_rel: str, leading: tuple) -> list:
-        vals = tuple(leading)
-        arr = _arr(vals)
-        rows: list = []
-
-        def sink(t):
-            rows.append(t)
-            return None
-
-        trap = make_tuple_cb(sink)
-        n = self._call(
-            self._raw.dl_query_magic, goal_rel.encode(), arr, c_uint8(len(vals)),
-            trap, c_void_p(0),
-        )
-        if n < 0:
-            raise DlError(f"query_magic({goal_rel}) failed", n)
-        return rows
-
     # ─── snapshot / as-of ──────────────────────────────────────
 
     def publish_snapshot(self) -> None:

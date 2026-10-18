@@ -24,8 +24,6 @@
  *       re-derives after reopen + new facts
  *   T8  snapshot publish: per-variant manifest lines + mmap query fan-out
  *       equals the in-memory result (full scan and bound prefix)
- *   T9  magic-sets rejection: dl_query_magic returns -1 on a db that
- *       contains a variadic relation
  *   T10 backward-compat: fixed relations coexisting with variadic ones
  *       keep their exact v1 files and metadata lines
  */
@@ -818,40 +816,6 @@ static void t8_snapshot(void)
     if (pass) PASS(); else FAIL("snapshot fan-out mismatch");
 }
 
-/* ─── T9: magic-sets rejection ────────────────────────────────────────── */
-
-static void t9_magic_reject(void)
-{
-    char dir[256];
-    dl_db *db;
-    uint32_t e1[2] = {1,2};
-    int pass = 1;
-
-    TEST("T9 magic-sets rejects variadic programs");
-
-    db = fresh_db(dir, sizeof(dir), "t9");
-    assert(db);
-    assert(dl_declare_relation_variadic(db, "v") == 0);
-    assert(dl_declare_relation(db, "edge", 2) == 0);
-    assert(dl_declare_relation(db, "tc", 2) == 0);
-    addf(db, "v", e1, 2);
-    addf(db, "edge", e1, 2);
-    assert(dl_load_rules(db,
-        "tc(X,Y) :- edge(X,Y).\n"
-        "tc(X,Y) :- tc(X,Z), edge(Z,Y).\n") == 0);
-    assert(dl_compile(db) == 0);
-
-    {
-        uint32_t lead[1] = {1};
-        if (dl_query_magic(db, "tc", lead, 1, vcb, NULL) != -1) pass = 0;
-        if (dl_query_magic_adorn(db, "tc", "bf", lead, 1, vcb, NULL) != -1)
-            pass = 0;
-    }
-
-    dl_close(db);
-    if (pass) PASS(); else FAIL("magic-sets did not reject");
-}
-
 /* ─── T10: backward-compat coexistence ────────────────────────────────── */
 
 static void t10_backward_compat(void)
@@ -914,7 +878,6 @@ int main(void)
     t6_compile_errors();
     t7_persistence();
     t8_snapshot();
-    t9_magic_reject();
     t10_backward_compat();
 
     printf("\n%d tests run, %d failed.\n", tests_run, tests_failed);

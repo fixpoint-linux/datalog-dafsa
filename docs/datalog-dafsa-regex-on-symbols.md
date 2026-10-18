@@ -113,7 +113,7 @@ The set `S` is an open-addressing u32 hash set (`symset_init` / `symset_add` /
 | 7 | `src/vm.c` `OP_WALK` (~619) | Build the sym set via `symbols_dfa_walk(db->ir->fwd, dfa)` then `rel_filter_col(r, in->c, &set, tbuf_cb, &f->tuples)`. |
 | 8 | `src/dl.h` + `src/dl.c` `dl_pattern` (~3507) | Add `uint8_t col` param. Snapshot path opens `<sdir>/symbols.dafsa` view + `symbols_dfa_walk_view` → set → `view_filter_col` per (variadic) variant; in-memory path `symbols_dfa_walk(db->ir->fwd)` → set → `rel_filter_col`/`vrel_filter_col`. |
 | 9 | `src/dl_cli.c` `dl pattern` (~439) + usage (~123) | Optional `col` arg — `dl pattern <rel> [<col>] '<regex>'`. |
-| 10 | `src/magic.c` `atom_copy` (~294) | Also copy `src->pattern_col`. |
+| 10 | `src/magic.c` `atom_copy` (~294) | Also copy `src->pattern_col`. (Moot: the magic-sets transform was deleted 2026-08-11.) |
 | 11 | `docs/language.html` regex section (~293-304) + `CHANGELOG.md` (~440-444) | Rewrite the regex operator description for column string-content semantics. |
 
 ## Test / verification plan
@@ -152,7 +152,8 @@ Cross-check every emitted sym_id against `intern_str_of(db->ir, sym_id)` in a te
 2. **Snapshot must walk `<sdir>/symbols.dafsa`**, not the live `db->ir` — the
    live interner may be a superset after post-publish inserts.
 3. **Don't forget `magic.c` `atom_copy` `pattern_col`** — a missed copy silently
-   drops the column selection in magic-set re-written rules.
+   drops the column selection in magic-set re-written rules. (Moot: the
+   magic-sets transform was deleted 2026-08-11.)
 4. **NUL separator is safe** — interned strings never contain NUL (`intern_str`
    uses `strlen`), so `0x00` unambiguously terminates the string portion.
 5. **Update ALL `dl_pattern` callers** (CLI + `test_m5` + `test_m5_review`) for

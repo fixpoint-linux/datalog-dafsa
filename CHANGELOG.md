@@ -3,6 +3,25 @@
 All notable changes to this project are documented in this file.
 
 ## [Unreleased]
+- **Magic-sets and top-down/QSQ evaluation DELETED** (2026-08-11): both were
+  alternate routes to answers the semi-naive fixpoint already computes, and
+  neither beat publish-once + `dl_query_bound` on the measured workloads, so
+  the regimes are gone rather than kept as dead weight:
+  - removed `zig/src/magic.zig`, `zig/src/topdown.zig`, `src/magic.h`,
+    `src/topdown.h` and the two C suites that gated them (`test_m8_magic`,
+    `test_topdown`);
+  - removed the entry points `dl_query_magic`, `dl_query_magic_adorn`,
+    `dl_query_topdown`, `dl_query_topdown_adorn` (declarations in `dl.h`,
+    mirrors in `dl_abi.zig`, `td_eval`), the `dl qmagic` CLI command, and
+    `dlb.Db.query_magic` in the Python binding;
+  - the VM's now-unreachable skip-materialize hook (`vm_nomaterialize` /
+    `vm_export_relid` / `vm_export_ts`) went with them; `vm_exec_rule` and the
+    internal `vm_override` plumbing STAY (the semi-naive cascade builds
+    overrides per join, and `tests/test_m15_vmiter.c` drives `vm_exec_rule`);
+  - four kept suites (test_vararity, test_m9_arith, test_m9_str, test_homog)
+    lost only their magic-specific assertions; nothing else was weakened.
+  The semi-naive fixpoint, stratified negation, WFS, IVM/DRed and the CLI are
+  unchanged. `dl_query_bound` is the bound-query entry point.
 - **6e/6f/6g — publish cost, WAL durability, periodic snapshots** (three
   changes, one corrected attribution):
   - **6e publish gate** (`64564c5`): `dl_publish_snapshot` was saving EVERY

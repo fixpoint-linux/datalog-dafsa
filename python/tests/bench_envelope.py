@@ -223,11 +223,6 @@ def bench_recursive_query():
         print(
             f"  chain={n_edges:6d} query_bound(1,) median {r['median_us']/1000:9.3f} ms"
         )
-        r = timing_loop(lambda: db.query_magic("tc", (1,)), 20, n_warmup=2)
-        print(
-            f"  chain={n_edges:6d} query_magic(1,) median {r['median_us']/1000:9.3f} ms"
-            f"  (scoped fixpoint: {n_edges} tuples)"
-        )
         db.close()
 
 

@@ -33,7 +33,7 @@ export TMPDIR="$ROOT/$TMP"
 # MEASURED: of the matrix's ~11m25s only ~2m04s is CPU.  The suites hardcode
 # relative "build-tmp/..." paths and fsync a WAL constantly; this repo sits on
 # ZFS where fsync costs ~9 ms, so ~95% of the wall time is blocked on I/O.
-# Same suites on tmpfs: test_ivm 42.5s -> 0.25s, test_m8_magic 67.7s -> 1.7s.
+# Same suites on tmpfs: test_ivm 42.5s -> 0.25s.
 # $TMP stays the RELATIVE name "build-tmp" so every "$TMP/..." use below is
 # unchanged; only what that name resolves to moves.
 TMPFS_ROOT=${DL_BUILD_TMP:-/tmp/datalog-dafsa-build-tmp}
@@ -118,8 +118,6 @@ test_m6_deep_review
 test_m7
 test_cas
 test_concurrency
-test_m8_magic
-test_topdown
 test_m9_arith
 test_m9_str
 test_ivm

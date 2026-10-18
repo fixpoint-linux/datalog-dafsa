@@ -34,8 +34,6 @@ src/snapshot.h
 src/regexwalk.h
 src/permindex.h
 src/util.h
-src/magic.h
-src/topdown.h
 src/analyze.h
 src/schema.h
 src/typecheck.h

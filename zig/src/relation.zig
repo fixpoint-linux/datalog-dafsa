@@ -85,7 +85,7 @@ pub const Relation = struct {
     // (3 stays reserved for the compile-time cache join).
     //
     // Lives in the Relation tail (not dl_db's) on purpose: every eval clone
-    // (rules_ro/magic/wfs) ALIASES the relation pointers, so kinds ride
+    // (rules_ro/wfs) ALIASES the relation pointers, so kinds ride
     // along into the clones that check them; a dl_db-tail field would be
     // invisible to wfs.zig's dl.DlDb clone.
     col_kind: [MAX_ARITY]u8 = @splat(0),

@@ -417,7 +417,6 @@ fn usage(prog: [*:0]const u8) noreturn {
         \\  %s [-d <dir>] lookup <rel> <val> [<val> ...]
         \\  %s [-d <dir>] prefix <rel> [<val> ...]
         \\  %s [-d <dir>] query '<rule>' | <file.dl> <goal-rel>
-        \\  %s [-d <dir>] qmagic '<rule>' | <file.dl> <goal-rel> [-a <adorn>] <val> [<val> ...]
         \\  %s [-d <dir>] publish [--keep N]
         \\  %s [-d <dir>] bound <rel> <val> [<val> ...]
         \\  %s [-d <dir>] pattern <rel> [<col>] '<regex>'
@@ -434,7 +433,7 @@ fn usage(prog: [*:0]const u8) noreturn {
         \\Values: bare integer -> raw u32; anything else -> interned string
         \\Hex args: concatenated hex digits (no spaces, no 0x prefix)
         \\
-    , prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
+    , prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
     exit(1);
 }
 
@@ -674,75 +673,6 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
         const n = c.dl_query(db, goal_rel.ptr, printTuple, db);
         if (n < 0) {
             _ = fprintf(stderr, "dl: query failed\n");
-            return 1;
-        }
-        if (n == 0)
-            _ = printf("(no results)\n");
-        return 0;
-    }
-
-    if (eq(cmd, "qmagic")) {
-        if (argp >= argv.len) usage(argv[0].ptr);
-        var source: [*c]const u8 = argv[argp].ptr;
-        argp += 1;
-
-        if (argp >= argv.len) usage(argv[0].ptr);
-        const goal_rel = argv[argp];
-        argp += 1;
-
-        // Optional -a <adorn>: arbitrary-adornment form (e.g. "fb" binds
-        // position 1).  Without it, the legacy leading-prefix form is used.
-        var adorn: ?[*:0]const u8 = null;
-        if (argp < argv.len and eq(argv[argp], "-a")) {
-            argp += 1;
-            if (argp >= argv.len) usage(argv[0].ptr);
-            adorn = argv[argp];
-            argp += 1;
-        }
-
-        // Check if source is a file path
-        var source_buf: ?*anyopaque = null;
-        {
-            const f = fopen(source, "r");
-            if (f != null) {
-                _ = fseek(f.?, 0, SEEK_END);
-                const sz = ftell(f.?);
-                _ = fseek(f.?, 0, SEEK_SET);
-                if (sz > 0 and sz < 1024 * 1024) {
-                    const buf = malloc(@intCast(sz + 1));
-                    if (buf != null) {
-                        const nr = fread(@ptrCast(buf.?), 1, @intCast(sz), f.?);
-                        (@as([*]u8, @ptrCast(buf.?)))[nr] = 0;
-                        source_buf = buf;
-                        source = @ptrCast(buf.?);
-                    }
-                }
-                _ = fclose(f.?);
-            }
-        }
-
-        var vals: [8]u32 = undefined;
-        var nvals: u8 = 0;
-        while (argp < argv.len and nvals < 8) {
-            vals[nvals] = cliParseValue(db, argv[argp].ptr);
-            nvals += 1;
-            argp += 1;
-        }
-
-        if (c.dl_load_rules(db, source) != 0) {
-            _ = fprintf(stderr, "dl: failed to parse/compile rules\n");
-            free(source_buf);
-            return 1;
-        }
-        free(source_buf);
-
-        var n: c_long = undefined;
-        if (adorn != null)
-            n = c.dl_query_magic_adorn(db, goal_rel.ptr, adorn.?, &vals, nvals, printTuple, db)
-        else
-            n = c.dl_query_magic(db, goal_rel.ptr, &vals, nvals, printTuple, db);
-        if (n < 0) {
-            _ = fprintf(stderr, "dl: magic query failed\n");
             return 1;
         }
         if (n == 0)

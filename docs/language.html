@@ -32,8 +32,8 @@
     This is the complete reference for the rule language. Every example is a
     real construct that the parser and compiler accept (several are drawn
     directly from the passing test suite). Rules are passed to the engine as
-    source text via <code>dl_load_rules</code>, the CLI <code>query</code> /
-    <code>qmagic</code> commands, or a <code>.dl</code> file.
+    source text via <code>dl_load_rules</code>, the CLI <code>query</code>
+    command, or a <code>.dl</code> file.
   </p>
 
   <h2 id="comments">Comments</h2>
@@ -378,9 +378,8 @@ q(X, Lo, Hi) :- bounds(Lo, Hi), range(X, r, Lo, Hi).   # var bounds
     1&ndash;8. Storage is per-arity fixed-width; rule atoms resolve to the
     variant matching their syntactic argument count. A variadic head must be
     declared before <code>dl_load_rules</code>. Aggregates over a variadic
-    relation, recursive variadic heads, and magic/top-down queries over programs
-    containing variadics are rejected at compile time (they always evaluate via
-    the full fixpoint).
+    relation and recursive variadic heads are rejected at compile time (such
+    programs always evaluate via the full fixpoint).
   </p>
   <pre class="code"><code>/* C API: */
 dl_declare_relation_variadic(db, "v");</code></pre>

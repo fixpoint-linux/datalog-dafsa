@@ -1,8 +1,8 @@
 //! wfs.zig — well-founded semantics (van Gelder's alternating fixpoint) as
 //! a per-query evaluation strategy.
 //!
-//! This is the THIRD evaluation regime beside the bottom-up semi-naive
-//! fixpoint (vm.zig), magic-sets (magic.zig) and topdown/QSQ (topdown.zig).
+//! This is the evaluation regime beside the bottom-up semi-naive fixpoint
+//! (vm.zig) for programs the stratified fixpoint cannot express.
 //! It exists because the existing drivers only evaluate programs whose
 //! dependency graph stratifies: the compiler rejects a rule whose body
 //! negates a predicate of its own recursion cycle ("unstratifiable
@@ -12,7 +12,7 @@
 //!
 //! NULL-ISOLATION: nothing here changes any existing path.  The driver is
 //! reachable ONLY through the exported entry dl_query_wfs_ro (dl.zig);
-//! every other entry (dl_load_rules/dl_compile/dl_query_*/magic/topdown)
+//! every other entry (dl_load_rules/dl_compile/dl_query_*)
 //! keeps rejecting unstratifiable programs exactly as before — the
 //! stratifier itself is untouched.
 //!
@@ -65,7 +65,7 @@
 //! predicates, safe negation, no aggregates/builtins/lists/regex/variadic/
 //! arithmetic.  Truth mode 0 (TRUE-only) is implemented; modes 1/2/3 return
 //! DL_WFS_ERR_NOT_IMPLEMENTED rather than a wrong answer.  Not implemented:
-//! publish/materialization of WFS results (query-scoped, like magic/topdown).
+//! publish/materialization of WFS results (query-scoped, like dl_query_rules_ro).
 
 const std = @import("std");
 const c = std.c;
@@ -111,7 +111,7 @@ const MAX_HEADS: usize = 64; // dl.DlDb.rels is [64]
 const RELK_FIXED: u8 = 0;
 const RELK_VARIADIC: u8 = 1;
 
-// ─── extern bindings (same discipline as vm.zig/topdown.zig) ───────────────
+// ─── extern bindings (same discipline as vm.zig/compiler.zig) ──────────────
 
 extern "c" fn strdup(s: [*:0]const u8) ?[*:0]u8;
 // The INSERTING intern (intern.zig's intern_str): what the compiler's

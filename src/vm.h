@@ -31,7 +31,7 @@ int vm_execute(dl_db *db, compiled_rule **rules, int n_rules);
 long vm_query(dl_db *db, compiled_rule **rules, int n_rules,
               const char *goal_rel, dl_tuple_cb cb, void *user);
 
-/* ─── top-down QSQ support (expose the body-atom override + rule entry) ── */
+/* ─── Body-atom override + single-rule entry ────────────────────────────── */
 
 struct tuple_set;  /* full def in tupleset.h */
 
@@ -43,8 +43,9 @@ typedef struct {
 
 /* Run ONE compiled rule body with overrides, collecting projected head
  * tuples via cb when dry==1 (no DAFSA commit).  This is the body-evaluation
- * primitive the top-down driver (src/topdown.c) reuses; it is a thin wrapper
- * over the existing static exec_rule. */
+ * primitive the semi-naive cascade builds per join, exposed as a thin
+ * wrapper over the static exec_rule for the C test probes
+ * (tests/test_m15_vmiter.c drives the dry-run / early-stop contract). */
 long vm_exec_rule(dl_db *db, const compiled_rule *cr,
                   const vm_override *ov, int n_ov,
                   int dry, dl_tuple_cb cb, void *user);

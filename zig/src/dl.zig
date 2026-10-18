@@ -6,9 +6,9 @@
 //! revision API + transaction buffer, interner/term-store access, the query
 //! family (lookup/prefix/rank/select/range_count + _perm/_bound/count), rule
 //! loading + compilation, snapshot publish (with the IVM/DRed/aggregate
-//! incremental-maintenance dispatch cascade), magic-sets / top-down bound
-//! queries, permutation-index management, fault hooks, graph traversal,
-//! node observations and the regex pattern query.
+//! incremental-maintenance dispatch cascade), permutation-index management,
+//! fault hooks, graph traversal, node observations and the regex pattern
+//! query.
 //!
 //! Strangler-hybrid ABI: `struct dl_db` is OPAQUE in dl.h but its
 //! AUTHORITATIVE layout lives in src/dl_internal.h (still C, still
@@ -17,7 +17,7 @@
 //! byte-for-byte identical to that header — comptime-gated against
 //! @cImport("dl_internal.h")'s translate-c layout via @sizeOf/@offsetOf.
 //! The still-C consumers and every ported module (vm.zig/permindex.zig/
-//! snapshot.zig/iter.zig/topdown.zig/compiler.zig, each with its OWN
+//! snapshot.zig/iter.zig/compiler.zig, each with its OWN
 //! @cImport of dl_internal.h) all dereference the SAME byte layout, so this
 //! one mirror is the single point of truth for the migration.
 //!
@@ -40,7 +40,6 @@ const parser = @import("parser.zig");
 const compiler = @import("compiler.zig");
 const regexwalk = @import("regexwalk.zig");
 const schema_mod = @import("schema.zig");
-const magic = @import("magic.zig");
 const wfs = @import("wfs.zig");
 const reactive = @import("reactive.zig");
 const intern_mod = @import("intern.zig");
@@ -219,11 +218,6 @@ const OP_LIST_CDR: u8 = 22;
 const OP_LIST_APPEND: u8 = 23;
 const OP_LIST_MEMBER: u8 = 24;
 const OP_RANGE: u8 = 25;
-
-/// All-zero `owned` collision-head map — the magic/topdown eval clones never
-/// deep-copy a borrowed head (fresh heads are appended), so this shared const
-/// is the always-false owned[] passed to evalDbFreeOwned.
-const ZERO_OWNED = [_]u8{0} ** MAX_RELS;
 
 // ─── Callback types (mirror dl.h typedefs) ─────────────────────────────────
 
@@ -417,9 +411,6 @@ extern "c" fn vm_dred_delete(db: ?*DlDb) c_int;
 extern "c" fn vm_agg_eligible(db: ?*DlDb) c_int;
 extern "c" fn vm_agg_maintain(db: ?*DlDb) c_int;
 
-// topdown.zig.
-extern "c" fn td_eval(edb: ?*DlDb, prog: ?*const magic.magic_program, crules: ?[*]?*compiler.compiled_rule, n_crules: c_int, goal_variant_id: c_int, bound: ?[*]const u32, cb: DlTupleCb, user: ?*anyopaque) c_long;
-
 // snapshot.zig.
 extern "c" fn snapshot_read_current(db_dir: [*c]const u8) u32;
 extern "c" fn vcache_invalidate(vcache: [*c]ViewCacheSlot) void;
@@ -447,39 +438,6 @@ extern "c" fn symbols_dfa_walk_view(v: ?*const anyopaque, dfa: ?*const regexwalk
 // util.zig.
 extern "c" fn atomic_write_str(path: [*c]const u8, content: [*c]const u8) c_int;
 extern "c" fn fsync_dir_path(dirpath: [*c]const u8) c_int;
-
-// ─── Data-global GOT accessors (U9 copy-relocation fix) ───────────────────
-// dl.c reads/writes vm_nomaterialize/vm_export_relid/vm_export_ts (magic skip-
-// materialize hook) and g_reorder/g_bushy (top-down compile toggles).  C exes
-// take R_X86_64_COPY on these data globals, so shared-lib accesses must go
-// through GOTPCREL — the same thing -fPIC refs in dl.c do.
-const use_got_refs = builtin.output_mode == .Lib and builtin.mode != .Debug and
-    builtin.cpu.arch == .x86_64 and builtin.os.tag == .linux;
-
-inline fn gotDataRef(comptime name: []const u8, comptime T: type) *T {
-    if (use_got_refs) {
-        return asm ("movq " ++ name ++ "@GOTPCREL(%rip), %[p]"
-            : [p] "={rax}" (-> *T),
-        );
-    }
-    return @extern(*T, .{ .name = name });
-}
-
-inline fn vmNomaterializeRef() *c_int {
-    return gotDataRef("vm_nomaterialize", c_int);
-}
-inline fn vmExportRelidRef() *c_int {
-    return gotDataRef("vm_export_relid", c_int);
-}
-inline fn vmExportTsRef() *?*tupleset.tuple_set {
-    return gotDataRef("vm_export_ts", ?*tupleset.tuple_set);
-}
-inline fn gReorderRef() *c_int {
-    return gotDataRef("g_reorder", c_int);
-}
-inline fn gBushyRef() *c_int {
-    return gotDataRef("g_bushy", c_int);
-}
 
 // ─── Small C-string helpers ────────────────────────────────────────────────
 
@@ -3216,7 +3174,7 @@ pub export fn dl_range_count_bound(db: ?*const DlDb, rel_name: [*c]const u8, lea
 
 // ─── Rule loading & compilation (M1) ───────────────────────────────────────
 
-/// M8: AST deep-copy — retain rules for the magic-sets transform.
+/// AST deep-copy — retain the resident rules (see dl_load_rules).
 fn astTokFree(t: ?*parser.token) void {
     const tt = t orelse return;
     if (tt.children) |ch| {
@@ -3463,7 +3421,8 @@ pub export fn dl_load_rules(db: ?*DlDb, dl_source: [*c]const u8) c_int {
         return -1;
     }
 
-    // M8: retain a DEEP copy of the rule AST for the magic-sets transform.
+    // Retain a DEEP copy of the rule AST: dl_add_fact's constant-kind
+    // recheck (compiler.checkAllRuleConstKinds) consults the resident rules.
     {
         const cloned = c.calloc(@intCast(n_rules), @sizeOf(?*parser.rule)) orelse {
             var i: c_int = 0;
@@ -3842,7 +3801,7 @@ pub export fn dl_snapshot_relations(db: ?*DlDb, version: u32, cb: DlRelationCb, 
     return manifest_enumerate_rels(&sdir, cb, user);
 }
 
-// ─── M8: magic-sets bound query (scoped re-eval, clone-and-scope) ───────────
+// ─── Query-scoped eval clone (EDB aliasing for dl_query_rules_ro) ──────────
 
 /// Clone-and-scope: build an eval-only dl_db that shallow-aliases EDB rels.
 fn evalDbClone(src: *const DlDb, out: *DlDb) void {
@@ -3912,719 +3871,6 @@ fn evalDbDeclareInmem(edb: *DlDb, name: [*c]const u8, arity: u8) c_int {
     edb.rels[edb.nrels].vrel = null;
     edb.nrels += 1;
     return 0;
-}
-
-/// Is goal_rel a rule head (i.e. IDB) in the retained AST?
-fn astHasHead(db: *const DlDb, pred: [*c]const u8) bool {
-    var i: c_int = 0;
-    while (i < db.n_ast_rules) : (i += 1) {
-        const r = db.ast_rules.?[@intCast(i)] orelse continue;
-        if (r.head != null and r.head.?.pred != null and
-            strEq(r.head.?.pred, pred))
-            return true;
-    }
-    return false;
-}
-
-/// Adapter turning a dl_tuple_cb into a per-position adornment filter.
-const MagicFilterCtx = struct {
-    user_cb: DlTupleCb,
-    user: ?*anyopaque,
-    arity: u8,
-    adorn: [9]u8,
-    vals: [8]u32,
-    matched: c_long,
-};
-
-fn magicFilterCb(cols: ?[*]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_int {
-    const ctx: *MagicFilterCtx = @ptrCast(@alignCast(user.?));
-    _ = arity;
-    var i: u8 = 0;
-    var b: u8 = 0;
-    while (i < ctx.arity) : (i += 1) {
-        if (ctx.adorn[i] == 'b') {
-            if (cols.?[i] != ctx.vals[b]) return 0;
-            b += 1;
-        }
-    }
-    ctx.matched += 1;
-    return ctx.user_cb.?(cols, ctx.arity, ctx.user);
-}
-
-pub export fn dl_query_magic(db: ?*DlDb, goal_rel: [*c]const u8, leading: ?[*]const u32, k: u8, cb: DlTupleCb, user: ?*anyopaque) c_long {
-    const d = db orelse return -1;
-    if (goal_rel == null or cb == null) return -1;
-
-    if (db_has_variadic(d) != 0) {
-        dlErr("dl_query_magic: rejected: program contains a variadic relation (outside the magic-sets class)\n", .{});
-        return -1;
-    }
-    if (db_has_list_builtin(d) != 0 or db_has_range_builtin(d) != 0) {
-        dlErr("dl_query_magic: rejected: program uses a list builtin (outside the magic-sets class)\n", .{});
-        return -1;
-    }
-
-    const goal_idx = findRel(d, goal_rel);
-    if (goal_idx < 0) return -1;
-    const goal_arity = relation.rel_arity(d.rels[@intCast(goal_idx)].rel);
-    if (k > goal_arity) return -1;
-
-    if (k == 0)
-        return dl_query(d, goal_rel, cb, user);
-
-    var adorn: [9]u8 = undefined;
-    var i: u8 = 0;
-    while (i < k) : (i += 1) adorn[i] = 'b';
-    while (i < goal_arity) : (i += 1) adorn[i] = 'f';
-    adorn[goal_arity] = 0;
-
-    return dl_query_magic_adorn(d, goal_rel, @ptrCast(&adorn), leading, k, cb, user);
-}
-
-pub export fn dl_query_magic_adorn(db: ?*DlDb, goal_rel: [*c]const u8, adorn: [*c]const u8, vals: ?[*]const u32, nvals: u8, cb: DlTupleCb, user: ?*anyopaque) c_long {
-    const d = db orelse return -1;
-    if (goal_rel == null or adorn == null or cb == null) return -1;
-
-    const goal_idx = findRel(d, goal_rel);
-    if (goal_idx < 0) return -1;
-    const goal_arity = relation.rel_arity(d.rels[@intCast(goal_idx)].rel);
-
-    if (db_has_variadic(d) != 0) {
-        dlErr("dl_query_magic: rejected: program contains a variadic relation (outside the magic-sets class)\n", .{});
-        return -1;
-    }
-    if (db_has_list_builtin(d) != 0 or db_has_range_builtin(d) != 0) {
-        dlErr("dl_query_magic: rejected: program uses a list builtin (outside the magic-sets class)\n", .{});
-        return -1;
-    }
-
-    const alen = strLen(adorn);
-    if (alen != goal_arity) {
-        dlErr("dl_query_magic: adornment length {d} != goal arity {d}\n", .{ alen, goal_arity });
-        return -1;
-    }
-    var nb: c_int = 0;
-    {
-        var xi: usize = 0;
-        while (xi < alen) : (xi += 1) {
-            if (adorn[xi] != 'b' and adorn[xi] != 'f') {
-                dlErr("dl_query_magic: bad adornment char '{c}'\n", .{adorn[xi]});
-                return -1;
-            }
-            if (adorn[xi] == 'b') nb += 1;
-        }
-    }
-    if (nb != @as(c_int, nvals)) {
-        dlErr("dl_query_magic: nvals={d} != count_b(adorn)={d}\n", .{ nvals, nb });
-        return -1;
-    }
-
-    if (nvals == 0)
-        return dl_query(d, goal_rel, cb, user);
-
-    // U-homog S2: a BOUND value whose kind contradicts the goal column's
-    // kind is the same int/sym id-space collision the compile-time check
-    // rejects for rule constants — the magic bound compiles into an
-    // eq_const probe exactly like a rule constant.  Only ONE direction is
-    // observable through the u32 API, and it is the sound one: a value that
-    // does NOT resolve as a live sym id (ids are dense 1..next_id-1, so
-    // non-resolving == not a live id) is DEFINITELY a raw int, and a raw
-    // int against a sym-kind column is a mismatch.  The other direction
-    // (resolving value vs int-kind column) is AMBIGUOUS — a raw int below
-    // next_id resolves too whenever any symbol is interned — and MUST NOT
-    // reject (pre-S1 it answered 0 rows, not an error).
-    {
-        var bi2: usize = 0;
-        var vi2: usize = 0;
-        while (bi2 < alen) : (bi2 += 1) {
-            if (adorn[bi2] != 'b') continue;
-            const v = vals.?[vi2];
-            vi2 += 1;
-            const colk = compiler.relKindWithRulesPub(d, goal_idx, @intCast(bi2), goal_arity);
-            if (colk != 2) continue; // int/unknown/mixed: nothing observable
-            const resolves = v > 0 and v < intern_mod.liveSymBound(d.ir) and
-                intern_str_of(d.ir, v) != null;
-            if (!resolves) {
-                dlErr("dl_query_magic: column kind mismatch in {s}/{d}: bound value {d} is an integer but column holds symbols\n", .{
-                    goal_rel, bi2, v,
-                });
-                return -1;
-            }
-        }
-    }
-
-    // EDB goal → direct full-scan + per-position filter.
-    if (!astHasHead(d, goal_rel)) {
-        var ctx = std.mem.zeroes(MagicFilterCtx);
-        ctx.user_cb = cb;
-        ctx.user = user;
-        ctx.arity = goal_arity;
-        @memcpy(ctx.adorn[0..alen], adorn[0..alen]);
-        ctx.adorn[alen] = 0;
-        @memcpy(ctx.vals[0..nvals], vals.?[0..nvals]);
-        if (relation.rel_prefix(d.rels[@intCast(goal_idx)].rel, null, 0, magicFilterCb, &ctx) < 0)
-            return -1;
-        return ctx.matched;
-    }
-
-    if (d.n_ast_rules <= 0) return -1;
-
-    // Negation/aggregate soundness: materialize src first if dirty.
-    if (d.fixpoint_dirty != 0) {
-        var ri: c_int = 0;
-        while (ri < d.n_ast_rules) : (ri += 1) {
-            const r = d.ast_rules.?[@intCast(ri)] orelse continue;
-            if (r.has_negation != 0 or r.has_aggregate != 0) {
-                if (dl_compile(d) != 0) return -1;
-                break;
-            }
-        }
-    }
-
-    // Fast path: canonical left-recursive TC shape (bf adorn).
-    // The magic program for this shape is correct but its tc^bf stratum is
-    // O(n^2) in the semi-naive loop: the recursive rule's delta lands on the
-    // LAST body atom, so every iteration rescans the frozen leading
-    // magic_tc^b relation (O(n) per iteration, O(chain) iterations).  The
-    // BFS below derives the identical result in O(n).  Same interception
-    // point and same recognizer as dl_query_topdown_adorn.
-    {
-        var matched: c_int = 0;
-        const rc = tcRecognizeBf(d, goal_rel, adorn, vals, nvals, cb, user, &matched);
-        if (matched != 0)
-            return rc;
-    }
-
-    var edb: DlDb = undefined;
-    var prog: magic.magic_program = std.mem.zeroes(magic.magic_program);
-    var magic_crules: ?[*]?*compiler.compiled_rule = null;
-    var n_magic: c_int = 0;
-    var reject: [256]u8 = undefined;
-    var result: c_long = -1;
-
-    evalDbClone(d, &edb);
-    const n_aliased = edb.nrels;
-
-    if (magic.magic_transform_adorn(@ptrCast(d.ast_rules), d.n_ast_rules, goal_rel, goal_arity, adorn, vals, nvals, d.nrels, d.ir, &prog, &reject, reject.len) != 0) {
-        dlErr("dl_query_magic: rejected: {s}\n", .{@as([*c]const u8, @ptrCast(&reject))});
-        evalDbFreeOwned(&edb, n_aliased, &ZERO_OWNED);
-        return -1;
-    }
-
-    {
-        var dd: c_int = 0;
-        while (dd < prog.n_decls) : (dd += 1) {
-            if (evalDbDeclareInmem(&edb, @ptrCast(&prog.decls.?[@intCast(dd)].name), prog.decls.?[@intCast(dd)].arity) != 0) {
-                dlErr("dl_query_magic: cannot pre-declare '{s}'\n", .{@as([*c]const u8, @ptrCast(&prog.decls.?[@intCast(dd)].name))});
-                magic.magic_program_free(&prog);
-                evalDbFreeOwned(&edb, n_aliased, &ZERO_OWNED);
-                return -1;
-            }
-        }
-    }
-
-    // Seed the magic goal relation with the bound values.
-    {
-        var magic_goal: [64:0]u8 = undefined;
-        if (snprintf(&magic_goal, 64, "magic_%s", @as([*c]const u8, @ptrCast(&prog.adorned_goal))) >= 64) {
-            dlErr("dl_query_magic: magic goal name too long\n", .{});
-            magic.magic_program_free(&prog);
-            evalDbFreeOwned(&edb, n_aliased, &ZERO_OWNED);
-            return -1;
-        }
-        const m_idx = findRel(&edb, &magic_goal);
-        if (m_idx < 0 or relation.rel_arity(edb.rels[@intCast(m_idx)].rel) != nvals) {
-            dlErr("dl_query_magic: internal: magic goal '{s}' missing/arity-mismatch\n", .{@as([*c]const u8, @ptrCast(&magic_goal))});
-            magic.magic_program_free(&prog);
-            evalDbFreeOwned(&edb, n_aliased, &ZERO_OWNED);
-            return -1;
-        }
-        _ = relation.rel_add(edb.rels[@intCast(m_idx)].rel, vals);
-    }
-
-    if (compile_rules(&edb, prog.rules, prog.n_rules, &magic_crules, &n_magic) != 0) {
-        dlErr("dl_query_magic: compile of adorned program failed\n", .{});
-        magic.magic_program_free(&prog);
-        evalDbFreeOwned(&edb, n_aliased, &ZERO_OWNED);
-        return -1;
-    }
-
-    if (edb.dir != null or edb.nrels != n_aliased + @as(usize, @intCast(prog.n_decls))) {
-        dlErr("dl_query_magic: internal error: compile_rules grew the eval clone's relation table (missed head relation)\n", .{});
-        magic.magic_program_free(&prog);
-        evalDbFreeOwned(&edb, n_aliased, &ZERO_OWNED);
-        return -1;
-    }
-
-    {
-        const a_idx = findRel(&edb, @ptrCast(&prog.adorned_goal));
-        if (a_idx < 0) {
-            dlErr("dl_query_magic: internal: adorned goal '{s}' missing\n", .{@as([*c]const u8, @ptrCast(&prog.adorned_goal))});
-            magic.magic_program_free(&prog);
-            evalDbFreeOwned(&edb, n_aliased, &ZERO_OWNED);
-            return -1;
-        }
-
-        var goal_ts: tupleset.tuple_set = std.mem.zeroes(tupleset.tuple_set);
-        vmNomaterializeRef().* = 1;
-        vmExportRelidRef().* = a_idx;
-        vmExportTsRef().* = &goal_ts;
-
-        const exec_rc = vm_execute(&edb, magic_crules, n_magic);
-
-        vmNomaterializeRef().* = 0;
-        vmExportRelidRef().* = -1;
-        vmExportTsRef().* = null;
-
-        if (exec_rc != 0) {
-            dlErr("dl_query_magic: scoped fixpoint failed\n", .{});
-            tupleset.ts_free(&goal_ts);
-            magic.magic_program_free(&prog);
-            evalDbFreeOwned(&edb, n_aliased, &ZERO_OWNED);
-            return -1;
-        }
-
-        var ctx = std.mem.zeroes(MagicFilterCtx);
-        ctx.user_cb = cb;
-        ctx.user = user;
-        ctx.arity = goal_arity;
-        @memcpy(ctx.adorn[0..alen], adorn[0..alen]);
-        ctx.adorn[alen] = 0;
-        @memcpy(ctx.vals[0..nvals], vals.?[0..nvals]);
-
-        if (goal_ts.arity > 0) {
-            var ci: c_long = 0;
-            while (ci < goal_ts.count) : (ci += 1) {
-                const tt = goal_ts.data.? + @as(usize, @intCast(ci)) * goal_ts.arity;
-                if (magicFilterCb(tt, goal_ts.arity, &ctx) != 0) break;
-            }
-            result = ctx.matched;
-            tupleset.ts_free(&goal_ts);
-        } else {
-            if (relation.rel_prefix(edb.rels[@intCast(a_idx)].rel, null, 0, magicFilterCb, &ctx) < 0)
-                result = -1
-            else
-                result = ctx.matched;
-        }
-    }
-
-    magic.magic_program_free(&prog);
-    {
-        var i: c_int = 0;
-        while (i < n_magic) : (i += 1) compiler.compiled_rule_free(magic_crules.?[@intCast(i)]);
-        if (magic_crules) |x| c.free(@ptrCast(x));
-    }
-    evalDbFreeOwned(&edb, n_aliased, &ZERO_OWNED);
-    return result;
-}
-
-// ─── top-down / QSQ bound query ─────────────────────────────────────────────
-
-const TcBfsCtx = struct {
-    db: *DlDb,
-    edge_idx: c_int,
-    seed: u32,
-    cb: DlTupleCb,
-    user: ?*anyopaque,
-    visited: ?*tupleset.tuple_set,
-    queue: ?[*]u32,
-    qcap: c_long,
-    qtail: c_long,
-    count: c_long,
-    stop: c_int,
-};
-
-fn tcBfsEdgeCb(cols: ?[*]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_int {
-    const ctx: *TcBfsCtx = @ptrCast(@alignCast(user.?));
-    _ = arity;
-    const w = cols.?[1];
-    var emit: [2]u32 = undefined;
-
-    if (tupleset.ts_contains(ctx.visited, @ptrCast(&w)) != 0) return 0; // already reached
-
-    emit[0] = ctx.seed;
-    emit[1] = w;
-    ctx.count += 1;
-    if (ctx.cb.?(&emit, 2, ctx.user) != 0) {
-        ctx.stop = 1;
-        return 1;
-    }
-
-    if (tupleset.ts_add(ctx.visited, @ptrCast(&w)) != 1) {
-        ctx.stop = 1;
-        return 1;
-    }
-    if (ctx.qtail >= ctx.qcap) {
-        const nc: c_long = if (ctx.qcap != 0) ctx.qcap * 2 else 64;
-        const nq = c.realloc(@ptrCast(ctx.queue), @as(usize, @intCast(nc)) * @sizeOf(u32)) orelse {
-            ctx.stop = 1;
-            return 1;
-        };
-        ctx.queue = @ptrCast(@alignCast(nq));
-        ctx.qcap = nc;
-    }
-    ctx.queue.?[@intCast(ctx.qtail)] = w;
-    ctx.qtail += 1;
-    return 0;
-}
-
-/// Detect the exact canonical left-recursive transitive-closure shape
-/// tc(X,Y) :- edge(X,Y).  tc(X,Y) :- edge(X,Z), tc(Z,Y).  queried as tc(seed,?).
-fn tcRecognizeBf(db: *DlDb, goal_rel: [*c]const u8, adorn: [*c]const u8, vals: ?[*]const u32, nvals: u8, cb: DlTupleCb, user: ?*anyopaque, matched: *c_int) c_long {
-    matched.* = 0;
-
-    if (db.n_ast_rules != 2) return 0;
-    {
-        var i: c_int = 0;
-        while (i < 2) : (i += 1) {
-            const r = db.ast_rules.?[@intCast(i)] orelse return 0;
-            if (r.head == null or r.head.?.pred == null) return 0;
-        }
-    }
-
-    const h = db.ast_rules.?[0].?.head;
-    {
-        var i: c_int = 0;
-        while (i < 2) : (i += 1) {
-            const r = db.ast_rules.?[@intCast(i)].?;
-            if (!strEq(r.head.?.pred, goal_rel)) return 0;
-            if (r.head.?.nargs != 2) return 0;
-            if (r.head.?.args.?[0].?.kind != parser.TOK_VAR or
-                r.head.?.args.?[1].?.kind != parser.TOK_VAR) return 0;
-        }
-    }
-
-    if (adorn == null or adorn[0] != 'b' or adorn[1] != 'f' or
-        adorn[2] != 0 or nvals != 1 or vals == null) return 0;
-
-    var B: ?*const parser.rule = null;
-    var R: ?*const parser.rule = null;
-    {
-        var i: c_int = 0;
-        while (i < 2) : (i += 1) {
-            const r = db.ast_rules.?[@intCast(i)].?;
-            if (r.has_negation != 0 or r.has_aggregate != 0) return 0;
-            if (r.nbody == 1 and B == null) B = r else if (r.nbody == 2 and R == null) R = r else return 0;
-        }
-    }
-    if (B == null or R == null) return 0;
-
-    const X = h.?.args.?[0].?.text orelse return 0;
-    const Y = h.?.args.?[1].?.text orelse return 0;
-
-    var edge_pred: [*c]const u8 = undefined;
-    var edge_idx: c_int = undefined;
-    // E. Base rule: single pure-EDB edge atom edge(X,Y).
-    {
-        const a = B.?.body.?[0].?;
-        if (a.pred == null or strEq(a.pred, h.?.pred)) return 0;
-        if (a.nargs != 2) return 0;
-        if (a.args.?[0].?.kind != parser.TOK_VAR or a.args.?[1].?.kind != parser.TOK_VAR) return 0;
-        if (a.negated != 0 or a.aggregate != 0 or a.arith != null or a.pattern != null) return 0;
-        if (a.args.?[0].?.text == null or a.args.?[1].?.text == null) return 0;
-        if (!strEq(a.args.?[0].?.text, X)) return 0;
-        if (!strEq(a.args.?[1].?.text, Y)) return 0;
-        edge_pred = a.pred;
-        edge_idx = findRel(db, edge_pred);
-        if (edge_idx < 0) return 0;
-        if (db.rels[@intCast(edge_idx)].kind != RELK_FIXED) return 0;
-        if (relation.rel_arity(db.rels[@intCast(edge_idx)].rel) != 2) return 0;
-        if (astHasHead(db, edge_pred)) return 0;
-    }
-
-    // F. Recursive rule: edge(X,Z), tc(Z,Y) with Z fresh, tc the LAST atom.
-    var Z: [*c]const u8 = undefined;
-    {
-        const a0 = R.?.body.?[0].?;
-        const a1 = R.?.body.?[1].?;
-
-        if (!strEq(a0.pred, edge_pred)) return 0;
-        if (a0.nargs != 2) return 0;
-        if (a0.args.?[0].?.kind != parser.TOK_VAR or a0.args.?[1].?.kind != parser.TOK_VAR) return 0;
-        if (a0.negated != 0 or a0.aggregate != 0 or a0.arith != null or a0.pattern != null) return 0;
-        if (a0.args.?[0].?.text == null or a0.args.?[1].?.text == null) return 0;
-        if (!strEq(a0.args.?[0].?.text, X)) return 0;
-        Z = a0.args.?[1].?.text;
-        if (strEq(Z, X) or strEq(Z, Y)) return 0; // Z fresh
-
-        if (a1.pred == null or !strEq(a1.pred, h.?.pred)) return 0;
-        if (a1.nargs != 2) return 0;
-        if (a1.args.?[0].?.kind != parser.TOK_VAR or a1.args.?[1].?.kind != parser.TOK_VAR) return 0;
-        if (a1.negated != 0 or a1.aggregate != 0 or a1.arith != null or a1.pattern != null) return 0;
-        if (a1.args.?[0].?.text == null or a1.args.?[1].?.text == null) return 0;
-        if (!strEq(a1.args.?[0].?.text, Z)) return 0;
-        if (!strEq(a1.args.?[1].?.text, Y)) return 0;
-    }
-
-    // G. Every argument token in every atom of both rules is TOK_VAR.
-    {
-        var ri: c_int = 0;
-        while (ri < 2) : (ri += 1) {
-            const r = if (ri == 0) B else R;
-            var ai: c_int = 0;
-            while (ai < r.?.nbody) : (ai += 1) {
-                const a = r.?.body.?[@intCast(ai)].?;
-                var k: c_int = 0;
-                while (k < a.nargs) : (k += 1)
-                    if (a.args.?[@intCast(k)].?.kind != parser.TOK_VAR) return 0;
-            }
-        }
-    }
-
-    // Fires: single-source BFS reachability from seed.
-    matched.* = 1;
-    {
-        var qhead: c_long = 0;
-        var visited: tupleset.tuple_set = undefined;
-
-        if (tupleset.ts_init(&visited, 1) != 0) return -1;
-        var ctx = TcBfsCtx{
-            .db = db,
-            .edge_idx = edge_idx,
-            .seed = vals.?[0],
-            .cb = cb,
-            .user = user,
-            .visited = &visited,
-            .queue = null,
-            .qcap = 64,
-            .qtail = 0,
-            .count = 0,
-            .stop = 0,
-        };
-        ctx.queue = @ptrCast(@alignCast(c.malloc(@as(usize, @intCast(ctx.qcap)) * @sizeOf(u32)) orelse {
-            tupleset.ts_free(&visited);
-            return -1;
-        }));
-
-        ctx.queue.?[@intCast(ctx.qtail)] = ctx.seed; // NOT pre-visited
-        ctx.qtail += 1;
-
-        while (qhead < ctx.qtail) {
-            const u = ctx.queue.?[@intCast(qhead)];
-            qhead += 1;
-            if (ctx.stop != 0) break;
-            const n = relation.rel_prefix(db.rels[@intCast(edge_idx)].rel, @ptrCast(&u), 1, tcBfsEdgeCb, &ctx);
-            if (n < 0) {
-                c.free(@ptrCast(ctx.queue));
-                tupleset.ts_free(&visited);
-                return -1;
-            }
-        }
-        c.free(@ptrCast(ctx.queue));
-        tupleset.ts_free(&visited);
-        return ctx.count;
-    }
-}
-
-pub export fn dl_query_topdown(db: ?*DlDb, goal_rel: [*c]const u8, leading: ?[*]const u32, k: u8, cb: DlTupleCb, user: ?*anyopaque) c_long {
-    const d = db orelse return -1;
-    if (goal_rel == null or cb == null) return -1;
-
-    if (db_has_variadic(d) != 0) {
-        dlErr("dl_query_topdown: rejected: program contains a variadic relation (outside the magic-sets class)\n", .{});
-        return -1;
-    }
-    if (db_has_list_builtin(d) != 0 or db_has_range_builtin(d) != 0) {
-        dlErr("dl_query_topdown: rejected: program uses a list builtin (outside the magic-sets class)\n", .{});
-        return -1;
-    }
-
-    const goal_idx = findRel(d, goal_rel);
-    if (goal_idx < 0) return -1;
-    const goal_arity = relation.rel_arity(d.rels[@intCast(goal_idx)].rel);
-    if (k > goal_arity) return -1;
-    if (k == 0)
-        return dl_query(d, goal_rel, cb, user);
-
-    var adorn: [9]u8 = undefined;
-    var i: u8 = 0;
-    while (i < k) : (i += 1) adorn[i] = 'b';
-    while (i < goal_arity) : (i += 1) adorn[i] = 'f';
-    adorn[goal_arity] = 0;
-
-    return dl_query_topdown_adorn(d, goal_rel, @ptrCast(&adorn), leading, k, cb, user);
-}
-
-pub export fn dl_query_topdown_adorn(db: ?*DlDb, goal_rel: [*c]const u8, adorn: [*c]const u8, vals: ?[*]const u32, nvals: u8, cb: DlTupleCb, user: ?*anyopaque) c_long {
-    const d = db orelse return -1;
-    if (goal_rel == null or adorn == null or cb == null) return -1;
-
-    const goal_idx = findRel(d, goal_rel);
-    if (goal_idx < 0) return -1;
-    const goal_arity = relation.rel_arity(d.rels[@intCast(goal_idx)].rel);
-
-    if (db_has_variadic(d) != 0) {
-        dlErr("dl_query_topdown: rejected: program contains a variadic relation (outside the magic-sets class)\n", .{});
-        return -1;
-    }
-    if (db_has_list_builtin(d) != 0 or db_has_range_builtin(d) != 0) {
-        dlErr("dl_query_topdown: rejected: program uses a list builtin (outside the magic-sets class)\n", .{});
-        return -1;
-    }
-
-    const alen = strLen(adorn);
-    if (alen != goal_arity) {
-        dlErr("dl_query_topdown: adornment length {d} != goal arity {d}\n", .{ alen, goal_arity });
-        return -1;
-    }
-    var nb: c_int = 0;
-    {
-        var xi: usize = 0;
-        while (xi < alen) : (xi += 1) {
-            if (adorn[xi] != 'b' and adorn[xi] != 'f') {
-                dlErr("dl_query_topdown: bad adornment char '{c}'\n", .{adorn[xi]});
-                return -1;
-            }
-            if (adorn[xi] == 'b') nb += 1;
-        }
-    }
-    if (nb != @as(c_int, nvals)) {
-        dlErr("dl_query_topdown: nvals={d} != count_b(adorn)={d}\n", .{ nvals, nb });
-        return -1;
-    }
-
-    if (nvals == 0)
-        return dl_query(d, goal_rel, cb, user);
-
-    // EDB goal → direct full-scan + per-position filter.
-    if (!astHasHead(d, goal_rel)) {
-        var ctx = std.mem.zeroes(MagicFilterCtx);
-        ctx.user_cb = cb;
-        ctx.user = user;
-        ctx.arity = goal_arity;
-        @memcpy(ctx.adorn[0..alen], adorn[0..alen]);
-        ctx.adorn[alen] = 0;
-        @memcpy(ctx.vals[0..nvals], vals.?[0..nvals]);
-        if (relation.rel_prefix(d.rels[@intCast(goal_idx)].rel, null, 0, magicFilterCb, &ctx) < 0)
-            return -1;
-        return ctx.matched;
-    }
-
-    if (d.n_ast_rules <= 0) return -1;
-
-    // Fast path: canonical left-recursive TC shape (bf adorn).
-    {
-        var matched: c_int = 0;
-        const rc = tcRecognizeBf(d, goal_rel, adorn, vals, nvals, cb, user, &matched);
-        if (matched != 0)
-            return rc;
-    }
-
-    // Negation/aggregate soundness.
-    if (d.fixpoint_dirty != 0) {
-        var ri: c_int = 0;
-        while (ri < d.n_ast_rules) : (ri += 1) {
-            const r = d.ast_rules.?[@intCast(ri)] orelse continue;
-            if (r.has_negation != 0 or r.has_aggregate != 0) {
-                if (dl_compile(d) != 0) return -1;
-                break;
-            }
-        }
-    }
-
-    var edb: DlDb = undefined;
-    var prog: magic.magic_program = std.mem.zeroes(magic.magic_program);
-    var td_crules: ?[*]?*compiler.compiled_rule = null;
-    var n_td: c_int = 0;
-    var reject: [256]u8 = undefined;
-    var result: c_long = -1;
-    var goal_variant_id: c_int = -1;
-
-    evalDbClone(d, &edb);
-    const n_aliased = edb.nrels;
-
-    if (magic.magic_transform_adorn(@ptrCast(d.ast_rules), d.n_ast_rules, goal_rel, goal_arity, adorn, vals, nvals, d.nrels, d.ir, &prog, &reject, reject.len) != 0) {
-        dlErr("dl_query_topdown: rejected: {s}\n", .{@as([*c]const u8, @ptrCast(&reject))});
-        evalDbFreeOwned(&edb, n_aliased, &ZERO_OWNED);
-        return -1;
-    }
-
-    {
-        var dd: c_int = 0;
-        while (dd < prog.n_decls) : (dd += 1) {
-            if (evalDbDeclareInmem(&edb, @ptrCast(&prog.decls.?[@intCast(dd)].name), prog.decls.?[@intCast(dd)].arity) != 0) {
-                dlErr("dl_query_topdown: cannot pre-declare '{s}'\n", .{@as([*c]const u8, @ptrCast(&prog.decls.?[@intCast(dd)].name))});
-                magic.magic_program_free(&prog);
-                evalDbFreeOwned(&edb, n_aliased, &ZERO_OWNED);
-                return -1;
-            }
-        }
-    }
-
-    // Compile with g_reorder=0 / g_bushy=0 so body_idx == AST body position.
-    {
-        const saved_reorder = gReorderRef().*;
-        const saved_bushy = gBushyRef().*;
-        gReorderRef().* = 0;
-        gBushyRef().* = 0;
-        const compile_rc = compile_rules(&edb, prog.rules, prog.n_rules, &td_crules, &n_td);
-        gReorderRef().* = saved_reorder;
-        gBushyRef().* = saved_bushy;
-        if (compile_rc != 0) {
-            dlErr("dl_query_topdown: compile of adorned program failed\n", .{});
-            magic.magic_program_free(&prog);
-            evalDbFreeOwned(&edb, n_aliased, &ZERO_OWNED);
-            return -1;
-        }
-    }
-
-    // Build the permutation indices the compiler declared (OP_LOOKUP_PERM).
-    if (permindex_build_dirty(&edb) != 0) {
-        dlErr("dl_query_topdown: perm index build failed\n", .{});
-        magic.magic_program_free(&prog);
-        {
-            var i: c_int = 0;
-            while (i < n_td) : (i += 1) compiler.compiled_rule_free(td_crules.?[@intCast(i)]);
-            if (td_crules) |x| c.free(@ptrCast(x));
-        }
-        evalDbFreeOwned(&edb, n_aliased, &ZERO_OWNED);
-        return -1;
-    }
-
-    if (edb.dir != null or edb.nrels != n_aliased + @as(usize, @intCast(prog.n_decls))) {
-        dlErr("dl_query_topdown: internal error: compile_rules grew the eval clone's relation table\n", .{});
-        magic.magic_program_free(&prog);
-        {
-            var i: c_int = 0;
-            while (i < n_td) : (i += 1) compiler.compiled_rule_free(td_crules.?[@intCast(i)]);
-            if (td_crules) |x| c.free(@ptrCast(x));
-        }
-        evalDbFreeOwned(&edb, n_aliased, &ZERO_OWNED);
-        return -1;
-    }
-
-    // Locate the goal variant (adorned_goal among the decl pairs).
-    {
-        var dd: c_int = 0;
-        while (dd < prog.n_decls) : (dd += 2) {
-            if (strEq(@ptrCast(&prog.decls.?[@intCast(dd)].name), @ptrCast(&prog.adorned_goal))) {
-                goal_variant_id = @divTrunc(dd, 2);
-                break;
-            }
-        }
-    }
-    if (goal_variant_id < 0) {
-        dlErr("dl_query_topdown: internal: adorned goal '{s}' missing\n", .{@as([*c]const u8, @ptrCast(&prog.adorned_goal))});
-        magic.magic_program_free(&prog);
-        {
-            var i: c_int = 0;
-            while (i < n_td) : (i += 1) compiler.compiled_rule_free(td_crules.?[@intCast(i)]);
-            if (td_crules) |x| c.free(@ptrCast(x));
-        }
-        evalDbFreeOwned(&edb, n_aliased, &ZERO_OWNED);
-        return -1;
-    }
-
-    result = td_eval(&edb, &prog, td_crules, n_td, goal_variant_id, vals, cb, user);
-
-    magic.magic_program_free(&prog);
-    {
-        var i: c_int = 0;
-        while (i < n_td) : (i += 1) compiler.compiled_rule_free(td_crules.?[@intCast(i)]);
-        if (td_crules) |x| c.free(@ptrCast(x));
-    }
-    evalDbFreeOwned(&edb, n_aliased, &ZERO_OWNED);
-    return result;
 }
 
 // ─── M4: snapshot publish ───────────────────────────────────────────────────
@@ -5469,7 +4715,7 @@ pub export fn dl_set_snapshot_budget(db: ?*DlDb, bytes: u64) c_int {
 // EXISTING cascade: dl_fired_step runs the SAME consolidateInner cascade
 // (via consolidateForReactive — prologue, dispatch and epilogue live ONLY
 // here, never copied), then reports the watched relations' added/removed
-// tuples.  ZERO vm.zig/magic.zig/topdown.zig/compiler.zig behaviour is
+// tuples.  ZERO vm.zig/compiler.zig behaviour is
 // touched; with no observation session open (the default) nothing here runs
 // at all.
 

@@ -370,8 +370,6 @@ landingView =
                     , text ", "
                     , Fixpoint.Code.inline "pattern"
                     , text " (regex), "
-                    , Fixpoint.Code.inline "qmagic"
-                    , text " (magic-sets), "
                     , Fixpoint.Code.inline "search"
                     , text ", "
                     , Fixpoint.Code.inline "vsearch"
@@ -424,7 +422,7 @@ landingView =
                             ]
                         , tr []
                             [ td [ class "name" ] [ text "Evaluation" ]
-                            , td [] [ text "Semi-naive fixpoint, stratified negation, bushy joins, permutation-index selection + hash-join, magic-sets / QSQ top-down, incremental view maintenance" ]
+                            , td [] [ text "Semi-naive fixpoint, stratified negation, bushy joins, permutation-index selection + hash-join, incremental view maintenance" ]
                             , td [] [ a [ href "https://fixpointlinux.org/datalog-dafsa/architecture/#strategies", attribute "data-mfe-route" "/datalog-dafsa/architecture" ] [ text "Architecture § strategies" ] ]
                             ]
                         , tr []
@@ -498,9 +496,7 @@ languageView =
                     , Fixpoint.Code.inline "dl_load_rules"
                     , text ", the CLI "
                     , Fixpoint.Code.inline "query"
-                    , text " / "
-                    , Fixpoint.Code.inline "qmagic"
-                    , text " commands, or a "
+                    , text " command, or a "
                     , Fixpoint.Code.inline ".dl"
                     , text " file."
                     ]
@@ -982,7 +978,7 @@ languageView =
                     , em [] [ text "variadic" ]
                     , text ", accepting facts of any arity 1–8. Storage is per-arity fixed-width; rule atoms resolve to the variant matching their syntactic argument count. A variadic head must be declared before "
                     , Fixpoint.Code.inline "dl_load_rules"
-                    , text ". Aggregates over a variadic relation, recursive variadic heads, and magic/top-down queries over programs containing variadics are rejected at compile time (they always evaluate via the full fixpoint)."
+                    , text ". Aggregates over a variadic relation and recursive variadic heads are rejected at compile time (such programs always evaluate via the full fixpoint)."
                     ]
                 , Fixpoint.Code.block
                     [ text "/* C API: */\n"
@@ -1087,7 +1083,6 @@ cliView =
                     , text "dl [-d <dir>] lookup  <rel> <val> [<val> ...]\n"
                     , text "dl [-d <dir>] prefix  <rel> [<val> ...]\n"
                     , text "dl [-d <dir>] query   '<rule>' | <file.dl> <goal-rel>\n"
-                    , text "dl [-d <dir>] qmagic  '<rule>' | <file.dl> <goal-rel> [-a <adorn>] <val> [<val> ...]\n"
                     , text "dl [-d <dir>] publish\n"
                     , text "dl [-d <dir>] bound   <rel> <val> [<val> ...]\n"
                     , text "dl [-d <dir>] pattern <rel> '<regex>'\n"
@@ -1168,44 +1163,6 @@ cliView =
                     ]
                 , p []
                     [ text "Internally this loads the rules, publishes a snapshot (running the VM if the fixpoint is dirty), then queries the goal relation."
-                    ]
-                ]
-            }
-        , Fixpoint.Section.view
-            { id = "qmagic"
-            , title = "qmagic"
-            , hint = "// magic-sets bound query"
-            , children =
-                [ p []
-                    [ text "Magic-sets bound query: evaluates a "
-                    , em [] [ text "scoped" ]
-                    , text " fixpoint seeded by the bound values, materialising only the reachable IDB slice. The result is byte-for-byte identical to "
-                    , Fixpoint.Code.inline "dl_query_bound"
-                    , text " over the fully materialized goal."
-                    ]
-                , Fixpoint.Code.block
-                    [ text "# leading-prefix form: bind the first k args\n"
-                    , text "$ ./dl -d /tmp/db qmagic \\\n"
-                    , text "    'tc(X,Y) :- edge(X,Y). tc(X,Y) :- edge(X,Z), tc(Z,Y).' tc 1\n"
-                    , text "\n"
-                    , text "# arbitrary-adornment form: -a <adorn> binds named positions\n"
-                    , text "$ ./dl -d /tmp/db qmagic \\\n"
-                    , text "    'tc(X,Y) :- edge(X,Y). tc(X,Y) :- edge(X,Z), tc(Z,Y).' tc -a \"bf\" 1"
-                    ]
-                , p []
-                    [ text "The optional "
-                    , Fixpoint.Code.inline "-a <adorn>"
-                    , text " is a string of exactly "
-                    , Fixpoint.Code.inline "goal-arity"
-                    , text " characters, each "
-                    , Fixpoint.Code.inline "b"
-                    , text " (bound) or "
-                    , Fixpoint.Code.inline "f"
-                    , text " (free); "
-                    , Fixpoint.Code.inline "vals"
-                    , text " are packed left-to-right in the order of the "
-                    , Fixpoint.Code.inline "b"
-                    , text " positions. Programs using negation, aggregates, or cross-predicate mutual recursion are rejected with a diagnostic."
                     ]
                 ]
             }
@@ -1360,18 +1317,10 @@ cliView =
         , Fixpoint.Section.view
             { id = "scope"
             , title = "What is not in the CLI"
-            , hint = "// top-down / QSQ and order-statistics are C-API only"
+            , hint = "// order-statistics are C-API only"
             , children =
                 [ p []
-                    [ text "The top-down / QSQ path ("
-                    , Fixpoint.Code.inline "dl_query_topdown"
-                    , text " / "
-                    , Fixpoint.Code.inline "dl_query_topdown_adorn"
-                    , text ") is available only through the C API — there is "
-                    , strong [] [ text "no" ]
-                    , text " "
-                    , Fixpoint.Code.inline "topdown"
-                    , text " CLI subcommand. Likewise, order-statistics (rank / select / range / count) are C-API only. The semantic search tier relies on the "
+                    [ text "Order-statistics (rank / select / range / count) are C-API only. The semantic search tier relies on the "
                     , Fixpoint.Code.inline "dl-embed"
                     , text " companion tool (built with "
                     , Fixpoint.Code.inline "make dl-embed"
@@ -1518,16 +1467,12 @@ apiView =
         , Fixpoint.Section.view
             { id = "rules"
             , title = "Rules"
-            , hint = "// dl_load_rules · dl_compile · dl_query_magic · dl_query_topdown"
+            , hint = "// dl_load_rules · dl_compile · dl_query_bound · dl_query_rules_ro"
             , children =
                 [ table [ class "api" ]
                     [ tbody []
                         [ tr [] [ td [] [ Fixpoint.Code.inline "int dl_load_rules(dl_db *db, const char *dl_source)" ], td [] [ text "Parse and compile Datalog rules from a source string. Returns 0 / -1. Rules may reference existing relations or declare new derived relations." ] ]
                         , tr [] [ td [] [ Fixpoint.Code.inline "int dl_compile(dl_db *db)" ], td [] [ text "Compile all loaded rules into bytecode and run them (semi-naive fixpoint), materializing derived relations. Returns 0 / -1." ] ]
-                        , tr [] [ td [] [ Fixpoint.Code.inline "long dl_query_magic(db, goal_rel, leading, k, cb, user)" ], td [] [ text "Magic-sets bound query (leading/k). Re-evaluates a scoped fixpoint; result is byte-identical to ", Fixpoint.Code.inline "dl_query_bound", text ". Returns count, or -1." ] ]
-                        , tr [] [ td [] [ Fixpoint.Code.inline "long dl_query_magic_adorn(db, goal_rel, adorn, vals, nvals, cb, user)" ], td [] [ text "Magic-sets with an arbitrary adornment string of ", Fixpoint.Code.inline "b", text "/", Fixpoint.Code.inline "f", text " chars." ] ]
-                        , tr [] [ td [] [ Fixpoint.Code.inline "long dl_query_topdown(db, goal_rel, leading, k, cb, user)" ], td [] [ text "Top-down / QSQ: the same adorned magic program, scheduled demand-driven (SLG worklist) instead of forward semi-naive. C-API only — no CLI command." ] ]
-                        , tr [] [ td [] [ Fixpoint.Code.inline "long dl_query_topdown_adorn(db, goal_rel, adorn, vals, nvals, cb, user)" ], td [] [ text "Top-down / QSQ with an arbitrary adornment." ] ]
                         ]
                     ]
                 ]
@@ -1785,7 +1730,7 @@ architectureView =
         , Fixpoint.Section.view
             { id = "strategies"
             , title = "Join & evaluation strategies"
-            , hint = "// index-nested-loop · semi-naive · bushy · permutation-index · magic-sets · IVM"
+            , hint = "// index-nested-loop · semi-naive · bushy · permutation-index · IVM"
             , children =
                 [ h3 [] [ text "Prefix enumeration = index-nested-loop join" ]
                 , p []
@@ -1818,14 +1763,6 @@ architectureView =
                     , text ") using a cardinality cost gate. A recursive body atom is always served by a permutation index (never a hash join, which would read a stale DAFSA), and a hash-join fallback is used when no index is worth building. See "
                     , a [ href "https://fixpointlinux.org/datalog-dafsa/order-statistics/#perm", attribute "data-mfe-route" "/datalog-dafsa/order-statistics" ] [ text "Order Statistics" ]
                     , text "."
-                    ]
-                , h3 [] [ text "Magic-sets / QSQ top-down" ]
-                , p []
-                    [ text "The "
-                    , Fixpoint.Code.inline "dl_query_magic"
-                    , text " family re-evaluates a "
-                    , em [] [ text "scoped" ]
-                    , text " fixpoint seeded by the bound goal arguments, materializing only the reachable IDB slice — the result is byte-identical to a bound query over the fully materialized relation. The top-down / QSQ path evaluates the same adorned + magic program but schedules it demand-driven (an SLG worklist over subqueries) instead of as a forward fixpoint. Both are opt-in per-query paths and are available through the C API only."
                     ]
                 , h3 [] [ text "Incremental view maintenance (IVM)" ]
                 , p []

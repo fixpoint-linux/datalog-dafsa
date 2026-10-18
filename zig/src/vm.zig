@@ -11,7 +11,7 @@
 //!
 //! Strangler-hybrid ABI: `vm_instr`/`compiled_rule`/`var_info` are the
 //! byte-identical extern structs in compiler.zig; `vm_override` is defined
-//! here (still dereferenced by src/topdown.c and the C tests).  `struct dl_db`/
+//! here (the body-atom override the semi-naive cascade builds per join).  `struct dl_db`/
 //! `rel_entry`/`perm_index_entry` and every C function (`rel_*`, `term_*`,
 //! `intern_*`, `dl_iter_*`, `permindex_*`, `symset_*`, `symbols_dfa_walk`,
 //! `db_rel_at_arity_*`, `db_has_*`) are consumed through @cImport
@@ -39,7 +39,7 @@ const dl = @import("dl.zig");
 const permindex = @import("permindex.zig");
 
 // Byte-identical extern structs owned by compiler.zig (per the brief, the
-// canonical ABI types for the bytecode the still-C dl.c/topdown.c share).
+// canonical ABI types for the bytecode).
 const vm_instr = compiler.vm_instr;
 const compiled_rule = compiler.compiled_rule;
 const var_info = compiler.var_info;
@@ -92,7 +92,7 @@ const OP_RANGE: u8 = 25;
 const DlTupleCb = relation.RelEnumCb;
 
 /// typedef struct { int body_idx; const tuple_set *ts; int perm_id; }
-/// vm_override (vm.h:38-42) — still dereferenced by src/topdown.c and tests.
+/// vm_override (vm.h:38-42) — the per-body-atom timeset override.
 pub const vm_override = extern struct {
     body_idx: c_int,
     ts: ?*const tupleset.tuple_set,
@@ -104,8 +104,7 @@ comptime {
     // { int; const tuple_set *; int } — the C layout is pointer-width
     // dependent: 24 bytes with ts@8/perm_id@16 on LP64, 12 bytes with ts@4/
     // perm_id@8 on ILP32.  Pin the width's own numbers rather than the LP64
-    // ones.  This is the ONE definition; topdown.zig asserts the same layout
-    // against this type.
+    // ones.  This is the ONE definition of this ABI type.
     const lp64 = @sizeOf(usize) == 8;
     std.debug.assert(@sizeOf(vm_override) == (if (lp64) 24 else 12));
     std.debug.assert(@offsetOf(vm_override, "body_idx") == 0);
@@ -114,11 +113,6 @@ comptime {
 }
 
 // ─── Data globals (test-observable; MUST be writable export var D/B symbols) ─
-
-// Magic-sets skip-materialize hook (dl.c points the export-ts hook at a stack slot).
-export var vm_nomaterialize: c_int = 0;
-export var vm_export_relid: c_int = -1;
-export var vm_export_ts: ?*tupleset.tuple_set = null;
 
 export var vm_dred_runs: c_int = 0;
 export var vm_agg_runs: c_int = 0;
@@ -146,15 +140,6 @@ inline fn gotDataRef(comptime name: []const u8, comptime T: type) *T {
     return @extern(*T, .{ .name = name });
 }
 
-inline fn vmNomaterializeRef() *c_int {
-    return gotDataRef("vm_nomaterialize", c_int);
-}
-inline fn vmExportRelidRef() *c_int {
-    return gotDataRef("vm_export_relid", c_int);
-}
-inline fn vmExportTsRef() *?*tupleset.tuple_set {
-    return gotDataRef("vm_export_ts", ?*tupleset.tuple_set);
-}
 inline fn vmDredRunsRef() *c_int {
     return gotDataRef("vm_dred_runs", c_int);
 }
@@ -1656,7 +1641,9 @@ fn execRule(
     return rc;
 }
 
-/// long vm_exec_rule(...) — thin wrapper over exec_rule (top-down QSQ).
+/// long vm_exec_rule(...) — thin wrapper over exec_rule, for the C test
+/// probes that need one rule body fired with an explicit override list
+/// (tests/test_m15_vmiter.c drives the dry-run/early-stop contract through it).
 pub export fn vm_exec_rule(
     db: ?*dl.DlDb,
     cr: ?*const compiler.compiled_rule,
@@ -2237,11 +2224,6 @@ fn evalStratumRecursive(db: *dl.DlDb, rules: [*]?*compiler.compiled_rule, n: c_i
             // those facts must be folded in first or they are lost.
             _ = relation.rel_prefix(rel, null, 0, relation.ts_sink_cb, &rd[@intCast(i)].idb);
             tupleset.ts_sort(&rd[@intCast(i)].idb);
-            if (vmNomaterializeRef().* != 0 and rd[@intCast(i)].rel_id == vmExportRelidRef().*) {
-                vmExportTsRef().*.?.* = rd[@intCast(i)].idb;
-                rd[@intCast(i)].idb = std.mem.zeroes(tupleset.tuple_set);
-                continue;
-            }
             if (relation.rel_build_from_tupleset(rel, &rd[@intCast(i)].idb) != 0) {
                 permFreeAll(nr, perm_count, perm_ids, perm_cap, idb_perm_shadows);
                 rdFreeTs(rd, nr);

@@ -119,10 +119,6 @@
     <tbody>
       <tr><td><code>int dl_load_rules(dl_db *db, const char *dl_source)</code></td><td>Parse and compile Datalog rules from a source string. Returns 0 / -1. Rules may reference existing relations or declare new derived relations.</td></tr>
       <tr><td><code>int dl_compile(dl_db *db)</code></td><td>Compile all loaded rules into bytecode and run them (semi-naive fixpoint), materializing derived relations. Returns 0 / -1.</td></tr>
-      <tr><td><code>long dl_query_magic(db, goal_rel, leading, k, cb, user)</code></td><td>Magic-sets bound query (leading/k). Re-evaluates a scoped fixpoint; result is byte-identical to <code>dl_query_bound</code>. Returns count, or -1.</td></tr>
-      <tr><td><code>long dl_query_magic_adorn(db, goal_rel, adorn, vals, nvals, cb, user)</code></td><td>Magic-sets with an arbitrary adornment string of <code>b</code>/<code>f</code> chars.</td></tr>
-      <tr><td><code>long dl_query_topdown(db, goal_rel, leading, k, cb, user)</code></td><td>Top-down / QSQ: the same adorned magic program, scheduled demand-driven (SLG worklist) instead of forward semi-naive. C-API only — no CLI command.</td></tr>
-      <tr><td><code>long dl_query_topdown_adorn(db, goal_rel, adorn, vals, nvals, cb, user)</code></td><td>Top-down / QSQ with an arbitrary adornment.</td></tr>
     </tbody>
   </table>
 

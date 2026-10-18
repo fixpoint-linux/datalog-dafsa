@@ -3003,7 +3003,7 @@ fn compile_one(db: *dl.DlDb, r: *parser.rule, rel_strata: ?[*]const c_int, recur
 // returned ZERO rows (rc=0, no error) because 'foo' interned to sym_id 1
 // and OP_NEG_CHECK probed raw 1.  This pass makes the mismatch LOUD at the
 // single compile chokepoint every strategy path enters (dl_load_rules,
-// dl_query_rules_ro, WFS, magic, topdown, IVM, analyze).
+// dl_query_rules_ro, WFS, IVM, analyze).
 //
 // S2 kind model — RECORDED, never inferred.  The S1 attempt inferred a
 // column's kind by asking the SHARED interner whether a stored u32 resolves
@@ -3675,18 +3675,6 @@ fn checkRuleVarKinds(db: *dl.DlDb, cache: [*][HOMOG_MAX_ARITY]u8, r: *parser.rul
         }
     }
     return 0;
-}
-
-/// Settled kind of (rel,col) with head-kind propagation over the RESIDENT
-/// ruleset (d.ast_rules) folded in — the magic driver's BOUND-value check:
-/// a goal head's column kind is only derivable through its defining rules
-/// (the relation itself is empty at that point), exactly like the
-/// compile-time check.  Returns the kind, or KIND_UNKNOWN.
-pub fn relKindWithRulesPub(db: *dl.DlDb, ri: c_int, col: u8, arity: u8) u8 {
-    var cache = [_][HOMOG_MAX_ARITY]u8{[_]u8{0} ** HOMOG_MAX_ARITY} ** HOMOG_MAX_RELS;
-    const resident: ?[*]?*parser.rule = db.ast_rules;
-    if (propagateHeadKinds(db, resident orelse return KIND_UNKNOWN, db.n_ast_rules, &cache) != 0) return KIND_UNKNOWN;
-    return relColKind(db, &cache, ri, col, arity);
 }
 
 /// U-homog (review SH3): fold the settled head-column kinds of the RESIDENT

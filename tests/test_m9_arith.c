@@ -14,8 +14,6 @@
  *       comparison, ungrounded arithmetic operand, reversed dependency)
  *   T8  edge cases (u32 wrap 0-1, div-by-zero no-crash, arithmetic in a
  *       recursive rule, `X != symbol` via interner)
- *   T9  arithmetic under magic (dl_query_magic_adorn) == full-materialize
- *       filter
  *   T10 property — 200 seeded random cases vs a C reference loop
  *
  * Regression: full `make test` (M0-M8) must stay green.
@@ -44,7 +42,7 @@ static int tests_failed = 0;
     tests_failed++; \
 } while(0)
 
-/* ─── Tuple set (local, mirrors test_m8_magic.c) ──────────────────────── */
+/* ─── Tuple set (local to this suite) ─────────────────────────────────── */
 
 typedef struct {
     uint32_t *data;
@@ -562,64 +560,6 @@ static void test_t8_edge_cases(void)
     PASS();
 }
 
-/* ─── T9: arithmetic under magic ──────────────────────────────────────── */
-
-static void test_t9_magic_arith(void)
-{
-    dl_db *db;
-
-    TEST("T9: arithmetic under dl_query_magic_adorn == full-materialize filter");
-
-    setup_db(&db, "t9");
-    {
-        uint32_t e[] = {1,2, 1,3, 2,4, 2,5, 3,10};
-        load_rows(db, "edge", 2, e, 5, "t9");
-    }
-    /* next(X,Y) :- edge(X,Z), Y = Z + 1.  Goal next^bf (X bound). */
-    assert(dl_load_rules(db, "next(X,Y):-edge(X,Z),Y=Z+1.\n") == 0);
-    assert(dl_compile(db) == 0);
-
-    {
-        uint32_t vals[1] = {1};
-        tuple_set full = {0}, ground = {0}, rm = {0};
-        long nq, nm;
-
-        nq = dl_query(db, "next", tset_cb, &full);
-        assert(nq >= 0);
-        /* ground truth: filter full materialization on X == 1 */
-        ground.arity = 2;
-        {
-            long i;
-            for (i = 0; i < full.count; i++) {
-                const uint32_t *row = full.data + (size_t)i * 2;
-                if (row[0] == vals[0]) {
-                    tset_push_unique(&ground, row);
-                }
-            }
-        }
-        nm = dl_query_magic_adorn(db, "next", "bf", vals, 1, tset_cb, &rm);
-        if (nm < 0) {
-            FAIL("magic transform rejected arithmetic program");
-            tset_free(&full); tset_free(&ground); tset_free(&rm);
-            teardown_db(db, "t9"); return;
-        }
-        if ((long)ground.count != nm || !tset_sorted_eq(&ground, &rm)) {
-            FAIL("magic arithmetic != full-materialize filter");
-            tset_free(&full); tset_free(&ground); tset_free(&rm);
-            teardown_db(db, "t9"); return;
-        }
-        /* next(1,*) = {Z+1 : edge(1,Z)} = {3,4} */
-        if (nm != 2) {
-            FAIL("expected 2 rows for next(1,*)");
-            tset_free(&full); tset_free(&ground); tset_free(&rm);
-            teardown_db(db, "t9"); return;
-        }
-        tset_free(&full); tset_free(&ground); tset_free(&rm);
-    }
-    PASS();
-    teardown_db(db, "t9");
-}
-
 /* ─── T10: property test (backstop) ───────────────────────────────────── */
 
 static uint32_t rng_state = 0x9E3779B9u;
@@ -748,7 +688,6 @@ int main(void)
     test_t6_parser_rejects();
     test_t7_compile_rejects();
     test_t8_edge_cases();
-    test_t9_magic_arith();
     test_t10_property();
     test_t11_reserved_names();
 

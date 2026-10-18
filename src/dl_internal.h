@@ -126,8 +126,8 @@ struct dl_db {
     perm_index_entry  perms[MAX_PERMS];
     int               n_perms;
 
-    /* M8: retained rule AST (deep-copied in dl_load_rules; freed in
-     * dl_close).  Used by the magic-sets transform (dl_query_magic). */
+    /* Retained rule AST (deep-copied in dl_load_rules; freed in dl_close).
+     * Consulted by the constant-kind recheck on a later dl_add_fact. */
     rule            **ast_rules;
     int               n_ast_rules;
 
@@ -158,20 +158,20 @@ struct dl_db {
 /* 1 if the entry is a variadic relation, else 0. */
 int db_entry_is_variadic(const rel_entry *e);
 
-/* 1 if ANY relation in the db is variadic (the incremental-maintenance and
- * magic-sets exclusion test: such programs route to the full fixpoint). */
+/* 1 if ANY relation in the db is variadic (the incremental-maintenance
+ * exclusion test: such programs route to the full fixpoint). */
 int db_has_variadic(const dl_db *db);
 
 /* 1 if ANY compiled rule uses a list-CONSTRUCTION/DECOMPOSITION builtin
  * (OP_LIST_CONS/CAR/CDR/APPEND).  Such programs are excluded from the
- * incremental-maintenance classes (IVM/DRed/aggregates) and magic-sets
- * queries and always route to the full fixpoint — never silently
- * mis-evaluated.  List VALUES as pure data (a fact column holding a list
+ * incremental-maintenance classes (IVM/DRed/aggregates) and always route to
+ * the full fixpoint — never silently mis-evaluated.  List VALUES as pure
+ * data (a fact column holding a list
  * handle, with no list builtin) do NOT set this flag. */
 int db_has_list_builtin(const dl_db *db);
 /* 1 if ANY compiled rule emits OP_RANGE.  Such programs are excluded from
- * the incremental-maintenance classes (IVM/DRed/aggregates) and magic/
- * topdown queries and always route to the full fixpoint. */
+ * the incremental-maintenance classes (IVM/DRed/aggregates) and always
+ * route to the full fixpoint. */
 int db_has_range_builtin(const dl_db *db);
 
 /* LIVE-mode iterator constructor (defined in iter.c) for the VM's OP_RANGE

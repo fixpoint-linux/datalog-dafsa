@@ -9,8 +9,8 @@
  *
  * 'foo' interned to sym_id 1, q stored raw ints {1,2}, and OP_NEG_CHECK
  * probed (sym 1 == raw 1) -> TRUE -> the negation failed -> p had ZERO
- * rows, rc=0, no error — on dl_query_rules_ro, WFS, magic and the plain
- * `dl` CLI alike (the symbol-EDB control e={a,b} correctly returned both).
+ * rows, rc=0, no error — on dl_query_rules_ro, WFS and the plain `dl` CLI
+ * alike (the symbol-EDB control e={a,b} correctly returned both).
  *
  * S1 makes the constant-vs-column KIND mismatch LOUD at compile_rules (the
  * single chokepoint every strategy path enters) with the diagnostic
@@ -27,8 +27,7 @@
  *       e={1,2}) loads and answers the standard semantics
  *   T4  fresh/empty column stays PERMISSIVE (declared relation, no rows:
  *       no kind is established, no check fires)
- *   T5  the same rejection through the MAGIC path (dl_query_magic_adorn)
- *       and the WFS path (dl_query_wfs_ro)
+ *   T5  the same rejection through the WFS path (dl_query_wfs_ro)
  *   T6  the TYPED path is unchanged/stricter: an attached schema's
  *       Natural column still rejects a symbol constant at dl_load_rules
  *       (via the typechecker), and the untyped check does not weaken it
@@ -362,92 +361,22 @@ static void test_fresh_permissive(void)
     PASS();
 }
 
-/* ─── T5: the same rejection through the MAGIC and WFS paths ───────────── */
+/* ─── T5: the same rejection through the WFS path ──────────────────────── */
 
-static void test_magic_and_wfs(void)
+static void test_wfs_path(void)
 {
     uint32_t e_rows[2];
     tuple_set res;
     long n;
 
-    TEST("homog: magic path rejects the mixed-kind program (LOUD)");
+    TEST("homog: WFS path rejects the mixed-kind program (LOUD)");
 
     setup();
     /* values >= 10: fresh sym ids are 1..n, so interning 'foo' (id 1)
      * cannot make e's stored ints RESOLVE — kinds are RECORDED (S2), not
-     * inferred, so the comment below no longer matters for e; kept >=10 to
-     * also exercise large raw ints. */
+     * inferred; kept >=10 to also exercise large raw ints. */
     e_rows[0] = 10; e_rows[1] = 20;
     load_rows_u32("e", 1, e_rows, 2);
-    /* symcol: a symbol-kind column (loaded via STRING cells) for the
-     * magic bound check's sound direction */
-    {
-        const char *cells[2] = { "alpha", "beta" };
-        load_rows_sym("symcol", 1, cells, 2);
-    }
-
-    /* the resident program itself must be int/int-consistent (a mixed
-     * program is already rejected at dl_load_rules by T1) */
-    if (dl_load_rules(g_db, "q(X):-e(X).\n") != 0) {
-        teardown();
-        FAIL("magic setup: int/int program failed to load");
-        return;
-    }
-    assert(dl_compile(g_db) == 0);
-
-    /* the mixed program through the compile path every strategy shares:
-     * the magic driver compiles its ADORNED program through the same
-     * chokepoint, so this rules-ro probe covers that entry */
-    memset(&res, 0, sizeof res);
-    {
-        n = dl_query_rules_ro(g_db,
-            "qm(X):-e(X),!em(foo).\nem(X):-e(X).\n", "qm", tset_cb, &res);
-        tset_free(&res);
-        if (n >= 0) {
-            printf("(n=%ld) ", n);
-            teardown();
-            FAIL("mixed-kind program answered via the rules-ro path");
-            return;
-        }
-    }
-
-    /* ...and through the magic driver itself.  The sound direction of the
-     * u32 API: a bound value that does NOT resolve as a live sym id is
-     * DEFINITELY a raw int, so probing it against a SYM-kind column is the
-     * id-space collision and must be LOUD (pre-S1 it answered 1 row from
-     * the wrong value space).  The reverse (a resolving value vs an int
-     * column) is ambiguous and MUST pass — that is the reviewer's probe O:
-     * an int bound misread as "a symbol" once any symbol is interned. */
-    memset(&res, 0, sizeof res);
-    {
-        /* v1 = 1 is ambiguous: alpha interns to id 1, so 1 resolves and
-         * must NOT reject.  For the LOUD direction use a value ABOVE the
-         * interner's live bound (5, with ids 1..4 live) — that value is
-         * DEFINITELY a raw int against a sym-kind column. */
-        uint32_t loud_v = 5;
-        n = dl_query_magic_adorn(g_db, "symcol", "b", &loud_v, 1, tset_cb, &res);
-        tset_free(&res);
-        if (n >= 0) {
-            printf("(n=%ld) ", n);
-            teardown();
-            FAIL("magic answered a raw-int bound on a symbol column");
-            return;
-        }
-    }
-    {
-        /* e is int-kind; the bound 1 resolves (ids are interned by now),
-         * which is AMBIGUOUS — must NOT reject */
-        uint32_t v1 = 1;
-        memset(&res, 0, sizeof res);
-        n = dl_query_magic_adorn(g_db, "q", "b", &v1, 1, tset_cb, &res);
-        tset_free(&res);
-        if (n < 0) {
-            printf("(n=%ld) ", n);
-            teardown();
-            FAIL("magic rejected an ambiguous bound on an int column");
-            return;
-        }
-    }
 
     /* WFS path: same shape, negation over an IDB predicate */
     memset(&res, 0, sizeof res);
@@ -3948,7 +3877,7 @@ int main(void)
     test_symbol_control();
     test_int_control();
     test_fresh_permissive();
-    test_magic_and_wfs();
+    test_wfs_path();
     test_typed_path();
     test_multi_relation_int_and_sym();
     test_repro_loud_multi_relation();

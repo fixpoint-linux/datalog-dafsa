@@ -218,14 +218,6 @@ class TestRulesAndQueries(unittest.TestCase):
         rows1 = db.query_bound("tc", (1,), collect=True)
         self.assertEqual(sorted(rows1), [(1, j) for j in range(2, 41)])
 
-    def test_query_magic_matches_bound(self):
-        db = self.db
-        db.load_rules(self.TC_RULES)
-        db.compile_rules()
-        full = db.query_bound("tc", (5,), collect=True)
-        magic = db.query_magic("tc", (5,))
-        self.assertEqual(sorted(magic), sorted(full))
-
 
 class TestWritePath(unittest.TestCase):
     def setUp(self):

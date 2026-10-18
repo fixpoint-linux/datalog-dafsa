@@ -17,10 +17,14 @@ per-step budget are reported, not tuned away.**
 | prefix, 1 row + Python cb | 6.6 µs | PASS |
 | iter open+scan+close, 1 row | 8.5 µs | PASS |
 | **iter full scan** | 1.97 µs/tuple | per-tuple PASS; a 1 000-row scan = ~2 ms — **NOT a per-step op** |
-| query_magic (chain 40, bound) | 0.74 ms | **MISS by 74×** — off per-step path |
+| query_magic (chain 40, bound) — path DELETED, see note | 0.74 ms | **MISS by 74×** — off per-step path |
 | query_rules_ro (chain 40) | 1.8 ms | **MISS by 180×** |
 | query_rules_ro (chain 1000) | 1.23 s | **MISS by 123 000×** |
 | vector_search (production obs index, r=8) | 34 ms | **MISS** — semantic recall, not per-step |
+
+`query_magic` rows are kept as measured, but that path no longer exists: the
+magic-sets / top-down regimes were deleted on 2026-08-11 (see `CHANGELOG.md`).
+`dlb.Db.query_bound` is the bound-query entry point.
 
 Point reads on an open handle are comfortably inside the budget (the brief's
 1.6 µs raw-ctypes figure becomes ~3.5 µs through the checked binding — the
@@ -77,14 +81,17 @@ Bound/scoped paths after a one-time compile (chain 40):
 | path | median |
 |---|---|
 | query_bound("tc",(1,)) | 66 µs |
-| query_magic("tc",(1,)) | 0.74 ms |
+| query_magic("tc",(1,)) — path DELETED | 0.74 ms |
 
-Chain 1 000: query_bound 1.6 ms; query_magic 306 ms.
+Chain 1 000: query_bound 1.6 ms (and 306 ms for `query_magic`, whose
+magic-sets/top-down regime was deleted on 2026-08-11 — the figures above are
+kept as the measurement that motivated the deletion).
 
 **Reading:** unbounded transitive closure is quadratic-plus in derived tuples
-— per-step budget only survives with (a) pre-compiled rules + bound queries
-(66 µs at chain 40 — still 6.6× over budget), or (b) magic-sets scoped to a
-seed. The agent's control loop must treat recursive queries as amortized
+— per-step budget only survives with pre-compiled rules + bound queries
+(66 µs at chain 40 — still 6.6× over budget; the magic-sets route measured
+here was deleted 2026-08-11 and never closed the gap). The agent's control
+loop must treat recursive queries as amortized
 work, not per-step reads.
 
 ## 4. Concurrency envelope (MEASURED, contradicts the naive reading)

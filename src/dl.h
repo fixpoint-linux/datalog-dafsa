@@ -103,8 +103,8 @@ int dl_declare_relation(dl_db *db, const char *name, uint8_t arity);
  * must be declared BEFORE dl_load_rules; aggregates over a variadic
  * relation and recursive variadic heads are compile errors; programs
  * containing a variadic relation are excluded from incremental
- * maintenance (IVM/DRed/aggregates) and magic-sets queries — they always
- * evaluate via the full fixpoint (never silently mis-evaluated). */
+ * maintenance (IVM/DRed/aggregates) — they always evaluate via the full
+ * fixpoint (never silently mis-evaluated). */
 int dl_declare_relation_variadic(dl_db *db, const char *name);
 
 /* ─── Fact loading ────────────────────────────────────────────────────── */
@@ -551,91 +551,6 @@ long dl_fired_clear(dl_db *db);
 long dl_query_bound(dl_db *db, const char *goal_rel,
                     const uint32_t *leading, uint8_t k,
                     dl_tuple_cb cb, void *user);
-
-/* Magic-sets bound query (M8, opt-in, first slice).
- *
- * Re-evaluates a SCOPED fixpoint seeded by the bound leading args
- * leading[0..k-1], materializing only the reachable IDB slice, streaming
- * the result, and leaving `db` completely unmutated.
- *
- * Invariant: the result is byte-for-byte identical to
- * dl_query_bound(db, goal_rel, leading, k, cb, user) over the fully
- * materialized goal relation.  Returns tuple count, or -1 on error.
- *
- * Semantics of edge cases:
- *   - k == 0: routes to dl_query (full materialization) — no bound args.
- *   - goal_rel is an EDB relation (not a rule head): degenerates to a
- *     plain prefix lookup (equivalent to dl_query_bound).
- *   - programs using negation, aggregates, or cross-predicate mutual
- *     recursion are REJECTED with a diagnostic and return -1 (never silently
- *     mis-evaluated).
- *
- * NOTE: reads db->rels[].rel without a lock — safe only when no concurrent
- * publish is in flight (documented single-writer / multi-reader model). */
-long dl_query_magic(dl_db *db, const char *goal_rel,
-                    const uint32_t *leading, uint8_t k,
-                    dl_tuple_cb cb, void *user);
-
-/* Magic-sets bound query with an ARBITRARY adornment (M8, non-leading slice).
- *
- * Binds the goal relation on an arbitrary subset of positions described by
- * `adorn`: a NUL-terminated string of exactly goal_arity chars, each 'b'
- * (bound) or 'f' (free) — e.g. "fb" binds position 1 of an arity-2 goal,
- * "bfb" binds position 1 of an arity-3 goal.  `vals` holds the bound values
- * packed in left-to-right bound-position order (exactly matching the 'b'
- * positions of `adorn`); `nvals` is their count.
- *
- * Invariant: the result is byte-for-byte identical to filtering the full
- * materialization of the goal (dl_query) on the bound positions.  Returns
- * tuple count, or -1 on error (never silently mis-evaluated).
- *
- * Semantics / rejection list (all return -1):
- *   - NULL db / goal_rel / adorn / cb.
- *   - goal_rel not found in db.
- *   - strlen(adorn) != goal arity.
- *   - adorn contains chars other than 'b' / 'f'.
- *   - nvals != count of 'b' in adorn.
- *   - nvals == 0 (all-free adorn): ROUTES to dl_query — no bound args.
- *   - goal_rel is an EDB relation (not a rule head): ROUTES to a direct
- *     full-scan + per-position filter (no transform).
- *   - the same conservative magic-transform rejects as dl_query_magic
- *     (negation on an adorned-closure predicate, aggregates over one,
- *     cross-predicate mutual recursion, adornment-closure blow-up,
- *     MAX_RELS overflow).  Multiple distinct adornments of one predicate
- *     (e.g. tc^bf and tc^bb) are now SUPPORTED via the adornment-closure
- *     fixpoint; each is a distinct relation.
- *
- * dl_query_magic (leading/k) is a shorthand shim that synthesizes
- * adorn = "b"*k ++ "f"*(arity-k) and routes here. */
-long dl_query_magic_adorn(dl_db *db, const char *goal_rel,
-                          const char *adorn, const uint32_t *vals, uint8_t nvals,
-                          dl_tuple_cb cb, void *user);
-
-/* Top-down / QSQ bound query (opt-in 4th per-query path).
- *
- * Evaluates the SAME adorned + magic program as dl_query_magic, but scheduled
- * DEMAND-DRIVEN (SLG worklist over subqueries) instead of as a forward
- * semi-naive fixpoint.  Invariant: the result is byte-for-byte identical to
- * dl_query_magic / dl_query_magic_adorn (and to filtering the full
- * materialization of the goal on the bound positions).  Returns tuple count,
- * or -1 on error (same rejection list as the magic path — variadic, list
- * builtins, negation on a closure predicate, aggregates over one,
- * cross-predicate mutual recursion, adornment-closure blow-up).  Leaves `db`
- * unmutated.  Not a speedup over forward magic for dense closures (both are
- * scoped evaluations of the same program); it is the architecture-of-record
- * for future selective-query / early-termination workloads. */
-long dl_query_topdown(dl_db *db, const char *goal_rel,
-                      const uint32_t *leading, uint8_t k,
-                      dl_tuple_cb cb, void *user);
-
-/* Top-down/QSQ with an ARBITRARY adornment (mirrors dl_query_magic_adorn's
- * signature and rejection semantics; `vals` are packed in left-to-right
- * bound-position order).  Routes all-free adornments to dl_query and EDB
- * goals to a direct full-scan + per-position filter, exactly like the magic
- * path. */
-long dl_query_topdown_adorn(dl_db *db, const char *goal_rel,
-                            const char *adorn, const uint32_t *vals,
-                            uint8_t nvals, dl_tuple_cb cb, void *user);
 
 /* ─── Regex pattern query ─────────────────────────────────────────────── */
 

@@ -44,7 +44,7 @@ DATA=$WORK/data
 rm -rf "$DATA"
 mkdir -p "$DATA"
 
-# Edge graph (traverse/tc fixtures from tests/test_topdown.c / test_m8_magic.c)
+# Edge graph (traverse/tc fixtures)
 cat > "$DATA/edge.csv" <<'EOF'
 1,2
 2,3
@@ -160,7 +160,7 @@ build_corpus() {
     local db=$1 out=$2
     mkdir -p "$out"
 
-    # versions/publish/query/qmagic/bound/pattern/rev/cas/txn/traverse/obs/
+    # versions/publish/query/bound/pattern/rev/cas/txn/traverse/obs/
     # index/search/vsearch/vhybrid + load/lookup/prefix
     run_cmd "$out" c01 "$db" versions
     run_cmd "$out" c02 "$db" load "$DATA/edge.csv" --rel edge
@@ -212,11 +212,6 @@ build_corpus() {
     run_cmd "$out" c48 "$db" bound tc 1
     run_cmd "$out" c49 "$db" bound edge 1
     run_cmd "$out" c50 "$db" bound nosuchrel
-    run_cmd "$out" c51 "$db" qmagic "$DATA/tc.dl" tc 1
-    run_cmd "$out" c52 "$db" qmagic "$DATA/tc3.dl" tc 1
-    run_cmd "$out" c53 "$db" qmagic "$DATA/tc.dl" tc -a bf 1
-    run_cmd "$out" c54 "$db" qmagic "$DATA/tc.dl" tc -a xx 1
-    run_cmd "$out" c55 "$db" qmagic "$DATA/ntc.dl" ntc 2
     run_cmd "$out" c56 "$db" pattern edge "^[12]$"
     run_cmd "$out" c57 "$db" pattern edge 1 "^3$"
     run_cmd "$out" c58 "$db" pattern edge "^zzz$"
@@ -270,7 +265,7 @@ build_corpus() {
 }
 
 # read_corpus <dbdir> <outdir> — the read-only persistence corpus (queries
-# only: lookup/prefix/query/qmagic/bound/pattern/traverse/obs/search/vsearch/
+# only: lookup/prefix/query/bound/pattern/traverse/obs/search/vsearch/
 # vhybrid/versions/rev/txn).  Run against a COPY of the fully-built db so the
 # on-disk format is re-opened and re-read from scratch.
 read_corpus() {
@@ -290,8 +285,6 @@ read_corpus() {
     run_cmd "$out" r12 "$db" search "red" --version 1
     run_cmd "$out" r13 "$db" query "tc(X,Y):-edge(X,Y)." tc
     run_cmd "$out" r14 "$db" bound tc 1
-    run_cmd "$out" r15 "$db" qmagic "$DATA/tc.dl" tc 1
-    run_cmd "$out" r16 "$db" qmagic "$DATA/tc.dl" tc -a bf 1
     run_cmd "$out" r17 "$db" pattern edge "^[12]$"
     run_cmd "$out" r18 "$db" vsearch "q" --sig "$QSIG" --ivec "$QIVEC" --k 10 --radius 16
     run_cmd "$out" r19 "$db" vhybrid "red" "q" --sig "$QSIG" --ivec "$QIVEC"
