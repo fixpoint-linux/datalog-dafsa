@@ -3,6 +3,36 @@
 All notable changes to this project are documented in this file.
 
 ## [Unreleased]
+- **The browser playground and its stale prebuilt WebAssembly bundles DELETED**
+  (2026-10-18): `docs/playground.wasm` and `docs/dl-lsp.wasm` were committed
+  emscripten builds of the OLD C engine (dated Aug 17). They were already
+  wrong — they still embedded the magic/topdown/analyze machinery this tree no
+  longer has — and there is no emscripten on this host to rebuild them.
+  Shipping a page that runs a stale engine is worse than not shipping the page:
+  - deleted the bundles and their glue: `docs/playground.wasm`,
+    `docs/dl-lsp.wasm`, `docs/playground.js`, `docs/playground-ui.js`,
+    `docs/dl-lsp.js`, `docs/playground.html`; the `<datalog-playground>`
+    custom element `shell/mfe/playground-element.js`; and the route template
+    `shell/templates/dafsa-playground.html`;
+  - `scripts/ssg.mjs` lost the `dafsa-playground` import-map entry, the
+    playground-asset copy loop and the CodeMirror copy (its only consumer was
+    the deleted page); `Dhakefile.dhall` lost the playground template/asset
+    dependencies (including the already-missing
+    `shell/mfe/dafsa-playground.js`). The CodeMirror files under
+    `docs/vendor/` remain on disk, now unused;
+  - site wiring: the `dafsa-playground` slot/route in
+    `shell/pages.js`, `shell/shell.js` and `shell/index.html`, and the
+    `playground-element.js` import in `shell/mfe/dafsa-page.js`;
+  - the Elm app lost the `Playground` page variant, its route case, its nav
+    link and view, and the landing hero "Open the Playground" CTA
+    (`src/Main.elm`);
+  - `docs/index.html` lost the "Try it right here" CTA banner;
+    `docs/README.md` lost its playground asset bullets and the whole
+    "The playground" section. `docs/style.css` keeps the now-unused
+    playground/CTA rules. The native LSP server (`dl-lsp`) is unaffected —
+    only its WebAssembly build is gone;
+  - comments that named the browser playground were corrected, not the code:
+    `src/parser.h`, `zig/src/parser.zig`.
 - **The `dlp` typed-database-project tool DELETED** (2026-10-18): it is outside
   the kept scope (store + rules + fixpoint + WFS + the `dl` CLI + regex + the
   search tiers) — a separate Dhall-driven project tool layered on the engine —

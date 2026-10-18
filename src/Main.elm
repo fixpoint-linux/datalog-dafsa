@@ -8,7 +8,6 @@ import Browser
 import Fixpoint.Callout
 import Fixpoint.Checks
 import Fixpoint.Code
-import Fixpoint.Cta
 import Fixpoint.Footer
 import Fixpoint.Headline
 import Fixpoint.Hero
@@ -31,7 +30,7 @@ main =
 
 type alias Flags = { pathname : String }
 
-type Page = Landing | Language | Cli | Api | Architecture | TimeTravel | VectorSearch | OrderStatistics | Playground
+type Page = Landing | Language | Cli | Api | Architecture | TimeTravel | VectorSearch | OrderStatistics
 
 type alias Model = Page
 
@@ -76,7 +75,6 @@ parsePage path =
         "time-travel" -> TimeTravel
         "vector-search" -> VectorSearch
         "order-statistics" -> OrderStatistics
-        "playground" -> Playground
         _ -> Landing
 
 
@@ -108,8 +106,7 @@ navView =
             , a [ href "https://fixpointlinux.org/datalog-dafsa/order-statistics/", attribute "data-mfe-route" "/datalog-dafsa/order-statistics" ] [ text "Order Stats" ]
             ]
         , extra =
-            [ a [ class "home", href "https://fixpointlinux.org/datalog-dafsa/playground/", attribute "data-mfe-route" "/datalog-dafsa/playground" ] [ text "Playground" ]
-            , a [ class "home", href "https://fixpointlinux.org/", attribute "data-mfe-route" "/" ]
+            [ a [ class "home", href "https://fixpointlinux.org/", attribute "data-mfe-route" "/" ]
                 [ text "fixpoint-linux" ]
             ]
         }
@@ -126,7 +123,6 @@ pageView model =
         TimeTravel -> timeTravelView
         VectorSearch -> vectorSearchView
         OrderStatistics -> orderStatisticsView
-        Playground -> playgroundView
 
 
 footerView : Html Msg
@@ -171,15 +167,6 @@ landingView =
                     , strong [] [ text "time travel is a first-class feature" ]
                     , text ", not an afterthought."
                     ]
-                , Fixpoint.Cta.view
-                    { body =
-                        [ strong [] [ text "Try it right here" ]
-                        , text " — the real engine, compiled to WebAssembly, runs in your browser. No setup, no server."
-                        ]
-                    , href = "https://fixpointlinux.org/datalog-dafsa/playground/"
-                    , label = "Open the Playground →"
-                    , attrs = [ attribute "data-mfe-route" "/datalog-dafsa/playground" ]
-                    }
                 , p []
                     [ text "Every "
                     , Fixpoint.Code.inline "dl_publish_snapshot"
@@ -2384,172 +2371,3 @@ orderStatisticsView =
             }
         ]
 
-
-playgroundView : Html Msg
-playgroundView =
-    div []
-        [ Fixpoint.Hero.view
-            { prompt =
-                [ Fixpoint.Hero.hash
-                , text " datalog-dafsa "
-                , Fixpoint.Hero.dollar
-                , text " dl query 'tc(X,Y) :- edge(X,Y).' tc"
-                , Fixpoint.Hero.blink
-                ]
-            , title = [ text "Playground" ]
-            , tagline = []
-            }
-        , Fixpoint.Section.view
-            { id = "playground"
-            , title = "Playground"
-            , hint = "// the real engine, in your browser"
-            , children =
-                [ p []
-                    [ text "Type Datalog facts and rules below and hit "
-                    , strong [] [ text "Run" ]
-                    , text ". The program is evaluated "
-                    , em [] [ text "entirely in your browser" ]
-                    , text " by the real C engine, compiled to WebAssembly -- no server, no filesystem. The goal relation's tuples are streamed back as plain text."
-                    ]
-                , Html.node "datalog-playground" [] []
-                ]
-            }
-        , Fixpoint.Section.view
-            { id = "supported-subset"
-            , title = "Supported subset"
-            , hint = "// the in-memory feature set"
-            , children =
-                [ p []
-                    [ text "The in-browser engine supports the "
-                    , em [] [ text "in-memory" ]
-                    , text " feature set of the language:"
-                    ]
-                , ul []
-                    [ li []
-                        [ strong [] [ text "Facts" ]
-                        , text " -- bare lowercase symbols, double-quoted strings, integers, and "
-                        , em [] [ text "flat" ]
-                        , text " list literals (elements are single values; nested lists are not yet accepted in a fact)."
-                        ]
-                    , li []
-                        [ strong [] [ text "Rules" ]
-                        , text " -- including recursion (semi-naive fixpoint), stratified negation ("
-                        , code [] [ text "!q(X)" ]
-                        , text "), and conjunctions."
-                        ]
-                    , li []
-                        [ strong [] [ text "Aggregates" ]
-                        , text " -- "
-                        , code [] [ text "count()" ]
-                        , text ", "
-                        , code [] [ text "sum()" ]
-                        , text ", "
-                        , code [] [ text "min()" ]
-                        , text ", "
-                        , code [] [ text "max()" ]
-                        , text "."
-                        ]
-                    , li []
-                        [ strong [] [ text "Equality and comparisons" ]
-                        , text " -- "
-                        , code [] [ text "=" ]
-                        , text ", "
-                        , code [] [ text "<" ]
-                        , text " "
-                        , code [] [ text "<=" ]
-                        , text " "
-                        , code [] [ text ">" ]
-                        , text " "
-                        , code [] [ text ">=" ]
-                        , text " "
-                        , code [] [ text "!=" ]
-                        , text "."
-                        ]
-                    , li []
-                        [ strong [] [ text "Arithmetic" ]
-                        , text " -- "
-                        , code [] [ text "+" ]
-                        , text " "
-                        , code [] [ text "-" ]
-                        , text " "
-                        , code [] [ text "*" ]
-                        , text " "
-                        , code [] [ text "/" ]
-                        , text " "
-                        , code [] [ text "%" ]
-                        , text "."
-                        ]
-                    , li []
-                        [ strong [] [ text "Strings" ]
-                        , text " -- "
-                        , code [] [ text "concat" ]
-                        , text ", "
-                        , code [] [ text "length" ]
-                        , text ", "
-                        , code [] [ text "lower" ]
-                        , text ", "
-                        , code [] [ text "upper" ]
-                        , text ", "
-                        , code [] [ text "prefix" ]
-                        , text ", "
-                        , code [] [ text "suffix" ]
-                        , text ", "
-                        , code [] [ text "contains" ]
-                        , text "."
-                        ]
-                    , li []
-                        [ strong [] [ text "Lists" ]
-                        , text " -- "
-                        , code [] [ text "cons" ]
-                        , text ", "
-                        , code [] [ text "car" ]
-                        , text ", "
-                        , code [] [ text "cdr" ]
-                        , text ", "
-                        , code [] [ text "append" ]
-                        , text ", "
-                        , code [] [ text "member" ]
-                        , text ", "
-                        , code [] [ text "[X|Xs]" ]
-                        , text " patterns."
-                        ]
-                    , li []
-                        [ strong [] [ text "Range predicate" ]
-                        , text " -- "
-                        , code [] [ text "range(X, Rel, Lo, Hi)" ]
-                        , text "."
-                        ]
-                    , li []
-                        [ strong [] [ text "Regex pattern walks" ]
-                        , text " -- the "
-                        , code [] [ text "~ '...'" ]
-                        , text " form."
-                        ]
-                ]
-                ]
-            }
-        , div [ class "wrap" ]
-            [ Fixpoint.Callout.warn
-                [ text "Not supported in the browser: "
-                , code [] [ text "publish" ]
-                , text "/snapshot, time-travel (as-of) queries, variadic relations, and the WAL / incremental-maintenance API -- all of which require the disk-backed engine."
-                ]
-            , Fixpoint.Callout.note
-                [ text "Rendering caveat: the engine uses the CLI's value heuristic, so a raw integer result (including one inside a list literal) that happens to equal a small symbol id can display as that symbol instead of the number. This is the documented B6 int-vs-symbol collision -- a display heuristic, not a bug. Examples above use integer data to stay unambiguous."
-                ]
-            ]
-        , Fixpoint.Section.view
-            { id = "rebuild"
-            , title = "Rebuild"
-            , hint = "// make wasm"
-            , children =
-                [ p []
-                    [ text "The WebAssembly bundle is rebuilt from the C source with "
-                    , code [] [ text "make wasm" ]
-                    , text "; see "
-                    , a [ href "https://github.com/fixpoint-linux/datalog-dafsa" ] [ text "the repo" ]
-                    , text " for details."
-                    ]
-                ]
-            }
-        ]

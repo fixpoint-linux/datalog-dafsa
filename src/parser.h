@@ -116,7 +116,7 @@ parser *parse_create(const char *source);
 
 /* Create a parser that does NOT free itself on a lexer error, so the caller
  * can read the error position via parse_last_error().  Otherwise identical to
- * parse_create() (source copied).  LSP-only: the CLI/playground use
+ * parse_create() (source copied).  LSP-only: the CLI uses
  * parse_create() whose behaviour is unchanged. */
 parser *parse_create_reporting(const char *source);
 

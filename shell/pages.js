@@ -3,7 +3,7 @@
 // Single source of truth for all routes, templates, slots, and output paths.
 // Imported by both shell/shell.js (browser ESM) and scripts/ssg.mjs (Node ESM).
 //
-// CANONICAL ROUTE TABLE (10 dafsa pages):
+// CANONICAL ROUTE TABLE (8 dafsa pages):
 //   '/datalog-dafsa'              → template 'dafsa-landing'
 //   '/datalog-dafsa/language'     → template 'dafsa-language'
 //   '/datalog-dafsa/cli'          → template 'dafsa-cli'
@@ -12,12 +12,10 @@
 //   '/datalog-dafsa/time-travel'  → template 'dafsa-time-travel'
 //   '/datalog-dafsa/vector-search' → template 'dafsa-vector-search'
 //   '/datalog-dafsa/order-statistics' → template 'dafsa-order-statistics'
-//   '/datalog-dafsa/playground'  → template 'dafsa-playground'
 //
 // SLOT NAME == TEMPLATE NAME for all dafsa pages.
 // The landing page's `dir` is '' so its output is dist/index.html.
 // All other content pages have dir == slug, output to dist/<slug>/index.html.
-// The playground is NOT Elm-rendered (WASM + CodeMirror), so it's type 'playground'.
 // The cross-nav home route '/' → 'fixpoint' is handled separately (main site owns
 // /shell/templates/fixpoint.html and the importmap key 'fixpoint-landing').
 
@@ -94,18 +92,9 @@ export const PAGES = [
     title: 'Order Statistics — datalog-dafsa',
     type: 'content',
   },
-  {
-    slug: 'playground',
-    path: '/datalog-dafsa/playground',
-    slot: 'dafsa-playground',
-    template: 'dafsa-playground',
-    dir: 'playground',
-    title: 'Playground — datalog-dafsa',
-    type: 'content',
-  },
 ];
 
-// All content pages (Elm-rendered) — excludes playground
+// All content pages (Elm-rendered)
 export const CONTENT_PAGES = PAGES.filter((p) => p.type === 'content');
 
 // Just the dafsa pages (all of them)

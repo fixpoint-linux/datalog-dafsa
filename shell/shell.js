@@ -1,6 +1,6 @@
 // shell/shell.js — @mfe/framework thin-shell entry for datalog-dafsa MFE site.
 //
-// Boots the datalog-dafsa docs app with 11 routes:
+// Boots the datalog-dafsa docs app with 9 routes:
 //   '/'                    → template 'fixpoint'        (cross-nav home, main site)
 //   '/datalog-dafsa'       → template 'dafsa-landing'
 //   '/datalog-dafsa/language'     → template 'dafsa-language'
@@ -10,7 +10,6 @@
 //   '/datalog-dafsa/time-travel' → template 'dafsa-time-travel'
 //   '/datalog-dafsa/vector-search' → template 'dafsa-vector-search'
 //   '/datalog-dafsa/order-statistics' → template 'dafsa-order-statistics'
-//   '/datalog-dafsa/playground' → template 'dafsa-playground'
 //
 // Matching the main site means a data-mfe-route like '/datalog-dafsa' or '/'
 // resolves the same way on either page, so cross-site MFE nav links agree.
@@ -20,8 +19,7 @@
 // place instead of wiping it and re-fetching the template on first paint.
 //
 // Rehydrate only when the current pathname (trailing-slash-stripped) matches
-// a pre-rendered dafsa page (i.e. starts with /datalog-dafsa and is NOT
-// /datalog-dafsa/playground, since playground isn't pre-rendered).
+// a pre-rendered dafsa page (i.e. starts with /datalog-dafsa).
 
 import { createApp } from '@mfe/framework';
 
@@ -37,19 +35,17 @@ const app = await createApp({
     { path: '/datalog-dafsa/time-travel', template: 'dafsa-time-travel', name: 'dafsa-time-travel' },
     { path: '/datalog-dafsa/vector-search', template: 'dafsa-vector-search', name: 'dafsa-vector-search' },
     { path: '/datalog-dafsa/order-statistics', template: 'dafsa-order-statistics', name: 'dafsa-order-statistics' },
-    { path: '/datalog-dafsa/playground', template: 'dafsa-playground', name: 'dafsa-playground' },
   ],
   basePath: '/',
   // dafsa's templates are served from /datalog-dafsa/shell/templates
   // (the main site owns /shell/templates). Pin the baseURL here so both route
   // templates resolve under this site's shell regardless of the deep-link subpath.
   baseURL: '/datalog-dafsa/shell/templates',
-  // The SSG output pre-renders all content pages except playground.
+  // The SSG output pre-renders every dafsa content page.
   // Rehydrate only when the current pathname matches a pre-rendered route.
   ssr: (() => {
     const path = (window.location.pathname.replace(/\/+$/, '') || '/');
-    // Pre-rendered: all dafsa routes EXCEPT playground
-    return path.startsWith('/datalog-dafsa') && path !== '/datalog-dafsa/playground';
+    return path.startsWith('/datalog-dafsa');
   })(),
 });
 

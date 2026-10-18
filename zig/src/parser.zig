@@ -1473,7 +1473,7 @@ export fn parse_create(source: ?[*:0]const u8) ?*parser {
 
 /// LSP-only variant: identical to parse_create() EXCEPT that a lexer error does
 /// NOT free the parser — it is returned so the caller can read the error
-/// position via parse_last_error() before freeing it.  The CLI/playground keep
+/// position via parse_last_error() before freeing it.  The CLI keeps
 /// using parse_create(), whose observable behaviour is unchanged.
 export fn parse_create_reporting(source: ?[*:0]const u8) ?*parser {
     const src = source orelse return null;

@@ -17,32 +17,9 @@ This directory is a static, dependency-free documentation site for the
 - `vector-search.html` — the semantic vector-search tier (MIH-over-ITQ,
   `dl vsearch`/`dl vhybrid`, pre-quantized vectors from an external encoder,
   in-store int8 re-rank).
-- `playground.html` — an interactive in-browser evaluator (WebAssembly).
-- `playground-ui.js` — the committed page glue + wasm bridge (loaded by
-  `playground.html` after the factory).
-- `playground.js` / `playground.wasm` — the compiled emscripten bundle
-  (committed; no build step at deploy time).
-- `style.css` — the shared theme (plus the playground's controls).
+- `style.css` — the shared theme.
 
 All navigation is plain relative links; there is no build step.
-
-## The playground
-
-`playground.html` runs the real C engine — compiled to WebAssembly — entirely
-in the browser. It uses a **CodeMirror editor**: type facts + rules, pick a
-goal relation, and press **Run**; the engine evaluates the program in memory
-and streams the result. As you type, the editor shows **live diagnostics** and
-**hover** from the real LSP server compiled to WebAssembly (`docs/dl-lsp.js`),
-so syntax and compile errors are underlined inline. The supported subset is the
-in-memory feature set (facts, rules/recursion, stratified negation, aggregates,
-arithmetic, comparisons, strings, lists, the range predicate, regex walks);
-disk-backed features (publish/snapshot, time-travel, variadic relations, the
-WAL/incremental-maintenance API) are not available in the browser. See the
-"Supported subset" section on the page for the honest list, including the
-int-vs-symbol rendering caveat.
-
-The WebAssembly bundle (`docs/playground.js`/`.wasm` + `docs/dl-lsp.js`/
-`.wasm`) is committed prebuilt, so the Pages site needs no build toolchain.
 
 ## Language Server (IDE support)
 

@@ -95,17 +95,8 @@ in  { targets =
                   , "shell/templates/dafsa-time-travel.html"
                   , "shell/templates/dafsa-vector-search.html"
                   , "shell/templates/dafsa-order-statistics.html"
-                  , "shell/templates/dafsa-playground.html"
                   , "shell/mfe/dafsa-page.js"
-                  , "shell/mfe/dafsa-playground.js"
                   , "scripts/ssg.mjs"
-                  , "docs/playground.js"
-                  , "docs/dl-lsp.js"
-                  , "docs/playground-ui.js"
-                  , "docs/vendor/codemirror.min.js"
-                  , "docs/vendor/codemirror.css"
-                  , "docs/vendor/codemirror-simple.js"
-                  , "docs/vendor/datalog-mode.js"
                   ]
               , phony = False
               , recipe = [ < Shell = "node scripts/ssg.mjs" > ]

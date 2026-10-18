@@ -1,14 +1,5 @@
-// shell/mfe/dafsa-page.js — the datalog-dafsa docs pages (all 9 content pages)
+// shell/mfe/dafsa-page.js — the datalog-dafsa docs pages (all 8 content pages)
 // as ONE @mfe MFE module backed by a single Elm bundle.
-//
-// Nine data-mfe slots (dafsa-landing, dafsa-language, dafsa-cli, dafsa-api,
-// dafsa-architecture, dafsa-time-travel, dafsa-vector-search,
-// dafsa-order-statistics, dafsa-playground) all resolve
-// to THIS module via the import map. The playground slot uses the
-// <datalog-playground> custom element for the interactive editor.
-//
-// Import the custom element module to register <datalog-playground> before Elm renders.
-import './playground-element.js';
 //
 // Eight data-mfe slots (dafsa-landing, dafsa-language, dafsa-cli, dafsa-api,
 // dafsa-architecture, dafsa-time-travel, dafsa-vector-search,
@@ -24,7 +15,7 @@ import './playground-element.js';
 //
 // IMPORTANT (reconcile subtlety — see handoff-dafsa-mfe-plan "KEY CRITICAL
 // FINDING"): @mfe/core's registry is keyed by slot NAME but makeRef is
-// STRUCTURAL, so a shared slot name across the 9 pages would send reconcile
+// STRUCTURAL, so a shared slot name across the 8 pages would send reconcile
 // down its TRANSPLANT + update(prev===next) bail path and show stale content.
 // That is why each page has its OWN slot name — reconcile then performs a clean
 // NEW mount + Pass-2 unmount of the previous slot on cross-page nav.

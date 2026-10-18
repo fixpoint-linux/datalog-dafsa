@@ -2,7 +2,7 @@
 /**
  * scripts/ssg.mjs — static-site-generator build step for the datalog-dafsa docs site.
  *
- * Multi-route SSG: pre-renders EACH of the 9 content pages to its own
+ * Multi-route SSG: pre-renders EACH of the 8 content pages to its own
  * dist/<dir>/index.html so deep-links + no-JS/SEO work under Caddy static hosting.
  *
  * Pipeline:
@@ -15,20 +15,14 @@
  *       to globalThis, so `Elm` lands on `globalThis.Elm`. The bundle is loaded
  *       exactly once and reused across all pages — loading it again would hit
  *       Elm's `_Debug_crash(6)` ("name clash") on `_Platform_mergeExportsProd`.
- *   3.  For each content page (from PAGES, now including playground):
+ *   3.  For each content page (from CONTENT_PAGES):
  *         - Creates a detached root `<div>`
  *         - Calls `Elm.Main.init({ node, flags: { pathname: page.path } })`
  *         - Waits for the initial render to flush
  *         - Reads back `node.innerHTML` — the pre-rendered page markup
  *   4.  Wraps the rendered markup in a full HTML document (import map + the
  *       page's template slot) and writes dist/<dir>/index.html.
- *   5.  The playground page is now pre-rendered like other content pages (Elm
- *       renders the hero/sections; the <datalog-playground> custom element is empty
- *       in static HTML and boots client-side).
- *   6.  Copies shell/ to dist/ and vendor/@mfe to dist/vendor/@mfe.
- *   7.  Copies the playground static assets from docs/ to dist/ (emscripten
- *       resolves *.wasm relative to the script's own directory, so they must be
- *       colocated: dist/playground.js + dist/playground.wasm, etc.).
+ *   5.  Copies shell/ to dist/ and vendor/@mfe to dist/vendor/@mfe.
  *
  * The output pages ship with content already present (no-JS / SEO) and all
  * styling inline (the rendered markup carries the `<style>` emitted by
@@ -49,10 +43,9 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, '..');
 const DIST = join(ROOT, 'dist');
 const ELM_BUNDLE = join(DIST, 'elm.js');
-const DOCS_DIR = join(ROOT, 'docs');
 
 // The import map is shared by every generated page. All paths are ABSOLUTE
-// (/datalog-dafsa/...) because the 9 pages live at different URL depths.
+// (/datalog-dafsa/...) because the 8 pages live at different URL depths.
 const IMPORT_MAP = `{
   "imports": {
     "@mfe/core": "/vendor/@mfe/core/index.js",
@@ -65,7 +58,6 @@ const IMPORT_MAP = `{
     "dafsa-time-travel": "/datalog-dafsa/shell/mfe/dafsa-page.js",
     "dafsa-vector-search": "/datalog-dafsa/shell/mfe/dafsa-page.js",
     "dafsa-order-statistics": "/datalog-dafsa/shell/mfe/dafsa-page.js",
-    "dafsa-playground": "/datalog-dafsa/shell/mfe/dafsa-page.js",
     "fixpoint-landing": "/shell/mfe/fixpoint-landing.js"
   }
 }`;
@@ -248,28 +240,6 @@ async function main() {
   if (existsSync(vendorMfeSrc)) {
     log('copying vendor/@mfe to dist/vendor/@mfe ...');
     copyRecursive(vendorMfeSrc, join(DIST, 'vendor', '@mfe'));
-  }
-
-  // Copy the playground static assets. The .wasm files MUST be colocated with
-  // their .js (emscripten currentScript -> scriptDirectory -> locateFile).
-  const playgroundAssets = ['playground.js', 'playground.wasm', 'dl-lsp.js', 'dl-lsp.wasm', 'playground-ui.js'];
-  for (const asset of playgroundAssets) {
-    const src = join(DOCS_DIR, asset);
-    if (existsSync(src)) {
-      cpSync(src, join(DIST, asset));
-      log(`  copied ${asset}`);
-    }
-  }
-
-  // Copy the CodeMirror assets from docs/vendor/ to dist/vendor/.
-  const cmAssets = ['codemirror.min.js', 'codemirror.css', 'codemirror-simple.js', 'datalog-mode.js'];
-  for (const asset of cmAssets) {
-    const src = join(DOCS_DIR, 'vendor', asset);
-    if (existsSync(src)) {
-      mkdirSync(join(DIST, 'vendor'), { recursive: true });
-      cpSync(src, join(DIST, 'vendor', asset));
-      log(`  copied vendor/${asset}`);
-    }
   }
 
   log('SSG complete.');
