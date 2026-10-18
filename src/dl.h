@@ -690,4 +690,9 @@ uint32_t dl_term_cdr(const dl_db *db, uint32_t h);
  * here so the whole public API surface is reachable via dl.h alone. */
 #include "vector.h"
 
+/* Full-text tier (lexical half) query path: tokenize, aux_index_*, dl_search*,
+ * dl_search_ranked* (the partial-match / OR entry point).  Included here for
+ * the same reason as vector.h: one include reaches the whole API. */
+#include "index.h"
+
 #endif /* DL_H */

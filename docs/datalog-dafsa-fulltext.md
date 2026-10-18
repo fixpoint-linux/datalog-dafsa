@@ -2,7 +2,7 @@
 
 **Status:** Implemented. Tier-2 feature. Multi-token / ranked search over free-text observation content, composed **beside** the graph as a word→doc-id DAFSA. The planned regex-on-symbols gives single-term pattern matching; full-text uses a postings index. **This is the *symbolic half* of hybrid retrieval — see `docs/datalog-dafsa-hybrid-search.md`.**
 
-**Design correction (implemented):** The relation store is SET-semantic (DAFSA collapses duplicate keys), so tf-from-duplicate-keys is IMPOSSIBLE. Ranking is based on DISTINCT matched terms per obs_id (more matched → higher). A separate count relation would be needed for true tf ranking (future refinement).
+**Design correction (implemented):** The relation store is SET-semantic (DAFSA collapses duplicate keys), so tf-from-duplicate-keys is IMPOSSIBLE. Ranking is based on DISTINCT matched terms per obs_id (more matched → higher) — a signal that is constant under AND and therefore lives on the ranked/partial-match entry point (`dl_search_ranked`, `min_terms`), see the ranked section. A separate count relation would be needed for true tf ranking (future refinement).
 
 ## TL;DR
 
@@ -42,7 +42,7 @@ long dl_search(dl_db *db, const char **terms, int n_terms,
 
 - For each term, prefix-enum/lookup `postings` → a per-term obs_id set.
 - **Multi-token AND** = intersect the per-term sets (smallest-first).
-- **Ranking**: term frequency (how many times term appears, from duplicate postings keys) and/or doc-frequency inverse weighting. Start with a simple score (sum of tf) and note IDF as a later refinement.
+- **Ranking**: score = number of DISTINCT matched query terms (see "Ranked / partial-match retrieval" below — tf is impossible on the SET-semantic store, and under pure AND this signal cannot vary, which is why the OR entry point exists).
 
 ### CLI
 
@@ -87,10 +87,63 @@ dl search 'hello world' --version 1  # Search as-of snapshot version 1
 dl search 'hello' --version 2 --top 5  # Top-5 results as-of version 2
 ```
 
+## Ranked / partial-match retrieval (OR)
+
+**Status:** Implemented (`zig/src/index.zig`, `src/index.h`). Item 4 of
+`search-plan.md` §6.
+
+Under pure AND the score could never vary: `score = n_terms` for every result by
+definition (`index.zig` assigned exactly that), so IDF, tf and positions were
+all moot. The ranking becomes live only once retrieval admits PARTIAL matches,
+so it lives in a **separate** entry point — `dl_search` / `dl_search_top` /
+`dl_search_version` keep their AND semantics untouched.
+
+```c
+/* A document is a result iff it matches >= min_terms of the query terms;
+ * score = number of DISTINCT query terms it matched. */
+long dl_search_ranked(dl_db *db, const uint32_t *terms, int n_terms, int min_terms,
+                      dl_search_cb cb, void *user);
+int  dl_search_ranked_top(dl_db *db, const uint32_t *terms, int n_terms, int min_terms,
+                          uint32_t *obs_ids_out, int *scores_out, int limit);
+```
+
+- `min_terms == n_terms` **is** the AND path: it delegates to the same
+  intersect/rank/emit body, so the result set, the scores and the emission order
+  are identical to `dl_search`'s on the same fixture, and the AND path keeps its
+  cost.
+- `min_terms == 1` is pure OR.
+- Order: score descending, then **obs_id ascending** as an explicit tie-break
+  (never std.mem.sort's stability).
+- `min_terms > n_terms` and `min_terms <= 0` are **rejected** (`-1`), not
+  silently emptied.
+- Counting reuses the IntSet posting machinery (insertion-ordered array + O(1)
+  membership index) and adds no membership scan: one u64 per posting, packed
+  `(obs_id << 32) | distinct_term_rank`, sorted — the sort groups each obs_id
+  with its ranks, and one linear pass over the groups yields the distinct count.
+- **IDF is deliberately NOT in the score.** The ingredients are enumerated (each
+  term's posting-set size is known before counting), but log-idf weights are
+  fractional: packing a fixed-point scale into the `int` score would be fake
+  precision, not a ranking. A caller who wants rarity ranks on it as a separate
+  axis. tf stays impossible (SET-semantic store); positions stay out (3x storage
+  for a signal that cannot vary within one term's own posting set).
+- MEASURED (ReleaseFast, 20,000 postings / 3 terms): `dl_search_ranked_top`
+  `min_terms=2` **1.19-1.22 ms**, `min_terms=1` 1.15-1.17 ms, vs `dl_search_top`
+  AND 1.06-1.07 ms — the same build measured on the pre-change tree gives
+  1.06-1.33 ms, i.e. the AND cost is unchanged.
+
+CLI (AND stays the default; `--min-terms` opts into OR):
+
+```bash
+dl search 'alpha beta gamma'              # AND, unchanged
+dl search 'alpha beta gamma' --min-terms 2  # partial match, ranked
+```
+`--min-terms` has no version-aware form and is rejected together with
+`--version`.
+
 ## Honest ceiling
 
 - This is a **second store** (postings DAFSA) beside the graph — not "full-text in the relation encoding." That's the correct boundary, not a compromise.
-- Ranking is simple (tf) to start; IDF/positional ranking is a later refinement. "Good enough" for finding content beats the O(len) `contains` scan.
+- Ranking is the DISTINCT matched-term count, and it only varies on the OR path (`dl_search_ranked`); IDF would need a fractional weight and is not in the `int` score (see the ranked section). Positions are a later refinement, and only if phrase/proximity search is added. "Good enough" for finding content beats the O(len) `contains` scan.
 - Tokenization quality bounds result quality — reuse/port `jing_meta/text.py` behavior to keep parity with the existing indexer.
 - No relevance snippet generation in-engine (the MCP can render snippets from the matched observations).
 

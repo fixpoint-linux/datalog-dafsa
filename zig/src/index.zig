@@ -300,6 +300,69 @@ fn collectTermObsIdsVersion(db: ?*dl.DlDb, version: u32, term_sym: u32, set: *In
     return 0;
 }
 
+/// One IntSet per query term — the collector shared by the AND path
+/// (searchImpl) and the ranked/partial path (searchRankedImpl) so there is
+/// exactly ONE place where a per-term collection failure is cleaned up.
+const TermSets = struct {
+    raw: [*]?*IntSet, // calloc'd `n` slots, every entry non-null on success
+    n: usize,
+
+    fn arr(self: TermSets) [*]*IntSet {
+        return @ptrCast(self.raw);
+    }
+
+    fn freeAll(self: TermSets) void {
+        freeTermSetsPartial(self.raw, self.n);
+    }
+};
+
+/// Free the first `n_init` slots of a calloc'd set array plus the array itself.
+fn freeTermSetsPartial(sets: [*]?*IntSet, n_init: usize) void {
+    var j: usize = 0;
+    while (j < n_init) : (j += 1) {
+        intSetFree(sets[j].?);
+        c.free(@ptrCast(sets[j]));
+    }
+    c.free(@ptrCast(sets));
+}
+
+/// Collect one obs_id set per query term with the read primitive the caller's
+/// mode requires (LIVE dl_prefix, or as-of-version dl_query_bound_version).
+/// Returns NULL on a genuine error (missing postings relation / OOM / relation
+/// absent from that version / version==0-nonexistent) with everything already
+/// freed.  An ABSENT term is not an error: it yields an empty set.
+fn collectTermSets(
+    db: ?*dl.DlDb,
+    version: u32,
+    use_version: bool,
+    terms: [*]const u32,
+    n_terms: usize,
+) ?TermSets {
+    const sets_raw = c.calloc(n_terms, @sizeOf(?*IntSet)) orelse return null;
+    const sets: [*]?*IntSet = @ptrCast(@alignCast(sets_raw));
+
+    var i: usize = 0;
+    while (i < n_terms) : (i += 1) {
+        const slot: *IntSet = @ptrCast(@alignCast(c.malloc(@sizeOf(IntSet)) orelse {
+            freeTermSetsPartial(sets, i);
+            return null;
+        }));
+        sets[i] = slot;
+        slot.* = .{};
+
+        const rc = if (use_version)
+            collectTermObsIdsVersion(db, version, terms[i], slot)
+        else
+            collectTermObsIds(db, terms[i], slot);
+        if (rc < 0) {
+            freeTermSetsPartial(sets, i + 1);
+            return null;
+        }
+    }
+
+    return .{ .raw = sets, .n = n_terms };
+}
+
 /// Intersect multiple obs_id sets using smallest-first strategy.
 /// Returns a new set containing the intersection, or NULL on OOM.
 fn intSetIntersect(sets: [*]*IntSet, n_sets: usize) ?*IntSet {
@@ -399,75 +462,32 @@ fn searchImpl(
     cb: DlSearchCb,
     user: ?*anyopaque,
 ) c_long {
-    // Collect obs_id sets for each term
-    const sets_raw = c.calloc(@intCast(n_terms), @sizeOf(?*IntSet)) orelse return -1;
-    const sets: [*]?*IntSet = @ptrCast(@alignCast(sets_raw));
+    const n: usize = @intCast(n_terms);
 
-    var i: usize = 0;
-    var collect_err = false;
-    var all_empty = true;
-    while (i < @as(usize, @intCast(n_terms))) : (i += 1) {
-        sets[i] = @ptrCast(@alignCast(c.malloc(@sizeOf(IntSet))));
-        if (sets[i] == null) {
-            var j: usize = 0;
-            while (j < i) : (j += 1) {
-                intSetFree(sets[j].?);
-                c.free(sets[j]);
-            }
-            c.free(sets_raw);
-            return -1;
-        }
-        sets[i].?.* = .{};
-
-        // collect_term_obs_ids[_version] returns 0 for an ABSENT term (empty
-        // set, valid) and -1 for a genuine error (missing postings relation /
-        // OOM / relation absent from that version / version==0-nonexistent).
-        // A genuine error must NOT be treated as "0 results".
-        const rc = if (use_version)
-            collectTermObsIdsVersion(db, version, terms.?[i], sets[i].?)
-        else
-            collectTermObsIds(db, terms.?[i], sets[i].?);
-        if (rc < 0) {
-            collect_err = true;
-            break;
-        }
-        if (sets[i].?.count > 0)
-            all_empty = false;
-    }
-
-    if (collect_err) {
-        var j: usize = 0;
-        while (j <= i) : (j += 1) {
-            intSetFree(sets[j].?);
-            c.free(sets[j]);
-        }
-        c.free(sets_raw);
-        return -1;
-    }
+    // Collect obs_id sets for each term.  A per-term collection failure
+    // (missing postings relation / OOM / relation absent from that version /
+    // version==0-nonexistent) is an ERROR here, never "0 results"; an absent
+    // term is a valid EMPTY set.
+    const ts = collectTermSets(db, version, use_version, terms.?, n) orelse return -1;
 
     // If any term has no postings, the AND is empty
+    var all_empty = true;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        if (ts.raw[i].?.count > 0)
+            all_empty = false;
+    }
     if (all_empty) {
-        i = 0;
-        while (i < @as(usize, @intCast(n_terms))) : (i += 1) {
-            intSetFree(sets[i].?);
-            c.free(sets[i]);
-        }
-        c.free(sets_raw);
+        ts.freeAll();
         return 0;
     }
 
     // Intersect all sets — alias the same array as non-optional pointers
     // (every entry is non-null here).
-    const sets_arr: [*]*IntSet = @ptrCast(sets);
-    const intersection = intSetIntersect(sets_arr, @intCast(n_terms));
+    const intersection = intSetIntersect(ts.arr(), n);
 
     // Free the individual sets
-    i = 0;
-    while (i < @as(usize, @intCast(n_terms))) : (i += 1) {
-        intSetFree(sets[i].?);
-        c.free(sets[i]);
-    }
-    c.free(sets_raw);
+    ts.freeAll();
 
     if (intersection == null)
         return -1;
@@ -519,6 +539,117 @@ fn searchImpl(
     return emitted;
 }
 
+/// Ranked (partial-match) sort order: score descending, then obs_id ASCENDING.
+/// The explicit tie-break makes the emitted order a total order on
+/// (obs_id, score) — it never depends on std.mem.sort's stability.
+fn rankedResultLt(_: void, a: ScoredResult, b: ScoredResult) bool {
+    if (a.score != b.score) return a.score > b.score; // descending
+    return a.obs_id < b.obs_id; // ascending, deterministic
+}
+
+/// Body of dl_search_ranked for min_terms < n_terms: partial / OR retrieval.
+///
+/// A document is a result iff it appears in at least `min_terms` of the query
+/// terms' posting sets; its score is the number of DISTINCT query terms it
+/// matched, i.e. the honest integer 1..n_terms.
+///
+/// Counting: one u64 per posting, packed (obs_id << 32) | distinct_term_rank,
+/// sorted ascending — the sort groups every obs_id with its ranks in ascending
+/// order, so a single linear pass over the groups yields the distinct
+/// matched-term count.  That is O(T log T) in the total posting count T, with
+/// NO membership probe at all: in particular it does not reintroduce the linear
+/// scan the AND path's IntSet was fixed to remove, and it avoids a third hash
+/// map type that would have to carry key -> count values.
+fn searchRankedImpl(
+    db: ?*dl.DlDb,
+    terms: [*]const u32,
+    n_terms: usize,
+    min_terms: usize,
+    cb: DlSearchCb,
+    user: ?*anyopaque,
+) c_long {
+    const ts = collectTermSets(db, 0, false, terms, n_terms) orelse return -1;
+    defer ts.freeAll();
+
+    // Per-position distinct-term rank: a caller that repeats a term sym must
+    // not have that document's score inflated, so equal syms share one rank.
+    const ranks: [*]u32 = @ptrCast(@alignCast(c.malloc(n_terms * @sizeOf(u32)) orelse return -1));
+    defer c.free(@ptrCast(ranks));
+
+    var n_ranks: u32 = 0;
+    var i: usize = 0;
+    while (i < n_terms) : (i += 1) {
+        var r: u32 = n_ranks;
+        var j: usize = 0;
+        while (j < i) : (j += 1) {
+            if (terms[j] == terms[i]) {
+                r = ranks[j];
+                break;
+            }
+        }
+        if (r == n_ranks) n_ranks += 1;
+        ranks[i] = r;
+    }
+
+    var total: usize = 0;
+    i = 0;
+    while (i < n_terms) : (i += 1) total += ts.raw[i].?.count;
+    if (total == 0) return 0;
+
+    const pk_all = c.malloc(total * @sizeOf(u64)) orelse return -1;
+    const pk: [*]u64 = @ptrCast(@alignCast(pk_all));
+    defer c.free(pk_all);
+
+    var k: usize = 0;
+    i = 0;
+    while (i < n_terms) : (i += 1) {
+        const s = ts.raw[i].?;
+        var e: usize = 0;
+        while (e < s.count) : (e += 1) {
+            pk[k] = (@as(u64, s.data.?[e]) << 32) | @as(u64, ranks[i]);
+            k += 1;
+        }
+    }
+
+    std.mem.sort(u64, pk[0..total], {}, std.sort.asc(u64));
+
+    // Every obs_id appears at least once, so `total` slots always suffice.
+    const results_all = c.malloc(total * @sizeOf(ScoredResult)) orelse return -1;
+    const results: [*]ScoredResult = @ptrCast(@alignCast(results_all));
+    defer c.free(results_all);
+
+    var n_res: usize = 0;
+    var p: usize = 0;
+    while (p < total) {
+        const obs_id: u32 = @truncate(pk[p] >> 32);
+        var matched: c_int = 0;
+        var prev_rank: u64 = ~@as(u64, 0);
+        while (p < total and @as(u32, @truncate(pk[p] >> 32)) == obs_id) : (p += 1) {
+            const r = pk[p] & 0xFFFF_FFFF;
+            if (r != prev_rank) {
+                matched += 1;
+                prev_rank = r;
+            }
+        }
+        if (@as(usize, @intCast(matched)) >= min_terms) {
+            results[n_res] = .{ .obs_id = obs_id, .score = matched };
+            n_res += 1;
+        }
+    }
+
+    std.mem.sort(ScoredResult, results[0..n_res], {}, rankedResultLt);
+
+    // Count before invoking the cb (same early-stop semantics as dl_search).
+    var emitted: c_long = 0;
+    k = 0;
+    while (k < n_res) : (k += 1) {
+        emitted += 1;
+        if (cb.?(results[k].obs_id, results[k].score, user) != 0)
+            break;
+    }
+    return emitted;
+}
+
 pub export fn dl_search(db: ?*dl.DlDb, terms: ?[*]const u32, n_terms: c_int, cb: DlSearchCb, user: ?*anyopaque) c_long {
     if (db == null or terms == null or n_terms <= 0 or cb == null)
         return -1;
@@ -533,6 +664,82 @@ pub export fn dl_search_top(db: ?*dl.DlDb, terms: ?[*]const u32, n_terms: c_int,
     var ctx = TopCtx{ .obs_ids = obs_ids_out.?, .scores = scores_out.?, .cap = limit, .count = 0 };
 
     const n = dl_search(db, terms, n_terms, topSearchCb, &ctx);
+    if (n < 0) return -1;
+    return ctx.count;
+}
+
+/// Ranked / partial-match (OR) full-text search — the entry point that makes
+/// the tier's ranking able to VARY.
+///
+/// A document is a result iff it matches at least `min_terms` of the query
+/// terms; its score is the number of DISTINCT query terms it matched.  Results
+/// are emitted score-descending with obs_id-ascending as the explicit
+/// tie-break, so the order is fully deterministic.
+///
+/// `min_terms == n_terms` is exactly dl_search's AND retrieval: it delegates to
+/// the SAME intersect/rank/emit body, so the result set, the scores AND the
+/// emission order are identical to dl_search's on the same fixture — and the
+/// AND path keeps its current cost, because the partial-match counting below
+/// runs only when retrieval actually admits partial matches.  `min_terms == 1`
+/// is pure OR.
+///
+/// Score: matched-term count, NOT tf-idf, and deliberately so.  tf is
+/// impossible (the store is SET-semantic, so duplicate postings cannot exist)
+/// and IDF would need fractional per-term weights — i.e. an arbitrary
+/// fixed-point scale packed into this `c_int` field, which is fake precision
+/// rather than a ranking.  The IDF ingredients ARE enumerated here (each
+/// term's posting-set size is known before the first posting is counted), so a
+/// caller may rank on rarity as a separate axis; the honest integer this entry
+/// point reports is the matched count.  Positions stay out on the same grounds
+/// as before: 3x storage for a signal that cannot vary within a term's own
+/// posting set.
+///
+/// Error contract: -1 for NULL db, NULL terms, NULL cb, n_terms <= 0,
+/// min_terms <= 0, min_terms > n_terms (a query cannot match more terms than it
+/// has — rejected as a caller bug rather than silently emptied), or a per-term
+/// read failure.  0 is a valid empty result.
+///
+/// Duplicate sym_ids in terms[] are counted ONCE by the partial-match path (a
+/// repeated term cannot raise a document's score or help it reach min_terms);
+/// the min_terms == n_terms branch keeps dl_search's existing score of n_terms
+/// verbatim.
+pub export fn dl_search_ranked(
+    db: ?*dl.DlDb,
+    terms: ?[*]const u32,
+    n_terms: c_int,
+    min_terms: c_int,
+    cb: DlSearchCb,
+    user: ?*anyopaque,
+) c_long {
+    if (db == null or terms == null or n_terms <= 0 or cb == null)
+        return -1;
+    if (min_terms <= 0 or min_terms > n_terms)
+        return -1;
+
+    if (min_terms == n_terms)
+        return searchImpl(db, 0, false, terms, n_terms, cb, user);
+
+    return searchRankedImpl(db, terms.?, @intCast(n_terms), @intCast(min_terms), cb, user);
+}
+
+/// Convenience: dl_search_ranked with a --top N limit.  Collects up to `limit`
+/// results, already ranked (score desc, obs_id asc), into caller buffers.
+/// Returns the number of results (<= limit), or -1 on error.
+pub export fn dl_search_ranked_top(
+    db: ?*dl.DlDb,
+    terms: ?[*]const u32,
+    n_terms: c_int,
+    min_terms: c_int,
+    obs_ids_out: ?[*]u32,
+    scores_out: ?[*]c_int,
+    limit: c_int,
+) c_int {
+    if (db == null or terms == null or n_terms <= 0 or min_terms <= 0 or obs_ids_out == null or scores_out == null or limit <= 0)
+        return -1;
+
+    var ctx = TopCtx{ .obs_ids = obs_ids_out.?, .scores = scores_out.?, .cap = limit, .count = 0 };
+
+    const n = dl_search_ranked(db, terms, n_terms, min_terms, topSearchCb, &ctx);
     if (n < 0) return -1;
     return ctx.count;
 }
@@ -887,6 +1094,89 @@ test "dl_search: AND-intersect + score = distinct matched terms" {
     try testing.expectEqual(@as(u32, 11), ids[0]);
     try testing.expectEqual(@as(c_int, 2), scores[0]);
     try testing.expectEqual(@as(c_int, -1), dl_search_top(db, &terms, 2, &ids, &scores, 0));
+}
+
+test "dl_search_ranked: partial match, score = matched distinct terms, deterministic order" {
+    const path = "/tmp/datalog_zig_u14_index_ranked";
+    const db = testOpenDb(path);
+    defer testCloseDb(db, path);
+
+    try testing.expectEqual(@as(c_int, 0), aux_index_ensure_postings(db));
+
+    // term 1 -> obs {30, 20, 10}; term 2 -> obs {20, 10}; term 3 -> obs {10}.
+    // Insertion order (30, 20, 10) is deliberately NOT obs_id order, so the
+    // obs_id tie-break cannot pass by accident.
+    try testing.expectEqual(@as(c_int, 1), dl.dl_add_fact(db, POSTINGS_REL_NAME, &[_]u32{ 1, 30 }, 2));
+    try testing.expectEqual(@as(c_int, 1), dl.dl_add_fact(db, POSTINGS_REL_NAME, &[_]u32{ 1, 20 }, 2));
+    try testing.expectEqual(@as(c_int, 1), dl.dl_add_fact(db, POSTINGS_REL_NAME, &[_]u32{ 1, 10 }, 2));
+    try testing.expectEqual(@as(c_int, 1), dl.dl_add_fact(db, POSTINGS_REL_NAME, &[_]u32{ 2, 20 }, 2));
+    try testing.expectEqual(@as(c_int, 1), dl.dl_add_fact(db, POSTINGS_REL_NAME, &[_]u32{ 2, 10 }, 2));
+    try testing.expectEqual(@as(c_int, 1), dl.dl_add_fact(db, POSTINGS_REL_NAME, &[_]u32{ 3, 10 }, 2));
+
+    const terms = [3]u32{ 1, 2, 3 };
+
+    // min_terms = 2 -> obs 10 (matched 3) then obs 20 (matched 2); obs 30 (1) out.
+    var got: std.ArrayList(u64) = .empty;
+    defer got.deinit(testing.allocator);
+    try testing.expectEqual(@as(c_long, 2), dl_search_ranked(db, &terms, 3, 2, collectVecCb, &got));
+    try testing.expectEqual(@as(usize, 2), got.items.len);
+    try testing.expectEqual(@as(u64, 10), got.items[0] >> 32);
+    try testing.expectEqual(@as(u32, 3), @as(u32, @truncate(got.items[0])));
+    try testing.expectEqual(@as(u64, 20), got.items[1] >> 32);
+    try testing.expectEqual(@as(u32, 2), @as(u32, @truncate(got.items[1])));
+
+    // min_terms = 1 is OR: all three, ranked 3, 2, 1.
+    var or_got: std.ArrayList(u64) = .empty;
+    defer or_got.deinit(testing.allocator);
+    try testing.expectEqual(@as(c_long, 3), dl_search_ranked(db, &terms, 3, 1, collectVecCb, &or_got));
+    try testing.expectEqual(@as(usize, 3), or_got.items.len);
+    try testing.expectEqual(@as(u64, 10), or_got.items[0] >> 32);
+    try testing.expectEqual(@as(u32, 3), @as(u32, @truncate(or_got.items[0])));
+    try testing.expectEqual(@as(u64, 20), or_got.items[1] >> 32);
+    try testing.expectEqual(@as(u32, 2), @as(u32, @truncate(or_got.items[1])));
+    try testing.expectEqual(@as(u64, 30), or_got.items[2] >> 32);
+    try testing.expectEqual(@as(u32, 1), @as(u32, @truncate(or_got.items[2])));
+
+    // min_terms == n_terms IS dl_search: identical (obs_id, score) sequence.
+    var ranked_and: std.ArrayList(u64) = .empty;
+    defer ranked_and.deinit(testing.allocator);
+    var plain_and: std.ArrayList(u64) = .empty;
+    defer plain_and.deinit(testing.allocator);
+    try testing.expectEqual(@as(c_long, 1), dl_search_ranked(db, &terms, 3, 3, collectVecCb, &ranked_and));
+    try testing.expectEqual(@as(c_long, 1), dl_search(db, &terms, 3, collectVecCb, &plain_and));
+    try testing.expectEqualSlices(u64, plain_and.items, ranked_and.items);
+
+    // A repeated term sym must not inflate the score: two positions carrying
+    // the same sym count ONCE, and equal scores break ties by obs_id ascending.
+    var dup_got: std.ArrayList(u64) = .empty;
+    defer dup_got.deinit(testing.allocator);
+    const dup_terms = [2]u32{ 1, 1 };
+    try testing.expectEqual(@as(c_long, 3), dl_search_ranked(db, &dup_terms, 2, 1, collectVecCb, &dup_got));
+    try testing.expectEqual(@as(usize, 3), dup_got.items.len);
+    for (dup_got.items, 0..) |item, d| {
+        try testing.expectEqual(@as(u32, 1), @as(u32, @truncate(item)));
+        try testing.expectEqual(@as(u64, 10 + @as(u64, d) * 10), item >> 32);
+    }
+
+    // Error contract: NULL db/terms/cb, n_terms <= 0, min_terms <= 0,
+    // min_terms > n_terms (rejected, not silently emptied).
+    try testing.expectEqual(@as(c_long, -1), dl_search_ranked(null, &terms, 3, 2, collectVecCb, &got));
+    try testing.expectEqual(@as(c_long, -1), dl_search_ranked(db, null, 3, 2, collectVecCb, &got));
+    try testing.expectEqual(@as(c_long, -1), dl_search_ranked(db, &terms, 0, 1, collectVecCb, &got));
+    try testing.expectEqual(@as(c_long, -1), dl_search_ranked(db, &terms, 3, 0, collectVecCb, &got));
+    try testing.expectEqual(@as(c_long, -1), dl_search_ranked(db, &terms, 3, 4, collectVecCb, &got));
+    try testing.expectEqual(@as(c_long, -1), dl_search_ranked(db, &terms, 3, -1, collectVecCb, &got));
+
+    // ranked_top mirrors the contract and truncates at the limit.
+    var ids: [2]u32 = undefined;
+    var scores: [2]c_int = undefined;
+    try testing.expectEqual(@as(c_int, 2), dl_search_ranked_top(db, &terms, 3, 1, &ids, &scores, 2));
+    try testing.expectEqual(@as(u32, 10), ids[0]);
+    try testing.expectEqual(@as(c_int, 3), scores[0]);
+    try testing.expectEqual(@as(u32, 20), ids[1]);
+    try testing.expectEqual(@as(c_int, 2), scores[1]);
+    try testing.expectEqual(@as(c_int, -1), dl_search_ranked_top(db, &terms, 3, 4, &ids, &scores, 2));
+    try testing.expectEqual(@as(c_int, -1), dl_search_ranked_top(db, &terms, 3, 1, &ids, &scores, 0));
 }
 
 test "dl_index_observations: tokenize + intern + txn postings, short-circuit on second call" {

@@ -3,6 +3,44 @@
 All notable changes to this project are documented in this file.
 
 ## [Unreleased]
+- **Ranked / partial-match (`OR`) full-text entry point** (2026-10-18,
+  `search-plan.md` §4(2) / §6 item 4): the full-text tier's ranking stops being
+  structurally dead.
+  - The finding: `index.zig` scored every AND result `n_terms` — and under pure
+    AND "distinct matched terms" *is* `n_terms` by definition, so no score could
+    ever vary. IDF, tf and positions were all moot until retrieval admitted
+    partial matches.
+  - New `dl_search_ranked(db, terms, n_terms, min_terms, cb, user)` +
+    `dl_search_ranked_top` (`src/index.h`, `zig/src/index.zig`): a document is a
+    result iff it matches at least `min_terms` query terms; **score = number of
+    DISTINCT query terms matched**; order is score-descending with obs_id
+    ascending as an explicit tie-break (never `std.mem.sort`'s stability).
+  - `min_terms == n_terms` delegates to the existing intersect/rank/emit body,
+    so the result set, scores *and* order are byte-identical to `dl_search`'s on
+    the same fixture — `dl_search` / `dl_search_top` / `dl_search_version`
+    semantics are untouched (`t_search_and` unchanged). `min_terms == 1` is OR.
+  - `min_terms > n_terms` and `min_terms <= 0` are rejected (`-1`), not
+    silently emptied. Duplicate term syms are counted once.
+  - Counting reuses the IntSet posting machinery (insertion-ordered array +
+    O(1) membership index) with no membership scan: per posting one u64 packed
+    `(obs_id << 32) | distinct_term_rank`, sorted, then one linear pass over the
+    obs_id groups. **IDF is deliberately not in the score** — log-idf weights are
+    fractional, and a fixed-point scale in an `int` field would be fake
+    precision; the per-term set sizes are enumerated and available for a separate
+    rarity axis. tf stays impossible (SET-semantic store); positions stay out.
+  - `dl search '<terms>' --min-terms N` (`zig/src/dl_cli.zig`); AND stays the
+    default, and `--min-terms` is rejected together with `--version` (no
+    version-aware form).
+  - MEASURED (ReleaseFast, 20,000 postings / 3 terms, best of 7):
+    `min_terms=2` **1.19–1.22 ms**, `min_terms=1` 1.15–1.17 ms, AND 1.06–1.07 ms
+    — the pre-change tree measures AND at 1.06–1.33 ms, so the AND path did not
+    regress.
+  - `tests/test_search.c` +4 cases (26 total, all green): the 3/2/1-term
+    fixture ranking, a brute-force cross-check of the whole `(obs_id, score)`
+    sequence at every threshold 1..4, `min_terms == n_terms` identity with
+    `dl_search` element by element, and the contract cases. Asymmetry proven by
+    mutation: a constant score fails 3 of the 4, a reversed obs_id tie-break
+    fails 3 of the 4.
 - **Fuzzy entity-name lookup: a Levenshtein automaton over `symbols.dafsa`**
   (2026-08-11, search-plan.md §2 item 3). Typo-tolerant name matching with
   **zero index storage**: the automaton for `(term, k)` is an ordinary DFA whose

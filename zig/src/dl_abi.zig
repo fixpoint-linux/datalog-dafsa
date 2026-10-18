@@ -367,4 +367,6 @@ pub extern "c" fn token_free(tokens: [*c][*c]u8) void;
 pub extern "c" fn aux_index_ensure_postings(db: [*c]dl_db) c_int;
 pub extern "c" fn dl_search_top(db: [*c]dl_db, terms: [*c]const u32, n_terms: c_int, obs_ids_out: [*c]u32, scores_out: [*c]c_int, limit: c_int) c_int;
 pub extern "c" fn dl_search_top_version(db: [*c]dl_db, version: u32, terms: [*c]const u32, n_terms: c_int, obs_ids_out: [*c]u32, scores_out: [*c]c_int, limit: c_int) c_int;
+pub extern "c" fn dl_search_ranked(db: [*c]dl_db, terms: [*c]const u32, n_terms: c_int, min_terms: c_int, cb: ?*const fn (obs_id: u32, score: c_int, user: ?*anyopaque) callconv(.c) c_int, user: ?*anyopaque) c_long;
+pub extern "c" fn dl_search_ranked_top(db: [*c]dl_db, terms: [*c]const u32, n_terms: c_int, min_terms: c_int, obs_ids_out: [*c]u32, scores_out: [*c]c_int, limit: c_int) c_int;
 pub extern "c" fn dl_index_observations(db: [*c]dl_db) c_long;

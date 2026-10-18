@@ -457,7 +457,7 @@ fn usage(prog: [*:0]const u8) noreturn {
         \\  %s [-d <dir>] traverse <start> [depth] [--max-nodes N]
         \\  %s [-d <dir>] obs <node> [--max-obs N]
         \\  %s [-d <dir>] index
-        \\  %s [-d <dir>] search '<terms>' [--top N] [--version N] (--version 0 = current)
+        \\  %s [-d <dir>] search '<terms>' [--top N] [--version N] [--min-terms N] (--version 0 = current)
         \\  %s [-d <dir>] vsearch '<query>' [--k N] [--version V] [--ivec <hex768>]
         \\  %s [-d <dir>] vhybrid '<terms>' '<query>' [--k N] [--version V] [--ivec <hex768>]
         \\  %s [-d <dir>] versions
@@ -982,6 +982,7 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
 
         var top_n: c_ulong = 10;
         var version: c_ulong = 0; // 0 means live (current)
+        var min_terms: c_ulong = 0; // 0 means AND (dl_search_top)
 
         // Parse optional flags in any order
         while (argp < argv.len) {
@@ -1001,10 +1002,31 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
                     return 1;
                 }
                 argp += 1;
+            } else if (eq(argv[argp], "--min-terms")) {
+                // Partial-match (OR) retrieval: a document is a result iff it
+                // matches at least N of the query terms, ranked by matched-term
+                // count.  Absent flag = today's AND semantics, unchanged.
+                argp += 1;
+                if (argp >= argv.len or !parseU32Strict(argv[argp].ptr, &min_terms) or min_terms < 1 or
+                    min_terms > 0x7FFFFFFF)
+                {
+                    _ = fprintf(stderr, "dl: invalid --min-terms value (must be 1..2147483647)\n");
+                    return 1;
+                }
+                argp += 1;
             } else {
                 _ = fprintf(stderr, "dl: unexpected argument '%s'\n", argv[argp].ptr);
                 return 1;
             }
+        }
+
+        // dl_search_ranked has no version-aware form (a partial-match query
+        // as-of a snapshot would need the per-term collectors' version path
+        // wired through it); reject the combination rather than silently
+        // ignoring one of the two flags.
+        if (min_terms != 0 and version != 0) {
+            _ = fprintf(stderr, "dl: --min-terms cannot be combined with --version\n");
+            return 1;
         }
 
         // Tokenize the search terms
@@ -1060,7 +1082,18 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
         }
 
         var n_results: c_int = undefined;
-        if (version == 0) {
+        if (min_terms != 0) {
+            // Partial-match path: reject a threshold above the term count here
+            // with a specific message (the engine also rejects it with -1).
+            if (min_terms > n_tokens) {
+                _ = fprintf(stderr, "dl: --min-terms %lu exceeds the %lu query terms\n", min_terms, n_tokens);
+                free(term_syms);
+                free(obs_ids);
+                free(scores);
+                return 1;
+            }
+            n_results = c.dl_search_ranked_top(db, syms, @intCast(n_tokens), @intCast(min_terms), @ptrCast(@alignCast(obs_ids.?)), @ptrCast(@alignCast(scores.?)), @intCast(top_n));
+        } else if (version == 0) {
             n_results = c.dl_search_top(db, syms, @intCast(n_tokens), @ptrCast(@alignCast(obs_ids.?)), @ptrCast(@alignCast(scores.?)), @intCast(top_n));
         } else {
             n_results = c.dl_search_top_version(db, @intCast(version), syms, @intCast(n_tokens), @ptrCast(@alignCast(obs_ids.?)), @ptrCast(@alignCast(scores.?)), @intCast(top_n));

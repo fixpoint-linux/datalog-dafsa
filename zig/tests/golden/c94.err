@@ -13,7 +13,7 @@ Usage:
   @PROG@ [-d <dir>] traverse <start> [depth] [--max-nodes N]
   @PROG@ [-d <dir>] obs <node> [--max-obs N]
   @PROG@ [-d <dir>] index
-  @PROG@ [-d <dir>] search '<terms>' [--top N] [--version N] (--version 0 = current)
+  @PROG@ [-d <dir>] search '<terms>' [--top N] [--version N] [--min-terms N] (--version 0 = current)
   @PROG@ [-d <dir>] vsearch '<query>' [--k N] [--version V] [--ivec <hex768>]
   @PROG@ [-d <dir>] vhybrid '<terms>' '<query>' [--k N] [--version V] [--ivec <hex768>]
   @PROG@ [-d <dir>] versions

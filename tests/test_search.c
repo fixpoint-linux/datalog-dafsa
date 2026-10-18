@@ -577,6 +577,360 @@ static void t_search_and_partial_absent(void)
     dl_close(db);
 }
 
+/* ─── Ranked (partial-match / OR) search ────────────────────────────────────
+ *
+ * dl_search_ranked is the entry point whose score CAN vary — that is the whole
+ * point of it — so these tests assert the (obs_id, score) SEQUENCE, not just
+ * membership.  The brute-force test re-derives each document's matched count
+ * from the test's own dense posting lists with a linear scan, so the expected
+ * side shares no code with the engine's group-count:
+ * t_search_ranked_partial fails outright if the engine emits a constant score.
+ */
+
+typedef struct {
+    uint32_t *ids;
+    int *scores;
+    int n;
+    int cap;
+} rk_sink;
+
+static int rk_sink_cb(uint32_t obs_id, int score, void *user)
+{
+    rk_sink *s = (rk_sink *)user;
+    if (s->n >= s->cap) return 1; /* stop: the test's buffer is fixed-size */
+    s->ids[s->n] = obs_id;
+    s->scores[s->n] = score;
+    s->n++;
+    return 0;
+}
+
+typedef struct {
+    uint32_t obs_id;
+    int score;
+} rk_expect;
+
+/* Brute-force ranked expectation: matched count per document (linear scan over
+ * the test's own posting lists), inserted into (score desc, obs_id asc) order
+ * by a plain insertion sort — an implementation the engine does not share. */
+static int rk_expected(const uint32_t *docs, int n_docs,
+                       const uint32_t *const *lists, const int *list_n, int n_terms,
+                       int min_terms, rk_expect *out)
+{
+    int d, t, j, n = 0;
+    for (d = 0; d < n_docs; d++) {
+        int matched = 0;
+        for (t = 0; t < n_terms; t++)
+            if (xc_has(lists[t], list_n[t], docs[d])) matched++;
+        if (matched < min_terms) continue;
+        j = n;
+        while (j > 0 && (out[j - 1].score < matched ||
+                         (out[j - 1].score == matched && out[j - 1].obs_id > docs[d]))) {
+            out[j] = out[j - 1];
+            j--;
+        }
+        out[j].obs_id = docs[d];
+        out[j].score = matched;
+        n++;
+    }
+    return n;
+}
+
+/* A 3-term query whose documents match 3, 2 and 1 terms: with min_terms=2 only
+ * the first two are returned and the 3-term document ranks FIRST.  Under
+ * dl_search's AND semantics the same query returns exactly one document with a
+ * score that cannot differ from any other result. */
+static void t_search_ranked_partial(void)
+{
+    char dir[512];
+    dl_db *db = fresh_db(dir, sizeof(dir), "t_search_ranked_partial");
+    uint32_t a, b, c;
+    uint32_t terms[3];
+    uint32_t ids[8];
+    int scores[8];
+    rk_sink sink;
+    int n;
+
+    TEST("dl_search_ranked: partial match, ranking varies, 3-term doc first");
+    if (aux_index_ensure_postings(db) != 0) { FAIL("ensure postings failed"); dl_close(db); return; }
+
+    a = dl_intern_str(db, "rk_alpha");
+    b = dl_intern_str(db, "rk_beta");
+    c = dl_intern_str(db, "rk_gamma");
+    if (a == 0 || b == 0 || c == 0) { FAIL("intern failed"); dl_close(db); return; }
+
+    /* obs 501 matches all 3 terms, 502 matches {a,b}, 503 matches {a} only.
+     * Postings go in SCRAMBLED obs order (503 first) so a tie-break that leaked
+     * posting/insertion order would be visible. */
+    aux_index_add_posting(db, a, 503);
+    aux_index_add_posting(db, a, 502);
+    aux_index_add_posting(db, a, 501);
+    aux_index_add_posting(db, b, 502);
+    aux_index_add_posting(db, b, 501);
+    aux_index_add_posting(db, c, 501);
+
+    terms[0] = a; terms[1] = b; terms[2] = c;
+
+    /* min_terms=2: 501 (3 terms) then 502 (2 terms); 503 (1 term) is out. */
+    n = dl_search_ranked_top(db, terms, 3, 2, ids, scores, 8);
+    if (n != 2) { FAIL("min_terms=2 did not return exactly 2 results"); dl_close(db); return; }
+    if (ids[0] != 501 || scores[0] != 3) { FAIL("3-term doc is not first with score 3"); dl_close(db); return; }
+    if (ids[1] != 502 || scores[1] != 2) { FAIL("2-term doc is not second with score 2"); dl_close(db); return; }
+
+    /* min_terms=1 is OR: all three, ranked 3, 2, 1 — the score VARIES. */
+    n = dl_search_ranked_top(db, terms, 3, 1, ids, scores, 8);
+    if (n != 3) { FAIL("min_terms=1 did not return all 3 documents"); dl_close(db); return; }
+    if (ids[0] != 501 || scores[0] != 3 ||
+        ids[1] != 502 || scores[1] != 2 ||
+        ids[2] != 503 || scores[2] != 1) {
+        FAIL("OR ranking is not (501,3),(502,2),(503,1)");
+        dl_close(db);
+        return;
+    }
+    if (scores[0] == scores[1] || scores[1] == scores[2]) {
+        FAIL("score did not vary across results");
+        dl_close(db);
+        return;
+    }
+
+    /* Tie-break: {a,b} with min_terms=1 gives 501 and 502 both at score 2, and
+     * 503 at 1 — equal scores must come out obs_id ASCENDING. */
+    {
+        uint32_t ab[2];
+        ab[0] = b; ab[1] = a; /* query order is not the tie-break order */
+        n = dl_search_ranked_top(db, ab, 2, 1, ids, scores, 8);
+        if (n != 3) { FAIL("{a,b} min_terms=1 did not return 3"); dl_close(db); return; }
+        if (ids[0] != 501 || scores[0] != 2 || ids[1] != 502 || scores[1] != 2 ||
+            ids[2] != 503 || scores[2] != 1) {
+            FAIL("equal scores not tie-broken by obs_id ascending");
+            dl_close(db);
+            return;
+        }
+    }
+
+    /* The AND tier is untouched: the same 3 terms still return exactly 501. */
+    n = dl_search_top(db, terms, 3, ids, scores, 8);
+    if (n != 1 || ids[0] != 501 || scores[0] != 3) {
+        FAIL("dl_search_top AND semantics changed");
+        dl_close(db);
+        return;
+    }
+
+    /* Streaming form emits the same sequence. */
+    sink.ids = ids;
+    sink.scores = scores;
+    sink.n = 0;
+    sink.cap = 8;
+    n = (int)dl_search_ranked(db, terms, 3, 1, rk_sink_cb, &sink);
+    if (n != 3 || sink.n != 3) { FAIL("dl_search_ranked stream count wrong"); dl_close(db); return; }
+    if (ids[0] != 501 || ids[1] != 502 || ids[2] != 503) {
+        FAIL("dl_search_ranked stream order differs from _top");
+        dl_close(db);
+        return;
+    }
+
+    PASS();
+    dl_close(db);
+}
+
+/* Brute-force cross-check of the WHOLE (obs_id, score) sequence, not just
+ * membership: every threshold 1..n_terms on the shared 4-term corpus. */
+static void t_search_ranked_bruteforce_crosscheck(void)
+{
+    char dir[512];
+    dl_db *db = fresh_db(dir, sizeof(dir), "t_search_ranked_xcheck");
+    uint32_t docs[XC_N_DOC];
+    uint32_t lists[XC_N_TERM][XC_N_DOC];
+    int list_n[XC_N_TERM];
+    uint32_t terms[XC_N_TERM];
+    const uint32_t *L[XC_N_TERM];
+    int ln[XC_N_TERM];
+    uint32_t got[XC_N_DOC];
+    int scores[XC_N_DOC];
+    rk_expect exp[XC_N_DOC];
+    int t, min_terms, n, ne;
+
+    TEST("dl_search_ranked brute-force cross-check (score sequence, all thresholds)");
+    if (xc_setup(db, docs, lists, list_n) != 0) {
+        FAIL("setup: posting add failed");
+        dl_close(db);
+        return;
+    }
+    for (t = 0; t < XC_N_TERM; t++) {
+        terms[t] = dl_intern_str(db, (char *)XC_TERM[t]); /* same sym, re-interned */
+        if (terms[t] == 0) { FAIL("intern failed"); dl_close(db); return; }
+        L[t] = lists[t];
+        ln[t] = list_n[t];
+    }
+
+    for (min_terms = 1; min_terms <= XC_N_TERM; min_terms++) {
+        int i, distinct_scores = 1;
+        ne = rk_expected(docs, XC_N_DOC, L, ln, XC_N_TERM, min_terms, exp);
+        n = dl_search_ranked_top(db, terms, XC_N_TERM, min_terms, got, scores, XC_N_DOC);
+        if (n < 0) { FAIL("ranked search returned -1"); dl_close(db); return; }
+        if (n != ne) { FAIL("result count disagrees with brute force"); dl_close(db); return; }
+        for (i = 0; i < n; i++) {
+            if (got[i] != exp[i].obs_id) {
+                FAIL("(obs_id) sequence disagrees with brute force");
+                dl_close(db);
+                return;
+            }
+            if (scores[i] != exp[i].score) {
+                FAIL("(score) sequence disagrees with brute force");
+                dl_close(db);
+                return;
+            }
+            if (i > 0 && scores[i] == scores[i - 1] && got[i] < got[i - 1]) {
+                FAIL("equal scores are not obs_id ascending");
+                dl_close(db);
+                return;
+            }
+        }
+        for (i = 1; i < n; i++)
+            if (scores[i] != scores[0]) distinct_scores++;
+        /* Instrument check: for min_terms=1 the corpus matches 1..4 terms, so a
+         * single-score (i.e. dead-ranking) result would be a bug in the
+         * expectation as much as in the engine. */
+        if (min_terms == 1 && distinct_scores < 2) {
+            FAIL("fixture does not exercise a varying score");
+            dl_close(db);
+            return;
+        }
+    }
+
+    PASS();
+    dl_close(db);
+}
+
+/* min_terms == n_terms must reproduce dl_search's result set EXACTLY — same
+ * ids, same scores, same order — proving the AND path is preserved. */
+static void t_search_ranked_and_equivalence(void)
+{
+    char dir[512];
+    dl_db *db = fresh_db(dir, sizeof(dir), "t_search_ranked_and_eq");
+    uint32_t docs[XC_N_DOC];
+    uint32_t lists[XC_N_TERM][XC_N_DOC];
+    int list_n[XC_N_TERM];
+    uint32_t and_ids[XC_N_DOC], rk_ids[XC_N_DOC];
+    int and_scores[XC_N_DOC], rk_scores[XC_N_DOC];
+    int qi, t, n_and, n_rk;
+
+    TEST("dl_search_ranked min_terms==n_terms is byte-identical to dl_search");
+    if (xc_setup(db, docs, lists, list_n) != 0) {
+        FAIL("setup: posting add failed");
+        dl_close(db);
+        return;
+    }
+
+    for (qi = -1; qi < XC_N_QUERY; qi++) {
+        uint32_t terms[3];
+        int n_terms = 0;
+        if (qi < 0) {
+            terms[0] = dl_intern_str(db, (char *)XC_TERM[0]); /* single term */
+            n_terms = 1;
+        } else {
+            for (t = 0; t < 3 && XC_QUERY[qi][t] >= 0; t++) {
+                terms[t] = dl_intern_str(db, (char *)XC_TERM[XC_QUERY[qi][t]]);
+                n_terms++;
+            }
+        }
+        n_and = dl_search_top(db, terms, n_terms, and_ids, and_scores, XC_N_DOC);
+        n_rk = dl_search_ranked_top(db, terms, n_terms, n_terms, rk_ids, rk_scores, XC_N_DOC);
+        if (n_and < 0 || n_rk < 0) { FAIL("search returned -1"); dl_close(db); return; }
+        if (n_and != n_rk) { FAIL("result counts differ from dl_search"); dl_close(db); return; }
+        for (t = 0; t < n_and; t++) {
+            if (and_ids[t] != rk_ids[t]) { FAIL("id order differs from dl_search"); dl_close(db); return; }
+            if (and_scores[t] != rk_scores[t]) { FAIL("score differs from dl_search"); dl_close(db); return; }
+        }
+    }
+
+    PASS();
+    dl_close(db);
+}
+
+/* Contract edge cases: min_terms > n_terms is REJECTED (-1) — defined and
+ * documented, never undefined and never silently emptied; min_terms <= 0
+ * likewise.  A wholly absent term under min_terms=1 is a valid EMPTY result. */
+static void t_search_ranked_contract(void)
+{
+    char dir[512];
+    dl_db *db = fresh_db(dir, sizeof(dir), "t_search_ranked_contract");
+    uint32_t a, b, absent;
+    uint32_t terms[3];
+    uint32_t ids[8];
+    int scores[8];
+    rk_sink sink;
+    int n;
+
+    TEST("dl_search_ranked contract: bad thresholds rejected, empty is not an error");
+    if (aux_index_ensure_postings(db) != 0) { FAIL("ensure postings failed"); dl_close(db); return; }
+
+    a = dl_intern_str(db, "rk_c_a");
+    b = dl_intern_str(db, "rk_c_b");
+    absent = dl_intern_str(db, "rk_c_absent"); /* interned, never posted */
+    if (a == 0 || b == 0 || absent == 0) { FAIL("intern failed"); dl_close(db); return; }
+    aux_index_add_posting(db, a, 602);
+    aux_index_add_posting(db, a, 601);
+    aux_index_add_posting(db, b, 601);
+
+    terms[0] = a;
+
+    sink.ids = ids; sink.scores = scores; sink.n = 0; sink.cap = 8;
+
+    /* min_terms > n_terms: rejected. */
+    if (dl_search_ranked_top(db, terms, 1, 2, ids, scores, 8) != -1) {
+        FAIL("min_terms > n_terms was not rejected");
+        dl_close(db);
+        return;
+    }
+    if (dl_search_ranked(db, terms, 1, 2, rk_sink_cb, &sink) != -1) {
+        FAIL("min_terms > n_terms was not rejected (stream form)");
+        dl_close(db);
+        return;
+    }
+    /* min_terms <= 0 and n_terms <= 0: rejected. */
+    if (dl_search_ranked_top(db, terms, 1, 0, ids, scores, 8) != -1) { FAIL("min_terms=0 accepted"); dl_close(db); return; }
+    if (dl_search_ranked_top(db, terms, 1, -3, ids, scores, 8) != -1) { FAIL("min_terms<0 accepted"); dl_close(db); return; }
+    if (dl_search_ranked_top(db, terms, 0, 0, ids, scores, 8) != -1) { FAIL("n_terms=0 accepted"); dl_close(db); return; }
+    if (dl_search_ranked_top(db, terms, 1, 1, ids, scores, 0) != -1) { FAIL("limit=0 accepted"); dl_close(db); return; }
+
+    /* NULL arguments: rejected on both forms. */
+    sink.n = 0;
+    if (dl_search_ranked(NULL, terms, 1, 1, rk_sink_cb, &sink) != -1) { FAIL("NULL db accepted"); dl_close(db); return; }
+    if (dl_search_ranked(db, NULL, 1, 1, rk_sink_cb, &sink) != -1) { FAIL("NULL terms accepted"); dl_close(db); return; }
+    if (dl_search_ranked(db, terms, 1, 1, NULL, &sink) != -1) { FAIL("NULL cb accepted"); dl_close(db); return; }
+    if (dl_search_ranked_top(NULL, terms, 1, 1, ids, scores, 8) != -1) { FAIL("NULL db accepted (_top)"); dl_close(db); return; }
+    if (dl_search_ranked_top(db, terms, 1, 1, NULL, scores, 8) != -1) { FAIL("NULL out buffer accepted"); dl_close(db); return; }
+
+    /* An absent term is a valid empty result, not an error. */
+    terms[0] = absent;
+    if (dl_search_ranked_top(db, terms, 1, 1, ids, scores, 8) != 0) {
+        FAIL("absent term did not yield 0 results");
+        dl_close(db);
+        return;
+    }
+
+    /* A repeated term sym counts ONCE: {a,a,b} with min_terms=2 keeps only the
+     * document matching both distinct terms, at score 2 (not 3). */
+    terms[0] = a; terms[1] = a; terms[2] = b;
+    n = dl_search_ranked_top(db, terms, 3, 2, ids, scores, 8);
+    if (n != 1 || ids[0] != 601 || scores[0] != 2) {
+        FAIL("repeated term sym inflated the score");
+        dl_close(db);
+        return;
+    }
+    /* ... and {a,a} with min_terms=1 scores every matching document 1. */
+    terms[0] = a; terms[1] = a;
+    n = dl_search_ranked_top(db, terms, 2, 1, ids, scores, 8);
+    if (n != 2 || ids[0] != 601 || scores[0] != 1 || ids[1] != 602 || scores[1] != 1) {
+        FAIL("repeated term sym inflated the score (min_terms=1)");
+        dl_close(db);
+        return;
+    }
+
+    PASS();
+    dl_close(db);
+}
+
 /* ─── Integration test ──────────────────────────────────────────────────── */
 
 static void t_integration_observation_indexing(void)
@@ -927,6 +1281,12 @@ int main(void)
     t_search_bruteforce_crosscheck();
     t_search_crosscheck_detects_diff();
     t_search_and_partial_absent();
+
+    /* Ranked (partial-match / OR) search */
+    t_search_ranked_partial();
+    t_search_ranked_bruteforce_crosscheck();
+    t_search_ranked_and_equivalence();
+    t_search_ranked_contract();
     
     /* Integration test */
     t_integration_observation_indexing();
