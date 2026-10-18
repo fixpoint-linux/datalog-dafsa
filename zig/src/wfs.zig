@@ -68,11 +68,37 @@
 //! graph {a,b,c,d,e}: T={a,c} F={b,d} U={e}; even cycle {1,2}: all
 //! undefined) BEFORE implementation.
 //!
-//! Per round the driver (a) rebuilds each complement from the PREVIOUS
+//! Per round the driver (a) refreshes each complement from the PREVIOUS
 //! assignment: wfs_c_P := Active^ar(P) \ prev|P, (b) runs vm_execute on the
 //! rewritten program from scratch (head views reset to base; the complement
 //! relations are body-only and never reset), (c) snapshots every head as
 //! the new assignment and tests fixpoint / 2-cycle.
+//!
+//! ─── Incremental complement (two-step, parity-alternated) ─────────────────
+//! Active^ar(P) is a CARTESIAN PRODUCT (|Active|^arity), so re-emitting
+//! `full \ prev|P` every round is the round's second-largest term.  The
+//! complement differs from the previous round's by exactly the assignment's
+//! delta, mirrored: an atom that ENTERED prev|P leaves the complement, one
+//! that LEFT it re-enters.  So it is maintained tuple-by-tuple (rel_delete /
+//! rel_add) from the symmetric difference of HEAD SNAPSHOTS the driver already
+//! keeps — no extra snapshot of P is taken — and only a delta past the
+//! measured crossover (WFS_REBUILD_DENOM) re-derives full \ prev|P.  `full`
+//! stays precomputed: it is the fallback's input and never changes.
+//!
+//! The delta is taken over TWO rounds, not one, because Γ is ANTITONE: S_k and
+//! S_{k+1} are incomparable, so their difference stays near half the domain
+//! even when the model has nearly settled (MEASURED win/move n=400: 106,175
+//! tuples over 775 rounds), while the two PARITY subsequences are monotone and
+//! differ by the round's actual new information (765 tuples — ONE per round).
+//! Each complement therefore has TWO materializations, alternated by round
+//! parity: round k installs rels[k%2] — the one idle for two rounds, i.e.
+//! reflecting S_{k-2} exactly — after applying Δ(S_{k-2}|P, S_k|P) to it.
+//! Rounds 0-1 and any post-crossover round rebuild instead.
+//!
+//! MIRRORED-CONTENT INVARIANT: the incremental update leaves exactly the set
+//! the from-scratch derivation would (inside Active^arity; outside it the
+//! content is never probed and is not written).  DL_WFS_VERIFY=1 checks it per
+//! round; the differential harness gates the answers byte-for-byte.
 //!
 //! ─── Slice 1 scope (S1) ───────────────────────────────────────────────────
 //! Rules: pure relational atoms over EDB + IDB, negation restricted to IDB
@@ -120,6 +146,26 @@ const WFS_ROUND_BOUND: c_int = 10000;
 /// clean DL_WFS_ERR_REJECTED: the S1 complement is materialized by
 /// enumeration, so arity>2 over a large domain is out of scope, not wrong.
 const WFS_COMPLEMENT_CAP: c_long = 1 << 20;
+
+/// Incremental-complement fallback rule: a round whose symmetric difference
+/// (|S_k \ S_{k-2}| + |S_{k-2} \ S_k|, restricted to P — the two-step delta)
+/// exceeds |Active|^arity / WFS_REBUILD_DENOM re-derives the complement from
+/// scratch instead of applying the delta tuple-by-tuple.
+///
+/// MEASURED, not guessed (/tmp/wfscross.c: the engine's own ts_*/rel_*
+/// primitives; the relation is reset to the real `full \ prev` before every
+/// timed delta, and the delta is drawn from the real complement / prev sets —
+/// an earlier version of that harness got both wrong and its numbers were
+/// meaningless).  Full rebuild vs rel_delete+rel_add of the delta:
+///
+///     arity 1 (|full| = 200 / 400 / 1024): crossover at 0.32 / 0.21 / 0.25
+///     arity 2 (|full| = 10k / 40k / 160k): crossover at 0.20 / 0.20 / 0.20
+///
+/// (fraction of |full| at which the delta costs as much as the rebuild).  A
+/// delta of 1/8 costs 5-85 % of a rebuild across those regimes — the tightest,
+/// 160k arity-2, is a near wash.  So 1/8 is the largest denominator that never
+/// lands past the crossover.
+const WFS_REBUILD_DENOM: c_long = 8;
 
 const MAX_ARITY: u8 = 8;
 const MAX_HEADS: usize = 64; // dl.DlDb.rels is [64]
@@ -177,6 +223,79 @@ fn wfsErr(comptime fmt: []const u8, args: anytype) void {
     var buf: [1024]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, fmt, args) catch buf[0..0];
     _ = c.write(2, msg.ptr, msg.len);
+}
+
+// ─── opt-in diagnostics (DL_WFS_STATS / DL_WFS_VERIFY) ────────────────────
+//
+// DL_WFS_STATS=1 prints one WFSSTAT line per query (the round count, how many
+// rounds took the incremental path, the per-round delta sizes, and the ms per
+// phase) — the instrument the incremental complement's economics were
+// measured with, kept so the split can be re-measured.
+//
+// DL_WFS_VERIFY=1 makes every round CHECK the two invariants the incremental
+// path rests on, and return DL_WFS_ERR_INTERNAL loudly on violation: (1) the
+// head snapshot equals the live P view, (2) the installed complement equals
+// full \ S_k recomputed from scratch.  It costs a full re-derivation per
+// round, so it is off by default; a query never changes behaviour without it.
+// Both knobs are read once per process (the first WFS query).
+const Timespec = extern struct { sec: isize, nsec: isize };
+extern fn clock_gettime(clk_id: c_int, tp: *Timespec) c_int;
+fn nowNs() u64 {
+    var ts: Timespec = undefined;
+    _ = clock_gettime(1, &ts); // CLOCK_MONOTONIC
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+var st_on: bool = false;
+var st_verify: bool = false;
+var st_checked: bool = false;
+var st_walk: u64 = 0;
+var st_sort: u64 = 0;
+var st_rel: u64 = 0;
+var st_dsort: u64 = 0;
+var st_vm: u64 = 0;
+var st_snap: u64 = 0;
+var st_rounds: u64 = 0;
+var st_full: u64 = 0;
+var st_delta: u64 = 0;
+var st_deltup: u64 = 0;
+var st_maxdelta: u64 = 0;
+var st_fullsz: u64 = 0;
+var st_psz: u64 = 0;
+
+fn statCheck() void {
+    if (st_checked) return;
+    st_checked = true;
+    const v = std.c.getenv("DL_WFS_STATS");
+    st_on = (v != null and v.?[0] != 0);
+    const vv = std.c.getenv("DL_WFS_VERIFY");
+    st_verify = (vv != null and vv.?[0] != 0);
+}
+
+fn statDump() void {
+    if (!st_on) return;
+    wfsErr("WFSSTAT rounds={d} full={d} deltas={d} deltatuples={d} maxdelta={d} |full|={d} |P|={d} walk_ms={d} sort_ms={d} rel_ms={d} delta_ms={d} vm_ms={d} snap_ms={d}\n", .{
+        st_rounds,        st_full,
+        st_delta,         st_deltup,
+        st_maxdelta,      st_fullsz,
+        st_psz,           st_walk / 1_000_000,
+        st_sort / 1_000_000, st_rel / 1_000_000,
+        st_dsort / 1_000_000, st_vm / 1_000_000,
+        st_snap / 1_000_000,
+    });
+    // Per-query figures: the next query must not inherit these totals.
+    st_walk = 0;
+    st_sort = 0;
+    st_rel = 0;
+    st_dsort = 0;
+    st_vm = 0;
+    st_snap = 0;
+    st_rounds = 0;
+    st_full = 0;
+    st_delta = 0;
+    st_deltup = 0;
+    st_maxdelta = 0;
+    st_fullsz = 0;
+    st_psz = 0;
 }
 
 // ─── sorted tuple_set set operations ───────────────────────────────────────
@@ -632,10 +751,31 @@ fn enumerateProduct(dom: *const tupleset.tuple_set, arity: u8, out: *tupleset.tu
 
 const CompRel = struct {
     pred_idx: c_int, // clone index of the negated predicate P
-    comp_idx: c_int, // clone index of wfs_c<k>_P
+    comp_idx: c_int, // clone index of wfs_c<k>_P (the body atom's slot)
     arity: u8,
+    /// Head slot of P: st.prev/prev2/prev3[slot].ts are exactly the LAST THREE
+    /// assignments restricted to P — the delta source.  (P is a rule head by
+    /// checkNegatedAreHeads, so the slot always exists.)
+    slot: usize,
     name: [96:0]u8 = undefined,
     full: tupleset.tuple_set, // Active^arity (sorted)
+    /// TWO materializations of the complement, alternated by round parity.
+    /// Round k installs rels[k % 2] into the clone slot for the body atom to
+    /// read; the other one is idle until round k+2.  Γ is ANTITONE, so
+    /// consecutive assignments S_k and S_{k+1} are not comparable and their
+    /// difference is large even when the model is nearly settled — but the
+    /// two PARITY subsequences are monotone, i.e. S_k and S_{k+2} differ by
+    /// the round's actual new information.  MEASURED (win/move chain,
+    /// n=400): the 1-step difference is 106,175 tuples over 775 rounds
+    /// (half the domain per round); the 2-step difference is 765 — ONE tuple
+    /// per round.  So the relation a round has to update is the one that sat
+    /// idle for two rounds, and its delta is the small one.
+    rels: [2]?*relation.Relation = .{ null, null },
+    /// Symmetric difference between two assignments (tuples that ENTERED /
+    /// LEFT prev|P).  Scratch, reset every round; held here so the per-round
+    /// delta never allocates a fresh tuple_set.
+    entered: tupleset.tuple_set,
+    left: tupleset.tuple_set,
 };
 
 const HeadSnap = struct {
@@ -655,13 +795,16 @@ const WfsState = struct {
     n_heads: usize = 0,
     prev: [MAX_HEADS]HeadSnap = undefined,
     prev2: [MAX_HEADS]HeadSnap = undefined,
+    prev3: [MAX_HEADS]HeadSnap = undefined,
     cur: [MAX_HEADS]HeadSnap = undefined,
     have_prev2: bool = false,
+    have_prev3: bool = false,
     crules: ?[*]?*compiler.compiled_rule = null,
     n_crules: c_int = 0,
     dom_ok: bool = false,
     prev_ok: bool = false, // prev[0..n_heads] initialized
     prev2_ok: bool = false,
+    prev3_ok: bool = false,
     cur_ok: bool = false,
     comps_ok: bool = false,
 };
@@ -674,10 +817,20 @@ fn teardown(st: *WfsState) void {
     if (st.dom_ok) tupleset.ts_free(&st.dom);
     if (st.comps_ok) {
         var i: usize = 0;
-        while (i < st.n_comps) : (i += 1) tupleset.ts_free(&st.comps[i].full);
+        while (i < st.n_comps) : (i += 1) {
+            const cp = &st.comps[i];
+            tupleset.ts_free(&cp.full);
+            tupleset.ts_free(&cp.entered);
+            tupleset.ts_free(&cp.left);
+            // The two complement relations are driver-owned: unhook the clone
+            // slot first so cloneFree cannot free one of them twice.
+            st.edb.rels[@intCast(cp.comp_idx)].rel = null;
+            for (cp.rels) |maybe_r| if (maybe_r) |r| relation.rel_free(r);
+        }
     }
     if (st.prev_ok) freeSnaps(st.prev[0..st.n_heads]);
     if (st.prev2_ok) freeSnaps(st.prev2[0..st.n_heads]);
+    if (st.prev3_ok) freeSnaps(st.prev3[0..st.n_heads]);
     if (st.cur_ok) freeSnaps(st.cur[0..st.n_heads]);
     if (st.crules) |cr| {
         var j: c_int = 0;
@@ -866,12 +1019,30 @@ pub fn wfs_eval_query(
                 if (ci < st.n_comps) continue; // complement already created
 
                 if (st.n_comps >= MAX_HEADS) return DL_WFS_ERR_OOM;
+                // P's head slot — the delta source (st.prev/prev2/prev3).
+                var slot: usize = 0;
+                var have_slot = false;
+                var si: usize = 0;
+                while (si < st.n_heads) : (si += 1) {
+                    if (st.head_idx[si] == pidx) {
+                        slot = si;
+                        have_slot = true;
+                        break;
+                    }
+                }
+                if (!have_slot) {
+                    wfsErr("dl_query_wfs_ro: internal error — negated predicate is not a tracked head\n", .{});
+                    return DL_WFS_ERR_INTERNAL;
+                }
                 var cr = CompRel{
                     .pred_idx = pidx,
                     .comp_idx = -1,
                     .arity = edb.rels[@intCast(pidx)].arity,
+                    .slot = slot,
                     .name = undefined,
                     .full = std.mem.zeroes(tupleset.tuple_set),
+                    .entered = std.mem.zeroes(tupleset.tuple_set),
+                    .left = std.mem.zeroes(tupleset.tuple_set),
                 };
                 _ = std.fmt.bufPrintZ(&cr.name, "wfs_c{d}_{s}", .{ st.n_comps, pname }) catch return -1;
                 if (cloneDeclareInmem(&edb, &cr.name, cr.arity) != 0) {
@@ -883,6 +1054,22 @@ pub fn wfs_eval_query(
                     wfsErr("dl_query_wfs_ro: rejected — complement of '{s}' exceeds the S1 enumeration cap (|active domain|^{d})\n", .{ pname, cr.arity });
                     return DL_WFS_ERR_REJECTED;
                 }
+                if (tupleset.ts_init(&cr.entered, cr.arity) != 0 or
+                    tupleset.ts_init(&cr.left, cr.arity) != 0)
+                {
+                    tupleset.ts_free(&cr.full);
+                    return DL_WFS_ERR_OOM;
+                }
+                // rels[0] is the relation the clone slot was declared with;
+                // rels[1] is the second parity's materialization.  Both are
+                // freed by teardown (which unhooks the clone slot first).
+                cr.rels[0] = edb.rels[@intCast(cr.comp_idx)].rel;
+                cr.rels[1] = relation.rel_create(cr.arity) orelse {
+                    tupleset.ts_free(&cr.full);
+                    tupleset.ts_free(&cr.entered);
+                    tupleset.ts_free(&cr.left);
+                    return DL_WFS_ERR_OOM;
+                };
                 st.comps[st.n_comps] = cr;
                 st.n_comps += 1;
                 st.comps_ok = true;
@@ -934,60 +1121,210 @@ pub fn wfs_eval_query(
     var converged = false;
     var two_cycle = false;
     {
+        statCheck();
         var round: c_int = 0;
         while (round < WFS_ROUND_BOUND) : (round += 1) {
-            // complements := Active^ar \ prev|P  (materialized into the
-            // stored view — what the rewritten atom's SCAN/LOOKUP reads)
+            if (st_on) st_rounds += 1;
+            // complements := Active^ar \ S_k  (materialized into the clone
+            // slot the rewritten atom's SCAN/LOOKUP reads).
+            //
+            // INCREMENTAL, TWO-STEP: Γ is antitone, so S_k and S_{k+1} are
+            // incomparable and their difference is large even close to
+            // convergence — but the parity subsequences are monotone, so the
+            // relation installed two rounds ago (S_{k-2}) differs from S_k by
+            // the round's actual new information (MEASURED win/move n=400:
+            // one tuple per round, vs half the domain for one step).  Each
+            // round therefore installs rels[k%2] — the one that sat idle for
+            // two rounds — after applying Δ(S_{k-2}|P, S_k|P) to it: an atom
+            // that ENTERED P leaves the complement, one that LEFT P re-enters.
+            // The from-scratch rebuild (full \ S_k) still covers rounds 0-1
+            // (no S_{k-2} yet) and any delta past the measured crossover.
+            const par: usize = @intCast(@mod(round, 2));
             var ci: usize = 0;
             while (ci < st.n_comps) : (ci += 1) {
                 const cp = &st.comps[ci];
-                const pv_snap = snapRel(edb.rels[@intCast(cp.pred_idx)].rel, cp.arity) orelse return DL_WFS_ERR_OOM;
-                var pv: tupleset.tuple_set = pv_snap;
-                var cts: tupleset.tuple_set = undefined;
-                if (tupleset.ts_init(&cts, cp.arity) != 0) {
-                    tupleset.ts_free(&pv);
-                    return DL_WFS_ERR_OOM;
+                const s_new = &st.prev[cp.slot].ts; // S_k|P — the head snapshot
+                var incremental = false;
+
+                if (round >= 2 and st.have_prev3) {
+                    const t_d0 = if (st_on) nowNs() else 0;
+                    const s_old = &st.prev3[cp.slot].ts; // S_{k-2}|P
+                    tupleset.ts_reset(&cp.entered);
+                    tupleset.ts_reset(&cp.left);
+                    var di: c_long = 0;
+                    while (di < s_new.count) : (di += 1) {
+                        const row = s_new.data.? + @as(usize, @intCast(di)) * cp.arity;
+                        if (tupleset.ts_contains(s_old, row) == 0)
+                            if (tupleset.ts_add(&cp.entered, row) < 0) return DL_WFS_ERR_OOM;
+                    }
+                    di = 0;
+                    while (di < s_old.count) : (di += 1) {
+                        const row = s_old.data.? + @as(usize, @intCast(di)) * cp.arity;
+                        if (tupleset.ts_contains(s_new, row) == 0)
+                            if (tupleset.ts_add(&cp.left, row) < 0) return DL_WFS_ERR_OOM;
+                    }
+                    const nd = cp.entered.count + cp.left.count;
+                    if (st_on) {
+                        st_deltup += @intCast(nd);
+                        if (@as(c_long, @intCast(st_maxdelta)) < nd) st_maxdelta = @intCast(nd);
+                        st_fullsz = @intCast(cp.full.count);
+                        st_psz = @intCast(s_new.count);
+                    }
+
+                    if (nd * WFS_REBUILD_DENOM <= cp.full.count) {
+                        const inc_rel = cp.rels[par].?;
+                        di = 0;
+                        while (di < cp.entered.count) : (di += 1) {
+                            const row = cp.entered.data.? + @as(usize, @intCast(di)) * cp.arity;
+                            if (relation.rel_delete(inc_rel, row) < 0) {
+                                wfsErr("dl_query_wfs_ro: complement update failed\n", .{});
+                                return -1;
+                            }
+                        }
+                        // Re-add only what Active^arity actually holds: the
+                        // complement's content outside it is never probed
+                        // (buildDomain's note above), and this guard keeps the
+                        // incrementally maintained view byte-identical to the
+                        // from-scratch one even if that invariant were violated.
+                        di = 0;
+                        while (di < cp.left.count) : (di += 1) {
+                            const row = cp.left.data.? + @as(usize, @intCast(di)) * cp.arity;
+                            if (tupleset.ts_contains(&cp.full, row) == 0) continue;
+                            if (relation.rel_add(inc_rel, row) < 0) {
+                                wfsErr("dl_query_wfs_ro: complement update failed\n", .{});
+                                return -1;
+                            }
+                        }
+                        incremental = true;
+                        if (st_on) {
+                            st_delta += 1;
+                            st_dsort += nowNs() - t_d0;
+                        }
+                    }
                 }
-                // cts := full \ pv  (both sorted — merge walk)
-                var fi: c_long = 0;
-                var vi: c_long = 0;
-                const ar = cp.arity;
-                while (fi < cp.full.count) {
-                    const ft = cp.full.data.? + @as(usize, @intCast(fi)) * ar;
-                    var skip = false;
-                    while (vi < pv.count) {
-                        const vt = pv.data.? + @as(usize, @intCast(vi)) * ar;
-                        var m: usize = 0;
-                        while (m < ar and ft[m] == vt[m]) m += 1;
-                        if (m == ar) {
-                            skip = true;
-                            vi += 1;
+
+                if (!incremental) {
+                    const t_w0 = if (st_on) nowNs() else 0;
+                    const build_rel = cp.rels[par].?;
+                    var rc: c_int = 0;
+                    if (s_new.count == 0) {
+                        // S_k|P is empty: the complement IS full — no walk.
+                        rc = relation.rel_build_from_tupleset(build_rel, &cp.full);
+                        if (st_on) {
+                            st_walk += nowNs() - t_w0;
+                            st_full += 1;
+                            st_fullsz = @intCast(cp.full.count);
+                            st_psz = 0;
+                        }
+                    } else {
+                        var cts: tupleset.tuple_set = undefined;
+                        if (tupleset.ts_init(&cts, cp.arity) != 0) return DL_WFS_ERR_OOM;
+                        // cts := full \ s_new  (both sorted — merge walk)
+                        var fi: c_long = 0;
+                        var vi: c_long = 0;
+                        const ar = cp.arity;
+                        while (fi < cp.full.count) {
+                            const ft = cp.full.data.? + @as(usize, @intCast(fi)) * ar;
+                            var skip = false;
+                            while (vi < s_new.count) {
+                                const vt = s_new.data.? + @as(usize, @intCast(vi)) * ar;
+                                var m: usize = 0;
+                                while (m < ar and ft[m] == vt[m]) m += 1;
+                                if (m == ar) {
+                                    skip = true;
+                                    vi += 1;
+                                    break;
+                                }
+                                if (ft[m] > vt[m]) {
+                                    vi += 1;
+                                    continue;
+                                }
+                                break; // ft < vt — difference element
+                            }
+                            if (!skip) _ = tupleset.ts_add(&cts, ft);
+                            fi += 1;
+                        }
+                        const t_w1 = if (st_on) nowNs() else 0;
+                        tupleset.ts_sort(&cts);
+                        const t_w2 = if (st_on) nowNs() else 0;
+                        rc = relation.rel_build_from_tupleset(build_rel, &cts);
+                        tupleset.ts_free(&cts);
+                        if (st_on) {
+                            const t_w3 = nowNs();
+                            st_walk += t_w1 - t_w0; // merge walk + ts_add
+                            st_sort += t_w2 - t_w1; // ts_sort
+                            st_rel += t_w3 - t_w2; // rel_build_from_tupleset
+                            st_full += 1;
+                            st_fullsz = @intCast(cp.full.count);
+                            st_psz = @intCast(s_new.count);
+                        }
+                    }
+                    if (rc != 0) {
+                        wfsErr("dl_query_wfs_ro: complement materialization failed\n", .{});
+                        return -1;
+                    }
+                }
+
+                // install this parity's materialization for the body atom
+                edb.rels[@intCast(cp.comp_idx)].rel = cp.rels[par].?;
+
+                if (st_verify) {
+                    // (1) the substitution: the head snapshot must equal the
+                    // live relation content the old code re-snapshotted.
+                    var live = snapRel(edb.rels[@intCast(cp.pred_idx)].rel, cp.arity) orelse return DL_WFS_ERR_OOM;
+                    if (!tsEq(&live, s_new)) {
+                        wfsErr("WFSVERIFY round {d}: st.prev|P != live P view ({d} vs {d})\n", .{ round, live.count, s_new.count });
+                        tupleset.ts_free(&live);
+                        return DL_WFS_ERR_INTERNAL;
+                    }
+                    tupleset.ts_free(&live);
+                    // (2) the complement content: the installed materialization
+                    // must equal full \ S_k byte for byte.
+                    var want: tupleset.tuple_set = undefined;
+                    if (tupleset.ts_init(&want, cp.arity) != 0) return DL_WFS_ERR_OOM;
+                    var fi2: c_long = 0;
+                    var vi2: c_long = 0;
+                    while (fi2 < cp.full.count) {
+                        const ft = cp.full.data.? + @as(usize, @intCast(fi2)) * cp.arity;
+                        var skip = false;
+                        while (vi2 < s_new.count) {
+                            const vt = s_new.data.? + @as(usize, @intCast(vi2)) * cp.arity;
+                            var m: usize = 0;
+                            while (m < cp.arity and ft[m] == vt[m]) m += 1;
+                            if (m == cp.arity) {
+                                skip = true;
+                                vi2 += 1;
+                                break;
+                            }
+                            if (ft[m] > vt[m]) {
+                                vi2 += 1;
+                                continue;
+                            }
                             break;
                         }
-                        if (ft[m] > vt[m]) {
-                            vi += 1;
-                            continue;
-                        }
-                        break; // ft < vt — difference element
+                        if (!skip) _ = tupleset.ts_add(&want, ft);
+                        fi2 += 1;
                     }
-                    if (!skip) _ = tupleset.ts_add(&cts, ft);
-                    fi += 1;
-                }
-                tupleset.ts_sort(&cts);
-                const rc = relation.rel_build_from_tupleset(edb.rels[@intCast(cp.comp_idx)].rel, &cts);
-                tupleset.ts_free(&cts);
-                tupleset.ts_free(&pv);
-                if (rc != 0) {
-                    wfsErr("dl_query_wfs_ro: complement materialization failed\n", .{});
-                    return -1;
+                    tupleset.ts_sort(&want);
+                    var got = snapRel(cp.rels[par].?, cp.arity) orelse return DL_WFS_ERR_OOM;
+                    if (!tsEq(&got, &want)) {
+                        wfsErr("WFSVERIFY round {d} comp {d}: complement != full \\ S_k ({d} vs {d} tuples, incremental={any})\n", .{ round, ci, got.count, want.count, incremental });
+                        tupleset.ts_free(&got);
+                        tupleset.ts_free(&want);
+                        return DL_WFS_ERR_INTERNAL;
+                    }
+                    tupleset.ts_free(&got);
+                    tupleset.ts_free(&want);
                 }
             }
 
             // Γ(S_k) from scratch: vm_execute resets head views to base
+            const t_v0 = if (st_on) nowNs() else 0;
             if (vm.vm_execute(&edb, st.crules, st.n_crules) != 0) {
                 wfsErr("dl_query_wfs_ro: evaluation failed\n", .{});
                 return -1;
             }
+            const t_v1 = if (st_on) nowNs() else 0;
 
             // snapshot S_{k+1}
             {
@@ -998,6 +1335,11 @@ pub fn wfs_eval_query(
                     st.cur[k] = .{ .rel_idx = st.head_idx[k], .arity = e.arity, .ts = ts };
                 }
                 st.cur_ok = true;
+            }
+            if (st_on) {
+                const t_v2 = nowNs();
+                st_vm += t_v1 - t_v0;
+                st_snap += t_v2 - t_v1;
             }
 
             // fixpoint?  S_{k+1} == S_k
@@ -1032,8 +1374,11 @@ pub fn wfs_eval_query(
                 }
             }
 
-            // rotate S_{k-1} <- S_k <- S_{k+1}
-            if (st.have_prev2) freeSnaps(st.prev2[0..st.n_heads]);
+            // rotate S_{k-2} <- S_{k-1} <- S_k <- S_{k+1}
+            if (st.have_prev3) freeSnaps(st.prev3[0..st.n_heads]);
+            st.prev3 = st.prev2;
+            st.prev3_ok = st.prev2_ok;
+            st.have_prev3 = st.prev2_ok;
             st.prev2 = st.prev;
             st.prev2_ok = st.prev_ok;
             st.prev = st.cur;
@@ -1041,6 +1386,7 @@ pub fn wfs_eval_query(
             st.have_prev2 = true;
             st.cur_ok = false; // slots re-snapshotted next round
         }
+        statDump();
         if (!converged and !two_cycle) {
             wfsErr("dl_query_wfs_ro: alternating fixpoint did not converge within {d} rounds\n", .{WFS_ROUND_BOUND});
             return DL_WFS_ERR_NO_CONVERGE;
