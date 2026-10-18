@@ -24,14 +24,12 @@ b52c1da82e14d62c276654ca14ed11ae63cd1b0905a3d1a7ab880c9643c7061a  ./r.dafsa
 f8fc5ffb4f55940d53eb992e21b29bb914cb015013407f1432716401aac8dabe  ./snapshots/1/observation.dafsa
 0f43e030d3c65b8ff9094db906b15e405ea01d28bb30f84d16e524b8c3868a91  ./snapshots/1/__postings__.dafsa
 f6e9053a1a221256ed7cf347032894b8aabaa70d31ed471232d06e5f2fa743cb  ./snapshots/1/symbols.array
-0109f61395689604dffbc816d8f637ecb2409f5cd64bdf99c0fbb40b6a21e7dd  ./snapshots/1/symbols.dafsa
 cfabffaab1ba46d5f6db92ce5fa5c78fc6446f39cb4d6c627d630715ac48f92c  ./snapshots/1/terms.bin
 51973790160b10a8055f6a4f38b0ec75b1615f22ecb892a7336a1d0e15205137  ./snapshots/2/edge.dafsa
 69e8cecbdfc7cc8e9652a8ca40b80f3e8a07550bb8aca8588f20f2a040a33555  ./snapshots/2/manifest.txt
 f8fc5ffb4f55940d53eb992e21b29bb914cb015013407f1432716401aac8dabe  ./snapshots/2/observation.dafsa
 0f43e030d3c65b8ff9094db906b15e405ea01d28bb30f84d16e524b8c3868a91  ./snapshots/2/__postings__.dafsa
 f6e9053a1a221256ed7cf347032894b8aabaa70d31ed471232d06e5f2fa743cb  ./snapshots/2/symbols.array
-0109f61395689604dffbc816d8f637ecb2409f5cd64bdf99c0fbb40b6a21e7dd  ./snapshots/2/symbols.dafsa
 cfabffaab1ba46d5f6db92ce5fa5c78fc6446f39cb4d6c627d630715ac48f92c  ./snapshots/2/terms.bin
 51973790160b10a8055f6a4f38b0ec75b1615f22ecb892a7336a1d0e15205137  ./snapshots/3/edge.dafsa
 e9050ba3ecf1da524710dffffa21984f246b333f40a9d422017c3338df1f1981  ./snapshots/3/edge__PI0__.dafsa
@@ -39,7 +37,6 @@ bdc59f143315a3bad2564967ade6695fa2ef5cbfdcdf4d809ed5178e32651066  ./snapshots/3/
 f8fc5ffb4f55940d53eb992e21b29bb914cb015013407f1432716401aac8dabe  ./snapshots/3/observation.dafsa
 0f43e030d3c65b8ff9094db906b15e405ea01d28bb30f84d16e524b8c3868a91  ./snapshots/3/__postings__.dafsa
 f6e9053a1a221256ed7cf347032894b8aabaa70d31ed471232d06e5f2fa743cb  ./snapshots/3/symbols.array
-0109f61395689604dffbc816d8f637ecb2409f5cd64bdf99c0fbb40b6a21e7dd  ./snapshots/3/symbols.dafsa
 f03839067d70f757dd67555a6aa9da4c04409e2f9f09a8e01603cec6d7fc2b96  ./snapshots/3/tc.dafsa
 cfabffaab1ba46d5f6db92ce5fa5c78fc6446f39cb4d6c627d630715ac48f92c  ./snapshots/3/terms.bin
 51973790160b10a8055f6a4f38b0ec75b1615f22ecb892a7336a1d0e15205137  ./snapshots/4/edge.dafsa
@@ -47,7 +44,6 @@ cfabffaab1ba46d5f6db92ce5fa5c78fc6446f39cb4d6c627d630715ac48f92c  ./snapshots/3/
 f8fc5ffb4f55940d53eb992e21b29bb914cb015013407f1432716401aac8dabe  ./snapshots/4/observation.dafsa
 0f43e030d3c65b8ff9094db906b15e405ea01d28bb30f84d16e524b8c3868a91  ./snapshots/4/__postings__.dafsa
 f6e9053a1a221256ed7cf347032894b8aabaa70d31ed471232d06e5f2fa743cb  ./snapshots/4/symbols.array
-0109f61395689604dffbc816d8f637ecb2409f5cd64bdf99c0fbb40b6a21e7dd  ./snapshots/4/symbols.dafsa
 51973790160b10a8055f6a4f38b0ec75b1615f22ecb892a7336a1d0e15205137  ./snapshots/4/tc3.dafsa
 f03839067d70f757dd67555a6aa9da4c04409e2f9f09a8e01603cec6d7fc2b96  ./snapshots/4/tc.dafsa
 cfabffaab1ba46d5f6db92ce5fa5c78fc6446f39cb4d6c627d630715ac48f92c  ./snapshots/4/terms.bin
@@ -58,7 +54,6 @@ b0e6adf9e7c5fa8a5abace5dde001a3ed689fbc7fff8d1392c6f75f35b1f4982  ./snapshots/5/
 f8fc5ffb4f55940d53eb992e21b29bb914cb015013407f1432716401aac8dabe  ./snapshots/5/observation.dafsa
 0f43e030d3c65b8ff9094db906b15e405ea01d28bb30f84d16e524b8c3868a91  ./snapshots/5/__postings__.dafsa
 f6e9053a1a221256ed7cf347032894b8aabaa70d31ed471232d06e5f2fa743cb  ./snapshots/5/symbols.array
-0109f61395689604dffbc816d8f637ecb2409f5cd64bdf99c0fbb40b6a21e7dd  ./snapshots/5/symbols.dafsa
 51973790160b10a8055f6a4f38b0ec75b1615f22ecb892a7336a1d0e15205137  ./snapshots/5/tc3.dafsa
 f03839067d70f757dd67555a6aa9da4c04409e2f9f09a8e01603cec6d7fc2b96  ./snapshots/5/tc.dafsa
 cfabffaab1ba46d5f6db92ce5fa5c78fc6446f39cb4d6c627d630715ac48f92c  ./snapshots/5/terms.bin
@@ -71,7 +66,6 @@ f8fc5ffb4f55940d53eb992e21b29bb914cb015013407f1432716401aac8dabe  ./snapshots/6/
 0f43e030d3c65b8ff9094db906b15e405ea01d28bb30f84d16e524b8c3868a91  ./snapshots/6/__postings__.dafsa
 b52c1da82e14d62c276654ca14ed11ae63cd1b0905a3d1a7ab880c9643c7061a  ./snapshots/6/r.dafsa
 f6e9053a1a221256ed7cf347032894b8aabaa70d31ed471232d06e5f2fa743cb  ./snapshots/6/symbols.array
-0109f61395689604dffbc816d8f637ecb2409f5cd64bdf99c0fbb40b6a21e7dd  ./snapshots/6/symbols.dafsa
 51973790160b10a8055f6a4f38b0ec75b1615f22ecb892a7336a1d0e15205137  ./snapshots/6/tc3.dafsa
 f03839067d70f757dd67555a6aa9da4c04409e2f9f09a8e01603cec6d7fc2b96  ./snapshots/6/tc.dafsa
 14461842b53d23a405288040b7f428cf84ce195acaa9d414a28ee7857aa7e584  ./snapshots/6/terms.bin

@@ -3,6 +3,28 @@
 All notable changes to this project are documented in this file.
 
 ## [Unreleased]
+- **Snapshots no longer persist the derived symbol DAFSA** (2026-10-18, unit
+  `derive-done`). `<snapshot>/symbols.dafsa` is a pure derived cache of
+  `<snapshot>/symbols.array` (the source of truth — `intern_load` rebuilds the
+  forward map from it), but a publish that interned even ONE new symbol paid a
+  full `ensureFwd` rebuild + `dafsa_save` of every state: **MEASURED 22-31 s of
+  publish CPU and ~298 MB per snapshot** on a 1.5 M-symbol store, which at
+  ~0.3 s of real query work was the entire cost of a content write. Publish now
+  writes only `symbols.array`, the relation files and the manifest, so a
+  content write is **0.22 s** and a snapshot is **43 MB instead of 328 MB**.
+  - Read path: `dl_pattern`'s VERSION route (`zig/src/dl.zig`, `snapshotSymSet`)
+    walks the file when it is present and the LIVE in-memory forward map when it
+    is absent. Sound because sym-ids are append-only and never reused, so the
+    live key set is a superset of any snapshot's: extra ids only widen a set
+    that is then intersected with that snapshot's own rows. The same argument
+    `dl_fuzzy_lookup` and the VM's `~` operator already rely on. Verified by
+    102 + 12 pattern observations, byte-identical between the two sources.
+  - Trade-off: a cold process issuing a version pattern query against a
+    file-less snapshot pays the lazy `ensureFwd` rebuild once (measured 12-17 s
+    vs 4.3 s file-backed on the 1.5 M-symbol store).
+  - Old snapshots that already contain the file are untouched and still read
+    normally — no migration, no deletion. `DL_PUB_DERIVED=1` restores the old
+    behaviour for a self-contained read-only snapshot.
 - **Vector/embedding tier REMOVED** (2026-08-11): the semantic half of the
   search stack is deleted, not superseded.
   - The decision: agents author the handoff data and query it with the SAME

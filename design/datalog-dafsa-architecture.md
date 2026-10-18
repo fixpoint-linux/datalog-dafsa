@@ -373,6 +373,12 @@ corrected attribution below).
    previous snapshot's file). Note the interner (`symbols.dafsa`) and term
    store (`terms.bin`) saves are NOT revision-gated -- they re-save on every
    publish (~33 ms + ~17 ms per publish at every store size measured).
+   **Correction 2026-10-18 (unit `derive-done`):** `symbols.dafsa` is no longer
+   written at all by default (pure derived cache of `symbols.array`; it cost
+   11.7 s rebuild + 17.5 s save ≈ 285 MB on a 1.5 M-symbol store whenever the
+   vocabulary changed, which is every content write). The pattern read path
+   falls back to the live in-memory forward map; `DL_PUB_DERIVED=1` restores
+   the old behaviour. Only `terms.bin` is still re-saved ungated.
 2. **VFS / atomic-commit syscall dance** -- per saved file:
    `open(tmp)` -> `writeAll` -> `fsync(fd)` -> `close` -> `renameat` ->
    `fsyncDirOf` (`persist.zig`). This is the price of crash-atomicity and is

@@ -70,6 +70,19 @@ primitives** (used by the raw-DAFSA engine tests), not as the `~` path.
 `db->ir->fwd` (live); `symbols_dfa_walk_view` runs over `<sdir>/symbols.dafsa`
 (snapshot mmap), mirroring how `dl_pattern` already routes live-vs-snapshot.
 
+> **Correction (2026-10-18, unit `derive-done`).** Publish no longer writes
+> `<snapshot>/symbols.dafsa` by default: it is a pure derived cache of
+> `symbols.array`, and re-serializing it whenever the vocabulary changed cost
+> ~22-31 s of publish CPU and ~285 MB per snapshot on a 1.5 M-symbol store.
+> The snapshot pattern path now walks the file **when present** (old snapshots,
+> and anything published with `DL_PUB_DERIVED=1`) and the LIVE `ir->fwd`
+> otherwise — `snapshotSymSet` in `zig/src/dl.zig`. That is sound because
+> sym-ids are append-only, so the live key set is a superset of any snapshot's
+> and extra ids can only widen a set that is then intersected with the
+> snapshot's own rows. Measured: 102 small-store and 12 large-store pattern
+> observations byte-identical between the two sources. Risk 2 below is
+> therefore no longer a requirement.
+
 ## The new primitive
 
 **`symbols_dfa_walk` / `symbols_dfa_walk_view`** — automaton intersection over
@@ -155,7 +168,9 @@ Cross-check every emitted sym_id against `intern_str_of(db->ir, sym_id)` in a te
    (verified linear by the prototype, even under id suffix sharing); guard with
    the `ntrans != 1` check and `*bad` out-param.
 2. **Snapshot must walk `<sdir>/symbols.dafsa`**, not the live `db->ir` — the
-   live interner may be a superset after post-publish inserts.
+   live interner may be a superset after post-publish inserts. *(Superseded
+   2026-10-18: the superset is harmless — see the correction under Q4 — and the
+   file is now absent from snapshots published by default.)*
 3. **Don't forget `magic.c` `atom_copy` `pattern_col`** — a missed copy silently
    drops the column selection in magic-set re-written rules. (Moot: the
    magic-sets transform was deleted 2026-08-11.)

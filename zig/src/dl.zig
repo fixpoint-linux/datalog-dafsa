@@ -3918,7 +3918,7 @@ extern fn clock_gettime(clk_id: c_int, tp: *Timespec) c_int;
 
 pub const dl_publish_timing_out = extern struct {
     n_publishes: u64, // number of publishes accumulated
-    t_intern_ns: u64, // interner save (symbols.dafsa + symbols.array)
+    t_intern_ns: u64, // interner save (symbols.array; + derived symbols.dafsa when DL_PUB_DERIVED=1)
     t_terms_ns: u64, // term store save (terms.bin)
     t_rel_save_ns: u64, // sum over relations: rel_save (dafsa serialization)
     t_rel_other_ns: u64, // manifest writes + misc per-relation work
@@ -4382,6 +4382,59 @@ fn consolidateInner(d: *DlDb) c_int {
     return 0;
 }
 
+// ─── Derived-file publish opt-in ───────────────────────────────────────────
+//
+// DL_PUB_DERIVED=1 makes publish persist <snapshot>/symbols.dafsa again (the
+// pre-2026-08 behaviour), for a snapshot that must answer a pattern query with
+// no live interner of its own.  Zero overhead when unset (one getenv at the
+// first publish); OFF is the default.  Motivated in the 4a block comment of
+// materializeSnapshot: the file is a pure derived cache of symbols.array, and
+// re-serializing it on every vocabulary change was the entire cost of a
+// content write.
+var pub_derived_on: bool = false;
+var pub_derived_env_checked: bool = false;
+
+fn pubDerivedCheckEnv() bool {
+    if (!pub_derived_env_checked) {
+        pub_derived_env_checked = true;
+        const v = getenv("DL_PUB_DERIVED");
+        pub_derived_on = (v != null and v.?[0] != 0 and !strEq(v.?, "0"));
+    }
+    return pub_derived_on;
+}
+
+/// Write the staged snapshot's derived symbols.dafsa.  Hardlinks the previous
+/// snapshot's pair when the freshly saved symbols.array is byte-identical (it
+/// then describes the same key set, and a DAFSA of the same keys is
+/// answer-equivalent — dafsa_view surfaces keys, never state ids), else
+/// serializes the live forward DAFSA.  Returns 0 on success, -1 on failure.
+fn publishDerivedDafsa(d: *DlDb, rev: *[4096:0]u8, fwd: *[4096:0]u8, prev_snap_dir: [*c]const u8) c_int {
+    var inherited = false;
+    if (prev_snap_dir[0] != 0) {
+        var prev_fwd: [4096:0]u8 = undefined;
+        var prev_rev: [4096:0]u8 = undefined;
+        _ = snprintf(&prev_fwd, 4096, "%s/symbols.dafsa", prev_snap_dir);
+        _ = snprintf(&prev_rev, 4096, "%s/symbols.array", prev_snap_dir);
+        if (filesIdentical(rev, &prev_rev)) {
+            _ = posix.unlink(rev);
+            if (posix.link(&prev_rev, rev) == 0 and posix.link(&prev_fwd, fwd) == 0) {
+                inherited = true;
+            } else {
+                // Half-made link, or the previous snapshot carries no derived
+                // file (it was published with the default, or predates it):
+                // drop the links and re-serialize rather than publish one half
+                // of the pair.
+                _ = posix.unlink(rev);
+                _ = posix.unlink(fwd);
+                if (intern_save(d.ir, fwd, rev) != 0) return -1;
+            }
+        }
+    }
+    if (inherited) return 0;
+    const f = intern_fwd(d.ir) orelse return -1;
+    return dc.dafsa_save(@ptrCast(@alignCast(f)), fwd);
+}
+
 /// Snapshot materialization: serialize the consolidated state into a NEW
 /// versioned snapshot dir and flip CURRENT (steps 2-8 of the publish
 /// contract).  This is the EXPENSIVE half — O(store) serialize + the tmp/
@@ -4435,29 +4488,41 @@ fn materializeSnapshot(d: *DlDb) c_int {
     if (mkdir(&tmp_dir, @as(posix.mode_t, 0o755)) != 0)
         return -1;
 
-    // 4a. Save interner.
+    // 4a. Save the interner — symbols.array, the SOURCE OF TRUTH, and nothing
+    // else by default.
     //
     // The forward DAFSA is a PURE DERIVED CACHE of symbols.array: nothing ever
     // reads <snapshot>/symbols.dafsa as the source of truth (intern_load builds
     // the interner from symbols.array alone and ensureFwd rebuilds the forward
     // DAFSA from it — intern.zig), and the only consumer of the file is the
-    // mmap'd pattern/regex walk, which needs exactly the key set the array
-    // describes.  So when the freshly serialized array is byte-identical to the
-    // previous snapshot's, that snapshot's two files already describe exactly
-    // the key set this build would produce — a DAFSA of the same keys, whose
-    // state numbering a fresh save might emit in another order, which nothing
-    // reads (dafsa_view surfaces keys, never state ids).  The pair can then be
-    // hardlinked instead of paying a full ensureFwd rebuild + dafsa_save
-    // re-serialization on EVERY publish.
+    // mmap'd pattern/regex walk, whose key set the array already determines.
+    // Publishing it therefore buys a read-path convenience (no rebuild) at the
+    // cost of re-serializing every state on any vocabulary change:
     //
-    // MEASURED (agent store: 166,745 symbols / 44 MB array): the unconditional
-    // path costs 11.7 s rebuild + 17.5 s save = ~29 s per publish, which at
-    // ~0.3 s of actual query work is the entire cost of a Datalog query.  The
-    // gate replaces it with a 44 MB compare (~15 ms; the bytes are in page
-    // cache from intern_save) plus two hardlinks.  Snapshot files are immutable
-    // once renamed into place (only rmRf unlinks them), so the links are safe
-    // exactly as relSaveGated's are.  Falls back to the full save when there is
-    // no previous snapshot, the vocabulary changed, or a link fails.
+    // MEASURED (agent store: 166,745 symbols, 44 MB array): a publish that
+    // interns ONE new symbol pays 11.7 s ensureFwd rebuild + 17.5 s dafsa_save
+    // ≈ 298 MB, which at ~0.3 s of actual query work is the entire cost of a
+    // content write — and every new agent-memory node adds symbols, so every
+    // content write paid it.  The snapshot's own copy was never consulted on a
+    // publishing process (the live in-memory map answers identically; see
+    // snapshotSymSet), so the default is: DO NOT PERSIST IT.
+    //
+    // What still reads it: the VERSION pattern path of a process that did not
+    // build the snapshot (old snapshots, and any snapshot published with
+    // DL_PUB_DERIVED=1 — see below).  Those snapshots keep working: the file is
+    // untouched where it exists and read exactly as before, and where it is
+    // absent dl_pattern falls back to the live in-memory forward map.
+    //
+    // DL_PUB_DERIVED=1 restores the old behaviour for a deliberate
+    // self-contained read-only snapshot (one that can answer a pattern query
+    // without any live interner).  The old hardlink gate lives there: when the
+    // freshly serialized array is byte-identical to the previous snapshot's,
+    // that snapshot's two files already describe the same key set (a DAFSA of
+    // the same keys is answer-equivalent even if a fresh save would number its
+    // states in another order — dafsa_view surfaces keys, never state ids), so
+    // the pair is hardlinked instead of re-serialized.  Snapshot files are
+    // immutable once renamed into place (only rmRf unlinks them), so the links
+    // are safe exactly as relSaveGated's are.
     {
         var fwd: [4096:0]u8 = undefined;
         var rev: [4096:0]u8 = undefined;
@@ -4466,32 +4531,8 @@ fn materializeSnapshot(d: *DlDb) c_int {
         if (intern_save(d.ir, &fwd, &rev) != 0)
             return dlPublishFail(&tmp_dir, &new_dir, renamed);
 
-        var inherited = false;
-        if (prev_snap_dir[0] != 0) {
-            var prev_fwd: [4096:0]u8 = undefined;
-            var prev_rev: [4096:0]u8 = undefined;
-            _ = snprintf(&prev_fwd, 4096, "%s/symbols.dafsa", &prev_snap_dir);
-            _ = snprintf(&prev_rev, 4096, "%s/symbols.array", &prev_snap_dir);
-            if (filesIdentical(&rev, &prev_rev)) {
-                _ = posix.unlink(&rev);
-                if (posix.link(&prev_rev, &rev) == 0 and posix.link(&prev_fwd, &fwd) == 0) {
-                    inherited = true;
-                } else {
-                    // Half-made link or no previous dafsa: drop the links and
-                    // re-serialize rather than publish a directory that is
-                    // missing the derived file.
-                    _ = posix.unlink(&rev);
-                    _ = posix.unlink(&fwd);
-                    if (intern_save(d.ir, &fwd, &rev) != 0)
-                        return dlPublishFail(&tmp_dir, &new_dir, renamed);
-                }
-            }
-        }
-
-        if (!inherited) {
-            if (dc.dafsa_save(@ptrCast(@alignCast(intern_fwd(d.ir))), &fwd) != 0)
-                return dlPublishFail(&tmp_dir, &new_dir, renamed);
-        }
+        if (pubDerivedCheckEnv() and publishDerivedDafsa(d, &rev, &fwd, &prev_snap_dir) != 0)
+            return dlPublishFail(&tmp_dir, &new_dir, renamed);
     }
     if (pub_timers_on) {
         pub_timers.t_intern_ns += nowNs() - t_mark;
@@ -4974,6 +5015,41 @@ fn symsetAddCb(sym_id: u32, user: ?*anyopaque) callconv(.c) c_int {
     return regexwalk.symset_add(set, sym_id);
 }
 
+/// Symbol set for a VERSION pattern query: walk the snapshot's own derived
+/// symbols.dafsa when it is present (every snapshot published before the
+/// derived file stopped being written, plus anything published with
+/// DL_PUB_DERIVED=1), otherwise the LIVE in-memory forward DAFSA.
+///
+/// SOUNDNESS OF THE FALLBACK — the same argument dl_fuzzy_lookup and the VM's
+/// `~` operator already rely on: sym-ids are append-only and never reused, so
+/// the live forward map's key set is a SUPERSET of the snapshot's.  A regex
+/// walked over the superset can only emit EXTRA sym-ids — ids the snapshot
+/// never interned — and such an id occurs in none of that snapshot's relation
+/// rows, so view_filter_col drops every row it could have matched.  The
+/// filtered result is therefore byte-identical to what the snapshot's own
+/// DAFSA yields (extra ids only widen a set that is then intersected with the
+/// rows).
+///
+/// The converse cannot arise: the interner this reads is the one publish
+/// serialized into symbols.array, and a snapshot's array is a prefix of the
+/// live one (ids are appended in order and never reused), so every sym-id a
+/// snapshot row references is present in the live map.
+///
+/// Cost shift: a process that did NOT build the snapshot pays the lazy
+/// ensureFwd rebuild (intern.zig) on its first version pattern query instead of
+/// mmap'ing the file.  That rebuild is already paid by the in-memory pattern
+/// path, by dl_fuzzy_lookup, and by any `~` rule evaluation.
+fn snapshotSymSet(d: *DlDb, sdir: [*c]const u8, dfa: ?*const regexwalk.regex_dfa, set: *regexwalk.sym_set) c_long {
+    var sym_path: [16384:0]u8 = undefined;
+    _ = snprintf(&sym_path, 16384, "%s/symbols.dafsa", sdir);
+    if (dc.dafsa_view_open(&sym_path)) |v| {
+        defer dc.dafsa_view_close(v);
+        return symbols_dfa_walk_view(@ptrCast(v), dfa, symsetAddCb, set);
+    }
+    const fwd = intern_fwd(d.ir) orelse return -1;
+    return symbols_dfa_walk(@ptrCast(fwd), dfa, symsetAddCb, set);
+}
+
 pub export fn dl_pattern(db: ?*DlDb, rel_name: [*c]const u8, col: u8, dfa: ?*const regexwalk.regex_dfa, cb: DlTupleCb, user: ?*anyopaque) c_long {
     const d = db orelse return -1;
     if (rel_name == null or dfa == null or cb == null) return -1;
@@ -4988,16 +5064,9 @@ pub export fn dl_pattern(db: ?*DlDb, rel_name: [*c]const u8, col: u8, dfa: ?*con
         if (manifest_find_rel_ex(&sdir, rel_name, &arity, &variadic) == 0)
             return -1;
 
-        var sym_path: [16384:0]u8 = undefined;
-        _ = snprintf(&sym_path, 16384, "%s/symbols.dafsa", &sdir);
-        const v = dc.dafsa_view_open(&sym_path) orelse return -1;
         var set: regexwalk.sym_set = std.mem.zeroes(regexwalk.sym_set);
-        if (regexwalk.symset_init(&set) != 0) {
-            dc.dafsa_view_close(v);
-            return -1;
-        }
-        const ns = symbols_dfa_walk_view(@ptrCast(v), dfa, symsetAddCb, &set);
-        dc.dafsa_view_close(v);
+        if (regexwalk.symset_init(&set) != 0) return -1;
+        const ns = snapshotSymSet(d, &sdir, dfa, &set);
         if (ns < 0) {
             regexwalk.symset_free(&set);
             return -1;
@@ -5561,6 +5630,56 @@ test "dl_snapshot_relations enumerates a published manifest" {
     try testing.expectEqual(@as(c_long, -1), dl_snapshot_relations(db, 0, Ctx.cb, &got));
     try testing.expectEqual(@as(c_long, -1), dl_snapshot_relations(db, 99, Ctx.cb, &got));
     try testing.expectEqual(@as(c_long, -1), dl_snapshot_relations(db, 1, null, &got));
+}
+
+test "version pattern: file-backed and live-map (fallback) answers agree" {
+    const dir = "/tmp/datalog_zig_u11_derived";
+    rmrfTestDir(dir);
+    defer rmrfTestDir(dir);
+
+    const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+    defer dl_close(db);
+
+    try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "e", 2));
+    const facts = [_][2][]const u8{ .{ "alice", "nyc" }, .{ "bob", "la" }, .{ "carol", "sf" } };
+    for (facts) |f| {
+        const ids = [2]u32{ intern_str(db.ir, f[0].ptr), intern_str(db.ir, f[1].ptr) };
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "e", &ids, 2));
+    }
+    try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db));
+
+    var snapbuf: [256]u8 = undefined;
+    const sdir = std.fmt.bufPrintZ(&snapbuf, "{s}/snapshots/1", .{dir}) catch unreachable;
+    var fbuf: [512]u8 = undefined;
+    const fpath = std.fmt.bufPrintZ(&fbuf, "{s}/symbols.dafsa", .{sdir}) catch unreachable;
+
+    // Default publish does NOT persist the derived cache, so the pattern query
+    // below can only be answered by the live in-memory forward map.
+    var st: Stat = undefined;
+    try testing.expect(stat(fpath, &st) != 0);
+
+    const dfa = regexwalk.regex_compile(".*a.*");
+    defer regexwalk.regex_dfa_free(dfa);
+    try testing.expect(dfa != null);
+    try testing.expect(dfa.?.errmsg == null);
+
+    var fallback = CollectCbCtx{};
+    try testing.expectEqual(@as(c_long, 2), dl_pattern(db, "e", 0, dfa, collectCb, &fallback));
+
+    // Now give the SAME snapshot its own derived DAFSA and re-ask: the file
+    // path must answer identically (this arm is what proves the fallback's
+    // superset argument on a real DAFSA rather than only in prose).
+    const fwd = intern_fwd(db.ir) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(c_int, 0), dc.dafsa_save(@ptrCast(@alignCast(fwd)), fpath));
+
+    var file_backed = CollectCbCtx{};
+    try testing.expectEqual(@as(c_long, 2), dl_pattern(db, "e", 0, dfa, collectCb, &file_backed));
+
+    try testing.expectEqual(fallback.n, file_backed.n);
+    for (fallback.rows[0..fallback.n], file_backed.rows[0..file_backed.n]) |fr, br| {
+        try testing.expectEqual(fr[0], br[0]);
+        try testing.expectEqual(fr[1], br[1]);
+    }
 }
 
 test "dl_open_ro never writes" {
