@@ -30,6 +30,11 @@ const compiler = @import("compiler.zig");
 const tupleset = @import("tupleset.zig");
 const regexwalk = @import("regexwalk.zig");
 const parser = @import("parser.zig");
+const relation = @import("relation.zig");
+const intern = @import("intern.zig");
+const termstore = @import("termstore.zig");
+const vrelation = @import("vrelation.zig");
+const iter_mod = @import("iter.zig");
 
 // Byte-identical extern structs owned by compiler.zig (per the brief, the
 // canonical ABI types for the bytecode the still-C dl.c/topdown.c share).
@@ -388,7 +393,7 @@ const VmFrame = struct {
     saved: Bindings,
     perm: [*c]const u8,
     perm_storage: [8]u8,
-    it: ?*dx.dl_iter,
+    it: ?*iter_mod.DlIter,
     last: u32,
     started: u8,
     lo: u32,
@@ -436,7 +441,7 @@ fn seekValid(f: *VmFrame, in: *const vm_instr, sc: c_int, ar: c_int, b: *Binding
 fn rangeResume(f: *VmFrame, fi: *const vm_instr, b: *Bindings) c_int {
     var cols: [8]u32 = undefined;
     while (true) {
-        const rc = dx.dl_iter_next(f.it, &cols);
+        const rc = iter_mod.dl_iter_next(f.it, &cols);
         if (rc == 1) {
             const v = cols[0];
             if (v < f.lo) continue;
@@ -462,7 +467,7 @@ fn backtrack(frames: []VmFrame, sp: *c_int, b: *Bindings, p: [*]const vm_instr, 
                 ip.* = f.ip + 1;
                 return 1;
             }
-            dx.dl_iter_close(f.it);
+            iter_mod.dl_iter_close(f.it);
             f.it = null;
             tbufFree(&f.tuples);
             sp.* -= 1;
@@ -589,8 +594,8 @@ fn matJoinBuild(l: *const tupleset.tuple_set, r: *const tupleset.tuple_set, cc: 
 // ─── OP_WALK symbol-walk callback ──────────────────────────────────────────
 
 fn symsetAddCb(sym_id: u32, user: ?*anyopaque) callconv(.c) c_int {
-    const set: *dx.sym_set = @ptrCast(@alignCast(user orelse return -1));
-    return dx.symset_add(set, sym_id);
+    const set: *regexwalk.sym_set = @ptrCast(@alignCast(user orelse return -1));
+    return regexwalk.symset_add(set, sym_id);
 }
 
 // ─── Bytecode interpreter ──────────────────────────────────────────────────
@@ -679,7 +684,7 @@ fn execRange(
                         break :blk;
                     }
                     f.tuples.arity = in.b;
-                    _ = dx.rel_prefix(r, null, 0, tbufCb, &f.tuples);
+                    _ = relation.rel_prefix(@ptrCast(@alignCast(r)), null, 0, tbufCb, &f.tuples);
                 }
 
                 if (f.tuples.count == 0) {
@@ -720,19 +725,19 @@ fn execRange(
                 }
                 f.tuples.arity = in.b;
 
-                var set: dx.sym_set = undefined;
-                if (dx.symset_init(&set) != 0) {
+                var set: regexwalk.sym_set = undefined;
+                if (regexwalk.symset_init(&set) != 0) {
                     ip = end;
                     break :blk;
                 }
-                const ns = dx.symbols_dfa_walk(dx.intern_fwd(db.ir), @ptrCast(@alignCast(dfa)), symsetAddCb, &set);
+                const ns = regexwalk.symbols_dfa_walk(@ptrCast(@alignCast(intern.intern_fwd(@ptrCast(@alignCast(db.ir))))), dfa, symsetAddCb, &set);
                 if (ns < 0) {
-                    dx.symset_free(&set);
+                    regexwalk.symset_free(&set);
                     ip = end;
                     break :blk;
                 }
-                _ = dx.rel_filter_col(r, in.c, &set, tbufCb, &f.tuples);
-                dx.symset_free(&set);
+                _ = relation.rel_filter_col(@ptrCast(@alignCast(r)), in.c, &set, tbufCb, &f.tuples);
+                regexwalk.symset_free(&set);
 
                 if (f.tuples.count == 0) {
                     tbufFree(&f.tuples);
@@ -786,7 +791,7 @@ fn execRange(
                         break :blk;
                     }
                     f.tuples.arity = in.c;
-                    _ = dx.rel_prefix(r, &pref, @intCast(k), tbufCb, &f.tuples);
+                    _ = relation.rel_prefix(@ptrCast(@alignCast(r)), &pref, @intCast(k), tbufCb, &f.tuples);
                     if (f.tuples.count == 0) {
                         tbufFree(&f.tuples);
                         if (backtrack(frames[0..], &sp, &b, p, &ip) == 0) ip = end;
@@ -855,7 +860,7 @@ fn execRange(
                         break :blk;
                     }
                     f.tuples.arity = @intCast(ar);
-                    _ = dx.rel_prefix(pr, &pref, @intCast(k), tbufCb, &f.tuples);
+                    _ = relation.rel_prefix(@ptrCast(@alignCast(pr)), &pref, @intCast(k), tbufCb, &f.tuples);
                     if (f.tuples.count == 0) {
                         tbufFree(&f.tuples);
                         f.perm = null;
@@ -906,7 +911,7 @@ fn execRange(
                         if (backtrack(frames[0..], &sp, &b, p, &ip) == 0) ip = end;
                         break :blk;
                     }
-                    _ = dx.rel_prefix(r, null, 0, dx.ts_sink_cb, &all_ts);
+                    _ = relation.rel_prefix(@ptrCast(@alignCast(r)), null, 0, relation.ts_sink_cb, &all_ts);
                     ts_sort(&all_ts);
                 }
 
@@ -1079,7 +1084,7 @@ fn execRange(
                     if (backtrack(frames[0..], &sp, &b, p, &ip) == 0) ip = end;
                     break :blk;
                 }
-                if (dx.rel_exact(r, &cols) != 0) {
+                if (relation.rel_exact(@ptrCast(@alignCast(r)), &cols) != 0) {
                     if (backtrack(frames[0..], &sp, &b, p, &ip) == 0) ip = end;
                     break :blk;
                 }
@@ -1189,8 +1194,8 @@ fn execRange(
             },
 
             OP_STR_FILTER => blk: {
-                const as = dx.intern_str_of(db.ir, bGet(&b, in.a));
-                const bs = dx.intern_str_of(db.ir, bGet(&b, in.b));
+                const as = intern.intern_str_of(@ptrCast(@alignCast(db.ir)), bGet(&b, in.a));
+                const bs = intern.intern_str_of(@ptrCast(@alignCast(db.ir)), bGet(&b, in.b));
                 var pass: c_int = 0;
                 if (as != null and bs != null) {
                     const al = strlen(as);
@@ -1200,7 +1205,7 @@ fn execRange(
                             pass = if (bl <= al and strncmp(as, bs, bl) == 0) 1 else 0;
                         },
                         1 => {
-                            pass = if (bl <= al and strcmp(as + al - bl, bs) == 0) 1 else 0;
+                            pass = if (bl <= al and strcmp(as.? + al - bl, bs) == 0) 1 else 0;
                         },
                         2 => {
                             pass = if (strstr(as, bs) != null) 1 else 0;
@@ -1219,8 +1224,8 @@ fn execRange(
 
             OP_STR_LEN => blk: {
                 const v = bGet(&b, in.a);
-                if (dx.term_is_list(db.terms, v) != 0) {
-                    const len = dx.term_length(db.terms, v);
+                if (termstore.term_is_list(@ptrCast(@alignCast(db.terms)), v) != 0) {
+                    const len = termstore.term_length(@ptrCast(@alignCast(db.terms)), v);
                     if (bTry(&b, in.c, len) == 0) {
                         if (backtrack(frames[0..], &sp, &b, p, &ip) == 0) ip = end;
                         break :blk;
@@ -1228,7 +1233,7 @@ fn execRange(
                     ip += 1;
                     break :blk;
                 }
-                const s = dx.intern_str_of(db.ir, v);
+                const s = intern.intern_str_of(@ptrCast(@alignCast(db.ir)), v);
                 if (s == null) {
                     if (backtrack(frames[0..], &sp, &b, p, &ip) == 0) ip = end;
                     break :blk;
@@ -1246,34 +1251,34 @@ fn execRange(
             OP_STR_BIND => blk: {
                 var sid: u32 = 0;
                 if (in.imm == 0) {
-                    const as = dx.intern_str_of(db.ir, bGet(&b, in.a));
-                    const bs = dx.intern_str_of(db.ir, bGet(&b, in.b));
+                    const as = intern.intern_str_of(@ptrCast(@alignCast(db.ir)), bGet(&b, in.a));
+                    const bs = intern.intern_str_of(@ptrCast(@alignCast(db.ir)), bGet(&b, in.b));
                     if (as != null and bs != null) {
                         const al = strlen(as);
                         const bl = strlen(bs);
                         if (al + bl <= 4096) {
                             const mem = c.malloc(al + bl + 1);
                             if (mem != null) {
-                                const buf: [*]u8 = @ptrCast(@alignCast(mem));
-                                @memcpy(buf[0..al], as[0..al]);
-                                @memcpy(buf[al..][0..bl], bs[0..bl]);
+                                const buf: [*:0]u8 = @ptrCast(@alignCast(mem));
+                                @memcpy(buf[0..al], as.?[0..al]);
+                                @memcpy(buf[al..][0..bl], bs.?[0..bl]);
                                 buf[al + bl] = 0;
-                                sid = dx.intern_str(db.ir, buf);
+                                sid = intern.intern_str(@ptrCast(@alignCast(db.ir)), buf);
                                 c.free(@ptrCast(buf));
                             }
                         }
                     }
                 } else if (in.imm == 1 or in.imm == 2) {
-                    const as = dx.intern_str_of(db.ir, bGet(&b, in.a));
+                    const as = intern.intern_str_of(@ptrCast(@alignCast(db.ir)), bGet(&b, in.a));
                     if (as != null) {
                         const al = strlen(as);
                         if (al <= 4096) {
                             const mem = c.malloc(al + 1);
                             if (mem != null) {
-                                const buf: [*]u8 = @ptrCast(@alignCast(mem));
+                                const buf: [*:0]u8 = @ptrCast(@alignCast(mem));
                                 var j: usize = 0;
                                 while (j < al) : (j += 1) {
-                                    var ch: u8 = as[j];
+                                    var ch: u8 = as.?[j];
                                     if (in.imm == 1) {
                                         if (ch >= 'A' and ch <= 'Z')
                                             ch += ('a' - 'A');
@@ -1284,7 +1289,7 @@ fn execRange(
                                     buf[j] = ch;
                                 }
                                 buf[al] = 0;
-                                sid = dx.intern_str(db.ir, buf);
+                                sid = intern.intern_str(@ptrCast(@alignCast(db.ir)), buf);
                                 c.free(@ptrCast(buf));
                             }
                         }
@@ -1302,7 +1307,7 @@ fn execRange(
             },
 
             OP_LIST_CONS => blk: {
-                const h = dx.term_cons(db.terms, bGet(&b, in.b), bGet(&b, in.c));
+                const h = termstore.term_cons(@ptrCast(@alignCast(db.terms)), bGet(&b, in.b), bGet(&b, in.c));
                 if (h == 0) {
                     if (backtrack(frames[0..], &sp, &b, p, &ip) == 0) ip = end;
                     break :blk;
@@ -1316,11 +1321,11 @@ fn execRange(
 
             OP_LIST_CAR => blk: {
                 const opv = bGet(&b, in.a);
-                if (dx.term_is_list(db.terms, opv) == 0 or opv == dx.TERM_NIL) {
+                if (termstore.term_is_list(@ptrCast(@alignCast(db.terms)), opv) == 0 or opv == dx.TERM_NIL) {
                     if (backtrack(frames[0..], &sp, &b, p, &ip) == 0) ip = end;
                     break :blk;
                 }
-                if (bTry(&b, in.c, dx.term_car(db.terms, opv)) == 0) {
+                if (bTry(&b, in.c, termstore.term_car(@ptrCast(@alignCast(db.terms)), opv)) == 0) {
                     if (backtrack(frames[0..], &sp, &b, p, &ip) == 0) ip = end;
                     break :blk;
                 }
@@ -1329,11 +1334,11 @@ fn execRange(
 
             OP_LIST_CDR => blk: {
                 const opv = bGet(&b, in.a);
-                if (dx.term_is_list(db.terms, opv) == 0 or opv == dx.TERM_NIL) {
+                if (termstore.term_is_list(@ptrCast(@alignCast(db.terms)), opv) == 0 or opv == dx.TERM_NIL) {
                     if (backtrack(frames[0..], &sp, &b, p, &ip) == 0) ip = end;
                     break :blk;
                 }
-                if (bTry(&b, in.c, dx.term_cdr(db.terms, opv)) == 0) {
+                if (bTry(&b, in.c, termstore.term_cdr(@ptrCast(@alignCast(db.terms)), opv)) == 0) {
                     if (backtrack(frames[0..], &sp, &b, p, &ip) == 0) ip = end;
                     break :blk;
                 }
@@ -1341,7 +1346,7 @@ fn execRange(
             },
 
             OP_LIST_APPEND => blk: {
-                const r = dx.term_append(db.terms, bGet(&b, in.a), bGet(&b, in.b));
+                const r = termstore.term_append(@ptrCast(@alignCast(db.terms)), bGet(&b, in.a), bGet(&b, in.b));
                 if (r == 0) {
                     if (backtrack(frames[0..], &sp, &b, p, &ip) == 0) ip = end;
                     break :blk;
@@ -1355,7 +1360,7 @@ fn execRange(
 
             OP_LIST_MEMBER => blk: {
                 const lv = bGet(&b, in.a);
-                if (bOk(&b, in.a) == 0 or dx.term_is_list(db.terms, lv) == 0) {
+                if (bOk(&b, in.a) == 0 or termstore.term_is_list(@ptrCast(@alignCast(db.terms)), lv) == 0) {
                     if (backtrack(frames[0..], &sp, &b, p, &ip) == 0) ip = end;
                     break :blk;
                 }
@@ -1363,12 +1368,12 @@ fn execRange(
                     const xv = bGet(&b, in.b);
                     var cur = lv;
                     var found: c_int = 0;
-                    while (dx.term_is_list(db.terms, cur) != 0 and cur != dx.TERM_NIL) {
-                        if (dx.term_car(db.terms, cur) == xv) {
+                    while (termstore.term_is_list(@ptrCast(@alignCast(db.terms)), cur) != 0 and cur != dx.TERM_NIL) {
+                        if (termstore.term_car(@ptrCast(@alignCast(db.terms)), cur) == xv) {
                             found = 1;
                             break;
                         }
-                        cur = dx.term_cdr(db.terms, cur);
+                        cur = termstore.term_cdr(@ptrCast(@alignCast(db.terms)), cur);
                     }
                     if (found == 0) {
                         if (backtrack(frames[0..], &sp, &b, p, &ip) == 0) ip = end;
@@ -1388,11 +1393,11 @@ fn execRange(
                     f.perm = null;
                     f.tuples = std.mem.zeroes(TupleBuf);
                     f.tuples.arity = 1;
-                    f.tuples.cap = @intCast(dx.term_length(db.terms, lv));
+                    f.tuples.cap = @intCast(termstore.term_length(@ptrCast(@alignCast(db.terms)), lv));
                     if (f.tuples.cap < 1) f.tuples.cap = 1;
                     const mem = c.malloc(@as(usize, @intCast(f.tuples.cap)) * @sizeOf(u32)) orelse return -1;
                     f.tuples.data = @ptrCast(@alignCast(mem));
-                    while (dx.term_is_list(db.terms, cur) != 0 and cur != dx.TERM_NIL) {
+                    while (termstore.term_is_list(@ptrCast(@alignCast(db.terms)), cur) != 0 and cur != dx.TERM_NIL) {
                         if (cnt >= f.tuples.cap) {
                             const nc: c_long = f.tuples.cap *% 2;
                             const old: ?*anyopaque = @ptrCast(f.tuples.data.?);
@@ -1400,9 +1405,9 @@ fn execRange(
                             f.tuples.data = @ptrCast(@alignCast(nd));
                             f.tuples.cap = nc;
                         }
-                        f.tuples.data.?[@intCast(cnt)] = dx.term_car(db.terms, cur);
+                        f.tuples.data.?[@intCast(cnt)] = termstore.term_car(@ptrCast(@alignCast(db.terms)), cur);
                         cnt +%= 1;
-                        cur = dx.term_cdr(db.terms, cur);
+                        cur = termstore.term_cdr(@ptrCast(@alignCast(db.terms)), cur);
                     }
                     f.tuples.count = cnt;
                     if (f.tuples.count == 0) {
@@ -1434,7 +1439,7 @@ fn execRange(
                 const hi = bGet(&b, in.b);
                 if (bOk(&b, in.c) != 0) {
                     const xv = bGet(&b, in.c);
-                    if (xv < lo or xv >= hi or dx.rel_has_col0(r, xv) == 0) {
+                    if (xv < lo or xv >= hi or relation.rel_has_col0(@ptrCast(@alignCast(r)), xv) == 0) {
                         if (backtrack(frames[0..], &sp, &b, p, &ip) == 0) ip = end;
                         break :blk;
                     }
@@ -1449,7 +1454,7 @@ fn execRange(
                     f.idx = 0;
                     f.perm = null;
                     f.tuples = std.mem.zeroes(TupleBuf);
-                    f.it = dx.dl_iter_open_live(r, null, 0);
+                    f.it = iter_mod.dl_iter_open_live(@ptrCast(@alignCast(r)), null, 0);
                     if (f.it == null) return -1;
                     f.lo = lo;
                     f.hi = hi;
@@ -1457,7 +1462,7 @@ fn execRange(
                     f.started = 0;
                     bSave(&f.saved, &b);
                     if (rangeResume(f, in, &b) == 0) {
-                        dx.dl_iter_close(f.it);
+                        iter_mod.dl_iter_close(f.it);
                         f.it = null;
                         tbufFree(&f.tuples);
                         if (backtrack(frames[0..], &sp, &b, p, &ip) == 0) ip = end;
@@ -1505,7 +1510,7 @@ fn execRange(
                         break :blk;
                     }
                 } else {
-                    const rr = dx.rel_add(r, cols[0..].ptr);
+                    const rr = relation.rel_add(@ptrCast(@alignCast(r)), cols[0..].ptr);
                     if (rr < 0) {
                         ip = end;
                         break :blk;
@@ -1611,7 +1616,7 @@ fn execRange(
             } else {
                 const r = dx.db_rel_at_arity_rw(db, acc.head_rel_id, acc.head_arity);
                 if (r != null) {
-                    const rr = dx.rel_add(r, cols[0..].ptr);
+                    const rr = relation.rel_add(@ptrCast(@alignCast(r)), cols[0..].ptr);
                     if (rr < 0) break;
                     if (rr == 1) {
                         rc +%= 1;
@@ -1626,7 +1631,7 @@ fn execRange(
     while (sp > 0) {
         const f = &frames[@intCast(sp - 1)];
         if (f.it != null) {
-            dx.dl_iter_close(f.it);
+            iter_mod.dl_iter_close(f.it);
             f.it = null;
         }
         tbufFree(&f.tuples);
@@ -1840,7 +1845,7 @@ fn evalStratumRecursive(db: *dx.dl_db, rules: [*]?*compiler.compiled_rule, n: c_
     i = 0;
     while (i < nr) : (i += 1) {
         const rc = dbRel(db, rp[@intCast(i)]);
-        const ar: u8 = if (rc != null) dx.rel_arity(rc) else 0;
+        const ar: u8 = if (rc != null) relation.rel_arity(@ptrCast(@alignCast(rc))) else 0;
         rd[@intCast(i)].rel_id = rp[@intCast(i)];
         rd[@intCast(i)].arity = ar;
         if (ts_init(&rd[@intCast(i)].idb, ar) != 0 or
@@ -1935,7 +1940,7 @@ fn evalStratumRecursive(db: *dx.dl_db, rules: [*]?*compiler.compiled_rule, n: c_
         while (i < nr) : (i += 1) {
             const rel = dbRel(db, rd[@intCast(i)].rel_id);
             if (rel != null)
-                _ = dx.rel_prefix(rel, null, 0, dx.ts_sink_cb, &rd[@intCast(i)].idb);
+                _ = relation.rel_prefix(@ptrCast(@alignCast(rel)), null, 0, relation.ts_sink_cb, &rd[@intCast(i)].idb);
         }
     }
 
@@ -2252,14 +2257,14 @@ fn evalStratumRecursive(db: *dx.dl_db, rules: [*]?*compiler.compiled_rule, n: c_
             // wrote their heads into the view via rel_add, and this stratum
             // read them from there — the rebuild below replaces the view, so
             // those facts must be folded in first or they are lost.
-            _ = dx.rel_prefix(rel, null, 0, dx.ts_sink_cb, &rd[@intCast(i)].idb);
+            _ = relation.rel_prefix(@ptrCast(@alignCast(rel)), null, 0, relation.ts_sink_cb, &rd[@intCast(i)].idb);
             ts_sort(&rd[@intCast(i)].idb);
             if (vmNomaterializeRef().* != 0 and rd[@intCast(i)].rel_id == vmExportRelidRef().*) {
                 vmExportTsRef().*.?.* = rd[@intCast(i)].idb;
                 rd[@intCast(i)].idb = std.mem.zeroes(tupleset.tuple_set);
                 continue;
             }
-            if (dx.rel_build_from_tupleset(rel, @ptrCast(@alignCast(&rd[@intCast(i)].idb))) != 0) {
+            if (relation.rel_build_from_tupleset(@ptrCast(@alignCast(rel)), &rd[@intCast(i)].idb) != 0) {
                 permFreeAll(nr, perm_count, perm_ids, perm_cap, idb_perm_shadows);
                 rdFreeTs(rd, nr);
                 c.free(@ptrCast(rd));
@@ -2274,7 +2279,7 @@ fn evalStratumRecursive(db: *dx.dl_db, rules: [*]?*compiler.compiled_rule, n: c_
             // the O(store) rebuild AND the O(store) re-read of the view.
             // Insert-only: delete deltas never route here (has_del forces
             // the full path).
-            if (dx.rel_add_tupleset(rel, @ptrCast(@alignCast(&rd[@intCast(i)].added))) != 0) {
+            if (relation.rel_add_tupleset(@ptrCast(@alignCast(rel)), &rd[@intCast(i)].added) != 0) {
                 permFreeAll(nr, perm_count, perm_ids, perm_cap, idb_perm_shadows);
                 rdFreeTs(rd, nr);
                 c.free(@ptrCast(rd));
@@ -2320,13 +2325,13 @@ fn vmExecuteMode(db: *dx.dl_db, rules: [*]?*compiler.compiled_rule, n_rules: c_i
             if (seen[hid] != 0) continue;
             seen[hid] = 1;
             if (db.rels[hid].kind == dx.RELK_VARIADIC) {
-                if (dx.vrel_reset_views(db.rels[hid].vrel) != 0) return -1;
+                if (vrelation.vrel_reset_views(@ptrCast(@alignCast(db.rels[hid].vrel))) != 0) return -1;
                 dx.permindex_mark_dirty(db, hid);
                 continue;
             }
             const r = dbRel(db, hid);
             if (r == null) return -1;
-            if (dx.rel_reset_view(r) != 0) return -1;
+            if (relation.rel_reset_view(@ptrCast(@alignCast(r))) != 0) return -1;
             dx.permindex_mark_dirty(db, hid);
         }
     }
@@ -2423,10 +2428,10 @@ pub export fn vm_query(
     const gri = dbFind(d, goal_rel);
     if (gri >= 0 and cb != null) {
         if (d.rels[@intCast(gri)].kind == dx.RELK_VARIADIC)
-            return dx.vrel_prefix(d.rels[@intCast(gri)].vrel, null, 0, cb, user);
+            return vrelation.vrel_prefix(@ptrCast(@alignCast(d.rels[@intCast(gri)].vrel)), null, 0, cb, user);
         const rel = d.rels[@intCast(gri)].rel;
         if (rel != null) {
-            const nn = dx.rel_prefix(rel, null, 0, cb, user);
+            const nn = relation.rel_prefix(@ptrCast(@alignCast(rel)), null, 0, cb, user);
             if (nn < 0) return -1;
             return nn;
         }
@@ -2609,7 +2614,7 @@ pub export fn vm_propagate_deltas(db: ?*dx.dl_db) c_int {
 
                     const hrel = dbRel(d, @intCast(cr.head_rel_id));
                     if (hrel == null) break :fail;
-                    const harity = dx.rel_arity(hrel);
+                    const harity = relation.rel_arity(@ptrCast(@alignCast(hrel)));
 
                     const head_ts = c.malloc(@sizeOf(tupleset.tuple_set)) orelse break :fail;
                     const hts: *tupleset.tuple_set = @ptrCast(@alignCast(head_ts));
@@ -2792,7 +2797,7 @@ pub export fn vm_dred_delete(db: ?*dx.dl_db) c_int {
         if (dtsp.count == 0) continue;
         const mem = c.malloc(@sizeOf(tupleset.tuple_set)) orelse break :out;
         const ts: *tupleset.tuple_set = @ptrCast(@alignCast(mem));
-        if (ts_init(ts, dx.rel_arity(d.rels[@intCast(i)].rel)) != 0) {
+        if (ts_init(ts, relation.rel_arity(@ptrCast(@alignCast(d.rels[@intCast(i)].rel)))) != 0) {
             c.free(mem);
             over[@intCast(i)] = null;
             break :out;
@@ -2882,7 +2887,7 @@ pub export fn vm_dred_delete(db: ?*dx.dl_db) c_int {
                     ov[0].ts = ob;
                     ov[0].perm_id = -1;
                     var cand: tupleset.tuple_set = undefined;
-                    if (ts_init(&cand, dx.rel_arity(d.rels[@intCast(hid)].rel)) != 0)
+                    if (ts_init(&cand, relation.rel_arity(@ptrCast(@alignCast(d.rels[@intCast(hid)].rel)))) != 0)
                         break :out;
                     var ctx = CandCtx{ .ts = &cand };
                     const m = execRule(d, cr, &ov, 1, 1, candCb, &ctx);
@@ -2937,8 +2942,8 @@ pub export fn vm_dred_delete(db: ?*dx.dl_db) c_int {
         var dirtied: c_int = 0;
         while (ci < ob.?.count) : (ci += 1) {
             const t = ob.?.data.? + @as(usize, @intCast(ci)) * @as(usize, ob.?.arity);
-            if (dx.rel_exact_base(rel, t) != 0) continue;
-            if (dx.rel_delete(rel, t) == 1) dirtied = 1;
+            if (relation.rel_exact_base(@ptrCast(@alignCast(rel)), t) != 0) continue;
+            if (relation.rel_delete(@ptrCast(@alignCast(rel)), t) == 1) dirtied = 1;
         }
         if (dirtied != 0) dx.permindex_mark_dirty(d, i);
     }
@@ -2946,7 +2951,7 @@ pub export fn vm_dred_delete(db: ?*dx.dl_db) c_int {
     i = 0;
     while (i < @as(c_int, @intCast(d.nrels))) : (i += 1) {
         if (full_reset[@intCast(i)] == 0 or is_head[@intCast(i)] == 0) continue;
-        if (dx.rel_reset_view(d.rels[@intCast(i)].rel) != 0) break :out;
+        if (relation.rel_reset_view(@ptrCast(@alignCast(d.rels[@intCast(i)].rel))) != 0) break :out;
         dx.permindex_mark_dirty(d, i);
     }
     if (dx.permindex_build_dirty(d) != 0) break :out;
@@ -3078,7 +3083,7 @@ fn relBaseEmpty(db: *dx.dl_db, rel_id: c_int) c_int {
     const r = dbRel(db, rel_id);
     var n: c_long = 0;
     if (r == null) return -1;
-    if (dx.rel_prefix_base(r, null, 0, aggCountCb, &n) < 0) return -1;
+    if (relation.rel_prefix_base(@ptrCast(@alignCast(r)), null, 0, aggCountCb, &n) < 0) return -1;
     return if (n == 0) 1 else 0;
 }
 
@@ -3274,14 +3279,14 @@ fn aggUpdateGroup(db: *dx.dl_db, cr: *const compiler.compiled_rule, group_key: [
     st.op = @intCast(op);
     st.src_col = @intCast(src_col);
 
-    if (dx.rel_prefix(arel, group_key, @intCast(n_key), aggScanCb, &st) < 0)
+    if (relation.rel_prefix(@ptrCast(@alignCast(arel)), group_key, @intCast(n_key), aggScanCb, &st) < 0)
         return -1;
 
-    if (dx.rel_prefix(hrel, group_key, @intCast(n_key), aggOldCb, &oh) < 0)
+    if (relation.rel_prefix(@ptrCast(@alignCast(hrel)), group_key, @intCast(n_key), aggOldCb, &oh) < 0)
         return -1;
 
     if (st.count == 0) {
-        if (oh.found != 0 and dx.rel_delete(hrel, &oh.cols) < 0) return -1;
+        if (oh.found != 0 and relation.rel_delete(@ptrCast(@alignCast(hrel)), &oh.cols) < 0) return -1;
         return 0;
     }
 
@@ -3299,9 +3304,9 @@ fn aggUpdateGroup(db: *dx.dl_db, cr: *const compiler.compiled_rule, group_key: [
         while (gi < n_key) : (gi += 1) new_tuple[@intCast(gi)] = group_key[@intCast(gi)];
         new_tuple[@intCast(n_key)] = agg_val;
 
-        if (dx.rel_exact(hrel, &new_tuple) != 0) return 0;
-        if (oh.found != 0 and dx.rel_delete(hrel, &oh.cols) < 0) return -1;
-        if (dx.rel_add(hrel, &new_tuple) < 0) return -1;
+        if (relation.rel_exact(@ptrCast(@alignCast(hrel)), &new_tuple) != 0) return 0;
+        if (oh.found != 0 and relation.rel_delete(@ptrCast(@alignCast(hrel)), &oh.cols) < 0) return -1;
+        if (relation.rel_add(@ptrCast(@alignCast(hrel)), &new_tuple) < 0) return -1;
     }
     return 0;
 }

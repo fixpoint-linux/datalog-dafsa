@@ -2073,7 +2073,7 @@ fn kindNoteRaw(db: *DlDb, idx: usize, cols: [*c]const u32, arity: u8) c_int {
     var i: usize = 0;
     while (i < arity) : (i += 1) {
         const v = cols[i];
-        const resolves = v > 0 and v < bound and dx.intern_str_of(ir_x, v) != null;
+        const resolves = v > 0 and v < bound and intern_mod.intern_str_of(@ptrCast(@alignCast(ir_x)), v) != null;
         if (resolves) continue; // ambiguous: neither records nor rejects
         const prev = relation.rel_col_kind(rel, @intCast(i));
         if (prev == relation.KIND_SYM) {
@@ -4090,7 +4090,7 @@ pub export fn dl_query_magic_adorn(db: ?*DlDb, goal_rel: [*c]const u8, adorn: [*
             const colk = compiler.relKindWithRulesPub(dxi, goal_idx, @intCast(bi2), goal_arity);
             if (colk != 2) continue; // int/unknown/mixed: nothing observable
             const resolves = v > 0 and v < intern_mod.liveSymBound(ir_x) and
-                dx.intern_str_of(ir_x, v) != null;
+                intern_mod.intern_str_of(@ptrCast(@alignCast(ir_x)), v) != null;
             if (!resolves) {
                 dlErr("dl_query_magic: column kind mismatch in {s}/{d}: bound value {d} is an integer but column holds symbols\n", .{
                     goal_rel, bi2, v,

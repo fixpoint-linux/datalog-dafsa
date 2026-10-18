@@ -28,6 +28,9 @@ const parser = @import("parser.zig");
 const regexwalk = @import("regexwalk.zig");
 const schema = @import("schema.zig");
 const relation_mod = @import("relation.zig");
+const intern = @import("intern.zig");
+const termstore = @import("termstore.zig");
+const vrelation = @import("vrelation.zig");
 
 // dl_internal.h pulls in dl.h/intern.h/relation.h/vrelation.h/snapshot.h/
 // permindex.h/termstore.h/compiler.h — so this one @cImport supplies dl_db,
@@ -246,7 +249,7 @@ fn db_find_rel(db: *dx.dl_db, name: [*c]const u8) c_int {
 
 fn db_rel_arity(db: *dx.dl_db, idx: c_int) u8 {
     if (idx < 0 or @as(usize, @intCast(idx)) >= db.nrels) return 0;
-    return dx.rel_arity(db.rels[@intCast(idx)].rel);
+    return relation_mod.rel_arity(@ptrCast(@alignCast(db.rels[@intCast(idx)].rel)));
 }
 
 fn db_rel_name(db: *dx.dl_db, idx: c_int) ?[*c]const u8 {
@@ -277,15 +280,15 @@ fn db_get_interner(db: *dx.dl_db) ?*dx.interner {
 fn db_rel_card_est(db: *dx.dl_db, idx: c_int) u64 {
     if (idx < 0 or @as(usize, @intCast(idx)) >= db.nrels) return 0;
     if (db.rels[@intCast(idx)].kind == dx.RELK_VARIADIC)
-        return dx.vrel_count(db.rels[@intCast(idx)].vrel);
-    return dx.rel_count_subtree(db.rels[@intCast(idx)].rel);
+        return vrelation.vrel_count(@ptrCast(@alignCast(db.rels[@intCast(idx)].vrel)));
+    return relation_mod.rel_count_subtree(@ptrCast(@alignCast(db.rels[@intCast(idx)].rel)));
 }
 
 fn db_rel_card(db: *dx.dl_db, idx: c_int) u64 {
     if (idx < 0 or @as(usize, @intCast(idx)) >= db.nrels) return 0;
     if (db.rels[@intCast(idx)].kind == dx.RELK_VARIADIC)
-        return dx.vrel_count(db.rels[@intCast(idx)].vrel);
-    return dx.rel_count(db.rels[@intCast(idx)].rel);
+        return vrelation.vrel_count(@ptrCast(@alignCast(db.rels[@intCast(idx)].vrel)));
+    return relation_mod.rel_count(@ptrCast(@alignCast(db.rels[@intCast(idx)].rel)));
 }
 
 fn db_rel_is_variadic(db: *dx.dl_db, idx: c_int) c_int {
@@ -482,7 +485,7 @@ fn token_const(db: *dx.dl_db, t: ?*const parser.token, out: *u32) c_int {
         return 0;
     }
     if (tt.kind == parser.TOK_IDENT or tt.kind == parser.TOK_STRING) {
-        out.* = dx.intern_str(db_get_interner(db), cs(tt.text));
+        out.* = intern.intern_str(@ptrCast(@alignCast(db_get_interner(db))), tt.text);
         if (out.* == 0) {
             var brief: [48]u8 = undefined;
             const tl = strLen(cs(tt.text));
@@ -532,7 +535,7 @@ fn token_const(db: *dx.dl_db, t: ?*const parser.token, out: *u32) c_int {
         while (i >= 0) : (i -= 1) {
             var eh: u32 = 0;
             if (token_const(db, tt.children.?[@intCast(i)], &eh) != 0) return -1;
-            acc = dx.term_cons(db.terms, eh, acc);
+            acc = termstore.term_cons(@ptrCast(@alignCast(db.terms)), eh, acc);
             if (acc == 0) {
                 cerr(g_rule_off, "compile error: out of memory interning a list literal (term store)\n", .{});
                 return -1;

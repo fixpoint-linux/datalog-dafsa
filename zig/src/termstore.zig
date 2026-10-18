@@ -153,20 +153,20 @@ export fn term_free(t: ?*Termstore) void {
 }
 
 /// int term_is_list(const termstore *t, uint32_t v) — EXACT index-range test.
-export fn term_is_list(t: ?*const Termstore, v: u32) c_int {
+pub export fn term_is_list(t: ?*const Termstore, v: u32) c_int {
     const s = t orelse return 0;
     return if (v >= TERM_BASE and (v -% TERM_BASE) < s.count) 1 else 0;
 }
 
 /// uint32_t term_car(const termstore *t, uint32_t h)
-export fn term_car(t: ?*const Termstore, h: u32) u32 {
+pub export fn term_car(t: ?*const Termstore, h: u32) u32 {
     const s = t orelse return 0;
     if (term_is_list(s, h) == 0 or h == TERM_NIL) return 0;
     return s.head.?[h - TERM_BASE];
 }
 
 /// uint32_t term_cdr(const termstore *t, uint32_t h)
-export fn term_cdr(t: ?*const Termstore, h: u32) u32 {
+pub export fn term_cdr(t: ?*const Termstore, h: u32) u32 {
     const s = t orelse return 0;
     if (term_is_list(s, h) == 0 or h == TERM_NIL) return 0;
     return s.tail.?[h - TERM_BASE];
@@ -175,7 +175,7 @@ export fn term_cdr(t: ?*const Termstore, h: u32) u32 {
 /// uint32_t term_cons(termstore *t, uint32_t head, uint32_t tail)
 /// Intern the cons cell; tail MUST be a list.  Returns the canonical handle
 /// (hash-consed), or 0 on OOM or a non-list tail.
-export fn term_cons(t: ?*Termstore, head: u32, tail: u32) u32 {
+pub export fn term_cons(t: ?*Termstore, head: u32, tail: u32) u32 {
     const s = t orelse return 0;
     if (term_is_list(s, tail) == 0) return 0; // improper tail rejected
 
@@ -207,7 +207,7 @@ export fn term_cons(t: ?*Termstore, head: u32, tail: u32) u32 {
 
 /// uint32_t term_append(termstore *t, uint32_t a, uint32_t b)
 /// append(a, b) with shared b suffix; append(NIL, b) == b; 0 on error.
-export fn term_append(t: ?*Termstore, a: u32, b: u32) u32 {
+pub export fn term_append(t: ?*Termstore, a: u32, b: u32) u32 {
     const s = t orelse return 0;
     if (term_is_list(s, a) == 0 or term_is_list(s, b) == 0) return 0;
     if (a == TERM_NIL) return b;
@@ -247,7 +247,7 @@ export fn term_append(t: ?*Termstore, a: u32, b: u32) u32 {
 
 /// uint32_t term_length(const termstore *t, uint32_t h) — 0 for NIL /
 /// non-list.
-export fn term_length(t: ?*const Termstore, h: u32) u32 {
+pub export fn term_length(t: ?*const Termstore, h: u32) u32 {
     const s = t orelse return 0;
     if (term_is_list(s, h) == 0) return 0;
     var n: u32 = 0;
