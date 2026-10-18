@@ -6,6 +6,7 @@ Usage:
   @PROG@ [-d <dir>] publish [--keep N]
   @PROG@ [-d <dir>] bound <rel> <val> [<val> ...]
   @PROG@ [-d <dir>] pattern <rel> [<col>] '<regex>'
+  @PROG@ [-d <dir>] similar '<name>' [--k N]  (edit distance, k = 0..2, default 1)
   @PROG@ [-d <dir>] rev <entity>
   @PROG@ [-d <dir>] cas <entity> <expected> <new>
   @PROG@ [-d <dir>] txn

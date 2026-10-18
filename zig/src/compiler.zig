@@ -1984,14 +1984,22 @@ fn compile_one(db: *dl.DlDb, r: *parser.rule, rel_strata: ?[*]const c_int, recur
             cerr(r.off, "compile error: negated pattern atom not supported (rule '{s}')\n", .{cs(r.head.?.pred)});
             return null;
         }
-        if (ba.pattern_col < 0 or ba.pattern_col >= ba.nargs) {
+        // `~~` (fuzzy) carries its edit distance in the spare high bits of
+        // pattern_col; the column itself is the low byte either way.
+        const fuzzy = parser.patternIsFuzzy(ba.pattern_col);
+        const col: c_int = parser.patternColGet(ba.pattern_col);
+        if (col < 0 or col >= ba.nargs) {
             cerr(r.off, "compile error: pattern column out of range for atom", .{});
             return null;
         }
-        pat_col.?[@intCast(bi)] = @intCast(ba.pattern_col);
-        const dfa = regexwalk.regex_compile(cs(ba.pattern));
+        pat_col.?[@intCast(bi)] = @intCast(col);
+        // Both constructors yield a regex_dfa, so OP_WALK is unchanged.
+        const dfa = if (fuzzy)
+            regexwalk.lev_compile(cs(ba.pattern), @intCast(parser.patternEditK(ba.pattern_col)))
+        else
+            regexwalk.regex_compile(cs(ba.pattern));
         if (dfa.?.errmsg != null) {
-            cerr(r.off, "compile error: bad regex pattern '{s}': {s} (rule '{s}')\n", .{ cs(ba.pattern), cs(dfa.?.errmsg), cs(r.head.?.pred) });
+            cerr(r.off, "compile error: bad {s} pattern '{s}': {s} (rule '{s}')\n", .{ if (fuzzy) @as([]const u8, "fuzzy") else @as([]const u8, "regex"), cs(ba.pattern), cs(dfa.?.errmsg), cs(r.head.?.pred) });
             regexwalk.regex_dfa_free(dfa);
             return null;
         }

@@ -28,6 +28,7 @@ test_m4_review
 test_bulk
 test_m5
 test_m5_review
+test_fuzzy
 test_m6
 test_m6_review
 test_m6_deep_review

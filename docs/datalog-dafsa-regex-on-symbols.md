@@ -1,9 +1,14 @@
 # `~ <regex>` on column string content (via `symbols.dafsa`)
 
-_Design/plan — not yet implemented._ Status: **Design/plan — not yet implemented.**
-Settled by the handoff plan (2026-08-17) and validated by a standalone C prototype
-(`read_sym_id` payload reconstruction). This doc records the decisions and the
-file-level work items; the engine change itself is **not** done.
+_Status: **IMPLEMENTED** (this status line was stale)._ The stack described here
+is wired in the engine: `regexwalk.zig`'s `symbols_dfa_walk` /
+`symbols_dfa_walk_view` match the string portion of symbol keys, `vm.zig`'s
+`OP_WALK` resolves the compiled pattern against the live interner DAFSA and
+filters the relation column by the emitted `sym_set`, and `tests/test_m5.c` +
+`tests/test_m5_review.c` exercise it (including `dl_pattern` on both the
+in-memory and the snapshot path). The doc below is the design record; see also
+[datalog-dafsa-fuzzy-lookup.md](datalog-dafsa-fuzzy-lookup.md), which reuses this
+stack unchanged for edit-distance (`~~`) matching.
 
 ## TL;DR
 

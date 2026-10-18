@@ -47,6 +47,10 @@ const dc = @import("dafsa_c.zig");
 // libc strdup (intern.zig declares the same extern; std.c does not re-export).
 extern "c" fn strdup(s: [*c]const u8) ?[*:0]u8;
 
+// libc strlen — lev_compile needs the pattern length (a [*c] pointer carries no
+// sentinel, so std.mem.span cannot help here).
+extern "c" fn strlen(s: [*c]const u8) usize;
+
 // ─── Constants (mirror regexwalk.h / dafsa_internal.h) ─────────────────────
 
 const DFA_DEAD: u32 = 0xFFFFFFFF;
@@ -56,6 +60,11 @@ const NFA_MAX_TRANS = 4;
 const VISITED_INIT_CAP = 1024;
 const SYMSET_INIT_CAP = 64;
 const MAX_WORD_LEN: usize = 65536; // dafsa_internal.h MAX_WORD_LEN
+/// lev_compile's hard limits.  k >= 3 is REFUSED (loudly, with an errmsg) —
+/// the DP-row determinisation explodes there: the row alphabet is k+2 wide per
+/// pattern position, so state count grows like m^(k+1).
+const LEV_MAX_K: u32 = 2;
+const LEV_PATTERN_MAX: usize = 512;
 const FNV_OFFSET: u64 = 14695981039346656037;
 const FNV_PRIME: u64 = 1099511628211;
 
@@ -1116,6 +1125,371 @@ pub export fn regex_dfa_free(dfa: ?*regex_dfa) void {
     c.free(@ptrCast(d));
 }
 
+// ─── Levenshtein automaton: lev_compile ────────────────────────────────────
+//
+// A Levenshtein automaton for (term, k) is an ORDINARY DFA whose states are
+// edit-distance DP rows:  state = one DP row (dp[j] = the edit distance
+// between the text prefix consumed so far and term[0..j]), the start row is
+// [0,1,...,m], a transition on byte c is the classic recurrence
+//     dp'[j] = min(dp[j]+1, dp'[j-1]+1, dp[j-1] + (term[j-1] != c))
+// and a state is ACCEPTING when dp[m] <= k.  Its layout is exactly the
+// `regex_dfa` extern struct, so `symProdDfs` (symbols_dfa_walk) walks it with
+// no walker change at all — that is the whole trick.
+//
+// Dead-state prune: a row with min_j dp[j] > k is unreachable-and-hopeless,
+// because min_j dp[i][j] is non-decreasing in the row index i (dp[i][j] is
+// always >= min_j dp[i-1][j]: term1 = dp[i-1][j]+1 > m, term3 >= dp[i-1][j-1]
+// >= m, and dp[i][0] = i > m), so no continuation can bring dp[m] back under
+// k.  Such a state becomes DFA_DEAD and the product DFS never descends.
+//
+// Two construction economies, both behaviour-preserving:
+//   * Values are clamped at k+1 (Ukkonen / Schulz-Mihov): any value above the
+//     threshold is "too far" and its exact magnitude cannot change an accept
+//     decision, so rows live in a bounded alphabet.
+//   * The automaton is built over byte EQUIVALENCE CLASSES (the distinct term
+//     bytes + one "other" class) and only then expanded into the 256-wide
+//     table the walker indexes: a DP transition depends on a byte only through
+//     the vector (term[j] == c), which the class determines exactly.  ~nclass
+//     times cheaper to build, same struct, same walker.
+//
+// BYTE SEMANTICS (documented limit, not a bug): the walker consumes BYTES, so
+// this is BYTE edit distance.  Correct for ASCII; it OVER-COUNTS non-ASCII
+// (one 'é' is two bytes, so caf<é> -> cafe is distance 2, not 1).  A
+// codepoint-aware distance needs a DP that advances only on a lead byte —
+// a different automaton, not built.
+
+/// Open-addressing state map for lev_compile: hash of the row, state id + 1
+/// (0 = empty slot).  Rows live in the caller's flat rows array, so growth
+/// rehashes by re-reading them — the same shape as dsmFindOrAdd above.
+const LevMap = struct {
+    hash: ?[*]u64,
+    slot: ?[*]u32, // state_id + 1; 0 = empty
+    cap: usize, // power of two
+    used: usize,
+};
+
+fn levHashRow(row: [*]const u8, rowlen: usize) u64 {
+    var h: u64 = FNV_OFFSET;
+    var i: usize = 0;
+    while (i < rowlen) : (i += 1) {
+        h ^= @as(u64, row[i]);
+        h *%= FNV_PRIME;
+    }
+    return h;
+}
+
+fn levMapGrow(map: *LevMap, rows: [*]const u8, rowlen: usize) c_int {
+    const old_cap = map.cap;
+    const new_cap = old_cap * 2;
+    const nh = c.calloc(new_cap, @sizeOf(u64)) orelse return -1;
+    const ns = c.calloc(new_cap, @sizeOf(u32)) orelse {
+        c.free(nh);
+        return -1;
+    };
+    const nhp: [*]u64 = @ptrCast(@alignCast(nh));
+    const nsp: [*]u32 = @ptrCast(@alignCast(ns));
+    const ohp = map.hash.?;
+    const osp = map.slot.?;
+
+    var i: usize = 0;
+    while (i < old_cap) : (i += 1) {
+        if (osp[i] == 0) continue;
+        const h = levHashRow(rows + (osp[i] - 1) * rowlen, rowlen);
+        var idx: usize = @intCast(h & @as(u64, @intCast(new_cap - 1)));
+        while (nsp[idx] != 0) idx = (idx +% 1) & (new_cap - 1);
+        nsp[idx] = osp[i];
+        nhp[idx] = h;
+    }
+    c.free(@ptrCast(ohp));
+    c.free(@ptrCast(osp));
+    map.hash = nhp;
+    map.slot = nsp;
+    map.cap = new_cap;
+    return 0;
+}
+
+/// Look `row` up in the map; insert it as state `new_id` (whose row is already
+/// stored at rows[new_id*rowlen]) when absent.  Returns the state id, or -1.
+fn levMapFindOrAdd(map: *LevMap, rows: [*]const u8, rowlen: usize, row: [*]const u8, new_id: u32, is_new: *c_int) c_int {
+    if (map.used * 4 >= map.cap * 3) {
+        if (levMapGrow(map, rows, rowlen) != 0) return -1;
+    }
+    const h = levHashRow(row, rowlen);
+    var idx: usize = @intCast(h & @as(u64, @intCast(map.cap - 1)));
+    while (true) {
+        const slot = map.slot.?;
+        if (slot[idx] == 0) {
+            slot[idx] = new_id + 1;
+            map.hash.?[idx] = h;
+            map.used += 1;
+            is_new.* = 1;
+            return @intCast(new_id);
+        }
+        const id: u32 = slot[idx] - 1;
+        if (map.hash.?[idx] == h and
+            std.mem.eql(u8, rows[id * rowlen ..][0..rowlen], row[0..rowlen]))
+        {
+            is_new.* = 0;
+            return @intCast(id);
+        }
+        idx = (idx +% 1) & (map.cap - 1);
+    }
+}
+
+/// One Levenshtein transition: consume byte `ch`, writing the next DP row into
+/// `out`.  Values clamp at k+1.  Returns false when the new row is DEAD
+/// (min > k) — the caller turns that into DFA_DEAD.
+fn levStep(row: [*]const u8, m: usize, pat: [*c]const u8, k: u8, ch: u8, out: [*]u8) bool {
+    const clamp: u8 = k + 1;
+    var v: u8 = row[0] + 1;
+    if (v > clamp) v = clamp;
+    out[0] = v;
+    var minv: u8 = v;
+    var j: usize = 1;
+    while (j <= m) : (j += 1) {
+        const sub: u8 = if (pat[j - 1] == ch) 0 else 1;
+        var x: u8 = row[j] + 1;
+        const a = out[j - 1] + 1;
+        if (a < x) x = a;
+        const b = row[j - 1] + sub;
+        if (b < x) x = b;
+        if (x > clamp) x = clamp;
+        out[j] = x;
+        if (x < minv) minv = x;
+    }
+    return minv <= k;
+}
+
+/// regex_dfa *lev_compile(const char *pattern, uint32_t k)
+///
+/// Compile a Levenshtein automaton for (pattern, k) into an ordinary
+/// regex_dfa.  Same contract as regex_compile: n_states > 0 with errmsg == NULL
+/// on success, n_states == 0 with errmsg != NULL on failure, and the result is
+/// always freed by regex_dfa_free.  k >= 3 is refused with a specific errmsg
+/// (state explosion) — never silently degraded to a smaller k.
+pub export fn lev_compile(pattern: [*c]const u8, k: u32) ?*regex_dfa {
+    if (pattern == null or pattern[0] == 0) return makeErrDfa("lev: empty pattern");
+    if (k > LEV_MAX_K) return makeErrDfa("lev: k must be 0..2 (k>=3 refused: automaton state explosion)");
+
+    const m: usize = strlen(pattern);
+    if (m > LEV_PATTERN_MAX) return makeErrDfa("lev: pattern too long (max 512 bytes)");
+
+    const rowlen = m + 1;
+    const k8: u8 = @intCast(k);
+    const clamp: u8 = k8 + 1;
+
+    // ── byte equivalence classes: distinct pattern bytes, then "other" ──
+    var is_pat = [_]bool{false} ** 256;
+    {
+        var i: usize = 0;
+        while (i < m) : (i += 1) is_pat[pattern[i]] = true;
+    }
+    var class_of: [256]u8 = undefined;
+    var class_rep: [257]u8 = undefined;
+    var nclass: usize = 0;
+    {
+        var b: usize = 0;
+        while (b < 256) : (b += 1) {
+            if (is_pat[b]) {
+                class_rep[nclass] = @intCast(b);
+                class_of[b] = @intCast(nclass);
+                nclass += 1;
+            }
+        }
+        // "other" = any byte the pattern does not contain.  A pattern spelling
+        // all 256 byte values has no "other" class (then every byte is exact).
+        if (nclass < 256) {
+            var other: u8 = 0;
+            b = 0;
+            while (b < 256) : (b += 1) {
+                if (!is_pat[b]) {
+                    other = @intCast(b);
+                    break;
+                }
+            }
+            class_rep[nclass] = other;
+            b = 0;
+            while (b < 256) : (b += 1) {
+                if (!is_pat[b]) class_of[b] = @intCast(nclass);
+            }
+            nclass += 1;
+        }
+    }
+
+    // ── state storage (grown by doubling) ──
+    var cap_states: usize = 64;
+    var rows: ?[*]u8 = @ptrCast(@alignCast(c.calloc(cap_states * rowlen, 1) orelse return makeErrDfa("lev: OOM")));
+    var accept: ?[*]u8 = @ptrCast(@alignCast(c.calloc(cap_states, 1) orelse return makeErrDfa("lev: OOM")));
+    var cls: ?[*]u32 = @ptrCast(@alignCast(c.malloc(cap_states * nclass * @sizeOf(u32)) orelse return makeErrDfa("lev: OOM")));
+    var queue: ?[*]u32 = @ptrCast(@alignCast(c.malloc(cap_states * @sizeOf(u32)) orelse return makeErrDfa("lev: OOM")));
+    var map = std.mem.zeroes(LevMap);
+    map.cap = 256;
+    map.hash = @ptrCast(@alignCast(c.calloc(map.cap, @sizeOf(u64)) orelse return makeErrDfa("lev: OOM")));
+    map.slot = @ptrCast(@alignCast(c.calloc(map.cap, @sizeOf(u32)) orelse return makeErrDfa("lev: OOM")));
+    defer {
+        if (rows) |p| c.free(@ptrCast(p));
+        if (accept) |p| c.free(@ptrCast(p));
+        if (cls) |p| c.free(@ptrCast(p));
+        if (queue) |p| c.free(@ptrCast(p));
+        if (map.hash) |p| c.free(@ptrCast(p));
+        if (map.slot) |p| c.free(@ptrCast(p));
+    }
+
+    // ── start state: dp row of the empty text prefix vs every term prefix ──
+    {
+        var j: usize = 0;
+        while (j <= m) : (j += 1) {
+            rows.?[j] = if (j < @as(usize, clamp)) @intCast(j) else clamp;
+        }
+        accept.?[0] = @intFromBool(m <= @as(usize, k));
+        queue.?[0] = 0;
+        var is_new: c_int = 0;
+        if (levMapFindOrAdd(&map, rows.?, rowlen, rows.?, 0, &is_new) < 0) return makeErrDfa("lev: OOM");
+    }
+
+    // ── DP-row determinisation (BFS over rows) ──
+    var n_states: usize = 1;
+    var scratch: [LEV_PATTERN_MAX + 1]u8 = undefined;
+    var head: usize = 0;
+    while (head < n_states) : (head += 1) {
+        const s = queue.?[head];
+        var ci: usize = 0;
+        while (ci < nclass) : (ci += 1) {
+            // `rows` is reallocated below when it fills, so the row pointer is
+            // recomputed EVERY iteration — never cached across a grow (a cached
+            // pointer would be a use-after-free that no test can see).
+            if (!levStep(rows.? + s * rowlen, m, pattern, k8, class_rep[ci], scratch[0..rowlen].ptr)) {
+                cls.?[s * nclass + ci] = DFA_DEAD;
+                continue;
+            }
+            if (n_states == cap_states) {
+                const ncap = cap_states * 2;
+                const nrm = c.calloc(ncap * rowlen, 1) orelse return makeErrDfa("lev: OOM");
+                const nam = c.calloc(ncap, 1) orelse {
+                    c.free(nrm);
+                    return makeErrDfa("lev: OOM");
+                };
+                const ncm = c.malloc(ncap * nclass * @sizeOf(u32)) orelse {
+                    c.free(nrm);
+                    c.free(nam);
+                    return makeErrDfa("lev: OOM");
+                };
+                const nqm = c.malloc(ncap * @sizeOf(u32)) orelse {
+                    c.free(nrm);
+                    c.free(nam);
+                    c.free(ncm);
+                    return makeErrDfa("lev: OOM");
+                };
+                const nr: [*]u8 = @ptrCast(nrm);
+                const na: [*]u8 = @ptrCast(nam);
+                const ncp: [*]u32 = @ptrCast(@alignCast(ncm));
+                const nqp: [*]u32 = @ptrCast(@alignCast(nqm));
+                @memcpy(nr[0 .. n_states * rowlen], rows.?[0 .. n_states * rowlen]);
+                @memcpy(na[0..n_states], accept.?[0..n_states]);
+                @memcpy(ncp[0 .. n_states * nclass], cls.?[0 .. n_states * nclass]);
+                @memcpy(nqp[0..n_states], queue.?[0..n_states]);
+                c.free(@ptrCast(rows.?));
+                c.free(@ptrCast(accept.?));
+                c.free(@ptrCast(cls.?));
+                c.free(@ptrCast(queue.?));
+                rows = nr;
+                accept = na;
+                cls = ncp;
+                queue = nqp;
+                cap_states = ncap;
+            }
+            // Tentatively store the candidate row at the next id, then let the
+            // map decide whether it is new (its slot is overwritten otherwise).
+            const nid: u32 = @intCast(n_states);
+            @memcpy(rows.?[n_states * rowlen ..][0..rowlen], scratch[0..rowlen]);
+            var is_new: c_int = 0;
+            const id = levMapFindOrAdd(&map, rows.?, rowlen, scratch[0..rowlen].ptr, nid, &is_new);
+            if (id < 0) return makeErrDfa("lev: OOM");
+            if (is_new != 0) {
+                if (n_states >= REGEX_DFA_MAX_STATES)
+                    return makeErrDfa("lev: state cap exceeded (50000: pattern too long for k)");
+                accept.?[n_states] = if (scratch[m] <= k8) 1 else 0;
+                queue.?[n_states] = nid;
+                n_states += 1;
+            }
+            cls.?[s * nclass + ci] = @intCast(id);
+        }
+    }
+
+    // ── expand the class table into the 256-wide table the walker indexes ──
+    const tmem = c.malloc(n_states * 256 * @sizeOf(u32)) orelse return makeErrDfa("lev: OOM");
+    const tr: [*]u32 = @ptrCast(@alignCast(tmem));
+    {
+        var s: usize = 0;
+        while (s < n_states) : (s += 1) {
+            var b: usize = 0;
+            while (b < 256) : (b += 1) {
+                tr[s * 256 + b] = cls.?[s * nclass + class_of[b]];
+            }
+        }
+    }
+
+    const mem = c.calloc(1, @sizeOf(regex_dfa)) orelse {
+        c.free(@ptrCast(tr));
+        return makeErrDfa("lev: OOM");
+    };
+    const d: *regex_dfa = @ptrCast(@alignCast(mem));
+    d.n_states = @intCast(n_states);
+    d.trans = tr;
+    d.accept = accept;
+    accept = null; // ownership transferred to the dfa
+    d.errmsg = null;
+    return d;
+}
+
+/// uint32_t lev_distance_cap(const uint8_t *a, size_t alen,
+///                           const uint8_t *b, size_t blen, uint32_t cap)
+///
+/// Exact BYTE edit distance, capped: cap+1 when the distance exceeds cap.
+/// This is the brute-force oracle the Levenshtein-automaton tests compare
+/// against (and what dl_fuzzy_lookup reports per hit) — it shares no code with
+/// lev_compile, deliberately.
+pub export fn lev_distance_cap(a: [*c]const u8, alen: usize, b: [*c]const u8, blen: usize, cap: u32) u32 {
+    if (a == null or b == null) return cap + 1;
+    const over = cap + 1;
+    if (alen > blen) return lev_distance_cap(b, blen, a, alen, cap); // row over the shorter
+    // a is now the shorter side: |alen - blen| alone already exceeds cap?
+    if (blen - alen > cap) return over;
+
+    const rowlen = alen + 1;
+    var stack: [257]u32 = undefined;
+    var heap: ?[*]u32 = null;
+    defer if (heap) |h| c.free(@ptrCast(h));
+    const row: [*]u32 = if (rowlen <= stack.len) stack[0..].ptr else blk: {
+        const hm = c.malloc(rowlen * @sizeOf(u32)) orelse return over;
+        heap = @ptrCast(@alignCast(hm));
+        break :blk heap.?;
+    };
+
+    var j: usize = 0;
+    while (j <= alen) : (j += 1) row[j] = @intCast(j);
+    var i: usize = 1;
+    var prev_diag: u32 = 0;
+    while (i <= blen) : (i += 1) {
+        prev_diag = row[0];
+        row[0] = @intCast(i);
+        var minv: u32 = row[0];
+        j = 1;
+        while (j <= alen) : (j += 1) {
+            const keep = row[j];
+            const sub: u32 = if (a[j - 1] == b[i - 1]) 0 else 1;
+            var v = row[j] + 1;
+            if (row[j - 1] + 1 < v) v = row[j - 1] + 1;
+            if (prev_diag + sub < v) v = prev_diag + sub;
+            row[j] = v;
+            prev_diag = keep;
+            if (v < minv) minv = v;
+        }
+        if (minv > cap) return over; // no later row can come back under cap
+    }
+    return if (row[alen] > cap) over else row[alen];
+}
+
 // ─── Visited hash set for product DFS ──────────────────────────────────────
 
 const VisitedSet = struct {
@@ -1953,4 +2327,205 @@ test "symset add/contains roundtrip" {
     try std.testing.expectEqual(@as(c_int, 1), symset_contains(&s, 100000));
     try std.testing.expectEqual(@as(c_int, 0), symset_contains(&s, 6));
     try std.testing.expectEqual(@as(c_int, 0), symset_contains(&s, 0));
+}
+
+// ─── lev_compile tests ─────────────────────────────────────────────────────
+
+const LevKeySet = struct {
+    keys: [256][8]u8 = undefined,
+    lens: [256]usize = undefined,
+    n: usize = 0,
+};
+
+fn levKeyCb(key_bytes: [*c]const u8, key_len: usize, user: ?*anyopaque) callconv(.c) c_int {
+    const ctx: *LevKeySet = @ptrCast(@alignCast(user orelse return -1));
+    if (ctx.n < ctx.keys.len and key_len <= ctx.keys[0].len) {
+        @memcpy(ctx.keys[ctx.n][0..key_len], key_bytes[0..key_len]);
+        ctx.lens[ctx.n] = key_len;
+        ctx.n += 1;
+    }
+    return 0;
+}
+
+fn levKeySetHas(ctx: *const LevKeySet, key: []const u8) bool {
+    var i: usize = 0;
+    while (i < ctx.n) : (i += 1) {
+        if (ctx.lens[i] == key.len and std.mem.eql(u8, ctx.keys[i][0..key.len], key)) return true;
+    }
+    return false;
+}
+
+/// The oracle for the automaton tests: exact byte edit distance, no shared code
+/// with lev_compile.
+fn powi(base: usize, e: usize) usize {
+    var r: usize = 1;
+    var i: usize = 0;
+    while (i < e) : (i += 1) r *= base;
+    return r;
+}
+
+fn levDist(a: []const u8, b: []const u8, cap: u32) u32 {
+    return lev_distance_cap(a.ptr, a.len, b.ptr, b.len, cap);
+}
+
+test "lev_distance_cap: hand-checked distances (incl. transposition = 2)" {
+    try std.testing.expectEqual(@as(u32, 0), levDist("abc", "abc", 3));
+    try std.testing.expectEqual(@as(u32, 1), levDist("abc", "abd", 3));
+    try std.testing.expectEqual(@as(u32, 1), levDist("abc", "ab", 3));
+    try std.testing.expectEqual(@as(u32, 1), levDist("abc", "abcd", 3));
+    // transposition is TWO edits under Levenshtein (not Damerau).
+    try std.testing.expectEqual(@as(u32, 2), levDist("abcd", "abdc", 3));
+    try std.testing.expectEqual(@as(u32, 4), levDist("", "abcd", 5));
+    // capped: cap+1 when it exceeds the cap.
+    try std.testing.expectEqual(@as(u32, 2), levDist("abcd", "wxyz", 1));
+    // BYTE distance: 'é' is 2 bytes, so this is 2, not 1.
+    try std.testing.expectEqual(@as(u32, 2), levDist("café", "cafe", 3));
+}
+
+test "lev_compile: exhaustive agreement with brute force over a {a,b,c} corpus" {
+    // Every string over {a,b,c} of length 0..4, and every pattern over {a,b}
+    // of length 1..4, for k = 0,1,2: the walk must emit EXACTLY the strings
+    // whose brute-force byte distance is <= k.  A wrong prune, a wrong accept or
+    // a wrong equivalence class all show up here.
+    var cands: [121][4]u8 = undefined;
+    var cand_lens: [121]usize = undefined;
+    var ncand: usize = 0;
+    const alphabet = "abc";
+    var len: usize = 0;
+    while (len <= 4) : (len += 1) {
+        const n_of_len = powi(alphabet.len, len);
+        var idx: usize = 0;
+        while (idx < n_of_len) : (idx += 1) {
+            var i: usize = 0;
+            while (i < len) : (i += 1) cands[ncand][i] = alphabet[(idx / powi(alphabet.len, i)) % alphabet.len];
+            cand_lens[ncand] = len;
+            ncand += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 121), ncand);
+
+    const d = dc.dafsa_create() orelse return error.OutOfMemory;
+    defer dc.dafsa_free(d);
+    {
+        var i: usize = 0;
+        while (i < ncand) : (i += 1) {
+            var buf: [8]u8 = undefined;
+            @memcpy(buf[0..cand_lens[i]], cands[i][0..cand_lens[i]]);
+            _ = dc.dafsa_add_n(d, &buf, cand_lens[i]);
+        }
+    }
+
+    var pats: [30][4]u8 = undefined;
+    var pat_lens: [30]usize = undefined;
+    var npat: usize = 0;
+    len = 1;
+    while (len <= 4) : (len += 1) {
+        const n_of_len = powi(2, len);
+        var idx: usize = 0;
+        while (idx < n_of_len) : (idx += 1) {
+            var i: usize = 0;
+            while (i < len) : (i += 1) pats[npat][i] = if ((idx / powi(2, i)) % 2 == 0) 'a' else 'b';
+            pat_lens[npat] = len;
+            npat += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 30), npat);
+
+    var k: u32 = 0;
+    while (k <= 2) : (k += 1) {
+        var pi: usize = 0;
+        while (pi < npat) : (pi += 1) {
+            var pbuf: [8:0]u8 = undefined;
+            @memcpy(pbuf[0..pat_lens[pi]], pats[pi][0..pat_lens[pi]]);
+            pbuf[pat_lens[pi]] = 0;
+            const dfa = lev_compile(&pbuf, k) orelse return error.CompileNull;
+            defer regex_dfa_free(dfa);
+            try std.testing.expect(dfa.*.errmsg == null);
+            try std.testing.expect(dfa.*.n_states > 0);
+
+            var got = LevKeySet{};
+            _ = regex_dfa_walk(d, dfa, levKeyCb, &got);
+
+            var ci: usize = 0;
+            while (ci < ncand) : (ci += 1) {
+                const cand = cands[ci][0..cand_lens[ci]];
+                const pat = pats[pi][0..pat_lens[pi]];
+                const want = levDist(pat, cand, k) <= k;
+                if (want != levKeySetHas(&got, cand)) {
+                    std.debug.print("lev mismatch: pat={s} k={d} cand=<{s}> want={} got={}\n", .{ pat, k, cand, want, !want });
+                    return error.LevMismatch;
+                }
+            }
+        }
+    }
+}
+
+test "lev_compile: symbols_dfa_walk path, a k+1 distractor is ABSENT" {
+    const d = dc.dafsa_create() orelse return error.OutOfMemory;
+    defer dc.dafsa_free(d);
+
+    addSymKey(d, "alice", 1);
+    addSymKey(d, "alise", 2); // distance 1 from "alice"
+    addSymKey(d, "alisee", 3); // distance 2
+    addSymKey(d, "aliseee", 4); // distance 3 — must stay absent at k=2
+    addSymKey(d, "bob", 5);
+
+    // k = 1: alice(0) + alise(1).  alisee is distance 2 -> absent.
+    {
+        const dfa = lev_compile("alice", 1) orelse return error.CompileNull;
+        defer regex_dfa_free(dfa);
+        try std.testing.expect(dfa.*.errmsg == null);
+        var ctx = SymTestCtx{ .count = 0, .sum = 0 };
+        const n = symbols_dfa_walk(d, dfa, symTestCb, &ctx);
+        try std.testing.expectEqual(@as(c_long, 2), n);
+        try std.testing.expectEqual(@as(u64, 3), ctx.sum); // 1 + 2
+    }
+    // k = 2: adds alisee(3); aliseee is distance 3 -> still absent.
+    {
+        const dfa = lev_compile("alice", 2) orelse return error.CompileNull;
+        defer regex_dfa_free(dfa);
+        var ctx = SymTestCtx{ .count = 0, .sum = 0 };
+        const n = symbols_dfa_walk(d, dfa, symTestCb, &ctx);
+        try std.testing.expectEqual(@as(c_long, 3), n);
+        try std.testing.expectEqual(@as(u64, 6), ctx.sum); // 1 + 2 + 3
+    }
+    // k = 0 is exact match only.
+    {
+        const dfa = lev_compile("alice", 0) orelse return error.CompileNull;
+        defer regex_dfa_free(dfa);
+        var ctx = SymTestCtx{ .count = 0, .sum = 0 };
+        const n = symbols_dfa_walk(d, dfa, symTestCb, &ctx);
+        try std.testing.expectEqual(@as(c_long, 1), n);
+        try std.testing.expectEqual(@as(u64, 1), ctx.sum);
+    }
+}
+
+test "lev_compile: refusals are loud and the struct stays freeable" {
+    // k >= 3 refused.
+    {
+        const dfa = lev_compile("abc", 3) orelse return error.CompileNull;
+        defer regex_dfa_free(dfa);
+        try std.testing.expect(dfa.*.errmsg != null);
+        try std.testing.expectEqual(@as(u32, 0), dfa.*.n_states);
+        try std.testing.expect(dfa.*.trans == null);
+        try std.testing.expect(dfa.*.accept == null);
+    }
+    // empty / NULL pattern refused.
+    {
+        const dfa = lev_compile("", 1) orelse return error.CompileNull;
+        defer regex_dfa_free(dfa);
+        try std.testing.expect(dfa.*.errmsg != null);
+    }
+    {
+        const dfa = lev_compile(null, 1) orelse return error.CompileNull;
+        defer regex_dfa_free(dfa);
+        try std.testing.expect(dfa.*.errmsg != null);
+    }
+    // A refused k=3 must NOT degrade to a k=2 automaton: the same pattern at
+    // k=2 compiles, at k=3 it does not.
+    {
+        const ok2 = lev_compile("abcdef", 2) orelse return error.CompileNull;
+        defer regex_dfa_free(ok2);
+        try std.testing.expect(ok2.*.errmsg == null);
+    }
 }

@@ -274,6 +274,8 @@ pub extern "c" fn dl_query(db: [*c]dl_db, goal_rel: [*c]const u8, cb: dl_tuple_c
 pub extern "c" fn dl_query_bound(db: [*c]dl_db, goal_rel: [*c]const u8, leading: [*c]const u32, k: u8, cb: dl_tuple_cb, user: ?*anyopaque) c_long;
 pub extern "c" fn dl_query_bound_version(db: [*c]dl_db, version: u32, goal_rel: [*c]const u8, leading: [*c]const u32, k: u8, cb: dl_tuple_cb, user: ?*anyopaque) c_long;
 pub extern "c" fn dl_pattern(db: [*c]dl_db, rel_name: [*c]const u8, col: u8, dfa: [*c]const regex_dfa, cb: dl_tuple_cb, user: ?*anyopaque) c_long;
+pub const dl_fuzzy_cb = ?*const fn (sym_id: u32, name: [*c]const u8, name_len: usize, dist: u32, user: ?*anyopaque) callconv(.c) c_int;
+pub extern "c" fn dl_fuzzy_lookup(db: [*c]dl_db, needle: [*c]const u8, k: u32, cb: dl_fuzzy_cb, user: ?*anyopaque) c_long;
 pub extern "c" fn dl_publish_snapshot(db: [*c]dl_db) c_int;
 pub extern "c" fn dl_snapshot_versions(db: [*c]const dl_db, out: [*c]u32, cap: usize) c_long;
 pub extern "c" fn dl_set_snapshot_retain(db: [*c]dl_db, n: c_uint) c_int;

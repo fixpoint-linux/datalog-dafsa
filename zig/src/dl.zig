@@ -226,6 +226,7 @@ const DlTupleCb = relation.RelEnumCb;
 pub const DlRelationCb = ?*const fn (name: [*c]const u8, arity: u8, idb: c_int, user: ?*anyopaque) callconv(.c) c_int;
 const DlTraverseCb = ?*const fn (node_sym: u32, depth: u8, user: ?*anyopaque) callconv(.c) c_int;
 const DlStrCb = ?*const fn (s: [*c]const u8, user: ?*anyopaque) callconv(.c) c_int;
+const DlFuzzyCb = ?*const fn (sym_id: u32, name: [*c]const u8, name_len: usize, dist: u32, user: ?*anyopaque) callconv(.c) c_int;
 const FaultHook = ?*const fn (fp: c_int, user: ?*anyopaque) callconv(.c) c_int;
 
 // ─── Public C-ABI structs (src/dl_internal.h, byte-for-byte) ───────────────
@@ -4935,6 +4936,60 @@ pub export fn dl_pattern(db: ?*DlDb, rel_name: [*c]const u8, col: u8, dfa: ?*con
 
     const n = relation.rel_filter_col(d.rels[@intCast(idx)].rel, col, &set, cb, user);
     regexwalk.symset_free(&set);
+    return n;
+}
+
+// ─── Fuzzy (Levenshtein) symbol lookup ─────────────────────────────────────
+
+const FuzzyCtx = struct {
+    ir: ?*anyopaque, // interner*
+    needle: [*c]const u8,
+    needle_len: usize,
+    k: u32,
+    cb: DlFuzzyCb,
+    user: ?*anyopaque,
+};
+
+/// symbols_dfa_walk callback: resolve the sym_id to its string, confirm the
+/// automaton's promise with an independent distance computation, and hand the
+/// name + distance to the caller.
+fn fuzzySymCb(sym_id: u32, user: ?*anyopaque) callconv(.c) c_int {
+    const ctx: *FuzzyCtx = @ptrCast(@alignCast(user orelse return -1));
+    const name = intern_str_of(ctx.ir, sym_id) orelse return 0;
+    const nm: [*]const u8 = @ptrCast(name);
+    const nlen = strlen(nm);
+    const dist = regexwalk.lev_distance_cap(ctx.needle, ctx.needle_len, nm, nlen, ctx.k);
+    if (dist > ctx.k) return 0; // unreachable unless the automaton is wrong
+    return ctx.cb.?(sym_id, name, nlen, dist, ctx.user);
+}
+
+/// long dl_fuzzy_lookup(dl_db *db, const char *needle, uint32_t k,
+///                      dl_fuzzy_cb cb, void *user)
+///
+/// Byte edit-distance lookup over the live interner forward DAFSA (keys:
+/// name, NUL, sym_id_u32BE).  The automaton is a plain regex_dfa, so the
+/// existing symbol walker does the product DFS — zero index storage, and a
+/// version read stays correct for the same reason dl_pattern's does (sym-ids
+/// are append-only, so the live symbol set is a superset of any snapshot's).
+pub export fn dl_fuzzy_lookup(db: ?*DlDb, needle: [*c]const u8, k: u32, cb: DlFuzzyCb, user: ?*anyopaque) c_long {
+    const d = db orelse return -1;
+    if (needle == null or cb == null) return -1;
+    if (k > 2) return -1; // refuse loudly; lev_compile would too
+
+    const dfa = regexwalk.lev_compile(needle, k) orelse return -1;
+    defer regexwalk.regex_dfa_free(dfa);
+    if (dfa.errmsg != null) return -1;
+
+    const fwd = intern_fwd(d.ir) orelse return -1;
+    var ctx = FuzzyCtx{
+        .ir = d.ir,
+        .needle = needle,
+        .needle_len = strlen(needle),
+        .k = k,
+        .cb = cb,
+        .user = user,
+    };
+    const n = regexwalk.symbols_dfa_walk(@ptrCast(@alignCast(fwd)), dfa, fuzzySymCb, &ctx);
     return n;
 }
 

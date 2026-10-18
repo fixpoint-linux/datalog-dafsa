@@ -418,6 +418,26 @@ fn obsPrintCb(s: [*c]const u8, user: ?*anyopaque) callconv(.c) c_int {
     return 0;
 }
 
+// ─── Fuzzy (dl similar) hit collection ─────────────────────────────────────
+
+const FuzzyHit = struct {
+    dist: u32,
+    name: [*:0]const u8,
+};
+
+fn fuzzyLess(_: void, a: FuzzyHit, b: FuzzyHit) bool {
+    if (a.dist != b.dist) return a.dist < b.dist;
+    return std.mem.lessThan(u8, std.mem.span(a.name), std.mem.span(b.name));
+}
+
+fn collectFuzzyHit(sym_id: u32, name: [*c]const u8, name_len: usize, dist: u32, user: ?*anyopaque) callconv(.c) c_int {
+    _ = sym_id;
+    _ = name_len;
+    const hits: *std.ArrayList(FuzzyHit) = @ptrCast(@alignCast(user orelse return -1));
+    hits.append(std.heap.c_allocator, FuzzyHit{ .dist = dist, .name = @ptrCast(name) }) catch return -1;
+    return 0;
+}
+
 // ─── Usage ──────────────────────────────────────────────────────────────────
 
 fn usage(prog: [*:0]const u8) noreturn {
@@ -430,6 +450,7 @@ fn usage(prog: [*:0]const u8) noreturn {
         \\  %s [-d <dir>] publish [--keep N]
         \\  %s [-d <dir>] bound <rel> <val> [<val> ...]
         \\  %s [-d <dir>] pattern <rel> [<col>] '<regex>'
+        \\  %s [-d <dir>] similar '<name>' [--k N]  (edit distance, k = 0..2, default 1)
         \\  %s [-d <dir>] rev <entity>
         \\  %s [-d <dir>] cas <entity> <expected> <new>
         \\  %s [-d <dir>] txn
@@ -443,7 +464,7 @@ fn usage(prog: [*:0]const u8) noreturn {
         \\Values: bare integer -> raw u32; anything else -> interned string
         \\Hex args: concatenated hex digits (no spaces, no 0x prefix)
         \\
-    , prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
+    , prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
     exit(1);
 }
 
@@ -1331,6 +1352,47 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
         free(vec_syms);
         free(lex_ids);
         free(lex_scores);
+        return 0;
+    }
+
+    if (eq(cmd, "similar")) {
+        // dl similar '<name>' [--k N] — typo-tolerant entity-name lookup.
+        // Zero index storage: the edit-distance automaton is compiled per call
+        // and walked product-wise over the symbol DAFSA.  BYTE distance (ASCII
+        // exact; a non-ASCII codepoint costs one edit per UTF-8 byte).
+        if (argp >= argv.len) usage(argv[0].ptr);
+        const needle = argv[argp];
+        argp += 1;
+
+        var k: u32 = 1;
+        if (argp < argv.len) {
+            if (argv.len - argp == 2 and eq(argv[argp], "--k")) {
+                const kv = strtoul(argv[argp + 1].ptr, null, 10);
+                if (kv > 2) {
+                    _ = fprintf(stderr, "dl: --k must be 0..2 (k>=3 refused: state explosion)\n");
+                    return 1;
+                }
+                k = @intCast(kv);
+                argp += 2;
+            }
+            if (argp < argv.len) usage(argv[0].ptr);
+        }
+
+        var hits: std.ArrayList(FuzzyHit) = .empty;
+        defer hits.deinit(std.heap.c_allocator);
+        const n = c.dl_fuzzy_lookup(db, needle.ptr, k, collectFuzzyHit, &hits);
+        if (n < 0) {
+            _ = fprintf(stderr, "dl: fuzzy lookup failed\n");
+            return 1;
+        }
+        if (hits.items.len == 0) {
+            _ = printf("(no results)\n");
+            return 0;
+        }
+        std.mem.sort(FuzzyHit, hits.items, {}, fuzzyLess);
+        for (hits.items) |h| {
+            _ = printf("%u\t%s\n", h.dist, h.name);
+        }
         return 0;
     }
 

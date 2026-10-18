@@ -1,6 +1,24 @@
 # Trigram fuzzy name matching (`search_similar`)
 
-**Status:** Design/plan — not yet implemented. Tier-3 gap (#7) — a *nice-to-have*, only worth building if fuzzy entity-name lookup matters for the memory use case. The memory MCP `search_similar` does trigram-based fuzzy name matching; datalog-dafsa has no trigram index.
+> **SUPERSEDED (2026-08-11) — do not build. This page is kept as the design
+> record only.** The capability it exists for (typo-tolerant entity-name lookup)
+> is delivered with **no relation, no build step and no incremental
+> maintenance** by the Levenshtein automaton over `symbols.dafsa` — see
+> [datalog-dafsa-fuzzy-lookup.md](datalog-dafsa-fuzzy-lookup.md) and the
+> `~~` atom operator / `dl similar`. This doc's own TL;DR already named
+> "Levenshtein over a candidate set" as the refinement, and the refinement is
+> strictly cheaper than the trigram index it refines: the trigram table would
+> have to be built, persisted, kept consistent with `entity(name, type)` and
+> re-published, whereas the automaton is compiled per query (measured 10–28 µs at
+> k=1) and walks the interner DAFSA that is already there.
+>
+> What is NOT delivered here: **similarity ranking** (trigram overlap scores, a
+> `threshold` parameter). The edit-distance automaton answers "which names are
+> within k edits", ranked by edit distance — it does not rank arbitrary
+> similarity. If weighted similarity ever becomes the need, that is a separate
+> design.
+
+**Status (original, kept for the record):** Design/plan — not yet implemented. Tier-3 gap (#7) — a *nice-to-have*, only worth building if fuzzy entity-name lookup matters for the memory use case. The memory MCP `search_similar` does trigram-based fuzzy name matching; datalog-dafsa has no trigram index.
 
 ## TL;DR
 

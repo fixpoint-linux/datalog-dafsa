@@ -62,6 +62,33 @@ pub const TOK_RBRACKET: token_kind = 25; // ]  (v2 lists)
 pub const TOK_PIPE: token_kind = 26; // |  (v2 lists — [X|Xs] head/tail pattern)
 pub const TOK_LIST: token_kind = 27; // [e1,e2,...] literal — one argument token
 // whose children are the element tokens
+pub const TOK_TILDE2: token_kind = 28; // ~~  (fuzzy/edit-distance pattern atom)
+
+// ─── atom.pattern_col encoding for `~` / `~~` ────────────────────────────
+//
+// pattern_col is a C `int` shared with src/parser.h (a pinned 80-byte atom
+// layout, so no new field).  M5 uses only the low 8 bits (the column index);
+// `~~` (Levenshtein) stores its edit distance in the next byte and sets a flag
+// bit, so an existing `~` atom encodes to exactly the same value it always did
+// and C consumers that read pattern_col as a column keep working.
+//   bits 0..7   column index
+//   bits 8..15  edit distance k (0..2)
+//   bit 24      PATTERN_FUZZY — the pattern is an edit-distance term
+pub const PATTERN_COL_MASK: c_int = 0xFF;
+pub const PATTERN_FUZZY: c_int = 1 << 24;
+
+pub inline fn patternColGet(v: c_int) c_int {
+    return v & PATTERN_COL_MASK;
+}
+pub inline fn patternEditK(v: c_int) c_int {
+    return (v >> 8) & 0xFF;
+}
+pub inline fn patternIsFuzzy(v: c_int) bool {
+    return (v & PATTERN_FUZZY) != 0;
+}
+pub inline fn patternColEncode(col: c_int, k: c_int) c_int {
+    return PATTERN_FUZZY | ((k & 0xFF) << 8) | (col & PATTERN_COL_MASK);
+}
 
 /// expr_kind (C enum).
 pub const EX_INT: c_int = 0;
@@ -408,8 +435,13 @@ fn lex(p: *parser) c_int {
         t = tokNew(TOK_PERCENT, null, 0);
         s += 1;
     } else if (s[0] == '~') {
-        t = tokNew(TOK_TILDE, null, 0);
-        s += 1;
+        if (s[1] == '~') {
+            t = tokNew(TOK_TILDE2, null, 0);
+            s += 2;
+        } else {
+            t = tokNew(TOK_TILDE, null, 0);
+            s += 1;
+        }
     } else if (s[0] == '[') {
         t = tokNew(TOK_LBRACKET, null, 0);
         s += 1;
@@ -1331,23 +1363,32 @@ fn parseBodyAtom(p: *parser) ?*atom {
         const a = parseAtom(p) orelse return null;
         a.negated = negated;
 
-        // M5: check for ~ [k] 'pattern' suffix (k is optional 0-based col)
+        // M5: check for ~ [col] 'pattern' suffix (col is optional 0-based col)
+        // M5-fuzzy: ~~ [k] [col] 'term' (k = edit distance, default 1)
         {
             var tt = peek(p);
-            if (tt != null and tt.?.kind == TOK_TILDE) {
+            if (tt != null and (tt.?.kind == TOK_TILDE or tt.?.kind == TOK_TILDE2)) {
+                const fuzzy = tt.?.kind == TOK_TILDE2;
                 _ = advance(p);
-                // Parse optional column index: ~ [k] or ~ k
+                var col: c_int = 0; // default to column 0
+                var edit: c_int = if (fuzzy) 1 else 0; // ~~ defaults to k = 1
+                // Parse the optional leading integer: the COLUMN for `~`, the
+                // EDIT DISTANCE for `~~` (which may then take a column too).
                 tt = peek(p);
                 if (tt != null and tt.?.kind == TOK_INT) {
-                    a.pattern_col = @intCast(tt.?.ival);
+                    if (fuzzy) edit = @intCast(tt.?.ival) else col = @intCast(tt.?.ival);
                     _ = advance(p);
                     tt = peek(p);
-                } else {
-                    a.pattern_col = 0; // default to column 0
+                    if (fuzzy and tt != null and tt.?.kind == TOK_INT) {
+                        col = @intCast(tt.?.ival);
+                        _ = advance(p);
+                        tt = peek(p);
+                    }
                 }
+                a.pattern_col = if (fuzzy) patternColEncode(col, edit) else col;
                 if (tt == null or tt.?.kind != TOK_STRING) {
                     perr(p, if (peek(p)) |tp| tp.off else 0, "parser: expected pattern string " ++
-                        "after '~'\n", .{});
+                        "after '{s}'\n", .{if (fuzzy) @as([]const u8, "~~") else @as([]const u8, "~")});
                     atomFree(a);
                     return null;
                 }
@@ -1844,6 +1885,46 @@ test "regex pattern atom: ~ [k] 'pattern'" {
     try std.testing.expectEqualStrings("a[b]c", std.mem.span(pat_atom.pattern.?));
     try std.testing.expectEqual(@as(c_int, 1), pat_atom.pattern_col);
     try std.testing.expectEqual(@as(c_int, 0), pat_atom.negated);
+}
+
+test "fuzzy pattern atom: ~~ [k] [col] 'term'" {
+    // Grammar: atom ~~ k [col] 'term' — k optional (default 1), col optional
+    // (default 0).  Both are carried in atom.pattern_col so the pinned atom
+    // layout is untouched.
+    const p = parse_create("g(X,Y) :- h(X,Y) ~~ 'alice', h(X,Y) ~~ 2 1 'bob', h(X,Y) ~~ 0 'carol'.") orelse return error.NoParser;
+    defer parse_free(p);
+
+    var n: c_int = 0;
+    const rules = parse_rules(p, &n) orelse return error.NoRules;
+    defer {
+        var i: c_int = 0;
+        while (i < n) : (i += 1) rule_free(rules[@intCast(i)]);
+        c.free(@ptrCast(rules));
+    }
+
+    // ~~ 'alice' — k defaults to 1, col to 0
+    const a0 = rules[0].?.body.?[0].?;
+    try std.testing.expectEqualStrings("alice", std.mem.span(a0.pattern.?));
+    try std.testing.expect(patternIsFuzzy(a0.pattern_col));
+    try std.testing.expectEqual(@as(c_int, 1), patternEditK(a0.pattern_col));
+    try std.testing.expectEqual(@as(c_int, 0), patternColGet(a0.pattern_col));
+
+    // ~~ 2 1 'bob' — k = 2, col = 1
+    const a1 = rules[0].?.body.?[1].?;
+    try std.testing.expectEqualStrings("bob", std.mem.span(a1.pattern.?));
+    try std.testing.expect(patternIsFuzzy(a1.pattern_col));
+    try std.testing.expectEqual(@as(c_int, 2), patternEditK(a1.pattern_col));
+    try std.testing.expectEqual(@as(c_int, 1), patternColGet(a1.pattern_col));
+
+    // ~~ 0 'carol' — k = 0 is EXACT match, still flagged fuzzy (not a `~`)
+    const a2 = rules[0].?.body.?[2].?;
+    try std.testing.expectEqualStrings("carol", std.mem.span(a2.pattern.?));
+    try std.testing.expect(patternIsFuzzy(a2.pattern_col));
+    try std.testing.expectEqual(@as(c_int, 0), patternEditK(a2.pattern_col));
+
+    // `~` is unchanged: same field, no fuzzy bit, low bits = column.
+    try std.testing.expect(!patternIsFuzzy(1));
+    try std.testing.expectEqual(@as(c_int, 1), patternColGet(1));
 }
 
 test "parse_last_error: reporting parser survives lexer errors, plain does not" {

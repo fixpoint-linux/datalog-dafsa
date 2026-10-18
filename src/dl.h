@@ -489,6 +489,28 @@ struct regex_dfa;
 long dl_pattern(dl_db *db, const char *rel_name, uint8_t col, const struct regex_dfa *dfa,
                dl_tuple_cb cb, void *user);
 
+/* ─── Fuzzy (Levenshtein) symbol lookup ────────────────────────────────── */
+
+/* Candidate callback: the matched sym_id, its string, its length, and the
+ * BYTE edit distance to the needle (always <= k).  Return non-zero to stop. */
+typedef int (*dl_fuzzy_cb)(uint32_t sym_id, const char *name, size_t name_len,
+                           uint32_t dist, void *user);
+
+/* Enumerate every interned symbol whose name is within edit distance k of
+ * `needle`, in DAFSA walk order.  Zero index storage: the edit-distance
+ * automaton is compiled per call and walked product-wise over the live
+ * interner forward DAFSA.
+ *
+ * k is 0..2; k >= 3 is REFUSED with -1 (the DP-row determinisation explodes).
+ *
+ * BYTE DISTANCE, not codepoint distance: the walk consumes bytes, so a
+ * non-ASCII codepoint costs one edit per UTF-8 byte ('é' = 2).  Correct for
+ * ASCII; over-counts non-ASCII.
+ *
+ * Returns the number of matches, or -1 on error (NULL args, k > 2, OOM). */
+long dl_fuzzy_lookup(dl_db *db, const char *needle, uint32_t k,
+                     dl_fuzzy_cb cb, void *user);
+
 /* ─── Snapshot publish (M4) ────────────────────────────────────────────── */
 
 /* Atomic publish: saves interner + all relations to a versioned snapshot

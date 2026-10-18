@@ -60,6 +60,32 @@ regex_dfa *regex_compile(const char *pattern);
 /* Free a regex DFA. NULL-safe. */
 void regex_dfa_free(regex_dfa *dfa);
 
+/* ─── Levenshtein (edit-distance) automaton ───────────────────────────── */
+
+/* The maximum edit distance lev_compile will build.  k >= 3 is REFUSED (the
+ * DP-row determinisation explodes), never silently reduced. */
+#define LEV_MAX_K 2
+
+/* Compile a Levenshtein automaton for (term, k) into an ordinary regex_dfa:
+ * its states are edit-distance DP rows, accepting states are those whose
+ * dp[term_len] <= k.  Because the layout IS a regex_dfa, the existing walkers
+ * (regex_dfa_walk / symbols_dfa_walk and their _view forms) walk it unchanged.
+ *
+ * Same contract as regex_compile: n_states > 0 with errmsg == NULL on success,
+ * n_states == 0 with errmsg != NULL on failure (k > 2, empty/NULL term, term
+ * longer than 512 bytes, state cap, OOM).  Free with regex_dfa_free().
+ *
+ * BYTE distance: the walk consumes bytes, so this matches byte edit distance.
+ * Correct for ASCII; it OVER-COUNTS non-ASCII (one 'e-acute' is two bytes).
+ */
+regex_dfa *lev_compile(const char *term, uint32_t k);
+
+/* Exact byte edit distance between two byte strings, capped: returns cap + 1
+ * when the distance exceeds cap.  The reference implementation the automaton
+ * is tested against; shares no code with lev_compile. */
+uint32_t lev_distance_cap(const uint8_t *a, size_t alen,
+                          const uint8_t *b, size_t blen, uint32_t cap);
+
 /* ─── Walkers ─────────────────────────────────────────────────────────── */
 
 /* Callback type: receives (key_bytes, key_len, user).

@@ -3,6 +3,47 @@
 All notable changes to this project are documented in this file.
 
 ## [Unreleased]
+- **Fuzzy entity-name lookup: a Levenshtein automaton over `symbols.dafsa`**
+  (2026-08-11, search-plan.md §2 item 3). Typo-tolerant name matching with
+  **zero index storage**: the automaton for `(term, k)` is an ordinary DFA whose
+  states are edit-distance DP rows, and its layout is *exactly* `regex_dfa`, so
+  the existing product DFS (`symProdDfs` via `symbols_dfa_walk`) walks it
+  verbatim — `vm.zig`'s `OP_WALK` needed no change. The only new engine code is
+  the constructor.
+  - `lev_compile(pattern, k)` in `zig/src/regexwalk.zig`: DP-row
+    determinisation with an open-addressing state map, built over byte
+    EQUIVALENCE CLASSES and expanded into the 256-wide table (~`nclass`x cheaper
+    build, same struct). Rows clamp at `k+1`; a row with `min > k` becomes
+    `DFA_DEAD` (sound: `min_j dp[i][j]` is non-decreasing in `i`). `k >= 3` is
+    REFUSED with a specific `errmsg`, never silently degraded. Plus
+    `lev_distance_cap`, the independent brute-force oracle.
+  - `~~` atom operator (`zig/src/parser.zig` + `compiler.zig`): grammar
+    `atom ~~ k [col] 'term'`, `k` defaulting to 1, encoded in the SPARE HIGH BITS
+    of `atom.pattern_col` — the pinned 80-byte atom layout and `src/parser.h` are
+    untouched, and an existing `~` atom encodes to the same value as before
+    (`test_m5.c` / `test_m5_review.c` pass unchanged, which is the proof that the
+    parser change is additive).
+  - `dl_fuzzy_lookup(db, needle, k, cb, user)` (`src/dl.h`, `zig/src/dl.zig`) and
+    `dl similar '<name>' [--k N]` (`zig/src/dl_cli.zig`), the surface
+    `docs/datalog-dafsa-trigram.md` had promised as `dl_similar`.
+  - MEASURED (ReleaseFast, 6,885-symbol db): `dl_fuzzy_lookup` k=1 10-28 us,
+    k=2 58-145 us, k=0 2-6 us end to end (build + walk), exact. Automaton sizes
+    k=1 20-52 states, k=2 58-186.
+  - **Documented limit: BYTE distance.** The walk consumes bytes, so a non-ASCII
+    codepoint costs one edit per UTF-8 byte (`café` vs `cafe` is 2, not 1).
+    MEASURED non-ASCII share of a real symbol space: 187/6,885 = 2.72 %, all
+    typographic (`—`, `→`, `×`, `µs`), no entity names. Not codepoint distance.
+  - `tests/test_fuzzy.c` (new, in both suite lists): brute-force DP oracle over a
+    hand-built vocabulary in both directions, a distractor at `k+1` ABSENT, a
+    transposition ABSENT at k=1 and present at k=2, `k=0` exact, the `~~`
+    operator through the VM joining entity rows, a non-ASCII symbol documenting
+    byte distance, and a compile/free arena-growth check. Asymmetry proven: an
+    off-by-one accept fails 7 of its 8 cases.
+  - Docs: `docs/datalog-dafsa-fuzzy-lookup.md` (new, the design of record);
+    `docs/datalog-dafsa-trigram.md` marked **SUPERSEDED** (kept as the design
+    record — the refinement it named is what landed); the stale "not yet
+    implemented" status in `docs/datalog-dafsa-regex-on-symbols.md` corrected
+    (`vm.zig:696` has wired it all along).
 - **The docs site and its whole build pipeline DELETED** (2026-10-18, U10,
   user-approved): the generated HTML under `docs/` was built by an Elm SSG
   (`src/Main.elm` → `scripts/ssg.mjs`) driven by `Dhakefile.dhall` and
