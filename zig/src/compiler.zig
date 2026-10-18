@@ -960,7 +960,15 @@ const Edge = struct {
     is_neg: c_int,
 };
 
-fn compute_strata(db: *dl.DlDb, rules: [*]?*parser.rule, n_rules: c_int, out_strata: [*]c_int, out_recursive: [*]c_int, out_max: c_int) c_int {
+/// Returns 0 when the program stratifies, 1 when the STRATIFIER REJECTS it
+/// (an unstratifiable program: negation — or a range atom — through a
+/// recursion cycle), and -1 when the check itself could not run (allocation
+/// failure).  `diagnose` gates the cerr diagnostic only: compile_rules passes
+/// true (behaviour unchanged), programStratifies passes false so a caller may
+/// probe a program it intends to route elsewhere without printing an error
+/// about it.  The 1/-1 split is what lets a caller tell "genuinely
+/// non-stratified" apart from "this check failed" without reading stderr.
+fn compute_strata(db: *dl.DlDb, rules: [*]?*parser.rule, n_rules: c_int, out_strata: [*]c_int, out_recursive: [*]c_int, out_max: c_int, diagnose: bool) c_int {
     const nrels = db_rel_count(db);
     if (nrels == 0 or out_max < 1) return 0;
 
@@ -1049,11 +1057,11 @@ fn compute_strata(db: *dl.DlDb, rules: [*]?*parser.rule, n_rules: c_int, out_str
     }
 
     if (changed != 0) {
-        cerr(0, "compile error: unstratifiable program — negation (or range) through a recursion cycle is not supported; only stratified negation is (negate a recursive predicate from a strictly-higher stratum)\n", .{});
+        if (diagnose) cerr(0, "compile error: unstratifiable program — negation (or range) through a recursion cycle is not supported; only stratified negation is (negate a recursive predicate from a strictly-higher stratum)\n", .{});
         c.free(@ptrCast(self_loop));
         c.free(@ptrCast(edges));
         c.free(@ptrCast(stratum));
-        return -1;
+        return 1;
     }
 
     // Kosaraju SCC on the positive subgraph.
@@ -1365,13 +1373,13 @@ fn compute_strata(db: *dl.DlDb, rules: [*]?*parser.rule, n_rules: c_int, out_str
         }
 
         if (changed != 0) {
-            cerr(0, "compile error: unstratifiable program — negation (or range) through a recursion cycle is not supported; only stratified negation is (negate a recursive predicate from a strictly-higher stratum)\n", .{});
+            if (diagnose) cerr(0, "compile error: unstratifiable program — negation (or range) through a recursion cycle is not supported; only stratified negation is (negate a recursive predicate from a strictly-higher stratum)\n", .{});
             c.free(@ptrCast(comp));
             comp = null;
             c.free(@ptrCast(self_loop));
             c.free(@ptrCast(edges));
             c.free(@ptrCast(stratum));
-            return -1;
+            return 1;
         }
     }
 
@@ -1384,11 +1392,11 @@ fn compute_strata(db: *dl.DlDb, rules: [*]?*parser.rule, n_rules: c_int, out_str
         const e = edges.?[@intCast(i)];
         if (e.is_neg != 0) {
             if (stratum[@intCast(e.to)] <= stratum[@intCast(e.from)]) {
-                cerr(0, "compile error: unstratifiable program — negation through recursion: '{s}' depends negatively on '{s}' in the same SCC\n", .{ cs(db_rel_name(db, e.from)), cs(db_rel_name(db, e.to)) });
+                if (diagnose) cerr(0, "compile error: unstratifiable program — negation through recursion: '{s}' depends negatively on '{s}' in the same SCC\n", .{ cs(db_rel_name(db, e.from)), cs(db_rel_name(db, e.to)) });
                 c.free(@ptrCast(self_loop));
                 c.free(@ptrCast(edges));
                 c.free(@ptrCast(stratum));
-                return -1;
+                return 1;
             }
         }
     }
@@ -1403,6 +1411,27 @@ fn compute_strata(db: *dl.DlDb, rules: [*]?*parser.rule, n_rules: c_int, out_str
 
     c.free(@ptrCast(stratum));
     return 0;
+}
+
+/// int programStratifies(dl_db*, rule**, int) — stratifiability probe.
+/// 1 = the program stratifies, 0 = the stratifier rejects it as
+/// unstratifiable, -1 = the check could not run.  Runs the SAME
+/// compute_strata compile_rules runs (so the verdict cannot drift from the
+/// compiler's) against scratch arrays, with the diagnostic suppressed: the
+/// caller is deciding where to route the program, not compiling it.  Nothing
+/// is emitted or mutated.
+pub fn programStratifies(db: *dl.DlDb, rules: [*]?*parser.rule, n_rules: c_int) c_int {
+    const nrels = db_rel_count(db);
+    if (nrels == 0 or n_rules <= 0) return 1; // nothing to stratify
+    const strata: [*]c_int = @ptrCast(@alignCast(c.calloc(nrels, @sizeOf(c_int)) orelse return -1));
+    defer c.free(@ptrCast(strata));
+    const recursive: [*]c_int = @ptrCast(@alignCast(c.calloc(nrels, @sizeOf(c_int)) orelse return -1));
+    defer c.free(@ptrCast(recursive));
+    return switch (compute_strata(db, rules, n_rules, strata, recursive, @intCast(nrels), false)) {
+        0 => 1,
+        1 => 0,
+        else => -1,
+    };
 }
 
 // ─── BUSHY (v2): natural-partition join planning ───────────────────────────
@@ -3847,7 +3876,7 @@ pub export fn compile_rules(db: ?*dl.DlDb, rules: ?[*]?*parser.rule, n_rules: c_
     const recursive: [*]c_int = @ptrCast(@alignCast(c.calloc(nrels, @sizeOf(c_int)) orelse return -1));
     defer c.free(@ptrCast(recursive));
 
-    if (compute_strata(d, rules.?, n_rules, rel_strata, recursive, @intCast(nrels)) != 0) return -1;
+    if (compute_strata(d, rules.?, n_rules, rel_strata, recursive, @intCast(nrels), true) != 0) return -1;
 
     // The out-params are published ONLY on success (n>0 <=> rules!=null):
     // every failure path below frees the partial array itself, so callers

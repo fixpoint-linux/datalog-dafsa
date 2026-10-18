@@ -16,6 +16,20 @@
 //! keeps rejecting unstratifiable programs exactly as before — the
 //! stratifier itself is untouched.
 //!
+//! ─── Stratified fast path ──────────────────────────────────────────────────
+//! The alternating fixpoint is only needed for programs the stratifier cannot
+//! order.  After the S1 subset/scope gate, the driver therefore probes the
+//! ORIGINAL program with compiler.programStratifies (the compiler's own
+//! stratifier, diagnosed silently): when it stratifies, the program is
+//! evaluated by ONE ordinary semi-naive fixpoint (compile + vm_execute on the
+//! same eval clone, exactly dl_query_rules_ro's shape) and the goal's TRUE
+//! atoms are streamed — the well-founded model of a stratified program IS its
+//! stratified least fixpoint (dl.h).  Only the stratifier's own rejection
+//! falls through to the rewrite below; a compile failure for any other reason
+//! is a loud error, never a re-reading as "non-stratified".  MEASURED (chain
+//! graph, n=400): the stratified column drops from 369-394 ms to ~66 ms, which
+//! is the plain-VM column.
+//!
 //! ─── Mechanism ────────────────────────────────────────────────────────────
 //! The key design move: REWRITE AT THE AST LEVEL.  Every NEGATED body atom
 //! over an IDB predicate becomes a POSITIVE atom over a fresh driver-owned
@@ -74,6 +88,7 @@ const parser = @import("parser.zig");
 const compiler = @import("compiler.zig");
 const tupleset = @import("tupleset.zig");
 const relation = @import("relation.zig");
+const vrelation = @import("vrelation.zig");
 const dl = @import("dl.zig");
 const vm = @import("vm.zig");
 const permindex = @import("permindex.zig");
@@ -383,6 +398,126 @@ fn checkSubset(rules: [*]?*parser.rule, n_rules: c_int) c_int {
     return 0;
 }
 
+// ─── stratified fast path + S1 negation scope ──────────────────────────────
+
+/// 0 when every negated body atom names a rule head (an IDB predicate) —
+/// S1 negates IDB predicates only.  Non-zero after the diagnostic otherwise.
+/// Split out of the complement loop so it can run BEFORE the stratified fast
+/// path: `p(X) :- q(X), !edb_r(X)` stratifies (and the ordinary evaluator
+/// answers it happily), so a fast path placed ahead of this check would
+/// silently accept an out-of-subset program.
+fn checkNegatedAreHeads(
+    edb: *const dl.DlDb,
+    rules: [*]?*parser.rule,
+    n_rules: c_int,
+    heads: []const c_int,
+) c_int {
+    var i: c_int = 0;
+    while (i < n_rules) : (i += 1) {
+        const r = rules[@intCast(i)] orelse return -1;
+        var j: c_int = 0;
+        while (j < r.nbody) : (j += 1) {
+            const a = r.body.?[@intCast(j)] orelse return -1;
+            if (a.negated == 0) continue;
+            const pname: [*:0]const u8 = @ptrCast(a.pred.?);
+            const pidx = cloneFindRel(edb, pname);
+            var is_head = false;
+            for (heads) |h| {
+                if (h == pidx) {
+                    is_head = true;
+                    break;
+                }
+            }
+            if (!is_head) {
+                wfsErr("dl_query_wfs_ro: rejected — negated atom '{s}' is not a rule head (S1 negates IDB predicates only)\n", .{pname});
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+const FastPathResult = union(enum) {
+    /// The stratified least fixpoint answered the goal; the payload is the
+    /// tuple count streamed.
+    answered: c_long,
+    /// programStratifies rejected the ORIGINAL program as unstratifiable — the
+    /// only case that belongs to the alternating fixpoint.
+    unstratifiable: void,
+    /// A loud failure (already diagnosed).  Never reinterpreted as
+    /// "non-stratified": a compile failure for any other reason must not be
+    /// re-read as a WFS problem.
+    failed: void,
+};
+
+/// Evaluate the ORIGINAL (unrewritten) program on the ordinary semi-naive
+/// fixpoint — the same shape dl_query_rules_ro uses (compile -> vm_execute ->
+/// goal scan) on the driver's already-populated eval clone.
+///
+/// A stratified program's well-founded model is its stratified least fixpoint
+/// (dl.h), and truth mode 0 streams that model's TRUE atoms, so the goal
+/// relation vm_execute leaves behind is exactly what the alternating path
+/// would compute — one fixpoint instead of a chain of them.
+///
+/// Distinguishing the fall-through: compiler.programStratifies runs the
+/// compiler's OWN stratifier (compute_strata, diagnosed silently) BEFORE any
+/// compile is attempted.  1 routes here, 0 is the unstratifiable rejection and
+/// the only value that falls through, -1 (the check could not run) is a loud
+/// failure.  Because the verdict is taken before compiling, a program that
+/// fails to compile for any OTHER reason (unsafe rule, arity, kind, OOM) can
+/// never be re-read as non-stratified: it fails in the compile below.
+fn stratifiedFastPath(
+    edb: *dl.DlDb,
+    rules: [*]?*parser.rule,
+    n_rules: c_int,
+    goal_rel: [*c]const u8,
+    cb: relation.RelEnumCb,
+    user: ?*anyopaque,
+) FastPathResult {
+    var crules: ?[*]?*compiler.compiled_rule = null;
+    var n_crules: c_int = 0;
+
+    switch (compiler.programStratifies(edb, rules, n_rules)) {
+        0 => return .unstratifiable, // the stratifier's own rejection
+        1 => {}, // stratified: the ordinary fixpoint answers it
+        else => {
+            wfsErr("dl_query_wfs_ro: stratification check failed\n", .{});
+            return .failed;
+        },
+    }
+
+    if (compiler.compile_rules(edb, rules, n_rules, &crules, &n_crules) != 0) {
+        // compile_rules publishes its out-params only on success; free
+        // defensively so a partial array cannot leak either way.
+        if (crules) |cr| {
+            var j: c_int = 0;
+            while (j < n_crules) : (j += 1) compiler.compiled_rule_free(cr[@intCast(j)]);
+            c.free(@ptrCast(cr));
+        }
+        wfsErr("dl_query_wfs_ro: compile failed\n", .{});
+        return .failed;
+    }
+    defer {
+        var j: c_int = 0;
+        while (j < n_crules) : (j += 1) compiler.compiled_rule_free(crules.?[@intCast(j)]);
+        c.free(@ptrCast(crules.?));
+    }
+
+    if (vm.vm_execute(edb, crules, n_crules) != 0) {
+        wfsErr("dl_query_wfs_ro: evaluation failed\n", .{});
+        return .failed;
+    }
+
+    const gi = cloneFindRel(edb, goal_rel);
+    if (gi < 0) {
+        wfsErr("dl_query_wfs_ro: goal '{s}' not found\n", .{@as([*c]const u8, @ptrCast(goal_rel))});
+        return .failed;
+    }
+    const e = &edb.rels[@intCast(gi)];
+    if (e.kind == RELK_VARIADIC) return .{ .answered = vrelation.vrel_prefix(e.vrel, null, 0, cb, user) };
+    return .{ .answered = relation.rel_prefix(e.rel, null, 0, cb, user) };
+}
+
 // ─── active domain + complement enumeration ────────────────────────────────
 
 /// Active domain: every column value of every fixed-arity relation's
@@ -684,6 +819,25 @@ pub fn wfs_eval_query(
         return DL_WFS_ERR_REJECTED;
     }
 
+    // ── S1 negation scope: every negated atom names a rule head (an IDB
+    // predicate).  Checked HERE, before the stratified fast path below,
+    // because negating an EDB predicate is a perfectly STRATIFIABLE program
+    // the ordinary evaluator would answer — taking the fast path there would
+    // silently widen the documented S1 rejection contract.
+    if (checkNegatedAreHeads(&edb, rs, n_rules, st.head_idx[0..st.n_heads]) != 0)
+        return DL_WFS_ERR_REJECTED;
+
+    // ── stratified fast path: a program the compiler's own stratifier
+    // accepts needs no alternating fixpoint (dl.h: the well-founded model of
+    // a stratified program IS its stratified least fixpoint, and truth mode 0
+    // streams exactly those TRUE atoms).  Only the stratifier's rejection
+    // falls through to the rewrite below.
+    switch (stratifiedFastPath(&edb, rs, n_rules, goal_rel, cb, user)) {
+        .answered => |n| return n,
+        .unstratifiable => {},
+        .failed => return -1,
+    }
+
     // ── active domain (before any mutation of the clone's borrowed rels)
     if (buildDomain(&edb, rs, n_rules, &st.dom) != 0) {
         wfsErr("dl_query_wfs_ro: active-domain build failed\n", .{});
@@ -702,18 +856,9 @@ pub fn wfs_eval_query(
                 if (a.negated == 0) continue;
                 const pname: [*:0]const u8 = @ptrCast(a.pred.?);
                 const pidx = cloneFindRel(&edb, pname);
-
-                var is_head = false;
-                var k: usize = 0;
-                while (k < st.n_heads) : (k += 1)
-                    if (st.head_idx[k] == pidx) {
-                        is_head = true;
-                        break;
-                    };
-                if (!is_head) {
-                    wfsErr("dl_query_wfs_ro: rejected — negated atom '{s}' is not a rule head (S1 negates IDB predicates only)\n", .{pname});
-                    return DL_WFS_ERR_REJECTED;
-                }
+                // pidx is a head: checkNegatedAreHeads ran above, before the
+                // fast path, precisely so the S1 scope rejection cannot be
+                // bypassed by a stratifiable negation of an EDB predicate.
 
                 var ci: usize = 0;
                 while (ci < st.n_comps) : (ci += 1)
