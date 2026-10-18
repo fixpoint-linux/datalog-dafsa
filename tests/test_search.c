@@ -304,6 +304,279 @@ static void t_search_empty_terms(void)
     dl_close(db);
 }
 
+/* ─── Brute-force cross-checks for the AND intersection ─────────────────────
+ *
+ * The engine collects one obs_id set per term and intersects them with a hash
+ * index (index.zig IntSet).  These tests deliberately re-derive the expected
+ * intersection from the TEST's own dense posting lists with a linear scan, so
+ * the expected side shares no code — and therefore no defect — with the engine
+ * side.  They can fail: t_search_crosscheck_detects_diff proves the comparator
+ * sees a one-element difference.
+ */
+
+#define XC_N_DOC 60
+#define XC_N_TERM 4
+#define XC_N_QUERY 5
+
+/* Term i covers every document whose index is a multiple of XC_MOD[i], so the
+ * four posting sets are all different sizes and the query that intersects them
+ * cannot always be answered from argument 0 (the engine picks the smallest set
+ * to iterate). */
+static const int XC_MOD[XC_N_TERM] = {2, 3, 5, 7};
+static const char *XC_TERM[XC_N_TERM] = {"xc_alpha", "xc_beta", "xc_gamma", "xc_delta"};
+
+/* Linear membership probe — the naive implementation on purpose. */
+static int xc_has(const uint32_t *a, int n, uint32_t v)
+{
+    int i;
+    for (i = 0; i < n; i++)
+        if (a[i] == v) return 1;
+    return 0;
+}
+
+/* Order-insensitive set equality that also rejects duplicates on either side
+ * (a duplicate means the engine emitted one document twice). */
+static int xc_same_set(const uint32_t *a, int na, const uint32_t *b, int nb)
+{
+    int i;
+    if (na != nb) return 0;
+    for (i = 0; i < na; i++)
+        if (!xc_has(b, nb, a[i])) return 0;
+    for (i = 0; i < nb; i++)
+        if (!xc_has(a, na, b[i])) return 0;
+    for (i = 1; i < na; i++)
+        if (xc_has(a, i, a[i])) return 0;
+    for (i = 1; i < nb; i++)
+        if (xc_has(b, i, b[i])) return 0;
+    return 1;
+}
+
+/* Expected intersection: for each document, scan every term's posting list. */
+static int xc_expected(const uint32_t *docs, int n_docs,
+                       const uint32_t *const *lists, const int *list_n, int n_terms,
+                       uint32_t *out)
+{
+    int d, t, n = 0;
+    for (d = 0; d < n_docs; d++) {
+        int in_all = 1;
+        for (t = 0; t < n_terms; t++) {
+            if (!xc_has(lists[t], list_n[t], docs[d])) { in_all = 0; break; }
+        }
+        if (in_all) out[n++] = docs[d];
+    }
+    return n;
+}
+
+/* Build the corpus: XC_N_DOC documents plus the four posting sets.  Every
+ * posting is added TWICE so the engine's dedup has to work too (the expected
+ * lists hold each document once). */
+static int xc_setup(dl_db *db, uint32_t *docs,
+                    uint32_t lists[XC_N_TERM][XC_N_DOC], int *list_n)
+{
+    int d, t;
+    if (aux_index_ensure_postings(db) != 0) return -1;
+    for (d = 0; d < XC_N_DOC; d++) {
+        char name[16];
+        snprintf(name, sizeof(name), "xcdoc%02d", d);
+        docs[d] = dl_intern_str(db, name);
+        if (docs[d] == 0) return -1;
+    }
+    for (t = 0; t < XC_N_TERM; t++) {
+        uint32_t term = dl_intern_str(db, (char *)XC_TERM[t]);
+        if (term == 0) return -1;
+        list_n[t] = 0;
+        for (d = 0; d < XC_N_DOC; d++) {
+            if (d % XC_MOD[t] != 0) continue;
+            if (aux_index_add_posting(db, term, docs[d]) != 1) return -1;
+            if (aux_index_add_posting(db, term, docs[d]) != 0) return -1; /* deduped */
+            lists[t][list_n[t]++] = docs[d];
+        }
+    }
+    return 0;
+}
+
+/* Query term-index triples; -1 terminates a row. */
+static const int XC_QUERY[XC_N_QUERY][3] = {
+    {0, 1, -1},   /* alpha AND beta            -> multiples of 6  */
+    {1, 3, -1},   /* beta AND delta            -> multiples of 21 */
+    {0, 1, 2},    /* alpha AND beta AND gamma  -> multiples of 30 */
+    {0, 3, -1},   /* alpha AND delta           -> multiples of 14 */
+    {2, 3, 1},    /* gamma AND delta AND beta  -> multiples of 105 */
+};
+
+static void t_search_bruteforce_crosscheck(void)
+{
+    char dir[512];
+    dl_db *db = fresh_db(dir, sizeof(dir), "t_search_xcheck");
+    uint32_t docs[XC_N_DOC];
+    uint32_t lists[XC_N_TERM][XC_N_DOC];
+    int list_n[XC_N_TERM];
+    uint32_t got[XC_N_DOC];
+    int scores[XC_N_DOC];
+    int qi, t;
+
+    TEST("dl_search brute-force cross-check (single + multi term)");
+    if (xc_setup(db, docs, lists, list_n) != 0) {
+        FAIL("setup: posting add failed");
+        dl_close(db);
+        return;
+    }
+
+    /* Single term: the whole set, duplicates collapsed. */
+    {
+        uint32_t term = dl_intern_str(db, (char *)XC_TERM[0]);
+        const uint32_t *L[1] = {lists[0]};
+        int ln[1] = {list_n[0]};
+        uint32_t exp[XC_N_DOC];
+        int ne = xc_expected(docs, XC_N_DOC, L, ln, 1, exp);
+        int n = dl_search_top(db, &term, 1, got, scores, XC_N_DOC);
+        if (n < 0) { FAIL("single-term search returned -1"); dl_close(db); return; }
+        if (!xc_same_set(got, n, exp, ne)) {
+            FAIL("single-term set disagrees with brute force");
+            dl_close(db);
+            return;
+        }
+        for (t = 0; t < n; t++) {
+            if (scores[t] != 1) { FAIL("single-term score != 1"); dl_close(db); return; }
+        }
+    }
+
+    for (qi = 0; qi < XC_N_QUERY; qi++) {
+        uint32_t terms[3];
+        const uint32_t *L[3];
+        int ln[3];
+        uint32_t exp[XC_N_DOC];
+        int n_terms = 0, ne, n;
+
+        for (t = 0; t < 3 && XC_QUERY[qi][t] >= 0; t++) {
+            terms[t] = dl_intern_str(db, (char *)XC_TERM[XC_QUERY[qi][t]]);
+            L[t] = lists[XC_QUERY[qi][t]];
+            ln[t] = list_n[XC_QUERY[qi][t]];
+            n_terms++;
+        }
+        ne = xc_expected(docs, XC_N_DOC, L, ln, n_terms, exp);
+        n = dl_search_top(db, terms, n_terms, got, scores, XC_N_DOC);
+        if (n < 0) { FAIL("multi-term search returned -1"); dl_close(db); return; }
+        if (!xc_same_set(got, n, exp, ne)) {
+            FAIL("multi-term intersection disagrees with brute force");
+            dl_close(db);
+            return;
+        }
+        for (t = 0; t < n; t++) {
+            if (scores[t] != n_terms) { FAIL("AND score != n_terms"); dl_close(db); return; }
+        }
+    }
+
+    PASS();
+    dl_close(db);
+}
+
+/* Proves the cross-check above is not a tautology: perturbing the expected set
+ * by exactly one member MUST be visible to xc_same_set. */
+static void t_search_crosscheck_detects_diff(void)
+{
+    char dir[512];
+    dl_db *db = fresh_db(dir, sizeof(dir), "t_search_xcheck_diff");
+    uint32_t docs[XC_N_DOC];
+    uint32_t lists[XC_N_TERM][XC_N_DOC];
+    int list_n[XC_N_TERM];
+    uint32_t got[XC_N_DOC];
+    uint32_t exp[XC_N_DOC];
+    uint32_t perturbed[XC_N_DOC];
+    int scores[XC_N_DOC];
+    uint32_t terms[2];
+    const uint32_t *L[2];
+    int ln[2];
+    int ne, n, i, np = 0;
+    uint32_t dropped;
+
+    TEST("cross-check sees a one-element difference");
+    if (xc_setup(db, docs, lists, list_n) != 0) {
+        FAIL("setup: posting add failed");
+        dl_close(db);
+        return;
+    }
+
+    terms[0] = dl_intern_str(db, (char *)XC_TERM[0]);
+    terms[1] = dl_intern_str(db, (char *)XC_TERM[1]);
+    L[0] = lists[0];
+    ln[0] = list_n[0];
+    L[1] = lists[1];
+    ln[1] = list_n[1];
+    ne = xc_expected(docs, XC_N_DOC, L, ln, 2, exp);
+    n = dl_search_top(db, terms, 2, got, scores, XC_N_DOC);
+    if (n < 0) { FAIL("search returned -1"); dl_close(db); return; }
+    if (ne < 3) { FAIL("expected set too small to perturb"); dl_close(db); return; }
+    if (!xc_same_set(got, n, exp, ne)) {
+        FAIL("cross-check disagrees with the engine on the true set");
+        dl_close(db);
+        return;
+    }
+
+    /* Drop the middle member — one document, nothing else changes. */
+    dropped = exp[ne / 2];
+    for (i = 0; i < ne; i++) {
+        if (exp[i] == dropped) continue;
+        perturbed[np++] = exp[i];
+    }
+    if (np != ne - 1) { FAIL("perturbation did not drop exactly one"); dl_close(db); return; }
+    if (xc_same_set(got, n, perturbed, np)) {
+        FAIL("comparator reported equality on a set that differs by one");
+        dl_close(db);
+        return;
+    }
+    /* And the difference must survive in the other direction too. */
+    if (xc_same_set(perturbed, np, got, n)) {
+        FAIL("comparator is asymmetric");
+        dl_close(db);
+        return;
+    }
+
+    PASS();
+    dl_close(db);
+}
+
+/* A document matching only ONE of two terms must be ABSENT under AND (this is
+ * the union/OR regression guard), in both query argument orders. */
+static void t_search_and_partial_absent(void)
+{
+    char dir[512];
+    dl_db *db = fresh_db(dir, sizeof(dir), "t_search_partial_absent");
+    uint32_t term1, term2, doc_a, doc_b, doc_ab;
+    uint32_t results[10];
+    int scores[10];
+    int n, order;
+
+    TEST("dl_search AND excludes single-term documents");
+    aux_index_ensure_postings(db);
+
+    term1 = dl_intern_str(db, "pa_hello");
+    term2 = dl_intern_str(db, "pa_world");
+    doc_a = dl_intern_str(db, "pa_doc_a");   /* term1 only */
+    doc_b = dl_intern_str(db, "pa_doc_b");   /* term2 only */
+    doc_ab = dl_intern_str(db, "pa_doc_ab"); /* both       */
+
+    aux_index_add_posting(db, term1, doc_a);
+    aux_index_add_posting(db, term2, doc_b);
+    aux_index_add_posting(db, term1, doc_ab);
+    aux_index_add_posting(db, term2, doc_ab);
+
+    for (order = 0; order < 2; order++) {
+        uint32_t terms[2];
+        terms[0] = order == 0 ? term1 : term2;
+        terms[1] = order == 0 ? term2 : term1;
+
+        n = dl_search_top(db, terms, 2, results, scores, 10);
+        if (n != 1) { FAIL("expected exactly 1 AND result"); dl_close(db); return; }
+        if (results[0] != doc_ab) { FAIL("expected doc_ab"); dl_close(db); return; }
+        if (xc_has(results, n, doc_a)) { FAIL("doc_a (one term) leaked into AND"); dl_close(db); return; }
+        if (xc_has(results, n, doc_b)) { FAIL("doc_b (one term) leaked into AND"); dl_close(db); return; }
+    }
+
+    PASS();
+    dl_close(db);
+}
+
 /* ─── Integration test ──────────────────────────────────────────────────── */
 
 static void t_integration_observation_indexing(void)
@@ -651,6 +924,9 @@ int main(void)
     t_search_no_match();
     t_search_top_limit();
     t_search_empty_terms();
+    t_search_bruteforce_crosscheck();
+    t_search_crosscheck_detects_diff();
+    t_search_and_partial_absent();
     
     /* Integration test */
     t_integration_observation_indexing();

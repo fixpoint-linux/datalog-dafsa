@@ -136,29 +136,43 @@ pub export fn aux_index_add_posting(db: ?*dl.DlDb, term_sym: u32, obs_id: u32) c
 
 // ─── Set operations for obs_id sets ────────────────────────────────────────
 
-/// Simple dynamic int set (obs_id is u32).
+/// Obs_id set (obs_id is u32): a DENSE insertion-ordered array plus an
+/// open-addressing membership index.
+///
+/// The two halves serve different jobs and both are required:
+///   - `data` is what iteration order comes from.  Order is load-bearing: every
+///     AND result carries the same score, so the stable score sort leaves ties in
+///     set order and emission follows the array verbatim.
+///   - `idx` makes membership O(1).  The old linear scan was correct but made
+///     posting collection and multi-term intersection O(N^2) — at 20k postings
+///     per term that is the measured 60/235/354 ms for 1/2/3 terms.  It reuses
+///     U64Set rather than introducing a third set type; keys are obs_id+1 so a
+///     real obs_id of 0 cannot collide with U64Set's 0 == empty sentinel.
 const IntSet = struct {
     data: ?[*]u32 = null,
     count: usize = 0,
     cap: usize = 0,
+    idx: U64Set = .{},
 };
 
 fn intSetFree(s: *IntSet) void {
     c.free(@ptrCast(s.data));
+    u64SetFree(&s.idx);
     s.* = .{};
 }
 
-/// Linear search; small sets expected (postings per term).
+inline fn obsKey(val: u32) u64 {
+    return @as(u64, val) + 1;
+}
+
 fn intSetContains(s: *const IntSet, val: u32) bool {
-    var i: usize = 0;
-    while (i < s.count) : (i += 1)
-        if (s.data.?[i] == val) return true;
-    return false;
+    return u64SetContains(&s.idx, obsKey(val));
 }
 
 /// Returns 1 if inserted, 0 if already present, -1 on OOM.
 fn intSetAdd(s: *IntSet, val: u32) c_int {
-    if (intSetContains(s, val))
+    const k = obsKey(val);
+    if (u64SetContains(&s.idx, k))
         return 0; // already present
     if (s.count >= s.cap) {
         const new_cap: usize = if (s.cap != 0) s.cap * 2 else 8;
@@ -166,6 +180,7 @@ fn intSetAdd(s: *IntSet, val: u32) c_int {
         s.data = new_data;
         s.cap = new_cap;
     }
+    if (u64SetAdd(&s.idx, k) != 1) return -1;
     s.data.?[s.count] = val;
     s.count += 1;
     return 1;
@@ -297,6 +312,7 @@ fn intSetIntersect(sets: [*]*IntSet, n_sets: usize) ?*IntSet {
         sets[0].data = null; // steal the data
         sets[0].count = 0;
         sets[0].cap = 0;
+        sets[0].idx = .{}; // ... and its membership index, so it is not freed twice
         return result;
     }
 
