@@ -10,8 +10,6 @@ from ._binding import (
     DlLockedError,
     VEC_D,
     VEC_IVEC_WORDS,
-    VEC_M,
-    VEC_SIG_WORDS,
     abi_version,
 )
 from .api import Db, Iter, Transaction
@@ -29,8 +27,6 @@ __all__ = [
     "SUPPORTED_ABI",
     "abi_version",
     "VEC_D",
-    "VEC_M",
-    "VEC_SIG_WORDS",
     "VEC_IVEC_WORDS",
 ]
 

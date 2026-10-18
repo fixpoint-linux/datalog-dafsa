@@ -13,8 +13,8 @@ Usage:
   @PROG@ [-d <dir>] obs <node> [--max-obs N]
   @PROG@ [-d <dir>] index
   @PROG@ [-d <dir>] search '<terms>' [--top N] [--version N] (--version 0 = current)
-  @PROG@ [-d <dir>] vsearch '<query>' [--k N] [--radius R] [--version V] [--sig <hex64>] [--ivec <hex768>]
-  @PROG@ [-d <dir>] vhybrid '<terms>' '<query>' [--k N] [--radius R] [--version V]
+  @PROG@ [-d <dir>] vsearch '<query>' [--k N] [--version V] [--ivec <hex768>]
+  @PROG@ [-d <dir>] vhybrid '<terms>' '<query>' [--k N] [--version V] [--ivec <hex768>]
   @PROG@ [-d <dir>] versions
 Values: bare integer -> raw u32; anything else -> interned string
 Hex args: concatenated hex digits (no spaces, no 0x prefix)

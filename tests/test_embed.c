@@ -1,13 +1,16 @@
 /*
- * test_embed.c — engine-side byte-identity gate for the dl-embed emission.
+ * test_embed.c — engine-side byte-identity gate for the encoder emission.
  *
- * Proves the src/embed/vec_bits.h emission formulas (band slicing, pack4,
- * float32 bits) are EXACTLY what src/vector.c consumes: entities are indexed
- * via vec_bits.h exactly as dl-embed pipeline would emit them, and the REAL
- * dl_vector_search / dl_vector_rerank engine paths must find/rank them.
+ * Proves the src/embed/vec_bits.h emission formulas (pack4, float32 bits) are
+ * EXACTLY what the query path consumes: an entity is indexed via vec_bits.h
+ * exactly as the external encoder emits it — `entity` liveness plus the 96
+ * packed __vec_q__ chunks, and nothing else — and the REAL dl_vector_search /
+ * dl_vector_rerank engine paths must find/rank it.
  *
- * (The dl-embed end-to-end pipeline needs the GGUF model and runs under
- * `make embed-test` / the guarded make-test hook instead.)
+ * Since U9 (2026-08-11) the encoder emits NO 256-bit band signature: the query
+ * path scans __vec_q__ and ranks by exact cosine, so there is no band layout
+ * for the two sides to disagree about (that was the silent-failure mode the
+ * old __sig{j}__ pipeline carried).
  */
 #include "dl.h"
 #include "vector.h"
@@ -42,32 +45,24 @@ static dl_db *fresh_db(char *dir_out, size_t cap, const char *name)
 
 static void t_vec_bits_goldens(void)
 {
-    TEST("vec_bits: band_slice/pack4/float32_bits goldens");
-    uint32_t sig[VEC_SIG_WORDS];
-    int w, ok = 1;
-    static uint32_t state = 0xC0FFEEu;
-    for (w = 0; w < VEC_SIG_WORDS; w++) {
-        state = state * 1664525u + 1013904223u;
-        sig[w] = state;
-    }
-    /* independent recomputation of the C1 formula */
-    for (int j = 0; j < VEC_M; j++) {
-        uint32_t want = (sig[j / 2] >> ((1u - (uint32_t)(j % 2)) * 16u)) & 0xFFFFu;
-        if (vec_band_slice(sig, j) != want) ok = 0;
-    }
-    if (vec_band_slice(sig, 0) != (sig[0] >> 16)) ok = 0;
-    if (vec_band_slice(sig, 1) != (sig[0] & 0xFFFFu)) ok = 0;
-    if (vec_band_slice(sig, 15) != (sig[7] & 0xFFFFu)) ok = 0;
+    TEST("vec_bits: pack4/unpack4/float32_bits goldens");
+    int ok = 1;
     if (vec_pack4_le(1, 2, 3, 4) != 0x04030201u) ok = 0;
     /* -1=0xFF, -128=0x80, 127=0x7F, 0=0x00 -> 0x007F80FF */
     if (vec_pack4_le(-1, -128, 127, 0) != 0x007F80FFu) ok = 0;
     if (vec_float32_bits(1.0f) != 0x3F800000u) ok = 0;
     if (vec_float32_bits(-2.0f) != 0xC0000000u) ok = 0;
     if (vec_bits_float32(0x3F800000u) != 1.0f) ok = 0;
-    /* round-trip */
-    uint32_t recon[VEC_SIG_WORDS] = {0};
-    for (int j = 0; j < VEC_M; j++) vec_band_set(recon, j, vec_band_slice(sig, j));
-    if (memcmp(sig, recon, sizeof sig) != 0) ok = 0;
+    /* every byte pattern round-trips through pack4/unpack4 */
+    for (int i = 0; i < 256; i++) {
+        int8_t b0 = (int8_t)(i & 0xFF);
+        int8_t b1 = (int8_t)((i * 7 + 13) & 0xFF);
+        int8_t b2 = (int8_t)((i * 31 + 5) & 0xFF);
+        int8_t b3 = (int8_t)((i * 13 + 3) & 0xFF);
+        int8_t out[4];
+        vec_unpack4_le(vec_pack4_le(b0, b1, b2, b3), out);
+        if (out[0] != b0 || out[1] != b1 || out[2] != b2 || out[3] != b3) ok = 0;
+    }
     if (ok) PASS(); else FAIL("vec_bits golden mismatch");
 }
 
@@ -89,13 +84,8 @@ static void t_emission_roundtrip(void)
     dl_db *db = fresh_db(dir, sizeof(dir), "t_roundtrip");
     if (!db) { FAIL("dl_open"); return; }
 
-    /* deterministic signature + int8 vector for one entity */
+    /* deterministic int8 vector for one entity */
     static uint32_t st = 0xABCDEF01u;
-    uint32_t sig[VEC_SIG_WORDS];
-    for (int w = 0; w < VEC_SIG_WORDS; w++) {
-        st = st * 1664525u + 1013904223u;
-        sig[w] = st;
-    }
     int8_t vec[VEC_D];
     for (int d = 0; d < VEC_D; d++) {
         st = st * 1664525u + 1013904223u;
@@ -105,50 +95,36 @@ static void t_emission_roundtrip(void)
     for (int c = 0; c < VEC_IVEC_WORDS; c++)
         ivec[c] = vec_pack4_le(vec[c*4+0], vec[c*4+1], vec[c*4+2], vec[c*4+3]);
 
-    /* declare relations + emit exactly like dl-embed pipeline does */
+    /* declare relations + emit exactly like the external encoder does:
+       `entity` liveness + the 96 packed __vec_q__ chunks, nothing else. */
     dl_declare_relation(db, VEC_ENTITY_REL, 2);
     dl_declare_relation(db, "__vec_q__", 3);
-    for (int j = 0; j < VEC_M; j++) {
-        char rel[32];
-        snprintf(rel, sizeof(rel), "__sig%d__", j);
-        dl_declare_relation(db, rel, 2);
-        uint32_t row[2] = { vec_band_slice(sig, j), 0 /*sym*/ };
-        (void)row;
-    }
     uint32_t sym = dl_intern_str(db, "roundtrip_entity");
     uint32_t type = dl_intern_str(db, "t");
     uint32_t ent_row[2] = { sym, type };
     if (dl_add_fact(db, VEC_ENTITY_REL, ent_row, 2) != 1) { FAIL("add entity"); dl_close(db); return; }
-    for (int j = 0; j < VEC_M; j++) {
-        char rel[32];
-        uint32_t row[2];
-        snprintf(rel, sizeof(rel), "__sig%d__", j);
-        row[0] = vec_band_slice(sig, j);
-        row[1] = sym;
-        if (dl_add_fact(db, rel, row, 2) != 1) { FAIL("add sig fact"); dl_close(db); return; }
-    }
     for (int c = 0; c < VEC_IVEC_WORDS; c++) {
         uint32_t row[3] = { sym, (uint32_t)c, ivec[c] };
         if (dl_add_fact(db, "__vec_q__", row, 3) != 1) { FAIL("add vecq fact"); dl_close(db); return; }
     }
 
-    /* search with the SAME signature at radius 0: every band must match ->
-     * score must be exactly VEC_M and the entity must be returned. */
+    /* search with the entity's OWN vector: the entity must be returned and
+     * its score must be the integer dot q.v = v.v (cosine 1.0 with itself). */
+    int64_t vd = 0;
+    for (int d = 0; d < VEC_D; d++) vd += (int64_t)vec[d] * (int64_t)vec[d];
     res_coll c1 = { {0}, {0}, 0 };
-    long n = dl_vector_search(db, sig, 10, 0, res_cb, &c1);
-    int ok = (n == 1 && c1.n == 1 && c1.syms[0] == sym && c1.scores[0] == VEC_M);
+    long n = dl_vector_search(db, ivec, 10, res_cb, &c1);
+    int ok = (n == 1 && c1.n == 1 && c1.syms[0] == sym &&
+              vd <= INT32_MAX && (int64_t)c1.scores[0] == vd);
     if (!ok) {
-        printf("\n    search returned n=%ld cnt=%d score=%d ", n, c1.n,
-               c1.n ? c1.scores[0] : -1);
-        FAIL("radius-0 search must match all 16 bands");
+        printf("\n    search returned n=%ld cnt=%d score=%d (want %lld) ", n, c1.n,
+               c1.n ? c1.scores[0] : -1, (long long)vd);
+        FAIL("search must return the entity with score = v.v");
         dl_close(db);
         return;
     }
 
-    /* rerank with the same int8 vector: the integer dot must equal v.v
-     * (score is int; only compared when the true dot fits) */
-    int64_t vd = 0;
-    for (int d = 0; d < VEC_D; d++) vd += (int64_t)vec[d] * (int64_t)vec[d];
+    /* rerank of that one candidate must agree (same ranking path). */
     res_coll c2 = { {0}, {0}, 0 };
     uint32_t cands[1] = { sym };
     long m = dl_vector_rerank(db, ivec, cands, 1, 10, res_cb, &c2);

@@ -1,5 +1,8 @@
 # The search stack: one sym-id space, co-versioned, Datalog-composable
 
+> ⚠ **PARTIALLY SUPERSEDED (2026-08-11, unit U9).** The thesis below — one `sym_id` space, co-versioned auxiliaries, Datalog-joinable search tiers — **stands and is what ships**. What changed is the semantic half's *mechanism*: vector search is now a **scan-and-rank** over the stored int8 chunks (`__vec_q__`; integer dot + norm, exact-cosine top-k, 100% recall by construction), not MIH-over-ITQ candidate retrieval. Read "MIH-over-ITQ / per-band `__sig{j}__` postings / `__itq_basis__`" below as the historical design; the per-band postings and the basis relation are no longer read by the engine, and an external encoder now emits only the `__vec_q__` chunks plus a liveness relation.
+
+
 **Status:** Synthesis / design thesis (2026-08-17). The capstone of the datalog-dafsa design docs — the framing that ties the graph, full-text, semantic, and fuzzy plans into one system, plus four ranked follow-on ideas. This doc is a thesis + an idea list, not a single implementable plan (each idea points to its concrete mechanism).
 
 ## The thesis

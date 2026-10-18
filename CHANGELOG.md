@@ -3,6 +3,47 @@
 All notable changes to this project are documented in this file.
 
 ## [Unreleased]
+- **Vector search is now SCAN-AND-RANK; the MIH-over-ITQ stage DELETED**
+  (2026-08-11, U9, user-approved): the engine never embeds, so `dl_vector_search`
+  took a pre-quantized int8 vector anyway — yet it first ran a *candidate
+  pre-filter* (MIH over 16 ITQ bit-code bands, pigeonhole radius) and then
+  re-ranked what survived. That bought latency the store did not need, at the
+  cost of recall (pigeonhole misses), 16 band-posting relations, a 98304-fact
+  `__itq_basis__` relation (~7.5 MB per db) and a band layout whose agreement
+  between the encoder and the engine failed SILENTLY. The query path now scans
+  `__vec_q__`, scores every live entity's stored int8 vector (integer dot +
+  norm), and emits the top k in exact cosine order via the existing signed
+  int64 cross-multiply:
+  - `zig/src/vector.zig` rewritten → ONE ranking path shared by search and
+    rerank; two scans (liveness + `__vec_q__`, both through the same
+    read primitive, so LIVE/`--version` discipline is unchanged) then a
+    sym-keyed accumulator and an exact sort. `__sig0__..__sig15__` and
+    `__itq_basis__` dropped from the read path; `VEC_C/VEC_M/VEC_W/
+    VEC_SIG_WORDS`, `sig_rel_fmt` and `basis_suffix` deleted;
+  - ABI: `dl_vector_search[_version|_corpus[_version]](db, q_int8, k, cb, user)`
+    — the `q_sig` argument is now the int8 query vector and the `r` (radius)
+    argument is gone; `src/vector.h`, `zig/src/dl_abi.zig` and the corpus
+    struct (`filter_rel`, `filter_col`, `vec_rel`) follow;
+  - CLI: `dl vsearch` keeps `--k`/`--ivec`/`--cand-only`/`--version` and loses
+    `--sig`/`--radius`; `dl vhybrid` intersects the lexical hits with the
+    ranked vector results and keeps that order (no second re-rank pass, which
+    also removes a LIVE re-rank that version reads had been using);
+  - tests: the MIH assertions (band slicing, band postings, basis round-trip,
+    pigeonhole recall) retired with the mechanism. The surviving contract is
+    asserted HARDER — top-k must equal a brute-force float cosine reference
+    exactly and in order (with margin guards, so a near-tie is never asserted
+    on), 100% recall, live filtering, corpus separation, version reads and the
+    CLI surface including rejection of the removed flags. Each rewritten
+    ranking assertion was verified to FAIL under an inverted-comparator
+    mutation of the engine;
+  - `python/dlb` exposes `vector_search(q_int8, k)` / `vector_search_version
+    (version, q_int8, k)`; `VEC_M`/`VEC_SIG_WORDS` dropped;
+  - docs: dated SUPERSEDED notes on
+    `docs/datalog-dafsa-{vector-search,vector-search-no-sidecar,
+    vector-storage-scope,bit-signature-index,search-stack,hybrid-search}.md`
+    and `docs/vector-search.html` (plus README, `python/ENVELOPE.md`,
+    `scripts/oracle.py`); emit-side truth recorded — an external encoder emits
+    ONLY the `__vec_q__` chunks plus a liveness relation.
 - **The browser playground and its stale prebuilt WebAssembly bundles DELETED**
   (2026-10-18): `docs/playground.wasm` and `docs/dl-lsp.wasm` were committed
   emscripten builds of the OLD C engine (dated Aug 17). They were already

@@ -1,15 +1,22 @@
 /*
  * test_vector_cli.c — S4 CLI vsearch/vhybrid tests
  *
- * Exercises the `dl vsearch` and `dl vhybrid` CLI paths via --sig/--ivec hex
- * (no Python / fastembed dependency).  A synthetic DB (entity + __sig0__..15__
- * + __vec_q__ + observation + postings) is built with the C API, persisted,
- * then the actual `dl` binary is run as a controlled subprocess against it:
- *   - vsearch returns the correct reranked entity
- *   - vsearch --cand-only dumps the raw MIH candidate sym-ids
- *   - vhybrid intersects lexical hits (mapped obs->entity) with vector
- *     candidates and re-ranks the intersection
- *   - the C API path is also exercised directly (candidate + rerank ordering)
+ * Exercises the `dl vsearch` and `dl vhybrid` CLI paths via --ivec hex (no
+ * Python / fastembed dependency).  A synthetic DB (entity + __vec_q__ +
+ * observation + postings) is built with the C API, persisted, then the actual
+ * `dl` binary is run as a controlled subprocess against it:
+ *   - vsearch returns the correct scan-ranked entity (exact cosine order)
+ *   - vsearch --cand-only dumps the ranked sym-ids
+ *   - vhybrid intersects lexical hits (mapped obs->entity) with the vector
+ *     ranking and emits the intersection in that order
+ *   - the C API path is also exercised directly (search + rerank ordering)
+ *
+ * SUPERSEDED (2026-08-11): the CLI used to take --sig (a 256-bit ITQ
+ * signature) and --radius (the MIH pigeonhole budget).  Neither exists any
+ * more: the query path is a scan-and-rank over __vec_q__, so the only query
+ * input is the pre-quantized int8 vector (--ivec) and the only knobs are --k
+ * and --version.  Passing --sig/--radius is now an "unexpected argument"
+ * error, which is itself asserted below.
  */
 #include "dl.h"
 #include "vector.h"
@@ -61,41 +68,10 @@ static uint32_t rng_next(void)
     return rng_state;
 }
 
-/* ─── Band layout (C1 formula — MUST match vector.c / embed.py) ─────────── */
-static uint32_t band_slice(const uint32_t *sig, int j)
-{
-    return (sig[j / 2] >> ((1u - (j % 2u)) * 16u)) & 0xFFFFu;
-}
-
 static uint32_t pack4(int8_t b0, int8_t b1, int8_t b2, int8_t b3)
 {
     return (uint32_t)(uint8_t)b0 | ((uint32_t)(uint8_t)b1 << 8) |
            ((uint32_t)(uint8_t)b2 << 16) | ((uint32_t)(uint8_t)b3 << 24);
-}
-
-/* ─── Signature: sign of random ±1 projections (256 bits -> 8 u32) ──────── */
-static int8_t P[VEC_C][VEC_D];
-static void init_projection(void)
-{
-    static int done = 0;
-    int b, d;
-    if (done) return;
-    rng_seed(0x5EED1234u);
-    for (b = 0; b < VEC_C; b++)
-        for (d = 0; d < VEC_D; d++)
-            P[b][d] = (rng_next() & 1u) ? 1 : -1;
-    done = 1;
-}
-
-static void sig_of(const int8_t *vec, uint32_t *sig)
-{
-    int b, d;
-    memset(sig, 0, (size_t)VEC_SIG_WORDS * sizeof(uint32_t));
-    for (b = 0; b < VEC_C; b++) {
-        int32_t acc = 0;
-        for (d = 0; d < VEC_D; d++) acc += P[b][d] * vec[d];
-        if (acc > 0) sig[b / 32] |= (1u << (31 - (b % 32)));
-    }
 }
 
 typedef struct {
@@ -103,7 +79,6 @@ typedef struct {
     uint32_t sym, type;
     int8_t vec[VEC_D];
     uint32_t ivec[VEC_IVEC_WORDS];
-    uint32_t sig[VEC_SIG_WORDS];
 } ent_t;
 
 static void gen_entity(ent_t *e, const char *name, dl_db *db)
@@ -115,7 +90,6 @@ static void gen_entity(ent_t *e, const char *name, dl_db *db)
     for (d = 0; d < VEC_D; d++) e->vec[d] = (int8_t)(int)(rng_next() % 201u) - 100;
     for (int c = 0; c < VEC_IVEC_WORDS; c++)
         e->ivec[c] = pack4(e->vec[c*4+0], e->vec[c*4+1], e->vec[c*4+2], e->vec[c*4+3]);
-    sig_of(e->vec, e->sig);
 }
 
 static void gen_query(ent_t *q, const ent_t *src)
@@ -130,36 +104,21 @@ static void gen_query(ent_t *q, const ent_t *src)
     }
     for (int c = 0; c < VEC_IVEC_WORDS; c++)
         q->ivec[c] = pack4(q->vec[c*4+0], q->vec[c*4+1], q->vec[c*4+2], q->vec[c*4+3]);
-    sig_of(q->vec, q->sig);
 }
 
 static void declare_vector_rels(dl_db *db)
 {
-    int j;
     dl_declare_relation(db, VEC_ENTITY_REL, 2);
     dl_declare_relation(db, "__vec_q__", 3);
-    for (j = 0; j < VEC_M; j++) {
-        char rel[32];
-        snprintf(rel, sizeof(rel), "__sig%d__", j);
-        dl_declare_relation(db, rel, 2);
-    }
 }
 
 static int add_entity_to_index(dl_db *db, const ent_t *e)
 {
     uint32_t cols[3];
-    int j, c;
+    int c;
     cols[0] = e->sym;
     cols[1] = e->type;
     if (dl_add_fact(db, VEC_ENTITY_REL, cols, 2) != 1) return -1;
-    for (j = 0; j < VEC_M; j++) {
-        char rel[32];
-        uint32_t b[2];
-        snprintf(rel, sizeof(rel), "__sig%d__", j);
-        b[0] = band_slice(e->sig, j);
-        b[1] = e->sym;
-        if (dl_add_fact(db, rel, b, 2) != 1) return -1;
-    }
     for (c = 0; c < VEC_IVEC_WORDS; c++) {
         cols[0] = e->sym;
         cols[1] = (uint32_t)c;
@@ -245,17 +204,6 @@ static void hex_word(uint32_t w, char *buf)
     snprintf(buf, 9, "%08x", w);
 }
 
-static void sig_hex_str(const uint32_t *sig, char *out)
-{
-    int i;
-    out[0] = '\0';
-    for (i = 0; i < VEC_SIG_WORDS; i++) {
-        char b[9];
-        hex_word(sig[i], b);
-        strcat(out, b);
-    }
-}
-
 static void ivec_hex_str(const uint32_t *ivec, char *out)
 {
     int i;
@@ -274,12 +222,12 @@ static void t_vsearch_cli(void)
     dl_db *db = fresh_db(dir, sizeof(dir), "t_vsearch");
     ent_t ents[3], q;
     int src = 0;
-    char sig[VEC_SIG_WORDS * 8 + 1], ivec[VEC_IVEC_WORDS * 8 + 1];
+    char ivec[VEC_IVEC_WORDS * 8 + 1];
     char out[65536];
     char *argv[16];
     int i;
 
-    TEST("vsearch CLI: candidate retrieval + rerank ordering");
+    TEST("vsearch CLI: scan-and-rank ordering");
 
     declare_vector_rels(db);
     rng_seed(0xF00Du);
@@ -296,7 +244,6 @@ static void t_vsearch_cli(void)
     gen_query(&q, &ents[src]);
     dl_close(db);   /* persist so the subprocess can open the dir */
 
-    sig_hex_str(q.sig, sig);
     ivec_hex_str(q.ivec, ivec);
 
     i = 0;
@@ -305,14 +252,10 @@ static void t_vsearch_cli(void)
     argv[i++] = (char *)dir;
     argv[i++] = "vsearch";
     argv[i++] = "dummy";
-    argv[i++] = "--sig";
-    argv[i++] = sig;
     argv[i++] = "--ivec";
     argv[i++] = ivec;
     argv[i++] = "--k";
     argv[i++] = "10";
-    argv[i++] = "--radius";
-    argv[i++] = "16";
     argv[i++] = NULL;
 
     if (run_cli(dir, argv, out, sizeof(out)) != 0) {
@@ -323,13 +266,93 @@ static void t_vsearch_cli(void)
         FAIL("vsearch reported an error");
         return;
     }
-    /* The query is a near-copy of ents[0] -> its rerank top-1 must be ents[0]
-     * and the name must be printed via print_value. */
+    /* The query is a near-copy of ents[0] -> its scan-ranked top-1 must be
+     * ents[0] and the name must be printed via print_value.  The FIRST
+     * printed line is the top-1 (the emission order is the ranking order). */
+    {
+        char first[256];
+        size_t k = 0;
+        while (out[k] != '\n' && out[k] != '\0' && k + 1 < sizeof first) {
+            first[k] = out[k];
+            k++;
+        }
+        first[k] = '\0';
+        if (strcmp(first, ents[src].name) != 0) {
+            printf("  (got first line: %s)", first);
+            FAIL("vsearch top-1 is not the true nearest entity");
+            return;
+        }
+    }
     if (!cli_has(out, ents[src].name)) {
         printf("  (got: %s)", out);
         FAIL("vsearch output missing the true nearest entity");
         return;
     }
+    PASS();
+}
+
+/* ─── Test 1b: --sig/--radius are gone (removed CLI surface) ────────────── */
+static void t_vsearch_removed_flags(void)
+{
+    char dir[512];
+    dl_db *db = fresh_db(dir, sizeof(dir), "t_removed_flags");
+    ent_t e, q;
+    char ivec[VEC_IVEC_WORDS * 8 + 1];
+    char sig[65];
+    char out[65536];
+    char *argv[16];
+    int i;
+
+    TEST("vsearch rejects the removed --sig/--radius flags");
+
+    declare_vector_rels(db);
+    rng_seed(0x11u);
+    gen_entity(&e, "only", db);
+    if (add_entity_to_index(db, &e) != 0) { FAIL("build index"); dl_close(db); return; }
+    gen_query(&q, &e);
+    dl_close(db);
+    ivec_hex_str(q.ivec, ivec);
+    memset(sig, '0', sizeof(sig) - 1);
+    sig[sizeof(sig) - 1] = '\0';
+
+    /* --sig: rejected */
+    i = 0;
+    argv[i++] = "dl";
+    argv[i++] = "-d";
+    argv[i++] = (char *)dir;
+    argv[i++] = "vsearch";
+    argv[i++] = "dummy";
+    argv[i++] = "--ivec";
+    argv[i++] = ivec;
+    argv[i++] = "--sig";
+    argv[i++] = sig;
+    argv[i++] = NULL;
+    if (run_cli(dir, argv, out, sizeof(out)) != 0) { FAIL("subprocess failed"); return; }
+    if (!cli_has(out, "unexpected argument")) {
+        printf("  (got: %s)", out);
+        FAIL("--sig must be rejected");
+        return;
+    }
+
+    /* --radius: rejected */
+    i = 0;
+    argv[i++] = "dl";
+    argv[i++] = "-d";
+    argv[i++] = (char *)dir;
+    argv[i++] = "vsearch";
+    argv[i++] = "dummy";
+    argv[i++] = "--ivec";
+    argv[i++] = ivec;
+    argv[i++] = "--radius";
+    argv[i++] = "16";
+    argv[i++] = NULL;
+    if (run_cli(dir, argv, out, sizeof(out)) != 0) { FAIL("subprocess failed"); return; }
+    if (!cli_has(out, "unexpected argument")) {
+        printf("  (got: %s)", out);
+        FAIL("--radius must be rejected");
+        return;
+    }
+
     PASS();
 }
 
@@ -339,12 +362,12 @@ static void t_vsearch_cand_only(void)
     char dir[512];
     dl_db *db = fresh_db(dir, sizeof(dir), "t_candonly");
     ent_t ents[4], q;
-    char sig[VEC_SIG_WORDS * 8 + 1], ivec[VEC_IVEC_WORDS * 8 + 1];
+    char ivec[VEC_IVEC_WORDS * 8 + 1];
     char out[65536];
     char *argv[16];
     int i;
 
-    TEST("vsearch --cand-only dumps raw MIH candidates");
+    TEST("vsearch --cand-only dumps the ranked sym-ids");
 
     declare_vector_rels(db);
     rng_seed(0xC0DECAu);
@@ -361,7 +384,6 @@ static void t_vsearch_cand_only(void)
     gen_query(&q, &ents[0]);
     dl_close(db);
 
-    sig_hex_str(q.sig, sig);
     ivec_hex_str(q.ivec, ivec);
 
     i = 0;
@@ -370,14 +392,10 @@ static void t_vsearch_cand_only(void)
     argv[i++] = (char *)dir;
     argv[i++] = "vsearch";
     argv[i++] = "dummy";
-    argv[i++] = "--sig";
-    argv[i++] = sig;
     argv[i++] = "--ivec";
     argv[i++] = ivec;
     argv[i++] = "--k";
     argv[i++] = "100";
-    argv[i++] = "--radius";
-    argv[i++] = "16";
     argv[i++] = "--cand-only";
     argv[i++] = NULL;
 
@@ -389,11 +407,11 @@ static void t_vsearch_cand_only(void)
         FAIL("cand-only reported an error");
         return;
     }
-    /* Every emitted line must be a bare u32 sym-id (raw candidate), and the
-     * query's source must be among them. */
+    /* Every emitted line must be a bare u32 sym-id, the query's source must
+     * be among them, AND it must be FIRST (the dump is the ranking). */
     {
         char *line = strtok(out, "\n");
-        int saw_src = 0;
+        int saw_src = 0, rank = 0;
         while (line) {
             char *end;
             long v = strtol(line, &end, 10);
@@ -401,11 +419,23 @@ static void t_vsearch_cand_only(void)
                 FAIL("cand-only emitted a non-integer line");
                 return;
             }
-            if ((uint32_t)v == ents[0].sym) saw_src = 1;
+            if ((uint32_t)v == ents[0].sym) {
+                saw_src = 1;
+                if (rank != 0) {
+                    FAIL("cand-only did not put the true source first");
+                    return;
+                }
+            }
+            rank++;
             line = strtok(NULL, "\n");
         }
         if (!saw_src) {
             FAIL("cand-only missing the true source candidate");
+            return;
+        }
+        if (rank != 4) {
+            printf("  (emitted %d of 4 ranked syms)\n", rank);
+            FAIL("cand-only should emit every live vector for k=100");
             return;
         }
     }
@@ -418,7 +448,7 @@ static void t_vhybrid_cli(void)
     char dir[512];
     dl_db *db = fresh_db(dir, sizeof(dir), "t_vhybrid");
     ent_t ents[3], q;
-    char sig[VEC_SIG_WORDS * 8 + 1], ivec[VEC_IVEC_WORDS * 8 + 1];
+    char ivec[VEC_IVEC_WORDS * 8 + 1];
     char out[65536];
     char *argv[18];
     uint32_t term_sym, obs_sym;
@@ -460,7 +490,6 @@ static void t_vhybrid_cli(void)
     gen_query(&q, &ents[0]);
     dl_close(db);
 
-    sig_hex_str(q.sig, sig);
     ivec_hex_str(q.ivec, ivec);
 
     i = 0;
@@ -470,14 +499,10 @@ static void t_vhybrid_cli(void)
     argv[i++] = "vhybrid";
     argv[i++] = "fox";
     argv[i++] = "dummy";
-    argv[i++] = "--sig";
-    argv[i++] = sig;
     argv[i++] = "--ivec";
     argv[i++] = ivec;
     argv[i++] = "--k";
     argv[i++] = "10";
-    argv[i++] = "--radius";
-    argv[i++] = "16";
     argv[i++] = NULL;
 
     if (run_cli(dir, argv, out, sizeof(out)) != 0) {
@@ -486,7 +511,22 @@ static void t_vhybrid_cli(void)
     }
     /* e0 and e1 are lexical hits AND vector candidates (near copies of e0);
      * e2 is a vector candidate but NOT a lexical hit, so it must NOT appear.
-     * The top-1 of the ranked intersection must be e0. */
+     * The top-1 of the ranked intersection must be e0 — and it must be the
+     * FIRST emitted line, i.e. the intersection keeps the vector ranking. */
+    {
+        char first[256];
+        size_t k = 0;
+        while (out[k] != '\n' && out[k] != '\0' && k + 1 < sizeof first) {
+            first[k] = out[k];
+            k++;
+        }
+        first[k] = '\0';
+        if (strcmp(first, ents[0].name) != 0) {
+            printf("  (got first line: %s)", first);
+            FAIL("vhybrid top-1 is not the ranked best intersection");
+            return;
+        }
+    }
     if (!cli_has(out, ents[0].name)) {
         printf("  (got: %s)", out);
         FAIL("vhybrid missing the ranked top entity");
@@ -524,7 +564,7 @@ static void t_api_path(void)
     }
     gen_query(&q, &ents[0]);
 
-    long n = dl_vector_search(db, q.sig, COLL_MAX, 16, coll_search_cb, &res);
+    long n = dl_vector_search(db, q.ivec, COLL_MAX, coll_search_cb, &res);
     if (n < 0) { FAIL("dl_vector_search error"); dl_close(db); return; }
     long r = dl_vector_rerank(db, q.ivec, res.syms, res.n, 1,
                               coll_search_cb, &rk);
@@ -542,9 +582,8 @@ int main(void)
 {
     printf("=== test_vector_cli (S4) ===\n");
 
-    init_projection();
-
     t_vsearch_cli();
+    t_vsearch_removed_flags();
     t_vsearch_cand_only();
     t_vhybrid_cli();
     t_api_path();

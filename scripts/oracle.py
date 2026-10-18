@@ -2,6 +2,15 @@
 """
 oracle.py — S4 int8-vs-float re-rank precision gate
 
+SUPERSEDED (2026-08-11, unit U9): this gate compares float-exact cosine with
+int8 cosine over MIH candidate sets fetched via `dl vsearch --sig ... --radius
+... --cand-only`. The engine no longer has a MIH candidate stage and no longer
+accepts --sig/--radius — ranking is an exhaustive scan-and-rank over
+__vec_q__ — so this script's premise (measuring recall lost to the pre-filter)
+is gone and the invocations below FAIL against current builds. Kept as the
+record of the int8-vs-float measurement; `dl vsearch --ivec ... --cand-only`
+still exists and returns the ranked ids if you want to re-run the comparison.
+
 Implements the precision_gate from handoff-no-sidecar-artifact-1:
 On REAL bge-small embeddings, feed REAL MIH candidates (from dl_vector_search
 via `dl vsearch --cand-only`), compute top-10 by float-exact cosine vs by

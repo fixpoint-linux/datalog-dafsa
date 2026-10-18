@@ -52,10 +52,10 @@ DL_E_CONFLICT = 2  # CAS: expected revision != current revision
 SUPPORTED_ABI = 1
 
 # Vector-tier layout constants (src/vector.h) — the Python side must match.
+# Since U9 the query path is a scan-and-rank over __vec_q__, so the only query
+# input is the pre-quantized int8 vector; the 256-bit ITQ signature
+# (VEC_C/VEC_M/VEC_SIG_WORDS) is gone with the MIH band postings.
 VEC_D = 384          # embedding dim (bge-small)
-VEC_C = 256          # ITQ bit-code length
-VEC_M = 16           # MIH bands (__sig0__..__sig15__)
-VEC_SIG_WORDS = 8    # 256-bit signature, u32 words, MSB-first
 VEC_IVEC_WORDS = 96  # int8 query vector, 4 int8 packed per u32
 
 
@@ -300,44 +300,39 @@ class DlRaw:
         # ── vector tier ────────────────────────────────────────────
         # struct dl_vec_corpus (vector.h): corpus-parameterized search.
         # The production memory store indexes OBSERVATION CONTENT
-        # (__obssig*__/__vec_obs__/observation), not entity names, so the
-        # plain dl_vector_search (hardcoded ENTITY corpus) returns -1 there.
+        # (__vec_obs__/observation), not entity names, so the plain
+        # dl_vector_search (hardcoded ENTITY corpus) returns -1 there.
         class DlVecCorpus(ctypes.Structure):
             _fields_ = [
                 ("filter_rel", c_char_p),      # liveness relation
                 ("filter_col", c_uint8),       # which col holds the sym
-                ("sig_rel_fmt", c_char_p),     # "__sig%d__" / "__obssig%d__"
                 ("vec_rel", c_char_p),         # "__vec_q__" / "__vec_obs__"
-                ("basis_suffix", c_char_p),    # "" / "_obs"
             ]
 
         self.DlVecCorpus = DlVecCorpus
         self.CORPUS_ENTITY = DlVecCorpus(
-            filter_rel=b"entity", filter_col=0,
-            sig_rel_fmt=b"__sig%d__", vec_rel=b"__vec_q__", basis_suffix=b"",
+            filter_rel=b"entity", filter_col=0, vec_rel=b"__vec_q__",
         )
         self.CORPUS_OBSERVATION_CONTENT = DlVecCorpus(
-            filter_rel=b"observation", filter_col=1,
-            sig_rel_fmt=b"__obssig%d__", vec_rel=b"__vec_obs__",
-            basis_suffix=b"_obs",
+            filter_rel=b"observation", filter_col=1, vec_rel=b"__vec_obs__",
         )
 
         lib.dl_vector_search.argtypes = [
-            c_void_p, POINTER(c_uint32), c_int, c_int, VEC_CB, c_void_p,
+            c_void_p, POINTER(c_uint32), c_int, VEC_CB, c_void_p,
         ]
         lib.dl_vector_search.restype = c_long
         lib.dl_vector_search_corpus.argtypes = [
             c_void_p, ctypes.POINTER(DlVecCorpus), POINTER(c_uint32),
-            c_int, c_int, VEC_CB, c_void_p,
+            c_int, VEC_CB, c_void_p,
         ]
         lib.dl_vector_search_corpus.restype = c_long
         lib.dl_vector_search_version.argtypes = [
-            c_void_p, c_uint32, POINTER(c_uint32), c_int, c_int, VEC_CB, c_void_p,
+            c_void_p, c_uint32, POINTER(c_uint32), c_int, VEC_CB, c_void_p,
         ]
         lib.dl_vector_search_version.restype = c_long
         lib.dl_vector_search_corpus_version.argtypes = [
             c_void_p, c_uint32, ctypes.POINTER(DlVecCorpus), POINTER(c_uint32),
-            c_int, c_int, VEC_CB, c_void_p,
+            c_int, VEC_CB, c_void_p,
         ]
         lib.dl_vector_search_corpus_version.restype = c_long
         lib.dl_vector_rerank.argtypes = [

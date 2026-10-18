@@ -1,5 +1,12 @@
 # Semantic vector search via multi-index hashing (MIH) over ITQ bit-codes
 
+> ⚠ **SUPERSEDED (2026-08-11, unit U9) — the MIH-over-ITQ query path described below is NOT what ships.** The vector tier's query path is now **scan-and-rank**: it scans `__vec_q__`, scores every live entity's stored int8 vector with integer arithmetic (dot + norm), and emits the top k in exact cosine order via the existing signed int64 cross-multiply (integer isqrt, no float). Recall is 100% by construction; a query costs O(N·D) int8 multiply-accumulates and O(N) query-time memory for N live vectors. Gone from the read path: the 16 per-band postings `__sig0__..__sig15__`, the `__itq_basis__` relation (98304 facts per db, stored and never read), and the `--sig`/`--radius` CLI flags. The user-visible interface survives (`dl vsearch`, `dl vhybrid`, `dl_vector_search*`), and `dl vsearch` now takes only the pre-quantized int8 vector (`--ivec`) plus `--k`/`--version`.
+>
+> **Emit-side truth:** an external encoder now emits ONLY the `__vec_q__` chunks (unit-normalised embedding → int8 → 96 packed u32 per entity) plus its own liveness relation (`entity`, or `observation` for the content corpus). Nothing else is read, so the old band-layout agreement between encoder and engine — which failed **silently** whenever the producer disagreed — no longer exists.
+>
+> This doc is kept as the design record. The reasoning below describes why MIH/ITQ was designed, not what the engine does; the mechanism was replaced because the engine never embeds, so the candidate pre-filter bought latency the engine did not need at the cost of recall and a 7.5 MB/db storage tail.
+
+
 **Status:** Design of record — **this is the chosen approach.** Recommended by the advisor (2026-08-17), consistent with the bit-signature index critique. Semantic vector search in datalog-dafsa, designed for **scale** (~1e5–1e6+ entities). Replaces the bit-signature doc's flawed best-first-walk/PCA-sign framing. This is the design we will implement. **The `.npy` sidecar this doc retains for re-rank can be eliminated afterward — see `docs/datalog-dafsa-vector-search-no-sidecar.md` (int8 re-rank vectors in-store).**
 
 ## TL;DR
@@ -131,3 +138,39 @@ def vector_search(db, q, k, d, m, r, snap_version):
 - `docs/datalog-dafsa-fulltext.md` (postings relation shape `term→doc`, same as `sig_j`).
 - `src/intern.h` (append-only sym-id stability), `src/dl.h` (snapshots, WAL, `dl_prefix`).
 - Norouzi et al., "Fast exact search in Hamming space," TPAMI 2012 (MIH); Gong & Lazebnik, ITQ 2011.
+
+---
+
+## Measured cost of the replacement (scan-and-rank), 2026-08-11
+
+Recorded here so the design record and the shipped behaviour are measured against each
+other rather than assumed. Fixture: synthetic corpus, uniform random int8 vectors
+(384 lanes), 96 `__vec_q__` rows per entity, bulk-loaded (`dl_load_facts`) and
+consolidated; `dl_vector_search(q_int8, k=10)` best-of-7 on this host; row count is
+`96 × N`.
+
+| live vectors N | rows | LIVE query | VERSION query | µs / vector |
+|---|---|---|---|---|
+| 10 000 | 960 000 | 107–129 ms | 167–190 ms | 10.7–12.9 |
+| 50 000 | 4 800 000 | 485–561 ms | 1 046–1 124 ms | 9.7–11.2 |
+
+**MEASURED:** the cost is linear in rows at ~10–13 µs per stored vector, i.e. **~0.5 s
+per query at 50 000 live vectors**, and **~1 s at 100 000** (that last figure is a
+PROJECTION — linear extrapolation of the 50 000 measurement, not a run).
+
+**MEASURED, and the reason the estimate in the handoff was optimistic by ~10–40×:** a
+bare `dl_prefix(db, "__vec_q__", NULL, 0, noop_cb, …)` enumeration of the same rows
+costs 415–630 ms at 50 000 vectors — the same as the whole query. The 384 int8
+multiply-accumulates per vector are *free* next to the DAFSA row enumeration
+(~90–130 ns/row; 96 rows per vector). The handoff's "~1e5 vectors = tens of ms" bound
+assumed the MACs dominate; they do not, and the cost is in the storage layer's row
+materialisation. Shrinking that is an engine-wide enumeration concern, not a
+vector-tier one — this note records the number rather than promising an optimisation
+that was not built.
+
+**MEASURED context for the trade:** the superseded MIH path cost 34 ms per query at
+`r=8` on a 37 679-observation production store, and 0.46–2.2 s at `r=16…48`
+(`python/ENVELOPE.md`). At that store's size (~37.7k vectors, ~3.6M rows) scan-and-rank
+projects to ~0.36–0.47 s — i.e. it is comparable to or slower than MIH at the *low*
+radii and much cheaper than MIH at the radii that actually gave recall. Both paths are
+tens-to-hundreds of ms: semantic search is a recall tool at that cost either way.

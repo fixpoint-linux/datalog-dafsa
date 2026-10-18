@@ -14,8 +14,7 @@ from dlb import (
     DlConflictError,
     DlError,
     DlLockedError,
-    VEC_M,
-    VEC_SIG_WORDS,
+    VEC_IVEC_WORDS,
 )
 
 TEST_DB = os.path.join(tempfile.gettempdir(), "dlb-test-db")
@@ -420,16 +419,24 @@ class TestLocking(unittest.TestCase):
 
 
 class TestVectorTier(unittest.TestCase):
-    """End-to-end vector test using the same random-projection model as the
-    C test suite (tests/test_vector_search.c): 256-bit signature of sign(P·v),
-    band j = bits [16j,16j+15] (band 0 = high 16 of sig[0]); int8 vectors
-    packed little-endian 4-per-u32."""
+    """End-to-end vector test against the scan-and-rank query path.
 
-    D, C = 384, 256
+    The engine never embeds: it consumes a PRE-QUANTIZED int8 query vector
+    (96 u32, 4 int8 packed little-endian) and ranks every live entity's stored
+    vector by exact cosine.  SUPERSEDED (2026-08-11): this fixture used to
+    build a 256-bit ITQ signature per entity (random +/-1 projections) and
+    write 16 __sig{j}__ band postings, then assert MIH recall.  The signature
+    and the postings relations are gone with the MIH mechanism; recall is now
+    100% by construction, so the assertions are ordering/exactness ones.
+    """
+
+    D, N = 384, 5
+
+    def pack4(self, b0, b1, b2, b3):
+        m = lambda x: x & 0xFF
+        return m(b0) | (m(b1) << 8) | (m(b2) << 16) | (m(b3) << 24)
 
     def _rng(self):
-        # xorshift32 matching the C test's usage pattern loosely (values only
-        # need to be deterministic here, not equal to the C fixture)
         state = 0x5EED1234
         while True:
             state ^= (state << 13) & 0xFFFFFFFF
@@ -437,35 +444,11 @@ class TestVectorTier(unittest.TestCase):
             state ^= (state << 5) & 0xFFFFFFFF
             yield state
 
-    def _build_model(self):
-        rng = self._rng()
-        P = [[1 if (next(rng) & 1) else -1 for _ in range(self.D)]
-             for _ in range(self.C)]
-        return P
-
-    def sig_of(self, P, vec):
-        sig = [0] * VEC_SIG_WORDS
-        for b in range(self.C):
-            acc = sum(P[b][d] * vec[d] for d in range(self.D))
-            if acc > 0:
-                sig[b // 32] |= 1 << (31 - (b % 32))
-        return sig
-
-    def band_slice(self, sig, j):
-        return (sig[j // 2] >> ((1 - (j % 2)) * 16)) & 0xFFFF
-
-    def pack4(self, b0, b1, b2, b3):
-        m = lambda x: x & 0xFF
-        return m(b0) | (m(b1) << 8) | (m(b2) << 16) | (m(b3) << 24)
-
     def setUp(self):
         self.dir = fresh_dir() + "-vec"
         self.db = db = dlb.Db.open(self.dir)
         db.declare_relation("entity", 2)
         db.declare_relation("__vec_q__", 3)
-        for j in range(VEC_M):
-            db.declare_relation(f"__sig{j}__", 2)
-        self.P = self._build_model()
         rng = self._rng()
         self.ents = {}
         for name in ("alpha", "beta", "gamma", "delta", "epsilon"):
@@ -473,42 +456,54 @@ class TestVectorTier(unittest.TestCase):
             sym = db.intern(name)
             typ = db.intern("doc")
             db.add_fact("entity", (sym, typ))
-            sig = self.sig_of(self.P, vec)
-            for j in range(VEC_M):
-                db.add_fact(f"__sig{j}__", (self.band_slice(sig, j), sym))
             ivec = [self.pack4(*vec[c * 4:c * 4 + 4]) for c in range(96)]
             for c, w in enumerate(ivec):
                 db.add_fact("__vec_q__", (sym, c, w))
-            self.ents[name] = (sym, vec, sig, ivec)
+            self.ents[name] = (sym, vec, ivec)
 
     def tearDown(self):
         self.db.close()
 
-    def test_prefix_over_sig_postings(self):
-        sym = self.ents["alpha"][0]
-        sig = self.ents["alpha"][2]
-        hits = []
-        n = self.db.prefix("__sig0__", (self.band_slice(sig, 0),), hits.append)
-        self.assertGreaterEqual(n, 1)
-        self.assertIn((self.band_slice(sig, 0), sym), hits)
-
-    def test_vector_search_finds_perturbed_query(self):
+    def _perturbed(self, vec):
         rng = self._rng()
-        sym, vec, sig, ivec = self.ents["alpha"]
-        qvec = [max(-128, min(127, v + int(next(rng) % 7) - 3)) for v in vec]
-        qsig = self.sig_of(self.P, qvec)
-        out = self.db.vector_search(qsig, k=5, r=48)
-        self.assertTrue(out, "expected at least one MIH candidate")
-        syms = [s for s, _ in out]
-        self.assertIn(sym, syms)
+        return [max(-128, min(127, v + int(next(rng) % 7) - 3)) for v in vec]
+
+    def test_vector_search_ranks_the_source_first(self):
+        sym, vec, _ = self.ents["alpha"]
+        qvec = self._perturbed(vec)
+        qivec = [self.pack4(*qvec[c * 4:c * 4 + 4]) for c in range(96)]
+        out = self.db.vector_search(qivec, k=self.N)
+        self.assertEqual(len(out), self.N, "scan-and-rank must recall every live vector")
+        self.assertEqual(out[0][0], sym, "perturbed source must rank first")
+        self.assertEqual({s for s, _ in out},
+                         {e[0] for e in self.ents.values()},
+                         "every live entity with a vector must be a candidate")
+
+    def test_vector_search_version_matches_live(self):
+        _, vec, _ = self.ents["beta"]
+        qvec = self._perturbed(vec)
+        qivec = [self.pack4(*qvec[c * 4:c * 4 + 4]) for c in range(96)]
+        self.db.publish_snapshot()
+        vs = self.db.snapshot_versions()
+        out_live = self.db.vector_search(qivec, k=self.N)
+        out_ver = self.db.vector_search_version(vs[-1], qivec, k=self.N)
+        self.assertEqual([s for s, _ in out_live], [s for s, _ in out_ver],
+                         "live and version reads must rank the same data the same way")
+
+    def test_vector_search_filters_dead_entities(self):
+        sym, vec, _ = self.ents["gamma"]
+        qivec = [self.pack4(*vec[c * 4:c * 4 + 4]) for c in range(96)]
+        self.db.delete_fact("entity", (sym, self.db.intern("doc")))
+        syms = [s for s, _ in self.db.vector_search(qivec, k=self.N)]
+        self.assertNotIn(sym, syms, "a dead entity must not be ranked")
+        self.assertEqual(len(syms), self.N - 1)
 
     def test_vector_rerank_orders_by_cosine(self):
-        rng = self._rng()
-        sym, vec, sig, ivec = self.ents["beta"]
-        qvec = [max(-128, min(127, v + int(next(rng) % 7) - 3)) for v in vec]
+        sym, vec, _ = self.ents["beta"]
+        qvec = self._perturbed(vec)
         qivec = [self.pack4(*qvec[c * 4:c * 4 + 4]) for c in range(96)]
         cands = [e[0] for e in self.ents.values()]
-        out = self.db.vector_rerank(qivec, cands, k=5)
+        out = self.db.vector_rerank(qivec, cands, k=self.N)
         self.assertTrue(out)
         # the perturbed source must rank first (highest cosine)
         self.assertEqual(out[0][0], sym)
@@ -518,7 +513,7 @@ class TestVectorTier(unittest.TestCase):
 
     def test_vector_search_bad_arity_rejected(self):
         with self.assertRaises(DlError):
-            self.db.vector_search([0] * 7, k=5, r=48)
+            self.db.vector_search([0] * 7, k=5)
 
 
 class TestSnapshot(unittest.TestCase):

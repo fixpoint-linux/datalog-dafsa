@@ -76,15 +76,13 @@ const X_OK = 1;
 const STDOUT_FILENO = 1;
 const DL_E_CONFLICT = 2; // dl.h
 
-/// vector.h layout constants (shared verbatim with embed.py).  Defined here
-/// rather than read from the cImport because translate-c cannot always fold
-/// the division macros; the comptime gate below pins them to the header when
-/// it did.
-const VEC_SIG_WORDS = 8; // VEC_C(256)/32 — MSB-first u32 words
+/// vector.h layout constants (shared verbatim with the external encoder).
+/// Defined here rather than read from the cImport because translate-c cannot
+/// always fold the division macros; the comptime gate below pins them to the
+/// header when it did.
 const VEC_IVEC_WORDS = 96; // VEC_D(384)/4 — 4 int8 packed per u32
 
 comptime {
-    if (@hasDecl(c, "VEC_SIG_WORDS")) std.debug.assert(VEC_SIG_WORDS == c.VEC_SIG_WORDS);
     if (@hasDecl(c, "VEC_IVEC_WORDS")) std.debug.assert(VEC_IVEC_WORDS == c.VEC_IVEC_WORDS);
 }
 
@@ -181,11 +179,13 @@ fn parseHexWords(hex_str: [*c]const u8, words: [*]u32, n_words: usize) isize {
 /// Run the external query-encoder helper: fork + execv (NO shell — the query
 /// is passed as a single argv element, so no shell-quoting/injection surface
 /// exists by construction).  The engine does not embed text, so the encoder is
-/// a separate program: it must answer `<encoder> encode --db DIR QRY` with a
-/// "sig_hex ivec_hex" stdout line (pre-quantized ITQ signature + int8 vector).
-/// Fills q_sig (VEC_SIG_WORDS) and q_int8 (VEC_IVEC_WORDS) from that line.
+/// a separate program: it must answer `<encoder> encode --db DIR QRY` with ONE
+/// stdout token, the 768-hex-character int8 vector (the same 96 packed chunks
+/// stored in __vec_q__).  Fills q_int8 (VEC_IVEC_WORDS) from it.
+/// (Since U9 the encoder emits no signature: the query path reads no band
+/// postings — see docs/datalog-dafsa-vector-search.md.)
 /// Returns 0 on success, -1 on any failure (message printed).
-fn runEncodeHelper(db_dir: [*c]const u8, query: [*c]const u8, q_sig: *[VEC_SIG_WORDS]u32, q_int8: *[VEC_IVEC_WORDS]u32) c_int {
+fn runEncodeHelper(db_dir: [*c]const u8, query: [*c]const u8, q_int8: *[VEC_IVEC_WORDS]u32) c_int {
     var helper: [PATH_MAX + 16]u8 = undefined;
     var fds: [2]c_int = undefined;
 
@@ -194,7 +194,7 @@ fn runEncodeHelper(db_dir: [*c]const u8, query: [*c]const u8, q_sig: *[VEC_SIG_W
     if (access(&helper, X_OK) != 0) {
         _ = snprintf(&helper, helper.len, "./dl-embed");
         if (access(&helper, X_OK) != 0) {
-            _ = fprintf(stderr, "dl: query encoder not found (no in-tree embedder; pass --sig/--ivec, or install an encoder as ./dl-embed)\n");
+            _ = fprintf(stderr, "dl: query encoder not found (no in-tree embedder; pass --ivec, or install an encoder as ./dl-embed)\n");
             return -1;
         }
     }
@@ -227,7 +227,6 @@ fn runEncodeHelper(db_dir: [*c]const u8, query: [*c]const u8, q_sig: *[VEC_SIG_W
     }
     _ = close(fds[1]);
     {
-        var sig_buf: [65]u8 = undefined;
         var ivec_buf: [769]u8 = undefined;
         const fp = fdopen(fds[0], "r");
         var status: c_int = 0;
@@ -238,12 +237,9 @@ fn runEncodeHelper(db_dir: [*c]const u8, query: [*c]const u8, q_sig: *[VEC_SIG_W
             _ = fprintf(stderr, "dl: fdopen failed\n");
             return -1;
         }
-        if (fscanf(fp.?, "%64s %768s", &sig_buf, &ivec_buf) == 2) {
-            if (parseHexWords(&sig_buf, q_sig, VEC_SIG_WORDS) == VEC_SIG_WORDS and
-                parseHexWords(&ivec_buf, q_int8, VEC_IVEC_WORDS) == VEC_IVEC_WORDS)
-            {
+        if (fscanf(fp.?, "%768s", &ivec_buf) == 1) {
+            if (parseHexWords(&ivec_buf, q_int8, VEC_IVEC_WORDS) == VEC_IVEC_WORDS)
                 ok = true;
-            }
         }
         _ = fclose(fp.?);
         if (waitpid(pid, &status, 0) < 0 or
@@ -278,7 +274,7 @@ fn collectVecCand(entity_sym: u32, score: c_int, user: ?*anyopaque) callconv(.c)
     return 0;
 }
 
-/// Callback to print ranked results from rerank.
+/// Callback to print ranked results from search/rerank.
 const VecResultPrinter = struct {
     db: [*c]c.dl_db,
     printed: c_int,
@@ -289,6 +285,20 @@ fn printVecResult(entity_sym: u32, score: c_int, user: ?*anyopaque) callconv(.c)
     _ = score;
     printValue(p.db.?, entity_sym, 0);
     _ = printf("\n");
+    p.printed += 1;
+    return 0;
+}
+
+/// Callback to print raw ranked sym-ids (vsearch --cand-only): the score is
+/// already reflected in the emitted order, so only the sym-id is printed.
+const VecCandPrinter = struct {
+    printed: c_int = 0,
+};
+
+fn printVecCand(entity_sym: u32, score: c_int, user: ?*anyopaque) callconv(.c) c_int {
+    const p: *VecCandPrinter = @ptrCast(@alignCast(user.?));
+    _ = score;
+    _ = printf("%u\n", entity_sym);
     p.printed += 1;
     return 0;
 }
@@ -431,8 +441,8 @@ fn usage(prog: [*:0]const u8) noreturn {
         \\  %s [-d <dir>] obs <node> [--max-obs N]
         \\  %s [-d <dir>] index
         \\  %s [-d <dir>] search '<terms>' [--top N] [--version N] (--version 0 = current)
-        \\  %s [-d <dir>] vsearch '<query>' [--k N] [--radius R] [--version V] [--sig <hex64>] [--ivec <hex768>]
-        \\  %s [-d <dir>] vhybrid '<terms>' '<query>' [--k N] [--radius R] [--version V]
+        \\  %s [-d <dir>] vsearch '<query>' [--k N] [--version V] [--ivec <hex768>]
+        \\  %s [-d <dir>] vhybrid '<terms>' '<query>' [--k N] [--version V] [--ivec <hex768>]
         \\  %s [-d <dir>] versions
         \\Values: bare integer -> raw u32; anything else -> interned string
         \\Hex args: concatenated hex digits (no spaces, no 0x prefix)
@@ -1067,9 +1077,7 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
         argp += 1;
 
         var k: c_ulong = 10;
-        var radius: c_ulong = 2;
         var version: c_ulong = 0;
-        var sig_hex: ?[*:0]const u8 = null;
         var ivec_hex: ?[*:0]const u8 = null;
         var cand_only = false;
 
@@ -1081,27 +1089,12 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
                     return 1;
                 }
                 argp += 1;
-            } else if (eq(argv[argp], "--radius")) {
-                argp += 1;
-                if (argp >= argv.len or !parseU32Strict(argv[argp].ptr, &radius)) {
-                    _ = fprintf(stderr, "dl: invalid --radius value\n");
-                    return 1;
-                }
-                argp += 1;
             } else if (eq(argv[argp], "--version")) {
                 argp += 1;
                 if (argp >= argv.len or !parseU32Strict(argv[argp].ptr, &version)) {
                     _ = fprintf(stderr, "dl: invalid --version value\n");
                     return 1;
                 }
-                argp += 1;
-            } else if (eq(argv[argp], "--sig")) {
-                argp += 1;
-                if (argp >= argv.len) {
-                    _ = fprintf(stderr, "dl: --sig requires a hex string\n");
-                    return 1;
-                }
-                sig_hex = argv[argp];
                 argp += 1;
             } else if (eq(argv[argp], "--ivec")) {
                 argp += 1;
@@ -1120,75 +1113,53 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
             }
         }
 
-        // Parse or encode query signature and int8 vector
-        var q_sig: [VEC_SIG_WORDS]u32 = undefined;
+        // Parse or encode the pre-quantized int8 query vector.
         var q_int8: [VEC_IVEC_WORDS]u32 = undefined;
-
-        if (sig_hex != null and ivec_hex != null) {
-            // Programmatic path: use provided hex
-            if (parseHexWords(sig_hex.?, &q_sig, VEC_SIG_WORDS) != VEC_SIG_WORDS) {
-                _ = fprintf(stderr, "dl: invalid --sig (need 64 hex chars = 8 u32)\n");
-                return 1;
-            }
+        if (ivec_hex != null) {
+            // Programmatic path: use the provided hex.
             if (parseHexWords(ivec_hex.?, &q_int8, VEC_IVEC_WORDS) != VEC_IVEC_WORDS) {
                 _ = fprintf(stderr, "dl: invalid --ivec (need 768 hex chars = 96 u32)\n");
                 return 1;
             }
-        } else if (sig_hex != null or ivec_hex != null) {
-            _ = fprintf(stderr, "dl: provide both --sig and --ivec, or neither\n");
-            return 1;
         } else {
             // Encode the query via the external encoder (fork+execv — no
             // shell, so the user-controlled query can never inject commands).
-            if (runEncodeHelper(db_dir, query_str.ptr, &q_sig, &q_int8) != 0) {
+            if (runEncodeHelper(db_dir, query_str.ptr, &q_int8) != 0) {
                 return 1;
             }
         }
 
-        // Collect candidates from vector search
-        const cand_syms = malloc(k * 10 * 4);
-        if (cand_syms == null) {
-            _ = fprintf(stderr, "dl: OOM\n");
-            return 1;
-        }
-        var collector = VecCandCollector{ .syms = @ptrCast(@alignCast(cand_syms.?)), .capacity = cIntTrunc(k * 10), .count = 0 };
-
-        var n_cand: c_long = undefined;
-        if (version == 0) {
-            n_cand = c.dl_vector_search(db, &q_sig, cIntTrunc(k * 10), cIntTrunc(radius), collectVecCand, &collector);
-        } else {
-            n_cand = c.dl_vector_search_version(db, @intCast(version), &q_sig, cIntTrunc(k * 10), cIntTrunc(radius), collectVecCand, &collector);
-        }
-        if (n_cand < 0) {
-            _ = fprintf(stderr, "dl: vector search failed\n");
-            free(cand_syms);
-            return 1;
-        }
-
-        // Re-rank candidates (or, with --cand-only, print the raw MIH
-        // candidate set — used by the S4 int8-vs-float precision oracle).
-        var printer = VecResultPrinter{ .db = db, .printed = 0 };
+        // Score-and-rank.  The search itself emits the top k in exact cosine
+        // order; it reads LIVE rows via dl_prefix or the snapshot via
+        // dl_query_bound_version (never both), so version reads stay inside
+        // the snapshot.
         var n_results: c_long = undefined;
         if (cand_only) {
-            const csyms: [*]u32 = @ptrCast(@alignCast(cand_syms.?));
-            for (0..@intCast(collector.count)) |i|
-                _ = printf("%u\n", csyms[i]);
-            n_results = collector.count;
-        } else if (version == 0) {
-            n_results = c.dl_vector_rerank(db, &q_int8, @ptrCast(@alignCast(cand_syms.?)), collector.count, cIntTrunc(k), printVecResult, &printer);
+            // The ranked sym-ids, unadorned (machine-consumable).
+            var cand_printer = VecCandPrinter{};
+            if (version == 0) {
+                n_results = c.dl_vector_search(db, &q_int8, cIntTrunc(k), printVecCand, &cand_printer);
+            } else {
+                n_results = c.dl_vector_search_version(db, @intCast(version), &q_int8, cIntTrunc(k), printVecCand, &cand_printer);
+            }
+            if (n_results < 0) {
+                _ = fprintf(stderr, "dl: vector search failed\n");
+                return 1;
+            }
         } else {
-            n_results = c.dl_vector_rerank(db, &q_int8, @ptrCast(@alignCast(cand_syms.?)), collector.count, cIntTrunc(k), printVecResult, &printer);
+            var printer = VecResultPrinter{ .db = db, .printed = 0 };
+            if (version == 0) {
+                n_results = c.dl_vector_search(db, &q_int8, cIntTrunc(k), printVecResult, &printer);
+            } else {
+                n_results = c.dl_vector_search_version(db, @intCast(version), &q_int8, cIntTrunc(k), printVecResult, &printer);
+            }
+            if (n_results < 0) {
+                _ = fprintf(stderr, "dl: vector search failed\n");
+                return 1;
+            }
+            if (printer.printed == 0)
+                _ = printf("(no results)\n");
         }
-        if (n_results < 0) {
-            _ = fprintf(stderr, "dl: vector rerank failed\n");
-            free(cand_syms);
-            return 1;
-        }
-
-        if (!cand_only and printer.printed == 0)
-            _ = printf("(no results)\n");
-
-        free(cand_syms);
         return 0;
     }
 
@@ -1200,9 +1171,7 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
         argp += 1;
 
         var k: c_ulong = 10;
-        var radius: c_ulong = 2;
         var version: c_ulong = 0;
-        var sig_hex: ?[*:0]const u8 = null;
         var ivec_hex: ?[*:0]const u8 = null;
 
         while (argp < argv.len) {
@@ -1213,27 +1182,12 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
                     return 1;
                 }
                 argp += 1;
-            } else if (eq(argv[argp], "--radius")) {
-                argp += 1;
-                if (argp >= argv.len or !parseU32Strict(argv[argp].ptr, &radius)) {
-                    _ = fprintf(stderr, "dl: invalid --radius value\n");
-                    return 1;
-                }
-                argp += 1;
             } else if (eq(argv[argp], "--version")) {
                 argp += 1;
                 if (argp >= argv.len or !parseU32Strict(argv[argp].ptr, &version)) {
                     _ = fprintf(stderr, "dl: invalid --version value\n");
                     return 1;
                 }
-                argp += 1;
-            } else if (eq(argv[argp], "--sig")) {
-                argp += 1;
-                if (argp >= argv.len) {
-                    _ = fprintf(stderr, "dl: --sig requires a hex string\n");
-                    return 1;
-                }
-                sig_hex = argv[argp];
                 argp += 1;
             } else if (eq(argv[argp], "--ivec")) {
                 argp += 1;
@@ -1249,25 +1203,17 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
             }
         }
 
-        // Parse or encode the query signature and int8 vector.
-        var q_sig: [VEC_SIG_WORDS]u32 = undefined;
+        // Parse or encode the pre-quantized int8 query vector.
         var q_int8: [VEC_IVEC_WORDS]u32 = undefined;
-        if (sig_hex != null and ivec_hex != null) {
-            if (parseHexWords(sig_hex.?, &q_sig, VEC_SIG_WORDS) != VEC_SIG_WORDS) {
-                _ = fprintf(stderr, "dl: invalid --sig (need 64 hex chars = 8 u32)\n");
-                return 1;
-            }
+        if (ivec_hex != null) {
             if (parseHexWords(ivec_hex.?, &q_int8, VEC_IVEC_WORDS) != VEC_IVEC_WORDS) {
                 _ = fprintf(stderr, "dl: invalid --ivec (need 768 hex chars = 96 u32)\n");
                 return 1;
             }
-        } else if (sig_hex != null or ivec_hex != null) {
-            _ = fprintf(stderr, "dl: provide both --sig and --ivec, or neither\n");
-            return 1;
         } else {
             // Encode the query via the external encoder (fork+execv — no
             // shell, so the user-controlled query can never inject commands).
-            if (runEncodeHelper(db_dir, query_str.ptr, &q_sig, &q_int8) != 0) {
+            if (runEncodeHelper(db_dir, query_str.ptr, &q_int8) != 0) {
                 return 1;
             }
         }
@@ -1326,7 +1272,7 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
             return 1;
         }
 
-        // Get vector candidates
+        // Get the scan-ranked vector results (already exact-cosine order).
         const vec_syms = malloc(k * 10 * 4);
         if (vec_syms == null) {
             free(lex_ids);
@@ -1336,9 +1282,9 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
         var vec_collector = VecCandCollector{ .syms = @ptrCast(@alignCast(vec_syms.?)), .capacity = cIntTrunc(k * 10), .count = 0 };
         var n_vec: c_long = undefined;
         if (version == 0) {
-            n_vec = c.dl_vector_search(db, &q_sig, cIntTrunc(k * 10), cIntTrunc(radius), collectVecCand, &vec_collector);
+            n_vec = c.dl_vector_search(db, &q_int8, cIntTrunc(k * 10), collectVecCand, &vec_collector);
         } else {
-            n_vec = c.dl_vector_search_version(db, @intCast(version), &q_sig, cIntTrunc(k * 10), cIntTrunc(radius), collectVecCand, &vec_collector);
+            n_vec = c.dl_vector_search_version(db, @intCast(version), &q_int8, cIntTrunc(k * 10), collectVecCand, &vec_collector);
         }
         if (n_vec < 0) {
             _ = fprintf(stderr, "dl: vector search failed\n");
@@ -1350,9 +1296,10 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
 
         // INTERSECT: build a sorted set of ENTITY sym-ids from the lexical
         // results (dl_search_top returns obs/content sym-ids; map each to its
-        // owning entity via the observation relation), keep only the vector
-        // candidates that are also lexical hits, then re-rank the
-        // intersection by exact int8 cosine (post-hoc join on sym-ids).
+        // owning entity via the observation relation), then keep the vector
+        // results that are also lexical hits — IN THE SEARCH'S RANKED ORDER,
+        // which is already exact cosine order (no second ranking pass, so no
+        // LIVE rerank can leak into a version read).
         const inter = malloc(@as(usize, @intCast(vec_collector.count)) * 4);
         if (inter == null) {
             _ = fprintf(stderr, "dl: OOM\n");
@@ -1385,18 +1332,12 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
         }
 
         if (n_inter > 0) {
-            var printer = VecResultPrinter{ .db = db, .printed = 0 };
-            const n_rank = c.dl_vector_rerank(db, &q_int8, @ptrCast(@alignCast(inter.?)), @intCast(n_inter), cIntTrunc(k), printVecResult, &printer);
-            if (n_rank < 0) {
-                _ = fprintf(stderr, "dl: vector rerank failed\n");
-                free(inter);
-                free(vec_syms);
-                free(lex_ids);
-                free(lex_scores);
-                return 1;
+            const limit: usize = if (@as(usize, @intCast(k)) < n_inter) @intCast(k) else n_inter;
+            var p: usize = 0;
+            while (p < limit) : (p += 1) {
+                printValue(db, isyms[p], 0);
+                _ = printf("\n");
             }
-            if (printer.printed == 0)
-                _ = printf("(no results)\n");
         } else {
             _ = printf("(no results)\n");
         }

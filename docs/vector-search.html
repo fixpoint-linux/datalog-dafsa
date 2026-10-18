@@ -28,6 +28,23 @@
 
 <main class="wrap">
 
+  <p class="warn">
+    <strong>SUPERSEDED (2026-08-11, unit U9) — the MIH-over-ITQ mechanism below is NOT what ships.</strong>
+    The vector query path is now <strong>scan-and-rank</strong>: it scans <code>__vec_q__</code>, scores
+    every live entity's stored int8 vector with integer arithmetic (dot + norm), and emits the top k in
+    exact cosine order (signed int64 cross-multiply, no float). Recall is 100% by construction; a query
+    costs O(N·D) int8 multiply-accumulates for N live vectors. Gone from the read path: the 16 per-band
+    postings <code>__sig0__</code>..<code>__sig15__</code>, the <code>__itq_basis__</code> relation
+    (stored, never read), and the <code>--sig</code>/<code>--radius</code> CLI flags. The interface
+    survives: <code>dl vsearch</code>, <code>dl vhybrid</code>, <code>dl_vector_search*</code>.
+  </p>
+  <p class="warn">
+    <strong>Emit-side truth:</strong> an external encoder now emits ONLY the <code>__vec_q__</code>
+    chunks (unit-normalised embedding → int8 → 96 packed u32 per entity) plus its own liveness
+    relation — nothing else is read, so the old band-layout agreement between encoder and engine
+    (which failed <em>silently</em> whenever the producer disagreed) no longer exists.
+  </p>
+
   <h1>Semantic <span class="fx">vector search</span></h1>
   <p>
     Meaning-aware retrieval on top of the full-text index. The engine does <strong>not</strong>

@@ -133,6 +133,16 @@ work, not per-step reads.
 
 ## 6. Vector tier (production memory store, OBSERVATION_CONTENT corpus)
 
+> ⚠ **SUPERSEDED (2026-08-11, unit U9) — the numbers below were measured on the
+> old MIH mechanism.** Vector search is now a scan-and-rank over `__vec_q__`
+> (integer dot + norm per live vector, exact-cosine top-k, 100% recall), so
+> there is no `r` (radius) knob at all: `dl_vector_search` takes only the query
+> vector and `k`, and the cost is O(N·D) int8 multiply-accumulates for N live
+> vectors — no `r=8/16/24/32/48` variants exist any more, and the per-band
+> `__obssig0..15__` / `__itq_basis__` relations named here are no longer read.
+> Treat the table as a dated record of the MIH design, not as current
+> latency.
+
 The production store (~/.config/hax/memory.dl, 37 679 observations) indexes
 observation CONTENT (`__obssig0..15__`, `__vec_obs__`, `__itq_basis__`),
 not entity names — the entity-corpus `dl_vector_search` returns -1 there;

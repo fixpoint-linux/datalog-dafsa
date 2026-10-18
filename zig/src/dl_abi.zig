@@ -40,7 +40,6 @@ pub const RELK_FIXED: c_int = 0; // dl_internal.h
 pub const RELK_VARIADIC: c_int = 1; // dl_internal.h
 pub const TERM_NIL: u32 = 0x80000000; // termstore.h TERM_BASE
 pub const DL_VIEW_CACHE_SZ: c_int = 8; // snapshot.h
-pub const VEC_SIG_WORDS: c_int = 8; // vector.h VEC_C/32
 pub const VEC_IVEC_WORDS: c_int = 96; // vector.h VEC_D/4
 
 // ─── Opaque handle types ─────────────────────────────────────────────────
@@ -205,9 +204,7 @@ pub const rel_entry = extern struct {
 pub const struct_dl_vec_corpus = extern struct {
     filter_rel: [*c]const u8,
     filter_col: u8,
-    sig_rel_fmt: [*c]const u8,
     vec_rel: [*c]const u8,
-    basis_suffix: [*c]const u8,
 };
 pub const dl_vec_corpus = struct_dl_vec_corpus;
 
@@ -287,8 +284,8 @@ pub extern "c" fn dl_term_cons(db: [*c]dl_db, head: u32, tail: u32) u32;
 pub extern "c" fn dl_term_is_list(db: [*c]const dl_db, v: u32) c_int;
 pub extern "c" fn dl_term_car(db: [*c]const dl_db, h: u32) u32;
 pub extern "c" fn dl_term_cdr(db: [*c]const dl_db, h: u32) u32;
-pub extern "c" fn dl_vector_search(db: [*c]dl_db, q_sig: [*c]const u32, k: c_int, r: c_int, cb: dl_vec_cb, user: ?*anyopaque) c_long;
-pub extern "c" fn dl_vector_search_version(db: [*c]dl_db, version: u32, q_sig: [*c]const u32, k: c_int, r: c_int, cb: dl_vec_cb, user: ?*anyopaque) c_long;
+pub extern "c" fn dl_vector_search(db: [*c]dl_db, q_int8: [*c]const u32, k: c_int, cb: dl_vec_cb, user: ?*anyopaque) c_long;
+pub extern "c" fn dl_vector_search_version(db: [*c]dl_db, version: u32, q_int8: [*c]const u32, k: c_int, cb: dl_vec_cb, user: ?*anyopaque) c_long;
 pub extern "c" fn dl_vector_rerank(db: [*c]dl_db, q_int8: [*c]const u32, cand_syms: [*c]const u32, n_cand: c_int, k: c_int, cb: dl_vec_cb, user: ?*anyopaque) c_long;
 
 // ─── dl_internal.h dispatch helpers ──────────────────────────────────────

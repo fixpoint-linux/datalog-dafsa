@@ -90,33 +90,23 @@ EOF
 # empty file: exercises the "could not determine arity" (empty-CSV) load path
 : > "$DATA/empty.csv"
 
-# Vector fixtures: deterministic entity/__sig{j}__/__vec_q__ corpora +
-# a query sig/ivec hex pair (mirrors tests/test_vector_cli.c storage layout).
-# Python writes the CSVs and emits the hex strings on stdout.
+# Vector fixtures: deterministic entity/__vec_q__ corpora + a query ivec hex
+# string (mirrors tests/test_vector_cli.c storage layout).  Since U9 the query
+# path reads ONLY __vec_q__ + a liveness relation, so there is no signature
+# fixture and no --sig/--radius case: the encoder contract is one int8 vector.
+# Python writes the CSVs and emits the hex string on stdout.
 python3 - "$DATA" > "$WORK/vhex.env" <<'PYEOF'
 import sys, os
 data = sys.argv[1]
 def pack4(b0,b1,b2,b3):
     return (b0 & 0xFF) | ((b1 & 0xFF) << 8) | ((b2 & 0xFF) << 16) | ((b3 & 0xFF) << 24)
-def band(sig, j):  # vector.c band layout: 16-bit slices, MSB half first
-    return (sig[j // 2] >> ((1 - (j % 2)) * 16)) & 0xFFFF
-# query signature: fixed 256 bits, entity sigs differ in <=1 bit per band so
-# radius 16 (pigeonhole budget 1) retrieves every entity
-q_sig = [0x01234567, 0x89ABCDEF, 0xFEDCBA98, 0x76543210,
-         0x0F1E2D3C, 0x4B5A6978, 0x8899AABB, 0xCCDDEEFF]
-ent_sig = []
-for k in range(3):
-    s = list(q_sig)
-    s[k] ^= (1 << ((k * 5) % 32))     # flip one bit in one band-half word
-    ent_sig.append(s)
 def ivec_close(seed):
     v = []
     x = seed
     for i in range(96):
         x = (x * 1103515245 + 12345) & 0x7FFFFFFF
         base = (x % 60) - 30
-        v.append([base, min(127, base + 3), max(-128, base - 2), base] if False else
-                 [max(-128, min(127, base)), max(-128, min(127, base + 1)),
+        v.append([max(-128, min(127, base)), max(-128, min(127, base + 1)),
                   max(-128, min(127, base - 1)), max(-128, min(127, base + 2))])
     return v
 q_ivec = ivec_close(7)
@@ -125,24 +115,17 @@ ent_ivec = [ivec_close(101), ivec_close(202), ivec_close(303)]
 with open(os.path.join(data, "vec_entity.csv"), "w") as f:
     for k in range(3):
         f.write("%d,%d\n" % (k + 1, 4))          # (name_sym, type_sym) raw ints
-for j in range(16):
-    with open(os.path.join(data, "vec_sig%d.csv" % j), "w") as f:
-        for k in range(3):
-            f.write("%d,%d\n" % (band(ent_sig[k], j), k + 1))
 with open(os.path.join(data, "vec_q.csv"), "w") as f:
     for k in range(3):
         for c in range(96):
             f.write("%d,%d,%d\n" % (k + 1, c, pack4(*ent_ivec[k][c])))
 
-sig_hex = "".join("%08x" % (w & 0xFFFFFFFF) for w in q_sig)
 q_ivec_words = [pack4(*q_ivec[c]) for c in range(96)]
 ivec_hex = "".join("%08x" % (w & 0xFFFFFFFF) for w in q_ivec_words)
-print("QSIG=%s" % sig_hex)
 print("QIVEC=%s" % ivec_hex)
 PYEOF
-QSIG=$(sed -n 's/^QSIG=//p' "$WORK/vhex.env")
 QIVEC=$(sed -n 's/^QIVEC=//p' "$WORK/vhex.env")
-[ -n "$QSIG" ] && [ -n "$QIVEC" ] || { note "vector fixture generation failed"; exit 1; }
+[ -n "$QIVEC" ] || { note "vector fixture generation failed"; exit 1; }
 
 # ─── Corpus drivers ─────────────────────────────────────────────────────────
 # run_cmd <outdir> <tag> <dbdir> <args...>: one command, capture
@@ -231,30 +214,27 @@ build_corpus() {
     run_cmd "$out" c72 "$db" load "$DATA/arity9.csv" --rel r9
     run_cmd "$out" c73 "$db" load "$DATA/empty.csv" --rel r9
     # vector tier: entity names interned in a fixed order (sym ids 5..7),
-    # then raw-int CSV loads for entity/__sig{j}__/__vec_q__
+    # then raw-int CSV loads for entity/__vec_q__
     run_cmd "$out" c74 "$db" lookup entity ent0 doc
     run_cmd "$out" c75 "$db" lookup entity ent1 doc
     run_cmd "$out" c76 "$db" lookup entity ent2 doc
     run_cmd "$out" c77 "$db" load "$DATA/vec_entity.csv" --rel entity
-    for j in $(seq 0 15); do
-        run_cmd "$out" "c78s$j" "$db" load "$DATA/vec_sig$j.csv" --rel "__sig${j}__"
-    done
     run_cmd "$out" c79 "$db" load "$DATA/vec_q.csv" --rel __vec_q__
-    run_cmd "$out" c80 "$db" vsearch "q" --sig "$QSIG" --ivec "$QIVEC" --k 10 --radius 16
-    run_cmd "$out" c81 "$db" vsearch "q" --sig "$QSIG" --ivec "$QIVEC" --k 1
-    run_cmd "$out" c82 "$db" vsearch "q" --sig "$QSIG" --ivec "$QIVEC" --cand-only
-    run_cmd "$out" c83 "$db" vsearch "q" --sig "$QSIG" --ivec "$QIVEC" --radius 0
-    run_cmd "$out" c84 "$db" vsearch "q" --sig "$QSIG"
-    run_cmd "$out" c85 "$db" vsearch "q" --sig "zz" --ivec "$QIVEC"
-    run_cmd "$out" c86 "$db" vsearch "q" --ivec "$QIVEC"
+    run_cmd "$out" c80 "$db" vsearch "q" --ivec "$QIVEC" --k 10
+    run_cmd "$out" c81 "$db" vsearch "q" --ivec "$QIVEC" --k 1
+    run_cmd "$out" c82 "$db" vsearch "q" --ivec "$QIVEC" --cand-only
+    run_cmd "$out" c83 "$db" vsearch "q" --ivec "$QIVEC" --k 2
+    run_cmd "$out" c84 "$db" vsearch "q"
+    run_cmd "$out" c85 "$db" vsearch "q" --ivec "zz"
+    run_cmd "$out" c86 "$db" vsearch "q" --ivec "$QIVEC" --cand-only --k 1
     run_cmd "$out" c87 "$db" vsearch "q" --k 0
-    run_cmd "$out" c88 "$db" vsearch "q" --sig "$QSIG" --ivec "$QIVEC" --version 1
-    run_cmd "$out" c89 "$db" vhybrid "red" "q" --sig "$QSIG" --ivec "$QIVEC"
-    run_cmd "$out" c90 "$db" vhybrid "zzz" "q" --sig "$QSIG" --ivec "$QIVEC"
-    run_cmd "$out" c91 "$db" vhybrid "red" "q" --sig "$QSIG" --ivec "$QIVEC" --version 1
+    run_cmd "$out" c88 "$db" vsearch "q" --ivec "$QIVEC" --version 1
+    run_cmd "$out" c89 "$db" vhybrid "red" "q" --ivec "$QIVEC"
+    run_cmd "$out" c90 "$db" vhybrid "zzz" "q" --ivec "$QIVEC"
+    run_cmd "$out" c91 "$db" vhybrid "red" "q" --ivec "$QIVEC" --version 1
     run_cmd "$out" c92 "$db" vhybrid "red"
-    # error paths
-    run_cmd "$out" c93 "$db" vsearch "q" --sig "$QSIG" --ivec "$QIVEC" --radius -1
+    # error paths (the removed --sig/--radius flags must be rejected)
+    run_cmd "$out" c93 "$db" vsearch "q" --ivec "$QIVEC" --radius 16
     run_cmd "$out" c94 "$db" search
     run_cmd "$out" c95 "$db" versions extra
     run_cmd "$out" c96 "$db" frobnicate
@@ -286,8 +266,8 @@ read_corpus() {
     run_cmd "$out" r13 "$db" query "tc(X,Y):-edge(X,Y)." tc
     run_cmd "$out" r14 "$db" bound tc 1
     run_cmd "$out" r17 "$db" pattern edge "^[12]$"
-    run_cmd "$out" r18 "$db" vsearch "q" --sig "$QSIG" --ivec "$QIVEC" --k 10 --radius 16
-    run_cmd "$out" r19 "$db" vhybrid "red" "q" --sig "$QSIG" --ivec "$QIVEC"
+    run_cmd "$out" r18 "$db" vsearch "q" --ivec "$QIVEC" --k 10
+    run_cmd "$out" r19 "$db" vhybrid "red" "q" --ivec "$QIVEC"
     run_cmd "$out" r20 "$db" txn
 }
 

@@ -1975,7 +1975,39 @@ vectorSearchView =
             , title = "Quickstart"
             , hint = "// no model in-tree: pre-quantized vectors from an external encoder"
             , children =
-                [ p []
+                [ Fixpoint.Callout.warn
+                    [ strong [] [ text "SUPERSEDED (2026-08-11, unit U9) — the MIH-over-ITQ mechanism below is NOT what ships." ]
+                    , text " The vector query path is now "
+                    , strong [] [ text "scan-and-rank" ]
+                    , text ": it scans "
+                    , Fixpoint.Code.inline "__vec_q__"
+                    , text ", scores every live entity's stored int8 vector with integer arithmetic (dot + norm), and emits the top k in exact cosine order (signed int64 cross-multiply, no float). Recall is 100% by construction; a query costs O(N·D) int8 multiply-accumulates for N live vectors. Gone from the read path: the 16 per-band postings "
+                    , Fixpoint.Code.inline "__sig0__"
+                    , text ".."
+                    , Fixpoint.Code.inline "__sig15__"
+                    , text ", the "
+                    , Fixpoint.Code.inline "__itq_basis__"
+                    , text " relation (stored, never read), and the "
+                    , Fixpoint.Code.inline "--sig"
+                    , text "/"
+                    , Fixpoint.Code.inline "--radius"
+                    , text " CLI flags. The interface survives: "
+                    , Fixpoint.Code.inline "dl vsearch"
+                    , text ", "
+                    , Fixpoint.Code.inline "dl vhybrid"
+                    , text ", "
+                    , Fixpoint.Code.inline "dl_vector_search*"
+                    , text "."
+                    ]
+                , Fixpoint.Callout.warn
+                    [ strong [] [ text "Emit-side truth:" ]
+                    , text " an external encoder now emits ONLY the "
+                    , Fixpoint.Code.inline "__vec_q__"
+                    , text " chunks (unit-normalised embedding → int8 → 96 packed u32 per entity) plus its own liveness relation — nothing else is read, so the old band-layout agreement between encoder and engine (which failed "
+                    , em [] [ text "silently" ]
+                    , text " whenever the producer disagreed) no longer exists."
+                    ]
+                , p []
                     [ text "Meaning-aware retrieval on top of the full-text index. The engine does "
                     , strong [] [ text "not" ]
                     , text " embed: it takes a pre-encoded ITQ signature plus a pre-quantized int8 query vector, retrieves candidates with "

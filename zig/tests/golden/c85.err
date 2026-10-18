@@ -1,1 +1,1 @@
-dl: invalid --sig (need 64 hex chars = 8 u32)
+dl: invalid --ivec (need 768 hex chars = 96 u32)

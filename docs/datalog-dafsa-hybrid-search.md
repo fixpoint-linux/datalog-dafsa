@@ -1,5 +1,8 @@
 # Hybrid retrieval: DAFSA-as-sparse-half + vector tier
 
+> ⚠ **PARTIALLY SUPERSEDED (2026-08-11, unit U9).** The composition thesis below — lexical (DAFSA postings) ∩ semantic (vector tier) over shared `sym_id`s — **stands and is what ships** (`dl vhybrid`). The semantic half's mechanism changed: it is now a **scan-and-rank** over the stored int8 chunks (`__vec_q__`; integer dot + norm, top-k in exact cosine order, 100% recall), not MIH-over-ITQ candidate retrieval, so `dl vhybrid` intersects the lexical hits with the *ranked* vector results and keeps that order (there is no separate re-rank pass, and no `--sig`/`--radius` flags any more — only `--ivec`, `--k`, `--version`). The per-band `__sig{j}__` postings and `__itq_basis__` named below are no longer read: an external encoder emits only the `__vec_q__` chunks plus a liveness relation.
+
+
 **Status:** Design/plan — not yet implemented. Architectural note that reframes the full-text doc (`docs/datalog-dafsa-fulltext.md`) and the semantic doc (`docs/datalog-dafsa-semantic-sidecar.md`) as **two halves of one story**: a DAFSA and a vector index are orthogonal query axes that compose on shared sym-ids. **The chosen vector-tier design of record is `docs/datalog-dafsa-vector-search.md`** (MIH over ITQ bit-codes as per-band DAFSA postings, exact-cosine re-rank); this doc's **lexical-gate pattern** (symbolic filter → exact cosine over the gated subset, post-hoc join on sym-ids) is the composition path that design uses. See also `docs/datalog-dafsa-bit-signature-index.md` (superseded exploratory framing + critique).
 
 ## TL;DR

@@ -1,5 +1,12 @@
 # Eliminating the `.npy` vector sidecar (int8 re-rank vectors in-store)
 
+> ⚠ **SUPERSEDED (2026-08-11, unit U9) — the MIH-over-ITQ query path described below is NOT what ships.** The vector tier's query path is now **scan-and-rank**: it scans `__vec_q__`, scores every live entity's stored int8 vector with integer arithmetic (dot + norm), and emits the top k in exact cosine order via the existing signed int64 cross-multiply (integer isqrt, no float). Recall is 100% by construction; a query costs O(N·D) int8 multiply-accumulates and O(N) query-time memory for N live vectors. Gone from the read path: the 16 per-band postings `__sig0__..__sig15__`, the `__itq_basis__` relation (98304 facts per db, stored and never read), and the `--sig`/`--radius` CLI flags. The user-visible interface survives (`dl vsearch`, `dl vhybrid`, `dl_vector_search*`), and `dl vsearch` now takes only the pre-quantized int8 vector (`--ivec`) plus `--k`/`--version`.
+>
+> **Emit-side truth:** an external encoder now emits ONLY the `__vec_q__` chunks (unit-normalised embedding → int8 → 96 packed u32 per entity) plus its own liveness relation (`entity`, or `observation` for the content corpus). Nothing else is read, so the old band-layout agreement between encoder and engine — which failed **silently** whenever the producer disagreed — no longer exists.
+>
+> This doc is kept as the design record. The reasoning below describes why MIH/ITQ was designed, not what the engine does; the mechanism was replaced because the engine never embeds, so the candidate pre-filter bought latency the engine did not need at the cost of recall and a 7.5 MB/db storage tail.
+
+
 **Status:** Design — recommended by the advisor (2026-08-17). A follow-on to `docs/datalog-dafsa-vector-search.md` (the MIH design of record). After the MIH engine is built, this design **kills the `.npy` float sidecar** that the MIH design retains for the exact-cosine re-rank step, by storing **int8-quantized re-rank vectors in datalog-dafsa**. Consolidates to one store/WAL/snapshot/crash-recovery story.
 
 > ⚠ This is a *refinement of* the MIH design, not a replacement. Read `docs/datalog-dafsa-vector-search.md` first. The re-rank still happens; only its *data source* moves from a `.npy` file to in-store relations.

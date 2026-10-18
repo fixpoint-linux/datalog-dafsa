@@ -40,15 +40,14 @@ from ._binding import (
     DlConflictError,
     DlError,
     DlLockedError,
-    VEC_M,
-    VEC_SIG_WORDS,
+    VEC_IVEC_WORDS,
     load_library,
     make_join_cb,
     make_tuple_cb,
     make_vec_cb,
 )
 
-__all__ = ["Db", "Iter", "Transaction", "VEC_M", "VEC_SIG_WORDS"]
+__all__ = ["Db", "Iter", "Transaction", "VEC_IVEC_WORDS"]
 
 _U32P = POINTER(c_uint32)
 _MAX_ARITY = 8
@@ -557,15 +556,18 @@ class Db:
 
     # ─── vector tier ───────────────────────────────────────────
 
-    def vector_search(self, q_sig, k: int, r: int, *, corpus=None) -> list:
-        """MIH candidate search over LIVE sig relations. q_sig is the
-        pre-encoded 256-bit signature as VEC_SIG_WORDS (8) u32, MSB-first.
+    def vector_search(self, q_int8, k: int, *, corpus=None) -> list:
+        """Scan-and-rank semantic search over LIVE relations.  q_int8 is the
+        PRE-QUANTIZED int8 query vector as VEC_IVEC_WORDS (96) u32, 4 int8
+        packed little-endian.  Every live entity's stored vector is scored and
+        the top k are emitted in exact cosine order (100% recall; no MIH
+        pre-filter — see the SUPERSEDED note in docs).
         corpus: None -> ENTITY (dl_vector_search), "obs" -> OBSERVATION_CONTENT
         (dl_vector_search_corpus; the production memory store's index).
-        Returns [(entity_sym, band_match_count), ...] best-first."""
-        sig = tuple(q_sig)
-        if len(sig) != VEC_SIG_WORDS:
-            raise DlError(f"vector_search: q_sig needs {VEC_SIG_WORDS} u32 values")
+        Returns [(entity_sym, integer_dot), ...] best-first."""
+        q = tuple(q_int8)
+        if len(q) != VEC_IVEC_WORDS:
+            raise DlError(f"vector_search: q_int8 needs {VEC_IVEC_WORDS} u32 values")
         out: list = []
 
         def sink(sym, score):
@@ -573,23 +575,25 @@ class Db:
             return None
 
         trap = make_vec_cb(sink)
-        arr = (c_uint32 * VEC_SIG_WORDS)(*sig)
+        arr = (c_uint32 * VEC_IVEC_WORDS)(*q)
         if corpus is None:
-            n = self._call(self._raw.dl_vector_search, arr, k, r, trap, c_void_p(0))
+            n = self._call(self._raw.dl_vector_search, arr, k, trap, c_void_p(0))
         else:
             c = self._raw.CORPUS_OBSERVATION_CONTENT if corpus == "obs" else corpus
             if not isinstance(c, self._raw.DlVecCorpus):
                 raise DlError("vector_search: corpus must be None, 'obs', or a DlVecCorpus")
             n = self._call(self._raw.dl_vector_search_corpus, ctypes.byref(c), arr,
-                           k, r, trap, c_void_p(0))
+                           k, trap, c_void_p(0))
         if n < 0:
             raise DlError("vector_search failed", n)
         return out
 
-    def vector_search_version(self, version: int, q_sig, k: int, r: int, *, corpus=None) -> list:
-        sig = tuple(q_sig)
-        if len(sig) != VEC_SIG_WORDS:
-            raise DlError(f"vector_search_version: q_sig needs {VEC_SIG_WORDS} u32")
+    def vector_search_version(self, version: int, q_int8, k: int, *, corpus=None) -> list:
+        """Same, as-of a published snapshot version (reads __vec_q__ + the
+        liveness relation through dl_query_bound_version)."""
+        q = tuple(q_int8)
+        if len(q) != VEC_IVEC_WORDS:
+            raise DlError(f"vector_search_version: q_int8 needs {VEC_IVEC_WORDS} u32")
         out: list = []
 
         def sink(sym, score):
@@ -597,10 +601,10 @@ class Db:
             return None
 
         trap = make_vec_cb(sink)
-        arr = (c_uint32 * VEC_SIG_WORDS)(*sig)
+        arr = (c_uint32 * VEC_IVEC_WORDS)(*q)
         if corpus is None:
             n = self._call(
-                self._raw.dl_vector_search_version, version, arr, k, r, trap, c_void_p(0)
+                self._raw.dl_vector_search_version, version, arr, k, trap, c_void_p(0)
             )
         else:
             c = self._raw.CORPUS_OBSERVATION_CONTENT if corpus == "obs" else corpus
@@ -608,7 +612,7 @@ class Db:
                 raise DlError("vector_search_version: corpus must be None, 'obs', or DlVecCorpus")
             n = self._call(
                 self._raw.dl_vector_search_corpus_version, version, ctypes.byref(c),
-                arr, k, r, trap, c_void_p(0),
+                arr, k, trap, c_void_p(0),
             )
         if n < 0:
             raise DlError("vector_search_version failed", n)

@@ -1,5 +1,12 @@
 # Bit-signature vector index via random-hyperplane LSH (the "DAFSA for vectors")
 
+> ⚠ **SUPERSEDED (2026-08-11, unit U9) — do not implement the index below; there is no vector index at all.** The engine's vector query path is a **scan-and-rank** over the stored int8 chunks (`__vec_q__`): integer dot + norm per live vector, top-k emitted in exact cosine order. Scan-and-rank was chosen deliberately over every candidate-pre-filter variant in this family (LSH bit-signatures, best-first walk, MIH/ITQ) because the engine never embeds, so the pre-filter buys latency the store does not need at the cost of recall and an extra relation family. Recall is 100% by construction; a query costs O(N·D) int8 multiply-accumulates for N live vectors. The `.npy` sidecar / band-posting / basis-matrix machinery named in this doc is gone from the read path, and `dl vsearch` takes only `--ivec` (plus `--k`/`--version`).
+>
+> **Emit-side truth:** an external encoder emits ONLY the `__vec_q__` chunks (unit-normalised embedding → int8 → 96 packed u32 per entity) plus its own liveness relation — nothing else is read.
+>
+> Kept as the record of the exploration (including the critique of its own two "improvements"), not as a description of shipped behaviour.
+
+
 **Status:** Design note — **SCALE-ONLY, SUPERSEDED for the chosen path.** Independently reviewed (2026-08-17, see **Critique & corrections** below); the review found it is a legitimate architecture but **not worth building at ~2K entities** — a plain exact-cosine scan dominates it on every axis that matters at that scale. **The chosen design of record is `docs/datalog-dafsa-vector-search.md` (multi-index hashing + ITQ as per-band DAFSA postings). This doc is kept as the record of the exploratory bit-signature framing and its critique.**
 
 > ⚠ **Read the Critique & corrections section first.** Two of the four "improvements" below (#1 best-first walk, #2 whitened PCA) were found **substantially wrong** on review — #1 is correct but *slower than a scan*; #2 breaks the very LSH math it relies on. The corrected recommendation is **multi-index hashing + ITQ**, not the walk/PCA-sign framing below. The body of this doc records the original (flawed) design so the critique has something to correct; don't implement from it directly.

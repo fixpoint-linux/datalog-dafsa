@@ -41,31 +41,34 @@ in-relation and snapshot-versioned:
 # Full-text (lexical) — AND-intersect + rank, version-aware.
 ./dl -d /tmp/db search 'gpu rental' --top 10
 
-# Semantic vector search — MIH retrieval + int8 re-rank over a PRE-ENCODED query.
-./dl -d /tmp/db vsearch 'a query' --sig <64-hex> --ivec <768-hex> --k 10
+# Semantic vector search — scan-and-rank over the stored int8 vectors.
+./dl -d /tmp/db vsearch 'a query' --ivec <768-hex> --k 10
 
-# Hybrid — lexical ∩ semantic, then re-rank.
-./dl -d /tmp/db vhybrid 'gpu rental' 'a query' --sig <64-hex> --ivec <768-hex> --k 10
+# Hybrid — lexical ∩ semantic, kept in the vector ranking order.
+./dl -d /tmp/db vhybrid 'gpu rental' 'a query' --ivec <768-hex> --k 10
 ```
 
 **The engine never embeds.** `dl_vector_search` takes a pre-quantized int8 query vector
-and a pre-encoded 256-bit ITQ signature; it does no model inference. Embeddings are
-produced *outside* the engine by whatever encoder you run (anything that can run a
-bge-small-class model) and ingested as ordinary relations — `__sig0__`…`__sig15__`,
-`__vec_q__`, `__itq_basis__` — with `dl load` plus one atomic `dl publish`. No encoder,
-no model and no ggml ship in this repository: the former C++/ggml `dl-embed` sidecar,
-its `ggml` submodule and the git-lfs GGUF model were removed, and the engine is a
-100%-Zig build.
+(96 packed u32 = 384 int8 lanes); it does no model inference. Embeddings are produced
+*outside* the engine by whatever encoder you run (anything that can run a
+bge-small-class model) and ingested as ordinary relations — the 96 `__vec_q__` chunks per
+entity plus a liveness relation (`entity`, or `observation` for the content corpus) — with
+`dl load` plus one atomic `dl publish`. No encoder, no model and no ggml ship in this
+repository: the former C++/ggml `dl-embed` sidecar, its `ggml` submodule and the git-lfs
+GGUF model were removed, and the engine is a 100%-Zig build.
 
 Query-time text encoding is likewise external. `dl vsearch`/`dl vhybrid` accept the
-encoded query directly (`--sig`, `--ivec`); given a bare text query they fork/exec a
-program named `dl-embed` next to the `dl` binary (falling back to `./dl-embed`), call
-`dl-embed encode --db <dir> <query>`, and read one `sig_hex ivec_hex` stdout line — the
-contract an external encoder must satisfy. Such a program does not ship here, so a text
-query fails until you install one.
+encoded query directly (`--ivec`); given a bare text query they fork/exec a program named
+`dl-embed` next to the `dl` binary (falling back to `./dl-embed`), call
+`dl-embed encode --db <dir> <query>`, and read one 768-hex-character int8-vector token —
+the contract an external encoder must satisfy. Such a program does not ship here, so a
+text query fails until you install one.
 
 See [`docs/datalog-dafsa-vector-search.md`](docs/datalog-dafsa-vector-search.md) for the
-full design (MIH over ITQ, in-store int8 re-rank, snapshot consistency).
+design record. **That document describes the superseded MIH-over-ITQ mechanism**: since
+U9 (2026-08-11) the query path scans `__vec_q__` and ranks by exact cosine (100% recall,
+O(N·D) int8 multiply-accumulates per query), and the `__sig{j}__` band postings,
+`__itq_basis__`, and the `--sig`/`--radius` flags are gone.
 
 ## How It Works
 
