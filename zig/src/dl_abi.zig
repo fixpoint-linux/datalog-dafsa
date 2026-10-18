@@ -1,5 +1,18 @@
 //! dl_abi.zig — hand-declared C ABI surface of the 100%-Zig datalog engine.
 //!
+//! OUT-OF-LIBRARY ABI MIRROR.  This module is NOT a type source for the
+//! library itself: every in-library module names the OWNER types directly
+//! (dl.DlDb/RelEntry/ViewCacheSlot/PermIndexEntry/Txn/TxnOp, compiler.
+//! compiled_rule/vm_instr/var_info, parser.token/expr/atom/rule, tupleset.
+//! tuple_set, regexwalk.regex_dfa/sym_set, relation.Relation, …) and calls the
+//! owner functions directly.  The C-shaped structs and `extern "c" fn`
+//! declarations below exist only for the executables that link libdatalog.so
+//! as a separate binary (dl_cli.zig, dlp.zig) and cannot @import dl.zig
+//! without compiling the whole engine into the exe, plus the comptime
+//! drift oracle in abi_witness.zig.  Do not add an in-library reference here;
+//! the witness pins every owner type against these mirrors so the two can
+//! never diverge silently.
+//!
 //! Single source of truth for every C-layout type and extern symbol the
 //! ported modules consume, in place of the removed translate-c blob
 //! (`dl_internal.zig`, 1608 lines of @cImport noise).  Nothing here uses

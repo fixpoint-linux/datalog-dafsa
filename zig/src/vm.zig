@@ -35,21 +35,14 @@ const intern = @import("intern.zig");
 const termstore = @import("termstore.zig");
 const vrelation = @import("vrelation.zig");
 const iter_mod = @import("iter.zig");
+const dl = @import("dl.zig");
+const permindex = @import("permindex.zig");
 
 // Byte-identical extern structs owned by compiler.zig (per the brief, the
 // canonical ABI types for the bytecode the still-C dl.c/topdown.c share).
 const vm_instr = compiler.vm_instr;
 const compiled_rule = compiler.compiled_rule;
 const var_info = compiler.var_info;
-
-// dl_internal.h pulls in dl.h/intern.h/relation.h/vrelation.h/snapshot.h/
-// permindex.h/termstore.h/compiler.h/regexwalk.h — supplying dl_db, rel_entry,
-// perm_index_entry, RELK_FIXED/RELK_VARIADIC, dl_tuple_cb/rel_enum_cb, and the
-// extern decls for every still-C / already-ported function the VM calls.
-// dl_internal.h: dl_db/rel_entry/relation/dl_iter + db_*/dl_*/rel_* externs.
-// The datalog engine is now Zig; dl_internal.zig hand-declares the C-layout
-// structs + extern ABI in place of the removed @cImport("dl_internal.h").
-const dx = @import("dl_abi.zig");
 
 // std.c does not re-export the C string functions the M9 string ops need.
 extern "c" fn strcmp(a: [*c]const u8, b: [*c]const u8) c_int;
@@ -66,11 +59,6 @@ extern "c" fn ts_add(ts: ?*tupleset.tuple_set, cols: ?[*]const u32) c_int;
 extern "c" fn ts_prefix(ts: ?*const tupleset.tuple_set, p: ?[*]const u32, k: u8, first_idx_out: ?[*]c_long) c_long;
 extern "c" fn ts_sort(ts: ?*tupleset.tuple_set) void;
 extern "c" fn ts_reset(ts: ?*tupleset.tuple_set) void;
-
-// compile_rules is compiler.zig's `pub export fn`; declare it against OUR
-// @cImport'd dl_db (each module's translate-c produces a distinct type for
-// the same C struct, so it cannot be called through the imported module).
-extern "c" fn compile_rules(db: ?*dx.dl_db, rules: ?[*]?*parser.rule, n_rules: c_int, out_rules: ?*?[*]?*compiled_rule, out_n: ?*c_int) c_int;
 
 // ─── Constants (mirror src/compiler.h / src/dl_internal.h) ────────────────
 
@@ -111,7 +99,7 @@ const OP_RANGE: u8 = 25;
 // ─── Public C-ABI types ───────────────────────────────────────────────────
 
 /// dl_tuple_cb / rel_enum_cb — identical C signature (cols, arity, user).
-const DlTupleCb = dx.dl_tuple_cb;
+const DlTupleCb = relation.RelEnumCb;
 
 /// typedef struct { int body_idx; const tuple_set *ts; int perm_id; }
 /// vm_override (vm.h:38-42) — still dereferenced by src/topdown.c and tests.
@@ -191,17 +179,16 @@ inline fn vmRangeYieldsRef() *c_long {
 
 // ─── db helpers (mirror vm.c statics db_rel/db_find) ──────────────────────
 
-fn dbRel(db: *const dx.dl_db, idx: c_int) ?*dx.relation {
+fn dbRel(db: *const dl.DlDb, idx: c_int) ?*relation.Relation {
     if (idx < 0 or @as(usize, @intCast(idx)) >= db.nrels) return null;
     return db.rels[@intCast(idx)].rel;
 }
 
-fn tsFromPending(p: ?*dx.struct_tuple_set) ?*tupleset.tuple_set {
-    if (p == null) return null;
-    return @ptrCast(@alignCast(p.?));
+fn tsFromPending(p: ?*tupleset.tuple_set) ?*tupleset.tuple_set {
+    return p;
 }
 
-fn dbFind(db: *const dx.dl_db, name: [*c]const u8) c_int {
+fn dbFind(db: *const dl.DlDb, name: [*c]const u8) c_int {
     var i: usize = 0;
     while (i < db.nrels) : (i += 1) {
         if (strcmp(db.rels[i].name, name) == 0) return @intCast(i);
@@ -601,7 +588,7 @@ fn symsetAddCb(sym_id: u32, user: ?*anyopaque) callconv(.c) c_int {
 // ─── Bytecode interpreter ──────────────────────────────────────────────────
 
 fn execRange(
-    db: *dx.dl_db,
+    db: *dl.DlDb,
     cr: *const compiler.compiled_rule,
     start: c_int,
     end: c_int,
@@ -678,13 +665,13 @@ fn execRange(
                     f.tuples.data = @ptrCast(@alignCast(mem));
                     @memcpy(f.tuples.data.?[0 .. @as(usize, @intCast(ov_ts.?.count)) * @as(usize, ov_ts.?.arity)], ov_ts.?.data.?[0 .. @as(usize, @intCast(ov_ts.?.count)) * @as(usize, ov_ts.?.arity)]);
                 } else {
-                    const r = dx.db_rel_at_arity_ro(db, in.a, in.b);
+                    const r = dl.db_rel_at_arity_ro(db, in.a, in.b);
                     if (r == null) {
                         ip = end;
                         break :blk;
                     }
                     f.tuples.arity = in.b;
-                    _ = relation.rel_prefix(@ptrCast(@alignCast(r)), null, 0, tbufCb, &f.tuples);
+                    _ = relation.rel_prefix(r, null, 0, tbufCb, &f.tuples);
                 }
 
                 if (f.tuples.count == 0) {
@@ -718,7 +705,7 @@ fn execRange(
                 }
                 const dfa = cr.patterns.?[@intCast(pat_idx)];
 
-                const r = dx.db_rel_at_arity_ro(db, in.a, in.b);
+                const r = dl.db_rel_at_arity_ro(db, in.a, in.b);
                 if (r == null) {
                     ip = end;
                     break :blk;
@@ -736,7 +723,7 @@ fn execRange(
                     ip = end;
                     break :blk;
                 }
-                _ = relation.rel_filter_col(@ptrCast(@alignCast(r)), in.c, &set, tbufCb, &f.tuples);
+                _ = relation.rel_filter_col(r, in.c, &set, tbufCb, &f.tuples);
                 regexwalk.symset_free(&set);
 
                 if (f.tuples.count == 0) {
@@ -785,13 +772,13 @@ fn execRange(
                     f.tuples.data = @ptrCast(@alignCast(mem));
                     @memcpy(f.tuples.data.?[0 .. @as(usize, @intCast(cnt)) * @as(usize, ov_ts.?.arity)], ov_ts.?.data.?[@as(usize, @intCast(first[0])) * @as(usize, ov_ts.?.arity) ..][0 .. @as(usize, @intCast(cnt)) * @as(usize, ov_ts.?.arity)]);
                 } else {
-                    const r = dx.db_rel_at_arity_ro(db, in.a, in.c);
+                    const r = dl.db_rel_at_arity_ro(db, in.a, in.c);
                     if (r == null) {
                         if (backtrack(frames[0..], &sp, &b, p, &ip) == 0) ip = end;
                         break :blk;
                     }
                     f.tuples.arity = in.c;
-                    _ = relation.rel_prefix(@ptrCast(@alignCast(r)), &pref, @intCast(k), tbufCb, &f.tuples);
+                    _ = relation.rel_prefix(r, &pref, @intCast(k), tbufCb, &f.tuples);
                     if (f.tuples.count == 0) {
                         tbufFree(&f.tuples);
                         if (backtrack(frames[0..], &sp, &b, p, &ip) == 0) ip = end;
@@ -816,7 +803,7 @@ fn execRange(
                 const rel_id: c_int = @intCast(in.a);
                 const k: c_int = @intCast(in.b);
                 const ar: c_int = @intCast(in.c);
-                const perm_arr = dx.dl_db_get_perm(db, rel_id, perm_id);
+                const perm_arr = dl.dl_db_get_perm(db, rel_id, perm_id);
                 if (perm_arr == null) {
                     if (backtrack(frames[0..], &sp, &b, p, &ip) == 0) ip = end;
                     break :blk;
@@ -832,7 +819,7 @@ fn execRange(
                 var pref: [8]u32 = undefined;
                 var pk: c_int = 0;
                 while (pk < k) : (pk += 1) {
-                    const oc: c_int = @intCast(perm_arr[@intCast(pk)]);
+                    const oc: c_int = @intCast(perm_arr.?[@intCast(pk)]);
                     pref[@intCast(pk)] = bGet(&b, in.slots[@intCast(oc)]);
                 }
 
@@ -853,14 +840,14 @@ fn execRange(
                     f.tuples.data = @ptrCast(@alignCast(mem));
                     @memcpy(f.tuples.data.?[0 .. @as(usize, @intCast(cnt)) * @as(usize, ov_ts.?.arity)], ov_ts.?.data.?[@as(usize, @intCast(first[0])) * @as(usize, ov_ts.?.arity) ..][0 .. @as(usize, @intCast(cnt)) * @as(usize, ov_ts.?.arity)]);
                 } else {
-                    const pr = dx.dl_db_get_perm_rel(db, rel_id, perm_id);
+                    const pr = dl.dl_db_get_perm_rel(db, rel_id, perm_id);
                     if (pr == null) {
                         f.perm = null;
                         if (backtrack(frames[0..], &sp, &b, p, &ip) == 0) ip = end;
                         break :blk;
                     }
                     f.tuples.arity = @intCast(ar);
-                    _ = relation.rel_prefix(@ptrCast(@alignCast(pr)), &pref, @intCast(k), tbufCb, &f.tuples);
+                    _ = relation.rel_prefix(pr, &pref, @intCast(k), tbufCb, &f.tuples);
                     if (f.tuples.count == 0) {
                         tbufFree(&f.tuples);
                         f.perm = null;
@@ -905,13 +892,13 @@ fn execRange(
                         _ = ts_add(&all_ts, ov_ts.?.data.? + @as(usize, @intCast(ci)) * @as(usize, ov_ts.?.arity));
                     }
                 } else {
-                    const r = dx.db_rel_at_arity_ro(db, rel_id, @intCast(ar));
+                    const r = dl.db_rel_at_arity_ro(db, rel_id, @intCast(ar));
                     if (r == null) {
                         ts_free(&all_ts);
                         if (backtrack(frames[0..], &sp, &b, p, &ip) == 0) ip = end;
                         break :blk;
                     }
-                    _ = relation.rel_prefix(@ptrCast(@alignCast(r)), null, 0, relation.ts_sink_cb, &all_ts);
+                    _ = relation.rel_prefix(r, null, 0, relation.ts_sink_cb, &all_ts);
                     ts_sort(&all_ts);
                 }
 
@@ -1063,7 +1050,7 @@ fn execRange(
             },
 
             OP_NEG_CHECK => blk: {
-                const r = dx.db_rel_at_arity_ro(db, in.a, in.b);
+                const r = dl.db_rel_at_arity_ro(db, in.a, in.b);
                 if (r == null) {
                     ip += 1;
                     break :blk;
@@ -1084,7 +1071,7 @@ fn execRange(
                     if (backtrack(frames[0..], &sp, &b, p, &ip) == 0) ip = end;
                     break :blk;
                 }
-                if (relation.rel_exact(@ptrCast(@alignCast(r)), &cols) != 0) {
+                if (relation.rel_exact(r, &cols) != 0) {
                     if (backtrack(frames[0..], &sp, &b, p, &ip) == 0) ip = end;
                     break :blk;
                 }
@@ -1321,7 +1308,7 @@ fn execRange(
 
             OP_LIST_CAR => blk: {
                 const opv = bGet(&b, in.a);
-                if (termstore.term_is_list(@ptrCast(@alignCast(db.terms)), opv) == 0 or opv == dx.TERM_NIL) {
+                if (termstore.term_is_list(@ptrCast(@alignCast(db.terms)), opv) == 0 or opv == termstore.TERM_NIL) {
                     if (backtrack(frames[0..], &sp, &b, p, &ip) == 0) ip = end;
                     break :blk;
                 }
@@ -1334,7 +1321,7 @@ fn execRange(
 
             OP_LIST_CDR => blk: {
                 const opv = bGet(&b, in.a);
-                if (termstore.term_is_list(@ptrCast(@alignCast(db.terms)), opv) == 0 or opv == dx.TERM_NIL) {
+                if (termstore.term_is_list(@ptrCast(@alignCast(db.terms)), opv) == 0 or opv == termstore.TERM_NIL) {
                     if (backtrack(frames[0..], &sp, &b, p, &ip) == 0) ip = end;
                     break :blk;
                 }
@@ -1368,7 +1355,7 @@ fn execRange(
                     const xv = bGet(&b, in.b);
                     var cur = lv;
                     var found: c_int = 0;
-                    while (termstore.term_is_list(@ptrCast(@alignCast(db.terms)), cur) != 0 and cur != dx.TERM_NIL) {
+                    while (termstore.term_is_list(@ptrCast(@alignCast(db.terms)), cur) != 0 and cur != termstore.TERM_NIL) {
                         if (termstore.term_car(@ptrCast(@alignCast(db.terms)), cur) == xv) {
                             found = 1;
                             break;
@@ -1397,7 +1384,7 @@ fn execRange(
                     if (f.tuples.cap < 1) f.tuples.cap = 1;
                     const mem = c.malloc(@as(usize, @intCast(f.tuples.cap)) * @sizeOf(u32)) orelse return -1;
                     f.tuples.data = @ptrCast(@alignCast(mem));
-                    while (termstore.term_is_list(@ptrCast(@alignCast(db.terms)), cur) != 0 and cur != dx.TERM_NIL) {
+                    while (termstore.term_is_list(@ptrCast(@alignCast(db.terms)), cur) != 0 and cur != termstore.TERM_NIL) {
                         if (cnt >= f.tuples.cap) {
                             const nc: c_long = f.tuples.cap *% 2;
                             const old: ?*anyopaque = @ptrCast(f.tuples.data.?);
@@ -1427,7 +1414,7 @@ fn execRange(
             },
 
             OP_RANGE => blk: {
-                const r = if (@as(usize, in.imm) < db.nrels and db.rels[@intCast(in.imm)].kind == dx.RELK_FIXED)
+                const r = if (@as(usize, in.imm) < db.nrels and db.rels[@intCast(in.imm)].kind == dl.RELK_FIXED)
                     db.rels[@intCast(in.imm)].rel
                 else
                     null;
@@ -1439,7 +1426,7 @@ fn execRange(
                 const hi = bGet(&b, in.b);
                 if (bOk(&b, in.c) != 0) {
                     const xv = bGet(&b, in.c);
-                    if (xv < lo or xv >= hi or relation.rel_has_col0(@ptrCast(@alignCast(r)), xv) == 0) {
+                    if (xv < lo or xv >= hi or relation.rel_has_col0(r, xv) == 0) {
                         if (backtrack(frames[0..], &sp, &b, p, &ip) == 0) ip = end;
                         break :blk;
                     }
@@ -1454,7 +1441,7 @@ fn execRange(
                     f.idx = 0;
                     f.perm = null;
                     f.tuples = std.mem.zeroes(TupleBuf);
-                    f.it = iter_mod.dl_iter_open_live(@ptrCast(@alignCast(r)), null, 0);
+                    f.it = iter_mod.dl_iter_open_live(r, null, 0);
                     if (f.it == null) return -1;
                     f.lo = lo;
                     f.hi = hi;
@@ -1486,7 +1473,7 @@ fn execRange(
                     if (backtrack(frames[0..], &sp, &b, p, &ip) == 0) ip = end;
                     break :blk;
                 }
-                const r = dx.db_rel_at_arity_rw(db, in.a, in.b);
+                const r = dl.db_rel_at_arity_rw(db, in.a, in.b);
                 if (r == null) {
                     ip = end;
                     break :blk;
@@ -1510,7 +1497,7 @@ fn execRange(
                         break :blk;
                     }
                 } else {
-                    const rr = relation.rel_add(@ptrCast(@alignCast(r)), cols[0..].ptr);
+                    const rr = relation.rel_add(r, cols[0..].ptr);
                     if (rr < 0) {
                         ip = end;
                         break :blk;
@@ -1614,9 +1601,9 @@ fn execRange(
                 rc +%= 1;
                 if (acc.cb != null and acc.cb.?(cols[0..].ptr, acc.head_arity, acc.user) != 0) break;
             } else {
-                const r = dx.db_rel_at_arity_rw(db, acc.head_rel_id, acc.head_arity);
+                const r = dl.db_rel_at_arity_rw(db, acc.head_rel_id, acc.head_arity);
                 if (r != null) {
-                    const rr = relation.rel_add(@ptrCast(@alignCast(r)), cols[0..].ptr);
+                    const rr = relation.rel_add(r, cols[0..].ptr);
                     if (rr < 0) break;
                     if (rr == 1) {
                         rc +%= 1;
@@ -1644,7 +1631,7 @@ fn execRange(
 // ─── Top-level rule entry ──────────────────────────────────────────────────
 
 fn execRule(
-    db: *dx.dl_db,
+    db: *dl.DlDb,
     cr: *const compiler.compiled_rule,
     ov: ?[*]const vm_override,
     n_ov: c_int,
@@ -1680,7 +1667,7 @@ fn execRule(
 
 /// long vm_exec_rule(...) — thin wrapper over exec_rule (top-down QSQ).
 pub export fn vm_exec_rule(
-    db: ?*dx.dl_db,
+    db: ?*dl.DlDb,
     cr: ?*const compiler.compiled_rule,
     ov: ?[*]const vm_override,
     n_ov: c_int,
@@ -1707,7 +1694,7 @@ fn candCb(cols: [*c]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_int 
 
 // ─── Non-recursive evaluation (M1 path) ────────────────────────────────────
 
-fn evalNonrecursive(db: *dx.dl_db, rules: [*]?*compiler.compiled_rule, n: c_int) c_int {
+fn evalNonrecursive(db: *dl.DlDb, rules: [*]?*compiler.compiled_rule, n: c_int) c_int {
     var pass: c_int = 0;
     while (pass <= n) : (pass += 1) {
         var changed: c_int = 0;
@@ -1717,8 +1704,8 @@ fn evalNonrecursive(db: *dx.dl_db, rules: [*]?*compiler.compiled_rule, n: c_int)
             if (m < 0) return -1;
             if (m > 0) changed = 1;
             if (m > 0) {
-                dx.permindex_mark_dirty(db, @intCast(rules[@intCast(i)].?.head_rel_id));
-                if (dx.permindex_build_dirty(db) != 0) return -1;
+                permindex.permindex_mark_dirty(db, @intCast(rules[@intCast(i)].?.head_rel_id));
+                if (permindex.permindex_build_dirty(db) != 0) return -1;
             }
         }
         if (changed == 0) break;
@@ -1763,7 +1750,7 @@ fn permFreeAll(nr: c_int, perm_count: [*]c_int, perm_ids: [*]?[*]c_int, perm_cap
     c.free(@ptrCast(idb_perm_shadows));
 }
 
-fn rebuildPermShadows(db: *dx.dl_db, nr: c_int, rd: [*]RdT, perm_count: [*]c_int, perm_ids: [*]?[*]c_int, idb_perm_shadows: [*]?[*]tupleset.tuple_set) void {
+fn rebuildPermShadows(db: *dl.DlDb, nr: c_int, rd: [*]RdT, perm_count: [*]c_int, perm_ids: [*]?[*]c_int, idb_perm_shadows: [*]?[*]tupleset.tuple_set) void {
     var rdi: c_int = 0;
     while (rdi < nr) : (rdi += 1) {
         var pi: c_int = 0;
@@ -1787,7 +1774,7 @@ fn rebuildPermShadows(db: *dx.dl_db, nr: c_int, rd: [*]RdT, perm_count: [*]c_int
     }
 }
 
-fn evalStratumRecursive(db: *dx.dl_db, rules: [*]?*compiler.compiled_rule, n: c_int, ivm: c_int) c_int {
+fn evalStratumRecursive(db: *dl.DlDb, rules: [*]?*compiler.compiled_rule, n: c_int, ivm: c_int) c_int {
     var i: c_int = 0;
     var ri: c_int = 0;
     var rp: [64]c_int = undefined;
@@ -1845,7 +1832,7 @@ fn evalStratumRecursive(db: *dx.dl_db, rules: [*]?*compiler.compiled_rule, n: c_
     i = 0;
     while (i < nr) : (i += 1) {
         const rc = dbRel(db, rp[@intCast(i)]);
-        const ar: u8 = if (rc != null) relation.rel_arity(@ptrCast(@alignCast(rc))) else 0;
+        const ar: u8 = if (rc != null) relation.rel_arity(rc) else 0;
         rd[@intCast(i)].rel_id = rp[@intCast(i)];
         rd[@intCast(i)].arity = ar;
         if (ts_init(&rd[@intCast(i)].idb, ar) != 0 or
@@ -1940,7 +1927,7 @@ fn evalStratumRecursive(db: *dx.dl_db, rules: [*]?*compiler.compiled_rule, n: c_
         while (i < nr) : (i += 1) {
             const rel = dbRel(db, rd[@intCast(i)].rel_id);
             if (rel != null)
-                _ = relation.rel_prefix(@ptrCast(@alignCast(rel)), null, 0, relation.ts_sink_cb, &rd[@intCast(i)].idb);
+                _ = relation.rel_prefix(rel, null, 0, relation.ts_sink_cb, &rd[@intCast(i)].idb);
         }
     }
 
@@ -1961,8 +1948,8 @@ fn evalStratumRecursive(db: *dx.dl_db, rules: [*]?*compiler.compiled_rule, n: c_
                 }
                 if (m > 0) {
                     changed_nr = 1;
-                    dx.permindex_mark_dirty(db, @intCast(cr.head_rel_id));
-                    if (dx.permindex_build_dirty(db) != 0) {
+                    permindex.permindex_mark_dirty(db, @intCast(cr.head_rel_id));
+                    if (permindex.permindex_build_dirty(db) != 0) {
                         permFreeAll(nr, perm_count, perm_ids, perm_cap, idb_perm_shadows);
                         rdFreeTs(rd, nr);
                         c.free(@ptrCast(rd));
@@ -1985,8 +1972,8 @@ fn evalStratumRecursive(db: *dx.dl_db, rules: [*]?*compiler.compiled_rule, n: c_
                 c.free(@ptrCast(rd));
                 return -1;
             }
-            dx.permindex_mark_dirty(db, @intCast(cr.head_rel_id));
-            if (dx.permindex_build_dirty(db) != 0) {
+            permindex.permindex_mark_dirty(db, @intCast(cr.head_rel_id));
+            if (permindex.permindex_build_dirty(db) != 0) {
                 permFreeAll(nr, perm_count, perm_ids, perm_cap, idb_perm_shadows);
                 rdFreeTs(rd, nr);
                 c.free(@ptrCast(rd));
@@ -2257,14 +2244,14 @@ fn evalStratumRecursive(db: *dx.dl_db, rules: [*]?*compiler.compiled_rule, n: c_
             // wrote their heads into the view via rel_add, and this stratum
             // read them from there — the rebuild below replaces the view, so
             // those facts must be folded in first or they are lost.
-            _ = relation.rel_prefix(@ptrCast(@alignCast(rel)), null, 0, relation.ts_sink_cb, &rd[@intCast(i)].idb);
+            _ = relation.rel_prefix(rel, null, 0, relation.ts_sink_cb, &rd[@intCast(i)].idb);
             ts_sort(&rd[@intCast(i)].idb);
             if (vmNomaterializeRef().* != 0 and rd[@intCast(i)].rel_id == vmExportRelidRef().*) {
                 vmExportTsRef().*.?.* = rd[@intCast(i)].idb;
                 rd[@intCast(i)].idb = std.mem.zeroes(tupleset.tuple_set);
                 continue;
             }
-            if (relation.rel_build_from_tupleset(@ptrCast(@alignCast(rel)), &rd[@intCast(i)].idb) != 0) {
+            if (relation.rel_build_from_tupleset(rel, &rd[@intCast(i)].idb) != 0) {
                 permFreeAll(nr, perm_count, perm_ids, perm_cap, idb_perm_shadows);
                 rdFreeTs(rd, nr);
                 c.free(@ptrCast(rd));
@@ -2279,7 +2266,7 @@ fn evalStratumRecursive(db: *dx.dl_db, rules: [*]?*compiler.compiled_rule, n: c_
             // the O(store) rebuild AND the O(store) re-read of the view.
             // Insert-only: delete deltas never route here (has_del forces
             // the full path).
-            if (relation.rel_add_tupleset(@ptrCast(@alignCast(rel)), &rd[@intCast(i)].added) != 0) {
+            if (relation.rel_add_tupleset(rel, &rd[@intCast(i)].added) != 0) {
                 permFreeAll(nr, perm_count, perm_ids, perm_cap, idb_perm_shadows);
                 rdFreeTs(rd, nr);
                 c.free(@ptrCast(rd));
@@ -2291,8 +2278,8 @@ fn evalStratumRecursive(db: *dx.dl_db, rules: [*]?*compiler.compiled_rule, n: c_
     {
         var mi: c_int = 0;
         while (mi < nr) : (mi += 1)
-            dx.permindex_mark_dirty(db, rd[@intCast(mi)].rel_id);
-        if (dx.permindex_build_dirty(db) != 0) {
+            permindex.permindex_mark_dirty(db, rd[@intCast(mi)].rel_id);
+        if (permindex.permindex_build_dirty(db) != 0) {
             permFreeAll(nr, perm_count, perm_ids, perm_cap, idb_perm_shadows);
             rdFreeTs(rd, nr);
             c.free(@ptrCast(rd));
@@ -2309,7 +2296,7 @@ fn evalStratumRecursive(db: *dx.dl_db, rules: [*]?*compiler.compiled_rule, n: c_
 
 // ─── vm_execute ────────────────────────────────────────────────────────────
 
-fn vmExecuteMode(db: *dx.dl_db, rules: [*]?*compiler.compiled_rule, n_rules: c_int, ivm: c_int) c_int {
+fn vmExecuteMode(db: *dl.DlDb, rules: [*]?*compiler.compiled_rule, n_rules: c_int, ivm: c_int) c_int {
     var i: c_int = 0;
     var s: c_int = 0;
     var max_stratum: c_int = 0;
@@ -2324,19 +2311,19 @@ fn vmExecuteMode(db: *dx.dl_db, rules: [*]?*compiler.compiled_rule, n_rules: c_i
             if (hid >= MAX_RELS) return -1;
             if (seen[hid] != 0) continue;
             seen[hid] = 1;
-            if (db.rels[hid].kind == dx.RELK_VARIADIC) {
-                if (vrelation.vrel_reset_views(@ptrCast(@alignCast(db.rels[hid].vrel))) != 0) return -1;
-                dx.permindex_mark_dirty(db, hid);
+            if (db.rels[hid].kind == dl.RELK_VARIADIC) {
+                if (vrelation.vrel_reset_views(db.rels[hid].vrel) != 0) return -1;
+                permindex.permindex_mark_dirty(db, hid);
                 continue;
             }
             const r = dbRel(db, hid);
             if (r == null) return -1;
-            if (relation.rel_reset_view(@ptrCast(@alignCast(r))) != 0) return -1;
-            dx.permindex_mark_dirty(db, hid);
+            if (relation.rel_reset_view(r) != 0) return -1;
+            permindex.permindex_mark_dirty(db, hid);
         }
     }
 
-    if (dx.permindex_build_dirty(db) != 0) return -1;
+    if (permindex.permindex_build_dirty(db) != 0) return -1;
 
     max_stratum = 0;
     {
@@ -2391,14 +2378,14 @@ fn vmExecuteMode(db: *dx.dl_db, rules: [*]?*compiler.compiled_rule, n_rules: c_i
 }
 
 /// int vm_execute(dl_db*, compiled_rule**, int)
-pub export fn vm_execute(db: ?*dx.dl_db, rules: ?[*]?*compiler.compiled_rule, n_rules: c_int) c_int {
+pub export fn vm_execute(db: ?*dl.DlDb, rules: ?[*]?*compiler.compiled_rule, n_rules: c_int) c_int {
     const d = db orelse return -1;
     const r = rules orelse return -1;
     return vmExecuteMode(d, r, n_rules, 0);
 }
 
 /// int vm_execute_ivm(dl_db*)
-pub export fn vm_execute_ivm(db: ?*dx.dl_db) c_int {
+pub export fn vm_execute_ivm(db: ?*dl.DlDb) c_int {
     const d = db orelse return -1;
     var i: c_int = 0;
     while (i < MAX_RELS) : (i += 1) {
@@ -2407,14 +2394,14 @@ pub export fn vm_execute_ivm(db: ?*dx.dl_db) c_int {
             ts_sort(tsFromPending(dp));
     }
     const cr = d.crules orelse return -1;
-    return vmExecuteMode(d, @ptrCast(cr), d.n_crules, 1);
+    return vmExecuteMode(d, cr, d.n_crules, 1);
 }
 
 // ─── vm_query ──────────────────────────────────────────────────────────────
 
 /// long vm_query(...)
 pub export fn vm_query(
-    db: ?*dx.dl_db,
+    db: ?*dl.DlDb,
     rules: ?[*]?*compiler.compiled_rule,
     n_rules: c_int,
     goal_rel: [*c]const u8,
@@ -2427,11 +2414,11 @@ pub export fn vm_query(
 
     const gri = dbFind(d, goal_rel);
     if (gri >= 0 and cb != null) {
-        if (d.rels[@intCast(gri)].kind == dx.RELK_VARIADIC)
-            return vrelation.vrel_prefix(@ptrCast(@alignCast(d.rels[@intCast(gri)].vrel)), null, 0, cb, user);
+        if (d.rels[@intCast(gri)].kind == dl.RELK_VARIADIC)
+            return vrelation.vrel_prefix(d.rels[@intCast(gri)].vrel, null, 0, cb, user);
         const rel = d.rels[@intCast(gri)].rel;
         if (rel != null) {
-            const nn = relation.rel_prefix(@ptrCast(@alignCast(rel)), null, 0, cb, user);
+            const nn = relation.rel_prefix(rel, null, 0, cb, user);
             if (nn < 0) return -1;
             return nn;
         }
@@ -2442,9 +2429,9 @@ pub export fn vm_query(
 // ─── IVM Slice 1/2: insert-only incremental maintenance ────────────────────
 
 /// int vm_ivm_eligible(dl_db*)
-pub export fn vm_ivm_eligible(db: ?*dx.dl_db) c_int {
+pub export fn vm_ivm_eligible(db: ?*dl.DlDb) c_int {
     const d = db orelse return 0;
-    if (dx.db_has_variadic(d) != 0 or dx.db_has_list_builtin(d) != 0 or dx.db_has_range_builtin(d) != 0) return 0;
+    if (dl.db_has_variadic(d) != 0 or dl.db_has_list_builtin(d) != 0 or dl.db_has_range_builtin(d) != 0) return 0;
 
     var is_rule_head: [MAX_RELS]u8 = [_]u8{0} ** MAX_RELS;
     var is_rec_head: [MAX_RELS]u8 = [_]u8{0} ** MAX_RELS;
@@ -2452,9 +2439,9 @@ pub export fn vm_ivm_eligible(db: ?*dx.dl_db) c_int {
 
     var i: c_int = 0;
     while (i < d.n_crules) : (i += 1) {
-        const cc = d.crules[@intCast(i)];
+        const cc = d.crules.?[@intCast(i)];
         if (cc == null) continue;
-        const cr: *const compiler.compiled_rule = @ptrCast(@alignCast(cc));
+        const cr: *const compiler.compiled_rule = cc.?;
         const hid: u8 = cr.head_rel_id;
         if (hid >= MAX_RELS) continue;
         is_rule_head[hid] = 1;
@@ -2466,9 +2453,9 @@ pub export fn vm_ivm_eligible(db: ?*dx.dl_db) c_int {
 
     i = 0;
     while (i < d.n_crules) : (i += 1) {
-        const cc = d.crules[@intCast(i)];
+        const cc = d.crules.?[@intCast(i)];
         if (cc == null) continue;
-        const cr: *const compiler.compiled_rule = @ptrCast(@alignCast(cc));
+        const cr: *const compiler.compiled_rule = cc.?;
         if (cr.has_aggregate != 0) return 0;
         var k: c_int = 0;
         while (k < cr.n_instrs) : (k += 1) {
@@ -2505,20 +2492,20 @@ pub export fn vm_ivm_eligible(db: ?*dx.dl_db) c_int {
 }
 
 /// int vm_has_recursive(dl_db*)
-pub export fn vm_has_recursive(db: ?*dx.dl_db) c_int {
+pub export fn vm_has_recursive(db: ?*dl.DlDb) c_int {
     const d = db orelse return 0;
     var i: c_int = 0;
     while (i < d.n_crules) : (i += 1) {
-        const cc = d.crules[@intCast(i)];
+        const cc = d.crules.?[@intCast(i)];
         if (cc == null) continue;
-        const cr: *const compiler.compiled_rule = @ptrCast(@alignCast(cc));
+        const cr: *const compiler.compiled_rule = cc.?;
         if (cr.is_recursive != 0) return 1;
     }
     return 0;
 }
 
 /// void vm_clear_deltas(dl_db*)
-pub export fn vm_clear_deltas(db: ?*dx.dl_db) void {
+pub export fn vm_clear_deltas(db: ?*dl.DlDb) void {
     const d = db orelse return;
     var i: c_int = 0;
     while (i < MAX_RELS) : (i += 1) {
@@ -2554,7 +2541,7 @@ fn ivmCaptureCb(cols: [*c]const u32, arity: u8, user: ?*anyopaque) callconv(.c) 
 }
 
 /// int vm_propagate_deltas(dl_db*)
-pub export fn vm_propagate_deltas(db: ?*dx.dl_db) c_int {
+pub export fn vm_propagate_deltas(db: ?*dl.DlDb) c_int {
     var queue: ?[*]IvmWork = null;
     var qcap: usize = 0;
     var qn: usize = 0;
@@ -2599,9 +2586,9 @@ pub export fn vm_propagate_deltas(db: ?*dx.dl_db) c_int {
             qh += 1;
             var ri: c_int = 0;
             while (ri < d.n_crules) : (ri += 1) {
-                const cc = d.crules[@intCast(ri)];
+                const cc = d.crules.?[@intCast(ri)];
                 if (cc == null) continue;
-                const cr: *const compiler.compiled_rule = @ptrCast(@alignCast(cc));
+                const cr: *const compiler.compiled_rule = cc.?;
                 var k: c_int = 0;
 
                 if (cr.has_aggregate != 0) continue;
@@ -2614,7 +2601,7 @@ pub export fn vm_propagate_deltas(db: ?*dx.dl_db) c_int {
 
                     const hrel = dbRel(d, @intCast(cr.head_rel_id));
                     if (hrel == null) break :fail;
-                    const harity = relation.rel_arity(@ptrCast(@alignCast(hrel)));
+                    const harity = relation.rel_arity(hrel);
 
                     const head_ts = c.malloc(@sizeOf(tupleset.tuple_set)) orelse break :fail;
                     const hts: *tupleset.tuple_set = @ptrCast(@alignCast(head_ts));
@@ -2638,8 +2625,8 @@ pub export fn vm_propagate_deltas(db: ?*dx.dl_db) c_int {
                     }
 
                     if (hts.count > 0) {
-                        dx.permindex_mark_dirty(d, @intCast(cr.head_rel_id));
-                        if (dx.permindex_build_dirty(d) != 0) {
+                        permindex.permindex_mark_dirty(d, @intCast(cr.head_rel_id));
+                        if (permindex.permindex_build_dirty(d) != 0) {
                             ts_free(hts);
                             c.free(@ptrCast(hts));
                             break :fail;
@@ -2687,14 +2674,14 @@ pub export fn vm_propagate_deltas(db: ?*dx.dl_db) c_int {
 // ─── IVM Slice 3: DRed deletion ────────────────────────────────────────────
 
 /// int vm_dred_eligible(dl_db*)
-pub export fn vm_dred_eligible(db: ?*dx.dl_db) c_int {
+pub export fn vm_dred_eligible(db: ?*dl.DlDb) c_int {
     const d = db orelse return 0;
-    if (dx.db_has_variadic(d) != 0 or dx.db_has_list_builtin(d) != 0 or dx.db_has_range_builtin(d) != 0) return 0;
+    if (dl.db_has_variadic(d) != 0 or dl.db_has_list_builtin(d) != 0 or dl.db_has_range_builtin(d) != 0) return 0;
     var i: c_int = 0;
     while (i < d.n_crules) : (i += 1) {
-        const cc = d.crules[@intCast(i)];
+        const cc = d.crules.?[@intCast(i)];
         if (cc == null) continue;
-        const cr: *const compiler.compiled_rule = @ptrCast(@alignCast(cc));
+        const cr: *const compiler.compiled_rule = cc.?;
         if (cr.is_recursive != 0) return 0;
         if (cr.has_aggregate != 0) return 0;
         var k: c_int = 0;
@@ -2711,7 +2698,7 @@ pub export fn vm_dred_eligible(db: ?*dx.dl_db) c_int {
 }
 
 /// void vm_clear_deletes(dl_db*)
-pub export fn vm_clear_deletes(db: ?*dx.dl_db) void {
+pub export fn vm_clear_deletes(db: ?*dl.DlDb) void {
     const d = db orelse return;
     var i: c_int = 0;
     while (i < MAX_RELS) : (i += 1) {
@@ -2740,7 +2727,7 @@ fn dredRuleReads(cr: *const compiler.compiled_rule, rel_id: c_int) c_int {
 }
 
 /// int vm_dred_delete(dl_db*)
-pub export fn vm_dred_delete(db: ?*dx.dl_db) c_int {
+pub export fn vm_dred_delete(db: ?*dl.DlDb) c_int {
     var over: [MAX_RELS]?*tupleset.tuple_set = [_]?*tupleset.tuple_set{null} ** MAX_RELS;
     var full_reset: [MAX_RELS]u8 = [_]u8{0} ** MAX_RELS;
     var changed: [MAX_RELS]u8 = [_]u8{0} ** MAX_RELS;
@@ -2773,9 +2760,9 @@ pub export fn vm_dred_delete(db: ?*dx.dl_db) c_int {
 
     i = 0;
     while (i < d.n_crules) : (i += 1) {
-        const cc = d.crules[@intCast(i)];
+        const cc = d.crules.?[@intCast(i)];
         if (cc == null) continue;
-        const cr: *const compiler.compiled_rule = @ptrCast(@alignCast(cc));
+        const cr: *const compiler.compiled_rule = cc.?;
         const hid: c_int = @intCast(cr.head_rel_id);
         if (cr.has_aggregate != 0) continue;
         if (hid < MAX_RELS) is_head[@intCast(hid)] = 1;
@@ -2797,7 +2784,7 @@ pub export fn vm_dred_delete(db: ?*dx.dl_db) c_int {
         if (dtsp.count == 0) continue;
         const mem = c.malloc(@sizeOf(tupleset.tuple_set)) orelse break :out;
         const ts: *tupleset.tuple_set = @ptrCast(@alignCast(mem));
-        if (ts_init(ts, relation.rel_arity(@ptrCast(@alignCast(d.rels[@intCast(i)].rel)))) != 0) {
+        if (ts_init(ts, relation.rel_arity(d.rels[@intCast(i)].rel)) != 0) {
             c.free(mem);
             over[@intCast(i)] = null;
             break :out;
@@ -2813,9 +2800,9 @@ pub export fn vm_dred_delete(db: ?*dx.dl_db) c_int {
     if (has_negation != 0 and any_change != 0) {
         i = 0;
         while (i < d.n_crules) : (i += 1) {
-            const cc = d.crules[@intCast(i)];
+            const cc = d.crules.?[@intCast(i)];
             if (cc == null) continue;
-            const cr: *const compiler.compiled_rule = @ptrCast(@alignCast(cc));
+            const cr: *const compiler.compiled_rule = cc.?;
             const hid: c_int = @intCast(cr.head_rel_id);
             if (cr.has_aggregate != 0) continue;
             if (hid >= MAX_RELS) continue;
@@ -2833,9 +2820,9 @@ pub export fn vm_dred_delete(db: ?*dx.dl_db) c_int {
                 again = 0;
                 i = 0;
                 while (i < d.n_crules) : (i += 1) {
-                    const cc = d.crules[@intCast(i)];
+                    const cc = d.crules.?[@intCast(i)];
                     if (cc == null) continue;
-                    const cr: *const compiler.compiled_rule = @ptrCast(@alignCast(cc));
+                    const cr: *const compiler.compiled_rule = cc.?;
                     const hid: c_int = @intCast(cr.head_rel_id);
                     if (cr.has_aggregate != 0) continue;
                     if (hid >= MAX_RELS or full_reset[@intCast(hid)] != 0) continue;
@@ -2865,9 +2852,9 @@ pub export fn vm_dred_delete(db: ?*dx.dl_db) c_int {
             again = 0;
             i = 0;
             while (i < d.n_crules) : (i += 1) {
-                const cc = d.crules[@intCast(i)];
+                const cc = d.crules.?[@intCast(i)];
                 if (cc == null) continue;
-                const cr: *const compiler.compiled_rule = @ptrCast(@alignCast(cc));
+                const cr: *const compiler.compiled_rule = cc.?;
                 const hid: c_int = @intCast(cr.head_rel_id);
                 if (cr.has_aggregate != 0) continue;
                 if (cr.stratum != s) continue;
@@ -2887,7 +2874,7 @@ pub export fn vm_dred_delete(db: ?*dx.dl_db) c_int {
                     ov[0].ts = ob;
                     ov[0].perm_id = -1;
                     var cand: tupleset.tuple_set = undefined;
-                    if (ts_init(&cand, relation.rel_arity(@ptrCast(@alignCast(d.rels[@intCast(hid)].rel)))) != 0)
+                    if (ts_init(&cand, relation.rel_arity(d.rels[@intCast(hid)].rel)) != 0)
                         break :out;
                     var ctx = CandCtx{ .ts = &cand };
                     const m = execRule(d, cr, &ov, 1, 1, candCb, &ctx);
@@ -2942,19 +2929,19 @@ pub export fn vm_dred_delete(db: ?*dx.dl_db) c_int {
         var dirtied: c_int = 0;
         while (ci < ob.?.count) : (ci += 1) {
             const t = ob.?.data.? + @as(usize, @intCast(ci)) * @as(usize, ob.?.arity);
-            if (relation.rel_exact_base(@ptrCast(@alignCast(rel)), t) != 0) continue;
-            if (relation.rel_delete(@ptrCast(@alignCast(rel)), t) == 1) dirtied = 1;
+            if (relation.rel_exact_base(rel, t) != 0) continue;
+            if (relation.rel_delete(rel, t) == 1) dirtied = 1;
         }
-        if (dirtied != 0) dx.permindex_mark_dirty(d, i);
+        if (dirtied != 0) permindex.permindex_mark_dirty(d, i);
     }
 
     i = 0;
     while (i < @as(c_int, @intCast(d.nrels))) : (i += 1) {
         if (full_reset[@intCast(i)] == 0 or is_head[@intCast(i)] == 0) continue;
-        if (relation.rel_reset_view(@ptrCast(@alignCast(d.rels[@intCast(i)].rel))) != 0) break :out;
-        dx.permindex_mark_dirty(d, i);
+        if (relation.rel_reset_view(d.rels[@intCast(i)].rel) != 0) break :out;
+        permindex.permindex_mark_dirty(d, i);
     }
-    if (dx.permindex_build_dirty(d) != 0) break :out;
+    if (permindex.permindex_build_dirty(d) != 0) break :out;
 
     {
         var queue: [MAX_RELS]c_int = undefined;
@@ -2977,9 +2964,9 @@ pub export fn vm_dred_delete(db: ?*dx.dl_db) c_int {
             qh2 += 1;
             i = 0;
             while (i < d.n_crules) : (i += 1) {
-                const cc = d.crules[@intCast(i)];
+                const cc = d.crules.?[@intCast(i)];
                 if (cc == null) continue;
-                const cr: *const compiler.compiled_rule = @ptrCast(@alignCast(cc));
+                const cr: *const compiler.compiled_rule = cc.?;
                 const hid: c_int = @intCast(cr.head_rel_id);
                 if (cr.has_aggregate != 0) continue;
                 if (hid >= MAX_RELS or affected[@intCast(hid)] != 0) continue;
@@ -3000,9 +2987,9 @@ pub export fn vm_dred_delete(db: ?*dx.dl_db) c_int {
         var sc: c_int = 0;
         i = 0;
         while (i < d.n_crules) : (i += 1) {
-            const cc = d.crules[@intCast(i)];
+            const cc = d.crules.?[@intCast(i)];
             if (cc == null) continue;
-            const cr: *compiler.compiled_rule = @ptrCast(@alignCast(cc));
+            const cr: *compiler.compiled_rule = cc.?;
             if (cr.has_aggregate != 0) continue;
             if (cr.stratum != s) continue;
             if (cr.head_rel_id < MAX_RELS and affected[@intCast(cr.head_rel_id)] == 0) continue;
@@ -3079,15 +3066,15 @@ fn aggCountCb(cols: [*c]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_
     return 0;
 }
 
-fn relBaseEmpty(db: *dx.dl_db, rel_id: c_int) c_int {
+fn relBaseEmpty(db: *dl.DlDb, rel_id: c_int) c_int {
     const r = dbRel(db, rel_id);
     var n: c_long = 0;
     if (r == null) return -1;
-    if (relation.rel_prefix_base(@ptrCast(@alignCast(r)), null, 0, aggCountCb, &n) < 0) return -1;
+    if (relation.rel_prefix_base(r, null, 0, aggCountCb, &n) < 0) return -1;
     return if (n == 0) 1 else 0;
 }
 
-fn aggRuleTractable(db: *dx.dl_db, cr: *const compiler.compiled_rule, is_head: [*]const u8) c_int {
+fn aggRuleTractable(db: *dl.DlDb, cr: *const compiler.compiled_rule, is_head: [*]const u8) c_int {
     var anchor: c_int = 0;
     var anchor_arity: c_int = 0;
     var n_key: c_int = 0;
@@ -3156,7 +3143,7 @@ fn aggRuleTractable(db: *dx.dl_db, cr: *const compiler.compiled_rule, is_head: [
 }
 
 /// int vm_agg_eligible(dl_db*)
-pub export fn vm_agg_eligible(db: ?*dx.dl_db) c_int {
+pub export fn vm_agg_eligible(db: ?*dl.DlDb) c_int {
     var is_head: [MAX_RELS]u8 = [_]u8{0} ** MAX_RELS;
     var agg_head: [MAX_RELS]u8 = [_]u8{0} ** MAX_RELS;
     var i: c_int = 0;
@@ -3164,13 +3151,13 @@ pub export fn vm_agg_eligible(db: ?*dx.dl_db) c_int {
     var has_agg: c_int = 0;
 
     const d = db orelse return 0;
-    if (dx.db_has_variadic(d) != 0 or dx.db_has_list_builtin(d) != 0 or dx.db_has_range_builtin(d) != 0) return 0;
+    if (dl.db_has_variadic(d) != 0 or dl.db_has_list_builtin(d) != 0 or dl.db_has_range_builtin(d) != 0) return 0;
 
     i = 0;
     while (i < d.n_crules) : (i += 1) {
-        const cc = d.crules[@intCast(i)];
+        const cc = d.crules.?[@intCast(i)];
         if (cc == null) continue;
-        const cr: *const compiler.compiled_rule = @ptrCast(@alignCast(cc));
+        const cr: *const compiler.compiled_rule = cc.?;
         if (cr.is_recursive != 0) return 0;
         if (cr.has_aggregate != 0) has_agg = 1;
         if (cr.head_rel_id < MAX_RELS) is_head[cr.head_rel_id] = 1;
@@ -3179,9 +3166,9 @@ pub export fn vm_agg_eligible(db: ?*dx.dl_db) c_int {
 
     i = 0;
     while (i < d.n_crules) : (i += 1) {
-        const cc = d.crules[@intCast(i)];
+        const cc = d.crules.?[@intCast(i)];
         if (cc == null) continue;
-        const cr: *const compiler.compiled_rule = @ptrCast(@alignCast(cc));
+        const cr: *const compiler.compiled_rule = cc.?;
         if (cr.has_aggregate != 0 and cr.head_rel_id < MAX_RELS)
             agg_head[cr.head_rel_id] = 1;
     }
@@ -3190,9 +3177,9 @@ pub export fn vm_agg_eligible(db: ?*dx.dl_db) c_int {
         var head_count: [MAX_RELS]c_int = [_]c_int{0} ** MAX_RELS;
         i = 0;
         while (i < d.n_crules) : (i += 1) {
-            const cc = d.crules[@intCast(i)];
+            const cc = d.crules.?[@intCast(i)];
             if (cc == null) continue;
-            const cr: *const compiler.compiled_rule = @ptrCast(@alignCast(cc));
+            const cr: *const compiler.compiled_rule = cc.?;
             if (cr.head_rel_id < MAX_RELS) head_count[cr.head_rel_id] += 1;
         }
         i = 0;
@@ -3203,9 +3190,9 @@ pub export fn vm_agg_eligible(db: ?*dx.dl_db) c_int {
 
     i = 0;
     while (i < d.n_crules) : (i += 1) {
-        const cc = d.crules[@intCast(i)];
+        const cc = d.crules.?[@intCast(i)];
         if (cc == null) continue;
-        const cr: *const compiler.compiled_rule = @ptrCast(@alignCast(cc));
+        const cr: *const compiler.compiled_rule = cc.?;
         k = 0;
         while (k < cr.n_instrs) : (k += 1) {
             const op: u8 = cr.instrs.?[@intCast(k)].op;
@@ -3221,9 +3208,9 @@ pub export fn vm_agg_eligible(db: ?*dx.dl_db) c_int {
 
     i = 0;
     while (i < d.n_crules) : (i += 1) {
-        const cc = d.crules[@intCast(i)];
+        const cc = d.crules.?[@intCast(i)];
         if (cc == null) continue;
-        const cr: *const compiler.compiled_rule = @ptrCast(@alignCast(cc));
+        const cr: *const compiler.compiled_rule = cc.?;
         if (cr.has_aggregate != 0) continue;
         k = 0;
         while (k < cr.n_instrs) : (k += 1) {
@@ -3235,9 +3222,9 @@ pub export fn vm_agg_eligible(db: ?*dx.dl_db) c_int {
 
     i = 0;
     while (i < d.n_crules) : (i += 1) {
-        const cc = d.crules[@intCast(i)];
+        const cc = d.crules.?[@intCast(i)];
         if (cc == null) continue;
-        const cr: *const compiler.compiled_rule = @ptrCast(@alignCast(cc));
+        const cr: *const compiler.compiled_rule = cc.?;
         if (cr.has_aggregate == 0) continue;
         if (aggRuleTractable(d, cr, &is_head) == 0) return 0;
     }
@@ -3245,7 +3232,7 @@ pub export fn vm_agg_eligible(db: ?*dx.dl_db) c_int {
     return 1;
 }
 
-fn aggUpdateGroup(db: *dx.dl_db, cr: *const compiler.compiled_rule, group_key: [*c]const u32) c_int {
+fn aggUpdateGroup(db: *dl.DlDb, cr: *const compiler.compiled_rule, group_key: [*c]const u32) c_int {
     const scan = &cr.instrs.?[0];
     const acc = &cr.instrs.?[1];
     const emit = &cr.instrs.?[2];
@@ -3279,14 +3266,14 @@ fn aggUpdateGroup(db: *dx.dl_db, cr: *const compiler.compiled_rule, group_key: [
     st.op = @intCast(op);
     st.src_col = @intCast(src_col);
 
-    if (relation.rel_prefix(@ptrCast(@alignCast(arel)), group_key, @intCast(n_key), aggScanCb, &st) < 0)
+    if (relation.rel_prefix(arel, group_key, @intCast(n_key), aggScanCb, &st) < 0)
         return -1;
 
-    if (relation.rel_prefix(@ptrCast(@alignCast(hrel)), group_key, @intCast(n_key), aggOldCb, &oh) < 0)
+    if (relation.rel_prefix(hrel, group_key, @intCast(n_key), aggOldCb, &oh) < 0)
         return -1;
 
     if (st.count == 0) {
-        if (oh.found != 0 and relation.rel_delete(@ptrCast(@alignCast(hrel)), &oh.cols) < 0) return -1;
+        if (oh.found != 0 and relation.rel_delete(hrel, &oh.cols) < 0) return -1;
         return 0;
     }
 
@@ -3304,14 +3291,14 @@ fn aggUpdateGroup(db: *dx.dl_db, cr: *const compiler.compiled_rule, group_key: [
         while (gi < n_key) : (gi += 1) new_tuple[@intCast(gi)] = group_key[@intCast(gi)];
         new_tuple[@intCast(n_key)] = agg_val;
 
-        if (relation.rel_exact(@ptrCast(@alignCast(hrel)), &new_tuple) != 0) return 0;
-        if (oh.found != 0 and relation.rel_delete(@ptrCast(@alignCast(hrel)), &oh.cols) < 0) return -1;
-        if (relation.rel_add(@ptrCast(@alignCast(hrel)), &new_tuple) < 0) return -1;
+        if (relation.rel_exact(hrel, &new_tuple) != 0) return 0;
+        if (oh.found != 0 and relation.rel_delete(hrel, &oh.cols) < 0) return -1;
+        if (relation.rel_add(hrel, &new_tuple) < 0) return -1;
     }
     return 0;
 }
 
-fn aggMaintainRule(db: *dx.dl_db, cr: *const compiler.compiled_rule) c_int {
+fn aggMaintainRule(db: *dl.DlDb, cr: *const compiler.compiled_rule) c_int {
     const scan = &cr.instrs.?[0];
     const acc = &cr.instrs.?[1];
     const anchor: c_int = @intCast(scan.a);
@@ -3366,7 +3353,7 @@ fn aggMaintainRule(db: *dx.dl_db, cr: *const compiler.compiled_rule) c_int {
 }
 
 /// int vm_agg_maintain(dl_db*)
-pub export fn vm_agg_maintain(db: ?*dx.dl_db) c_int {
+pub export fn vm_agg_maintain(db: ?*dl.DlDb) c_int {
     var ri: c_int = 0;
     var i: c_int = 0;
     var has_ins: c_int = 0;
@@ -3380,22 +3367,22 @@ pub export fn vm_agg_maintain(db: ?*dx.dl_db) c_int {
     fail: {
         ri = 0;
         while (ri < d.n_crules) : (ri += 1) {
-            const cc = d.crules[@intCast(ri)];
+            const cc = d.crules.?[@intCast(ri)];
             if (cc == null) continue;
-            const cr: *const compiler.compiled_rule = @ptrCast(@alignCast(cc));
+            const cr: *const compiler.compiled_rule = cc.?;
             if (cr.has_aggregate == 0) continue;
             if (aggMaintainRule(d, cr) != 0) break :fail;
         }
 
         ri = 0;
         while (ri < d.n_crules) : (ri += 1) {
-            const cc = d.crules[@intCast(ri)];
+            const cc = d.crules.?[@intCast(ri)];
             if (cc == null) continue;
-            const cr: *const compiler.compiled_rule = @ptrCast(@alignCast(cc));
+            const cr: *const compiler.compiled_rule = cc.?;
             if (cr.has_aggregate == 0) continue;
-            dx.permindex_mark_dirty(d, @intCast(cr.head_rel_id));
+            permindex.permindex_mark_dirty(d, @intCast(cr.head_rel_id));
         }
-        if (dx.permindex_build_dirty(d) != 0) break :fail;
+        if (permindex.permindex_build_dirty(d) != 0) break :fail;
 
         i = 0;
         while (i < MAX_RELS) : (i += 1) {
@@ -3404,9 +3391,9 @@ pub export fn vm_agg_maintain(db: ?*dx.dl_db) c_int {
         }
         ri = 0;
         while (ri < d.n_crules) : (ri += 1) {
-            const cc = d.crules[@intCast(ri)];
+            const cc = d.crules.?[@intCast(ri)];
             if (cc == null) continue;
-            const cr: *const compiler.compiled_rule = @ptrCast(@alignCast(cc));
+            const cr: *const compiler.compiled_rule = cc.?;
             var k: c_int = 0;
             if (cr.has_aggregate != 0) continue;
             has_nonagg = 1;
@@ -3475,28 +3462,28 @@ fn testRmRf(path: [*:0]const u8) void {
     _ = system(cmd.ptr);
 }
 
-fn testOpenDb(path: [*:0]const u8) *dx.dl_db {
+fn testOpenDb(path: [*:0]const u8) *dl.DlDb {
     testRmRf(path);
-    return dx.dl_open(path) orelse @panic("dl_open failed");
+    return dl.dl_open(path) orelse @panic("dl_open failed");
 }
 
-fn testCloseDb(db: *dx.dl_db, path: [*:0]const u8) void {
-    dx.dl_close(db);
+fn testCloseDb(db: *dl.DlDb, path: [*:0]const u8) void {
+    dl.dl_close(db);
     testRmRf(path);
 }
 
-fn testAddFacts(db: *dx.dl_db, rel: [*:0]const u8, cols: []const u32, ar: u8, n: usize) void {
+fn testAddFacts(db: *dl.DlDb, rel: [*:0]const u8, cols: []const u32, ar: u8, n: usize) void {
     var i: usize = 0;
     while (i < n) : (i += 1) {
-        if (dx.dl_add_fact(db, rel, cols.ptr + i * ar, ar) != 1) @panic("dl_add_fact failed");
+        if (dl.dl_add_fact(db, rel, cols.ptr + i * ar, ar) != 1) @panic("dl_add_fact failed");
     }
 }
 
-fn testCompile(db: *dx.dl_db, src: [*:0]const u8, n_out: *c_int) ?[*]?*compiler.compiled_rule {
+fn testCompile(db: *dl.DlDb, src: [*:0]const u8, n_out: *c_int) ?[*]?*compiler.compiled_rule {
     const pd = testParse(src) orelse return null;
     defer testParseFree(pd);
     var arr: ?[*]?*compiler.compiled_rule = null;
-    const rc = compile_rules(db, pd.rules, pd.n, &arr, n_out);
+    const rc = compiler.compile_rules(db, pd.rules, pd.n, &arr, n_out);
     if (rc != 0) return null;
     return arr;
 }
@@ -3520,7 +3507,7 @@ test "vm_execute: non-recursive program materializes derived facts" {
     const db = testOpenDb(path);
     defer testCloseDb(db, path);
 
-    try testing.expectEqual(@as(c_int, 0), dx.dl_declare_relation(db, "edge", 2));
+    try testing.expectEqual(@as(c_int, 0), dl.dl_declare_relation(db, "edge", 2));
     testAddFacts(db, "edge", &.{ 1, 2, 2, 3 }, 2, 2);
 
     var n: c_int = 0;
@@ -3533,9 +3520,9 @@ test "vm_execute: non-recursive program materializes derived facts" {
     const t1 = [2]u32{ 1, 2 };
     const t2 = [2]u32{ 2, 3 };
     const t3 = [2]u32{ 3, 4 };
-    try testing.expectEqual(@as(c_int, 1), dx.dl_lookup(db, "p", &t1, 2));
-    try testing.expectEqual(@as(c_int, 1), dx.dl_lookup(db, "p", &t2, 2));
-    try testing.expectEqual(@as(c_int, 0), dx.dl_lookup(db, "p", &t3, 2));
+    try testing.expectEqual(@as(c_int, 1), dl.dl_lookup(db, "p", &t1, 2));
+    try testing.expectEqual(@as(c_int, 1), dl.dl_lookup(db, "p", &t2, 2));
+    try testing.expectEqual(@as(c_int, 0), dl.dl_lookup(db, "p", &t3, 2));
 }
 
 test "vm_execute: recursive transitive closure (need_idb_sort trap shape)" {
@@ -3543,7 +3530,7 @@ test "vm_execute: recursive transitive closure (need_idb_sort trap shape)" {
     const db = testOpenDb(path);
     defer testCloseDb(db, path);
 
-    try testing.expectEqual(@as(c_int, 0), dx.dl_declare_relation(db, "edge", 2));
+    try testing.expectEqual(@as(c_int, 0), dl.dl_declare_relation(db, "edge", 2));
     testAddFacts(db, "edge", &.{ 1, 2, 2, 3, 3, 4, 4, 5 }, 2, 4);
 
     // The second rule has TWO recursive body atoms (reach(X,Z), reach(Z,Y)),
@@ -3565,10 +3552,10 @@ test "vm_execute: recursive transitive closure (need_idb_sort trap shape)" {
         .{ 1, 5 },
     };
     for (pairs) |t| {
-        try testing.expectEqual(@as(c_int, 1), dx.dl_lookup(db, "reach", &t, 2));
+        try testing.expectEqual(@as(c_int, 1), dl.dl_lookup(db, "reach", &t, 2));
     }
     const absent = [2]u32{ 5, 1 };
-    try testing.expectEqual(@as(c_int, 0), dx.dl_lookup(db, "reach", &absent, 2));
+    try testing.expectEqual(@as(c_int, 0), dl.dl_lookup(db, "reach", &absent, 2));
 }
 
 test "vm_query: streams goal tuples via callback" {
@@ -3576,7 +3563,7 @@ test "vm_query: streams goal tuples via callback" {
     const db = testOpenDb(path);
     defer testCloseDb(db, path);
 
-    try testing.expectEqual(@as(c_int, 0), dx.dl_declare_relation(db, "edge", 2));
+    try testing.expectEqual(@as(c_int, 0), dl.dl_declare_relation(db, "edge", 2));
     testAddFacts(db, "edge", &.{ 1, 2, 2, 3 }, 2, 2);
 
     var n: c_int = 0;
@@ -3594,18 +3581,18 @@ test "vm_ivm_eligible: eligible join vs ineligible negation" {
     const db = testOpenDb(path);
     defer testCloseDb(db, path);
 
-    try testing.expectEqual(@as(c_int, 0), dx.dl_declare_relation(db, "edge", 2));
-    try testing.expectEqual(@as(c_int, 0), dx.dl_declare_relation(db, "node", 1));
+    try testing.expectEqual(@as(c_int, 0), dl.dl_declare_relation(db, "edge", 2));
+    try testing.expectEqual(@as(c_int, 0), dl.dl_declare_relation(db, "node", 1));
     testAddFacts(db, "edge", &.{ 1, 2 }, 2, 1);
     testAddFacts(db, "node", &.{1}, 1, 1);
 
     // Eligible: a single non-recursive join (SCAN/LOOKUP only).
-    try testing.expectEqual(@as(c_int, 0), dx.dl_load_rules(db, "p(X,Y):-edge(X,Y).\n"));
+    try testing.expectEqual(@as(c_int, 0), dl.dl_load_rules(db, "p(X,Y):-edge(X,Y).\n"));
     try testing.expectEqual(@as(c_int, 1), vm_ivm_eligible(db));
     try testing.expectEqual(@as(c_int, 0), vm_has_recursive(db));
 
     // Ineligible: negation forces the full-fixpoint path.
-    try testing.expectEqual(@as(c_int, 0), dx.dl_load_rules(db, "q(X):-node(X),!edge(X,X).\n"));
+    try testing.expectEqual(@as(c_int, 0), dl.dl_load_rules(db, "q(X):-node(X),!edge(X,X).\n"));
     try testing.expectEqual(@as(c_int, 0), vm_ivm_eligible(db));
 }
 

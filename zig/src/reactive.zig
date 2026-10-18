@@ -53,7 +53,7 @@ const std = @import("std");
 const c = std.c;
 
 const tupleset = @import("tupleset.zig");
-const dx = @import("dl_abi.zig");
+const relation = @import("relation.zig");
 
 // ─── Public C-ABI constants (mirrored in src/dl.h) ─────────────────────────
 
@@ -241,16 +241,8 @@ test "ABI constants round-trip the C header (dl.h)" {
 // cycles.
 const dl = @import("dl.zig");
 
-// relation.zig export fns against dx's opaque relation type.
-extern "c" fn rel_prefix(
-    rel: ?*const dx.relation,
-    leading: [*c]const u32,
-    k: u8,
-    cb: dx.rel_enum_cb,
-    user: ?*anyopaque,
-) c_long;
-extern "c" fn rel_arity(rel: ?*const dx.relation) u8;
-extern "c" fn rel_is_idb(rel: ?*const dx.relation) c_int;
+// relation.zig export fns reached directly (Relation is its concrete owner
+// type; dl.DlDb.rels[].rel is already ?*relation.Relation).
 
 // ─── small helpers ─────────────────────────────────────────────────────────
 
@@ -268,10 +260,10 @@ fn reactiveErr(comptime fmt: []const u8, args: anytype) void {
 
 /// Snapshot one relation's view (DAFSA ∪ overlay) into a fresh SORTED
 /// tuple_set.  Caller frees.
-fn snapshotRel(rel: ?*const dx.relation) ?tupleset.tuple_set {
+fn snapshotRel(rel: ?*const relation.Relation) ?tupleset.tuple_set {
     var ts: tupleset.tuple_set = undefined;
-    if (ts_init(&ts, rel_arity(rel)) != 0) return null;
-    if (rel_prefix(rel, null, 0, tsSink, &ts) < 0) {
+    if (ts_init(&ts, relation.rel_arity(rel)) != 0) return null;
+    if (relation.rel_prefix(rel, null, 0, tsSink, &ts) < 0) {
         ts_free(&ts);
         return null;
     }
@@ -323,7 +315,7 @@ fn tsMinus(first: *const tupleset.tuple_set, second: *const tupleset.tuple_set) 
 
 // ─── per-db reactive state (ptr-keyed; alive only between init/clear) ──────
 
-// dx.dl_db.rels is [64] (MAX_RELS).
+// dl.DlDb.rels is [64] (MAX_RELS).
 const MAX_WATCHED: usize = 64;
 
 const Watch = struct {
@@ -332,7 +324,7 @@ const Watch = struct {
 };
 
 const ReactiveState = struct {
-    db: *dx.dl_db,
+    db: *dl.DlDb,
     watch: [MAX_WATCHED]?Watch = [_]?Watch{null} ** MAX_WATCHED,
     n_watch: usize = 0,
     fallback: bool = false, // last step's dispatch used full re-eval
@@ -352,7 +344,7 @@ const ReactiveState = struct {
 var tbl: [MAX_SESSIONS]?*ReactiveState = [_]?*ReactiveState{null} ** MAX_SESSIONS;
 const MAX_SESSIONS: usize = 64;
 
-fn stateFor(db: *dx.dl_db) ?*ReactiveState {
+fn stateFor(db: *dl.DlDb) ?*ReactiveState {
     for (&tbl) |e| {
         const st = e orelse continue;
         if (st.db == db) return st;
@@ -370,7 +362,7 @@ fn stateInsert(st: *ReactiveState) bool {
     return false; // table full (MAX_SESSIONS live sessions)
 }
 
-fn stateTake(db: *dx.dl_db) ?*ReactiveState {
+fn stateTake(db: *dl.DlDb) ?*ReactiveState {
     for (&tbl, 0..) |e, i| {
         const st = e orelse continue;
         if (st.db != db) continue;
@@ -382,7 +374,7 @@ fn stateTake(db: *dx.dl_db) ?*ReactiveState {
 
 /// Free the session for `db` if one is open (dl_close safety: never leave a
 /// freed db pointer keyed).
-pub fn reactiveForget(db: *dx.dl_db) void {
+pub fn reactiveForget(db: *dl.DlDb) void {
     if (stateTake(db)) |st| {
         freeWatched(st);
         c.free(st);
@@ -401,19 +393,19 @@ fn freeWatched(st: *ReactiveState) void {
 /// Resolve a watched entry's live relation from the CURRENT db layout.
 /// Relations are append-only (dl_declare_relation never moves earlier
 /// entries), so rel_id stays valid for the session.
-fn watchedRel(st: *ReactiveState, w: *Watch) ?*dx.relation {
+fn watchedRel(st: *ReactiveState, w: *Watch) ?*relation.Relation {
     if (w.rel_id >= st.db.nrels) return null;
     return st.db.rels[w.rel_id].rel;
 }
 
-/// Is rel_id the head of at least one loaded rule?  (dx.dl_db.crules holds
+/// Is rel_id the head of at least one loaded rule?  (dl.DlDb.crules holds
 /// the compiled rules; head_rel_id is the relation index.)
-fn isRuleHeadRel(d: *const dx.dl_db, rel_id: usize) bool {
+fn isRuleHeadRel(d: *const dl.DlDb, rel_id: usize) bool {
     var i: c_int = 0;
     while (i < d.n_crules) : (i += 1) {
-        const cc = d.crules[@intCast(i)];
+        const cc = d.crules.?[@intCast(i)];
         if (cc == null) continue;
-        if (@as(usize, cc.*.head_rel_id) == rel_id) return true;
+        if (@as(usize, cc.?.head_rel_id) == rel_id) return true;
     }
     return false;
 }
@@ -517,7 +509,7 @@ fn emitTuples(cb: FiredCb, event: c_int, ts: *const tupleset.tuple_set, user: ?*
 const RELK_VARIADIC: u8 = 1;
 
 /// int dl_set_reactive(dl_db *db, const char *rel_name, int on)
-pub fn dlSetReactive(db: ?*dx.dl_db, rel_name: [*c]const u8, on: c_int) c_int {
+pub fn dlSetReactive(db: ?*dl.DlDb, rel_name: [*c]const u8, on: c_int) c_int {
     const d = db orelse return -1;
     if (rel_name == null) return -1;
     if (d.read_only != 0) return -1;
@@ -544,7 +536,7 @@ pub fn dlSetReactive(db: ?*dx.dl_db, rel_name: [*c]const u8, on: c_int) c_int {
         // relation would conflate direct writes with derived tuples
         // (plan risk R1).  Accept a relation that is ALREADY a derived view
         // or is the head of a loaded rule (pre-compile registration).
-        if (rel_is_idb(d.rels[i].rel) == 0 and !isRuleHeadRel(d, i)) {
+        if (relation.rel_is_idb(d.rels[i].rel) == 0 and !isRuleHeadRel(d, i)) {
             reactiveErr("dl_set_reactive: '{s}' is not a rule head (EDB) — refusing\n", .{rel_name});
             return -1;
         }
@@ -567,7 +559,7 @@ pub fn dlSetReactive(db: ?*dx.dl_db, rel_name: [*c]const u8, on: c_int) c_int {
 }
 
 /// long dl_fired_init(dl_db *db)
-pub fn dlFiredInit(db: ?*dx.dl_db) c_long {
+pub fn dlFiredInit(db: ?*dl.DlDb) c_long {
     const d = db orelse return DL_REACTIVE_ERR_ARGS;
     if (d.read_only != 0) return DL_REACTIVE_ERR_ARGS;
     if (stateFor(d) != null) return DL_REACTIVE_ERR_CONFLICT; // session already open
@@ -583,7 +575,7 @@ pub fn dlFiredInit(db: ?*dx.dl_db) c_long {
 }
 
 /// long dl_fired_step(dl_db *db, dl_fired_cb cb, void *user)
-pub fn dlFiredStep(db: ?*dx.dl_db, cb: FiredCb, user: ?*anyopaque) c_long {
+pub fn dlFiredStep(db: ?*dl.DlDb, cb: FiredCb, user: ?*anyopaque) c_long {
     const d = db orelse return DL_REACTIVE_ERR_ARGS;
     if (cb == null) return DL_REACTIVE_ERR_ARGS;
     const st = stateFor(d) orelse return DL_REACTIVE_ERR_NOT_INIT;
@@ -594,7 +586,7 @@ pub fn dlFiredStep(db: ?*dx.dl_db, cb: FiredCb, user: ?*anyopaque) c_long {
 }
 
 /// long dl_fired_clear(dl_db *db)
-pub fn dlFiredClear(db: ?*dx.dl_db) c_long {
+pub fn dlFiredClear(db: ?*dl.DlDb) c_long {
     const d = db orelse return DL_REACTIVE_ERR_ARGS;
     const st = stateTake(d) orelse return DL_REACTIVE_ERR_NOT_INIT;
     freeWatched(st);

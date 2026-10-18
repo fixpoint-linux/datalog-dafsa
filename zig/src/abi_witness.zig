@@ -11,6 +11,14 @@
 const std = @import("std");
 const abi = @import("dl_abi.zig");
 
+// OWNER modules — the real in-library type sources.  Asserted against the
+// dl_abi.zig mirrors so a mirror can never silently drift from the truth.
+const dl = @import("dl.zig");
+const compiler = @import("compiler.zig");
+const parser = @import("parser.zig");
+const regexwalk = @import("regexwalk.zig");
+const vector = @import("vector.zig");
+
 const ch = @cImport({
     @cInclude("dl_internal.h");
 });
@@ -101,4 +109,64 @@ comptime {
     checkStruct(abi.struct_regex_dfa, ch.struct_regex_dfa);
     checkStruct(abi.struct_sym_set, ch.struct_sym_set);
     checkStruct(abi.struct_dl_vec_corpus, ch.struct_dl_vec_corpus);
+}
+
+// ─── Owner-vs-mirror: the mirror must equal the REAL in-library type ───────
+
+/// Full owner-vs-mirror check: same size, align, field count, field names and
+/// field OFFSETS.  Field TYPES are intentionally not compared — the owner
+/// types use Zig-native spellings (`?[*:0]u8` vs `[*c]u8`, `?*relation.Relation`
+/// vs opaque `relation`) that are layout-equivalent but @typeInfo-distinct.
+fn checkOwnerFull(comptime owner: type, comptime mirror: type) void {
+    if (@sizeOf(owner) != @sizeOf(mirror))
+        @compileError("abi_witness: owner size mismatch for " ++ @typeName(owner) ++ " vs " ++ @typeName(mirror));
+    if (@alignOf(owner) != @alignOf(mirror))
+        @compileError("abi_witness: owner align mismatch for " ++ @typeName(owner));
+    const of = @typeInfo(owner).@"struct".fields;
+    const mf = @typeInfo(mirror).@"struct".fields;
+    if (of.len != mf.len)
+        @compileError("abi_witness: owner field count mismatch for " ++ @typeName(owner));
+    inline for (of, mf) |oa, ma| {
+        if (!std.mem.eql(u8, oa.name, ma.name))
+            @compileError("abi_witness: owner field name mismatch " ++ @typeName(owner) ++ "." ++ oa.name ++ " vs " ++ ma.name);
+        if (@offsetOf(owner, oa.name) != @offsetOf(mirror, ma.name))
+            @compileError("abi_witness: owner offset mismatch " ++ @typeName(owner) ++ "." ++ oa.name);
+    }
+}
+
+/// Prefix check for a deliberate SUPERSET: the owner repeats every mirror field
+/// at the identical offset and then carries Zig-only trailing fields.  Requires
+/// @sizeOf(owner) >= @sizeOf(mirror); never whole-struct size equality.
+fn checkOwnerPrefix(comptime owner: type, comptime mirror: type) void {
+    if (@sizeOf(owner) < @sizeOf(mirror))
+        @compileError("abi_witness: owner superset smaller than mirror for " ++ @typeName(owner));
+    const mf = @typeInfo(mirror).@"struct".fields;
+    inline for (mf) |ma| {
+        if (@offsetOf(owner, ma.name) != @offsetOf(mirror, ma.name))
+            @compileError("abi_witness: owner prefix offset mismatch " ++ @typeName(owner) ++ "." ++ ma.name);
+    }
+}
+
+comptime {
+    // Supersets: DlDb repeats the C dl_db then appends Zig-only storage/
+    // publish-gate fields; Txn repeats the C txn then appends the rollback
+    // ksnap/meta_dirty tail.  Prefix identity only.
+    checkOwnerPrefix(dl.DlDb, abi.struct_dl_db);
+    checkOwnerPrefix(dl.Txn, abi.struct_txn);
+
+    // Everything else: full field equality (size/align/names/offsets).
+    checkOwnerFull(dl.RelEntry, abi.rel_entry);
+    checkOwnerFull(dl.TxnOp, abi.struct_txn_op);
+    checkOwnerFull(dl.ViewCacheSlot, abi.view_cache_slot);
+    checkOwnerFull(dl.PermIndexEntry, abi.perm_index_entry);
+    checkOwnerFull(compiler.compiled_rule, abi.compiled_rule);
+    checkOwnerFull(compiler.vm_instr, abi.vm_instr);
+    checkOwnerFull(compiler.var_info, abi.var_info);
+    checkOwnerFull(parser.token, abi.struct_token);
+    checkOwnerFull(parser.expr, abi.struct_expr);
+    checkOwnerFull(parser.atom, abi.atom);
+    checkOwnerFull(parser.rule, abi.rule);
+    checkOwnerFull(regexwalk.regex_dfa, abi.struct_regex_dfa);
+    checkOwnerFull(regexwalk.sym_set, abi.struct_sym_set);
+    checkOwnerFull(vector.DlVecCorpus, abi.struct_dl_vec_corpus);
 }

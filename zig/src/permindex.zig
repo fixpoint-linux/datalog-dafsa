@@ -16,13 +16,7 @@ const c = std.c;
 
 const relation = @import("relation.zig");
 const tupleset = @import("tupleset.zig");
-
-// dl_internal.h: dl_db, perm_index_entry (via permindex.h), db_rel_at_arity_ro.
-// dl_internal.h: dl_db, perm_index_entry, RELK_FIXED.  The datalog engine is
-// now Zig; dl_internal.zig hand-declares the C-layout structs + extern ABI
-// (db_rel_at_arity_ro is dl.zig's export, reached via extern "c") in place of
-// the removed @cImport("dl_internal.h").
-const dx = @import("dl_abi.zig");
+const dl = @import("dl.zig");
 
 // ts_* are `export fn`s in tupleset.zig (C ABI); link against them directly.
 extern "c" fn ts_init(ts: ?*tupleset.tuple_set, arity: u8) c_int;
@@ -44,31 +38,31 @@ fn pidxRevSeed(rel: ?*relation.Relation, rev: u64) void {
 // ─── Build a single permutation index ─────────────────────────────────────
 
 /// int permindex_build(dl_db *db, int rel_id, int perm_id)
-pub export fn permindex_build(db: ?*dx.dl_db, rel_id: c_int, perm_id: c_int) c_int {
+pub export fn permindex_build(db: ?*dl.DlDb, rel_id: c_int, perm_id: c_int) c_int {
     const d = db orelse return -1;
     if (perm_id < 0 or perm_id >= d.n_perms) return -1;
-    const pe: *dx.perm_index_entry = &d.perms[@intCast(perm_id)];
+    const pe: *dl.PermIndexEntry = &d.perms[@intCast(perm_id)];
     if (pe.*.rel_id != rel_id) return -1;
 
     // v2: a perm index is per-arity-variant by construction (dl_db_declare_
     // perm keys on rel_id + arity + perm, and every atom's nargs is its
     // static arity) — resolve the VARIANT the perm belongs to.
-    const base_rel_c = dx.db_rel_at_arity_ro(db, rel_id, pe.*.arity);
+    const base_rel_c = dl.db_rel_at_arity_ro(db, rel_id, pe.*.arity);
     if (base_rel_c == null) {
         // Fixed relation of a different arity, or a variadic variant that
         // does not exist: build an EMPTY index (an absent variant reads as
         // an empty relation everywhere else too).
-        const carry0: u64 = if (pe.*.pidx_rel) |old| relation.rel_rev(@ptrCast(@alignCast(old))) else 0;
-        if (pe.*.pidx_rel) |old| relation.rel_free(@ptrCast(@alignCast(old)));
-        pe.*.pidx_rel = @ptrCast(relation.rel_create(pe.*.arity));
+        const carry0: u64 = if (pe.*.pidx_rel) |old| relation.rel_rev(old) else 0;
+        if (pe.*.pidx_rel) |old| relation.rel_free(old);
+        pe.*.pidx_rel = relation.rel_create(pe.*.arity);
         // No build bump on this path: seed carry0 + 1 so the fresh object's
         // rev is strictly greater than any watermark the replaced object
         // serialized (carry0 == 0 -> rev 1, which beats a rev-0 watermark).
-        pidxRevSeed(@ptrCast(@alignCast(pe.*.pidx_rel)), carry0 +% 1);
+        pidxRevSeed(pe.*.pidx_rel, carry0 +% 1);
         pe.*.dirty = 0;
         return if (pe.*.pidx_rel != null) 0 else -1;
     }
-    const base_rel: *const relation.Relation = @ptrCast(@alignCast(base_rel_c));
+    const base_rel: *const relation.Relation = base_rel_c.?;
 
     const ar: u8 = pe.*.arity;
 
@@ -82,7 +76,7 @@ pub export fn permindex_build(db: ?*dx.dl_db, rel_id: c_int, perm_id: c_int) c_i
     // build path reaches rev_carry + 1 via the rel_build_from_tupleset bump;
     // the two no-bump paths (absent variant, empty base) seed rev_carry + 1
     // explicitly — see the pidxRevSeed calls below.
-    const rev_carry: u64 = if (pe.*.pidx_rel) |old| relation.rel_rev(@ptrCast(@alignCast(old))) else 0;
+    const rev_carry: u64 = if (pe.*.pidx_rel) |old| relation.rel_rev(old) else 0;
 
     // Collect base facts
     var ts: tupleset.tuple_set = undefined;
@@ -95,14 +89,14 @@ pub export fn permindex_build(db: ?*dx.dl_db, rel_id: c_int, perm_id: c_int) c_i
 
     if (ts.count == 0) {
         // Empty relation: create empty perm index
-        if (pe.*.pidx_rel) |old| relation.rel_free(@ptrCast(@alignCast(old)));
-        pe.*.pidx_rel = @ptrCast(relation.rel_create(ar));
+        if (pe.*.pidx_rel) |old| relation.rel_free(old);
+        pe.*.pidx_rel = relation.rel_create(ar);
         // No build bump on this path: seed rev_carry + 1 so the fresh
         // object's rev is strictly greater than any watermark the replaced
         // object serialized (rev_carry == 0 -> rev 1, beating a rev-0
         // watermark).  Otherwise the gate could hardlink stale bytes when
         // tcache reuses the freed chunk's address.
-        pidxRevSeed(@ptrCast(@alignCast(pe.*.pidx_rel)), rev_carry +% 1);
+        pidxRevSeed(pe.*.pidx_rel, rev_carry +% 1);
         pe.*.dirty = 0;
         ts_free(&ts);
         return 0;
@@ -130,9 +124,9 @@ pub export fn permindex_build(db: ?*dx.dl_db, rel_id: c_int, perm_id: c_int) c_i
         // Sort and bulk-build minimal DAFSA
         ts_sort(&pts);
 
-        if (pe.*.pidx_rel) |old| relation.rel_free(@ptrCast(@alignCast(old)));
+        if (pe.*.pidx_rel) |old| relation.rel_free(old);
 
-        pe.*.pidx_rel = @ptrCast(relation.rel_create(ar));
+        pe.*.pidx_rel = relation.rel_create(ar);
         if (pe.*.pidx_rel == null) {
             ts_free(&pts);
             ts_free(&ts);
@@ -140,10 +134,10 @@ pub export fn permindex_build(db: ?*dx.dl_db, rel_id: c_int, perm_id: c_int) c_i
         }
         // Seed BEFORE the build bump: final rev = rev_carry + 1 (build),
         // strictly greater than anything the previous object serialized.
-        pidxRevSeed(@ptrCast(@alignCast(pe.*.pidx_rel)), rev_carry);
+        pidxRevSeed(pe.*.pidx_rel, rev_carry);
 
-        if (relation.rel_build_from_tupleset(@ptrCast(@alignCast(pe.*.pidx_rel)), &pts) != 0) {
-            relation.rel_free(@ptrCast(@alignCast(pe.*.pidx_rel)));
+        if (relation.rel_build_from_tupleset(pe.*.pidx_rel, &pts) != 0) {
+            relation.rel_free(pe.*.pidx_rel);
             pe.*.pidx_rel = null;
             ts_free(&pts);
             ts_free(&ts);
@@ -161,7 +155,7 @@ pub export fn permindex_build(db: ?*dx.dl_db, rel_id: c_int, perm_id: c_int) c_i
 // ─── Build all dirty permutation indices ──────────────────────────────────
 
 /// int permindex_build_dirty(struct dl_db *db)
-pub export fn permindex_build_dirty(db: ?*dx.dl_db) c_int {
+pub export fn permindex_build_dirty(db: ?*dl.DlDb) c_int {
     const d = db orelse return 0;
 
     var i: c_int = 0;
@@ -177,7 +171,7 @@ pub export fn permindex_build_dirty(db: ?*dx.dl_db) c_int {
 // ─── Mark permutation indices dirty for a relation ────────────────────────
 
 /// void permindex_mark_dirty(struct dl_db *db, int rel_id)
-pub export fn permindex_mark_dirty(db: ?*dx.dl_db, rel_id: c_int) void {
+pub export fn permindex_mark_dirty(db: ?*dl.DlDb, rel_id: c_int) void {
     const d = db orelse return;
 
     var pi: c_int = 0;
@@ -190,13 +184,13 @@ pub export fn permindex_mark_dirty(db: ?*dx.dl_db, rel_id: c_int) void {
 // ─── Free all permutation index relations ─────────────────────────────────
 
 /// void permindex_free_all(struct dl_db *db)
-pub export fn permindex_free_all(db: ?*dx.dl_db) void {
+pub export fn permindex_free_all(db: ?*dl.DlDb) void {
     const d = db orelse return;
 
     var i: c_int = 0;
     while (i < d.n_perms) : (i += 1) {
         if (d.perms[@intCast(i)].pidx_rel) |rel| {
-            relation.rel_free(@ptrCast(@alignCast(rel)));
+            relation.rel_free(rel);
             d.perms[@intCast(i)].pidx_rel = null;
         }
     }
@@ -221,7 +215,7 @@ const CollectCtx = struct {
 };
 
 test "permindex build/mark_dirty/build_dirty/free_all over a permuted base" {
-    var db = std.mem.zeroes(dx.dl_db);
+    var db = std.mem.zeroes(dl.DlDb);
 
     // One fixed arity-2 relation "edge" {(1,2),(1,3),(2,4)}.
     var name_buf = "edge".*;
@@ -234,9 +228,9 @@ test "permindex build/mark_dirty/build_dirty/free_all over a permuted base" {
     try testing.expect(relation.rel_add(r, &t3) > 0);
 
     db.rels[0].name = @ptrCast(&name_buf);
-    db.rels[0].kind = dx.RELK_FIXED;
+    db.rels[0].kind = dl.RELK_FIXED;
     db.rels[0].arity = 2;
-    db.rels[0].rel = @ptrCast(r);
+    db.rels[0].rel = r;
     db.nrels = 1;
 
     // perm index swapping the two columns: prow[j] = row[perm[j]]
@@ -258,7 +252,7 @@ test "permindex build/mark_dirty/build_dirty/free_all over a permuted base" {
 
     // permuted contents: (2,1),(3,1),(4,2) in sorted order
     var got = CollectCtx{};
-    const pidx: *const relation.Relation = @ptrCast(@alignCast(db.perms[0].pidx_rel));
+    const pidx: *const relation.Relation = db.perms[0].pidx_rel.?;
     try testing.expectEqual(@as(c_long, 3), relation.rel_prefix(pidx, null, 0, CollectCtx.cb, &got));
     try testing.expectEqual(@as(usize, 3), got.n);
     try testing.expectEqual(@as(u32, 2), got.rows[0][0]);
@@ -284,7 +278,7 @@ test "permindex build/mark_dirty/build_dirty/free_all over a permuted base" {
     try testing.expectEqual(@as(c_int, 0), permindex_build(&db, 0, 1));
     try testing.expect(db.perms[1].pidx_rel != null);
     var got_empty = CollectCtx{};
-    const pidx5: *const relation.Relation = @ptrCast(@alignCast(db.perms[1].pidx_rel));
+    const pidx5: *const relation.Relation = db.perms[1].pidx_rel.?;
     try testing.expectEqual(@as(c_long, 0), relation.rel_prefix(pidx5, null, 0, CollectCtx.cb, &got_empty));
 
     permindex_free_all(&db);

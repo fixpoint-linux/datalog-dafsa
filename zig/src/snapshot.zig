@@ -22,14 +22,7 @@ const c = std.c;
 
 const regexwalk = @import("regexwalk.zig");
 const relation = @import("relation.zig");
-
-// dl_internal.h: dl_db, rel_entry, view_cache_slot, DL_VIEW_CACHE_SZ,
-// RELK_VARIADIC/MAX_RELS, dl_tuple_cb/dl_join_cb, db_rel_at_arity_ro (dl.c).
-// dl_internal.h: dl_db, rel_entry, view_cache_slot, DL_VIEW_CACHE_SZ,
-// RELK_VARIADIC/MAX_RELS, dl_tuple_cb/dl_relation_cb, db_rel_at_arity_ro.
-// The datalog engine is now Zig; dl_internal.zig hand-declares these
-// C-layout structs + extern ABI in place of the removed @cImport.
-const dx = @import("dl_abi.zig");
+const dl = @import("dl.zig");
 
 // dafsa_internal.h: dafsa_view, view_trans_find/view_enum_dfs/view_edge_next,
 // dafsa_view_{open,close,rank_n,select_n,range_count_n,subtree_counts}.
@@ -107,7 +100,7 @@ const VpCtx = struct {
     leading: ?[*]const u32,
     k: u8,
     arity: u8,
-    cb: dx.dl_tuple_cb,
+    cb: relation.RelEnumCb,
     user: ?*anyopaque,
     count: c_long,
 };
@@ -140,7 +133,7 @@ fn vpDfsCb(payload: [*c]const u8, payload_len: usize, user: ?*anyopaque) callcon
 /// W\0 trap (requires a 0x00 edge before DFS).  We call view_enum_dfs
 /// directly from the prefix-walk endpoint, exactly as relation.c's
 /// prefix_dfs does.
-pub export fn view_prefix(view_handle: ?*anyopaque, arity: u8, leading: ?[*]const u32, k: u8, cb: dx.dl_tuple_cb, user: ?*anyopaque) c_long {
+pub export fn view_prefix(view_handle: ?*anyopaque, arity: u8, leading: ?[*]const u32, k: u8, cb: relation.RelEnumCb, user: ?*anyopaque) c_long {
     const v: [*c]const dc.dafsa_view = @ptrCast(@alignCast(view_handle orelse return -1));
     if (cb == null) return -1;
     if (k > arity) return -1;
@@ -203,9 +196,9 @@ pub export fn snapshot_read_current(db_dir: [*c]const u8) u32 {
 // ─── View cache ───────────────────────────────────────────────────────────
 
 /// void vcache_invalidate(view_cache_slot *vcache)
-pub export fn vcache_invalidate(vcache: [*c]dx.view_cache_slot) void {
+pub export fn vcache_invalidate(vcache: [*c]dl.ViewCacheSlot) void {
     var i: usize = 0;
-    while (i < dx.DL_VIEW_CACHE_SZ) : (i += 1) {
+    while (i < dl.DL_VIEW_CACHE_SZ) : (i += 1) {
         const slot = &vcache[i];
         if (slot.*.view) |view| {
             dc.dafsa_view_close(@ptrCast(@alignCast(view)));
@@ -226,13 +219,13 @@ fn strncpyZeroPad(dst: [*]u8, src: [*c]const u8) void {
 
 /// void *view_open_cached(view_cache_slot *vcache, const char *rel_name,
 ///                        const char *sdir) — open or find a cached view.
-pub export fn view_open_cached(vcache: [*c]dx.view_cache_slot, rel_name: [*c]const u8, sdir: [*c]const u8) ?*anyopaque {
+pub export fn view_open_cached(vcache: [*c]dl.ViewCacheSlot, rel_name: [*c]const u8, sdir: [*c]const u8) ?*anyopaque {
     var lru_idx: usize = 0;
     var empty_idx: isize = -1;
     var lru_used_val: c_int = 0x7FFFFFFF;
 
     var i: usize = 0;
-    while (i < dx.DL_VIEW_CACHE_SZ) : (i += 1) {
+    while (i < dl.DL_VIEW_CACHE_SZ) : (i += 1) {
         const slot = &vcache[i];
         if (slot.*.view != null and strEq(@ptrCast(&slot.*.rel_name), rel_name)) {
             slot.*.used += 1;
@@ -425,7 +418,7 @@ fn manifestParseLine(buf: [*c]u8, l: usize) ?ManifestEntry {
 
 /// Star-base capacity: db->rels is bounded by MAX_RELS (dl_internal.h), so a
 /// manifest can never carry more variadic star bases than this.
-const MAX_STAR_BASES: usize = dx.MAX_RELS;
+const MAX_STAR_BASES: usize = dl.MAX_RELS;
 
 /// Star-base name cap: names longer than this cannot be recorded for
 /// variant-line matching, so the walk fails loudly (-1) rather than
@@ -455,7 +448,7 @@ fn isVariantOf(name: []const u8, bases: []const [MAX_STAR_NAME + 1]u8, base_lens
 /// while skipping the star markers themselves and their per-variant
 /// 'name.<d>' lines.  Returns the emitted count, or -1 when the manifest is
 /// unreadable or carries a star base this walk cannot represent.
-pub export fn manifest_enumerate_rels(sdir: [*c]const u8, cb: dx.dl_relation_cb, user: ?*anyopaque) c_long {
+pub export fn manifest_enumerate_rels(sdir: [*c]const u8, cb: dl.DlRelationCb, user: ?*anyopaque) c_long {
     if (sdir == null or cb == null) return -1;
 
     var path: [8192:0]u8 = undefined;
@@ -572,7 +565,7 @@ pub export fn manifest_find_variants(sdir: [*c]const u8, rel_name: [*c]const u8,
 ///                          view_cache_slot *vcache, const char *goal_rel,
 ///                          const uint32_t *leading, uint8_t k,
 ///                          dl_tuple_cb cb, void *user)
-pub export fn snapshot_query_scan(db_dir: [*c]const u8, snap_version: c_uint, vcache: [*c]dx.view_cache_slot, goal_rel: [*c]const u8, leading: ?[*]const u32, k: u8, cb: dx.dl_tuple_cb, user: ?*anyopaque) c_long {
+pub export fn snapshot_query_scan(db_dir: [*c]const u8, snap_version: c_uint, vcache: [*c]dl.ViewCacheSlot, goal_rel: [*c]const u8, leading: ?[*]const u32, k: u8, cb: relation.RelEnumCb, user: ?*anyopaque) c_long {
     // Build snapshot dir path
     var sdir: [8192:0]u8 = undefined;
     _ = snprintf(&sdir, 8192, "%s/snapshots/%u", db_dir, snap_version);
@@ -622,7 +615,7 @@ pub export fn snapshot_query_scan(db_dir: [*c]const u8, snap_version: c_uint, vc
 
 const VpatCtx = struct {
     arity: u8,
-    cb: dx.dl_tuple_cb,
+    cb: relation.RelEnumCb,
     user: ?*anyopaque,
     count: c_long,
 };
@@ -640,7 +633,7 @@ fn vpatCb(key_bytes: [*c]const u8, key_len: usize, user: ?*anyopaque) callconv(.
 
 /// long view_pattern(void *view_handle, uint8_t arity,
 ///                   const struct regex_dfa *dfa, dl_tuple_cb cb, void *user)
-pub export fn view_pattern(view_handle: ?*anyopaque, arity: u8, dfa: ?*const regexwalk.regex_dfa, cb: dx.dl_tuple_cb, user: ?*anyopaque) c_long {
+pub export fn view_pattern(view_handle: ?*anyopaque, arity: u8, dfa: ?*const regexwalk.regex_dfa, cb: relation.RelEnumCb, user: ?*anyopaque) c_long {
     const v: [*c]const dc.dafsa_view = @ptrCast(@alignCast(view_handle orelse return -1));
     if (dfa == null or cb == null) return -1;
 
@@ -664,7 +657,7 @@ const VfilterCtx = struct {
     arity: u8,
     col: u8,
     set: ?*const regexwalk.sym_set,
-    cb: dx.dl_tuple_cb,
+    cb: relation.RelEnumCb,
     user: ?*anyopaque,
     count: c_long,
 };
@@ -680,7 +673,7 @@ fn vfilterCb(cols: [*c]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_i
 
 /// long view_filter_col(void *view_handle, uint8_t arity, uint8_t col,
 ///                      const struct sym_set *set, dl_tuple_cb cb, void *user)
-pub export fn view_filter_col(view_handle: ?*anyopaque, arity: u8, col: u8, set: ?*const regexwalk.sym_set, cb: dx.dl_tuple_cb, user: ?*anyopaque) c_long {
+pub export fn view_filter_col(view_handle: ?*anyopaque, arity: u8, col: u8, set: ?*const regexwalk.sym_set, cb: relation.RelEnumCb, user: ?*anyopaque) c_long {
     if (view_handle == null or set == null or cb == null) return -1;
     if (col >= arity) return 0; // out of range: no matches
 
@@ -1053,7 +1046,7 @@ test "view_open_cached LRU + vcache_invalidate" {
     const v0 = openTestView(path) orelse return error.TestUnexpectedResult;
     defer dc.dafsa_view_close(v0);
 
-    var vcache: [dx.DL_VIEW_CACHE_SZ]dx.view_cache_slot = std.mem.zeroes([dx.DL_VIEW_CACHE_SZ]dx.view_cache_slot);
+    var vcache: [dl.DL_VIEW_CACHE_SZ]dl.ViewCacheSlot = std.mem.zeroes([dl.DL_VIEW_CACHE_SZ]dl.ViewCacheSlot);
 
     const name = "t";
     const v1 = view_open_cached(&vcache, name, dir) orelse return error.TestUnexpectedResult;
@@ -1065,7 +1058,7 @@ test "view_open_cached LRU + vcache_invalidate" {
     // invalidate closes + zeroes
     vcache_invalidate(&vcache);
     var i: usize = 0;
-    while (i < dx.DL_VIEW_CACHE_SZ) : (i += 1) {
+    while (i < dl.DL_VIEW_CACHE_SZ) : (i += 1) {
         try testing.expect(vcache[i].view == null);
         try testing.expectEqual(@as(c_int, 0), vcache[i].used);
         try testing.expectEqual(@as(u8, 0), vcache[i].rel_name[0]);

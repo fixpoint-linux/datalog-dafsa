@@ -18,11 +18,7 @@ const c = std.c;
 
 const relation = @import("relation.zig");
 const snapshot = @import("snapshot.zig");
-
-// dl_internal.h: dl_db, rel_entry, RELK_VARIADIC.  The datalog engine is now
-// Zig; dl_internal.zig hand-declares the C-layout structs + extern ABI in
-// place of the removed @cImport("dl_internal.h").
-const dx = @import("dl_abi.zig");
+const dl = @import("dl.zig");
 
 // dafsa_internal.h: struct dafsa/State/Edge, trans_find, dafsa_view,
 // view_trans_find, view_edge_next, dafsa_view_open/close.  The engine is now
@@ -78,11 +74,11 @@ fn strEq(a: [*c]const u8, b: [*c]const u8) bool {
 
 /// Local relation lookup duplicating dl.c's static find_rel (keeps dl.c
 /// untouched).
-fn iter_find_rel(db: [*c]const dx.dl_db, name: [*c]const u8) c_int {
+fn iter_find_rel(db: [*c]const dl.DlDb, name: [*c]const u8) c_int {
     // NB: unwrap to a single-item pointer before field+subscript —
     // `p.*.rels[i]` on a [*c] misparses (subscript swallowed by the field).
     if (db == null) return -1;
-    const d: *const dx.dl_db = @ptrCast(db);
+    const d: *const dl.DlDb = @ptrCast(db);
     var i: usize = 0;
     while (i < d.nrels) : (i += 1) {
         if (strEq(d.rels[i].name, name))
@@ -189,7 +185,7 @@ fn iter_is_final(it: *const DlIter, f: *const Frame) bool {
 
 /// dl_iter *dl_iter_open(dl_db *db, const char *rel,
 ///                       const uint32_t *leading, uint8_t k)
-pub export fn dl_iter_open(db: ?*dx.dl_db, rel: [*c]const u8, leading: ?[*]const u32, k: u8) ?*DlIter {
+pub export fn dl_iter_open(db: ?*dl.DlDb, rel: [*c]const u8, leading: ?[*]const u32, k: u8) ?*DlIter {
     const d0 = db orelse return null;
     if (d0.dir == null or rel == null) return null;
     const mem = c.calloc(1, @sizeOf(DlIter)) orelse return null;
@@ -205,7 +201,7 @@ pub export fn dl_iter_open(db: ?*dx.dl_db, rel: [*c]const u8, leading: ?[*]const
         var path: [8192]u8 = undefined;
         var arity: u8 = 0;
         var variadic: c_int = 0;
-        _ = snprintf(&path, path.len, "%s/snapshots/%u", d0.dir, d0.snap_version);
+        _ = snprintf(&path, path.len, "%s/snapshots/%u", d0.dir.?, d0.snap_version);
         if (snapshot.manifest_find_rel_ex(&path, rel, &arity, &variadic) == 0) {
             c.free(mem);
             return null; // unknown rel in snapshot
@@ -222,7 +218,7 @@ pub export fn dl_iter_open(db: ?*dx.dl_db, rel: [*c]const u8, leading: ?[*]const
             c.free(mem);
             return null;
         }
-        _ = snprintf(&path, path.len, "%s/snapshots/%u/%s.dafsa", d0.dir, d0.snap_version, rel);
+        _ = snprintf(&path, path.len, "%s/snapshots/%u/%s.dafsa", d0.dir.?, d0.snap_version, rel);
         it.v = dc.dafsa_view_open(&path);
         if (it.v == null) {
             c.free(mem);
@@ -237,7 +233,7 @@ pub export fn dl_iter_open(db: ?*dx.dl_db, rel: [*c]const u8, leading: ?[*]const
             return null; // unknown rel
         }
         const e = &d0.rels[@intCast(idx)];
-        if (e.*.kind == dx.RELK_VARIADIC) {
+        if (e.*.kind == dl.RELK_VARIADIC) {
             c.free(mem);
             return null; // rejected
         }
@@ -413,9 +409,14 @@ fn mj_keys_equal(a: [*]const u32, b: [*]const u32, j: u8) bool {
     return true;
 }
 
+/// dl_join_cb — dl.h's join callback: (left cols, left arity, right cols,
+/// right arity, user).  No other module owns this typedef, so iter.zig (the
+/// only in-library consumer, via dl_merge_join) declares it locally.
+pub const DlJoinCb = ?*const fn (l: [*c]const u32, la: u8, r: [*c]const u32, ra: u8, user: ?*anyopaque) callconv(.c) c_int;
+
 /// long dl_merge_join(dl_iter *l, dl_iter *r, uint8_t jcols,
 ///                    dl_join_cb cb, void *user)
-pub export fn dl_merge_join(l: ?*DlIter, r: ?*DlIter, jcols: u8, cb: dx.dl_join_cb, user: ?*anyopaque) c_long {
+pub export fn dl_merge_join(l: ?*DlIter, r: ?*DlIter, jcols: u8, cb: DlJoinCb, user: ?*anyopaque) c_long {
     var lt: [MAX_ARITY]u32 = undefined;
     var rt: [MAX_ARITY]u32 = undefined;
     var rbuf: ?[*]u32 = null;
@@ -622,16 +623,16 @@ test "dl_iter_open_live open/seek/next/arity/close" {
 }
 
 test "dl_iter_open live branch over a dl_db" {
-    var db = std.mem.zeroes(dx.dl_db);
+    var db = std.mem.zeroes(dl.DlDb);
     var dir_buf = "/tmp/datalog_zig_u7_iterdir".*;
     var name_buf = "edge".*;
 
     const rel = makeTestRel() orelse return error.TestUnexpectedResult;
     db.dir = @ptrCast(&dir_buf);
     db.rels[0].name = @ptrCast(&name_buf);
-    db.rels[0].kind = dx.RELK_FIXED;
+    db.rels[0].kind = dl.RELK_FIXED;
     db.rels[0].arity = 2;
-    db.rels[0].rel = @ptrCast(rel);
+    db.rels[0].rel = rel;
     db.nrels = 1;
     db.snap_version = 0; // LIVE path
 
@@ -643,7 +644,7 @@ test "dl_iter_open live branch over a dl_db" {
     // "edge" at index 0 stays the first match for its own lookup)
     var vary_buf = "edgy".*;
     db.rels[1].name = @ptrCast(&vary_buf);
-    db.rels[1].kind = dx.RELK_VARIADIC;
+    db.rels[1].kind = dl.RELK_VARIADIC;
     db.rels[1].arity = 0;
     db.rels[1].vrel = null;
     db.rels[1].rel = null;

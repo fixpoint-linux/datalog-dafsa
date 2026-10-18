@@ -21,7 +21,6 @@
 const std = @import("std");
 const c = std.c;
 const util = @import("util.zig");
-const dx = @import("dl_abi.zig");
 
 /// dafsa_internal.h: MAX_WORD_LEN guard (intern-side, on str \0 id_u32BE).
 const MAX_WORD_LEN: usize = 65536;
@@ -312,7 +311,7 @@ pub export fn intern_str_of(ir: ?*Interner, sym_id: u32) ?[*:0]const u8 {
 /// live sym id from a raw int that merely happens to be small.  Takes the
 /// opaque dl_internal interner type (same layout as this module's
 /// Interner, which is what intern.h leaves opaque).
-pub fn liveSymBound(ir: ?*const dx.interner) u32 {
+pub fn liveSymBound(ir: ?*const anyopaque) u32 {
     if (ir == null) return 0;
     const s: *const Interner = @ptrCast(@alignCast(ir.?));
     return s.next_id;

@@ -31,17 +31,7 @@ const relation_mod = @import("relation.zig");
 const intern = @import("intern.zig");
 const termstore = @import("termstore.zig");
 const vrelation = @import("vrelation.zig");
-
-// dl_internal.h pulls in dl.h/intern.h/relation.h/vrelation.h/snapshot.h/
-// permindex.h/termstore.h/compiler.h — so this one @cImport supplies dl_db,
-// rel_entry, RELK_VARIADIC, the vm_instr/compiled_rule reference layouts, and
-// extern decls for dl_declare_relation / dl_ensure_variant /
-// dl_db_declare_perm / dl_db_find_perm / rel_* / vrel_count / intern_str /
-// term_cons.
-// dl_internal.h: dl_db + rel_entry + dl_*/rel_*/intern_*/term_* externs.
-// The datalog engine is now Zig; dl_internal.zig hand-declares the C-layout
-// structs + extern ABI in place of the removed @cImport("dl_internal.h").
-const dx = @import("dl_abi.zig");
+const dl = @import("dl.zig");
 
 // glibc strdup (not re-exported by std.c; parser.zig declares its own too).
 extern "c" fn strdup(s: [*c]const u8) ?[*:0]u8;
@@ -116,21 +106,7 @@ pub const compiled_rule = extern struct {
     patterns: ?[*]?*regexwalk.regex_dfa,
 };
 
-// Comptime gate: our extern layouts must be byte-identical to the C header
-// (translate-c produces the C struct, so size/offset equality proves it).
-comptime {
-    std.debug.assert(@sizeOf(vm_instr) == @sizeOf(dx.vm_instr));
-    std.debug.assert(@offsetOf(vm_instr, "imm") == @offsetOf(dx.vm_instr, "imm"));
-    std.debug.assert(@offsetOf(vm_instr, "slots") == @offsetOf(dx.vm_instr, "slots"));
-    std.debug.assert(@offsetOf(vm_instr, "body_idx") == @offsetOf(dx.vm_instr, "body_idx"));
-    std.debug.assert(@sizeOf(var_info) == @sizeOf(dx.var_info));
-    std.debug.assert(@offsetOf(var_info, "slot") == @offsetOf(dx.var_info, "slot"));
-    std.debug.assert(@sizeOf(compiled_rule) == @sizeOf(dx.compiled_rule));
-    std.debug.assert(@offsetOf(compiled_rule, "stratum") == @offsetOf(dx.compiled_rule, "stratum"));
-    std.debug.assert(@offsetOf(compiled_rule, "has_aggregate") == @offsetOf(dx.compiled_rule, "has_aggregate"));
-    std.debug.assert(@offsetOf(compiled_rule, "n_patterns") == @offsetOf(dx.compiled_rule, "n_patterns"));
-    std.debug.assert(@offsetOf(compiled_rule, "patterns") == @offsetOf(dx.compiled_rule, "patterns"));
-}
+// The owner-vs-mirror layout assertions live in abi_witness.zig.
 
 // ─── Compile-time toggles (plain writable DATA globals; see compiler.h) ────
 
@@ -239,7 +215,7 @@ pub export fn compile_clear_error() void {
 
 // ─── dl_db internals access (authoritative layout in dl_internal.h) ───────
 
-fn db_find_rel(db: *dx.dl_db, name: [*c]const u8) c_int {
+fn db_find_rel(db: *dl.DlDb, name: [*c]const u8) c_int {
     var i: usize = 0;
     while (i < db.nrels) : (i += 1) {
         if (strEq(db.rels[i].name, name)) return @intCast(i);
@@ -247,53 +223,52 @@ fn db_find_rel(db: *dx.dl_db, name: [*c]const u8) c_int {
     return -1;
 }
 
-fn db_rel_arity(db: *dx.dl_db, idx: c_int) u8 {
+fn db_rel_arity(db: *dl.DlDb, idx: c_int) u8 {
     if (idx < 0 or @as(usize, @intCast(idx)) >= db.nrels) return 0;
-    return relation_mod.rel_arity(@ptrCast(@alignCast(db.rels[@intCast(idx)].rel)));
+    return relation_mod.rel_arity(db.rels[@intCast(idx)].rel);
 }
 
-fn db_rel_name(db: *dx.dl_db, idx: c_int) ?[*c]const u8 {
+fn db_rel_name(db: *dl.DlDb, idx: c_int) ?[*c]const u8 {
     if (idx < 0 or @as(usize, @intCast(idx)) >= db.nrels) return null;
     return db.rels[@intCast(idx)].name;
 }
 
-fn db_rel_count(db: *dx.dl_db) usize {
+fn db_rel_count(db: *dl.DlDb) usize {
     return db.nrels;
 }
 
 /// B3: does the relation at `idx` hold ZERO rows?  (rel_count = DAFSA
 /// words + overlay tuples; the same predicate recordHeadKindsPub uses to
 /// decide whether a propagated kind may land on a non-empty relation.)
-fn headEmpty(db: *dx.dl_db, idx: c_int) bool {
+fn headEmpty(db: *dl.DlDb, idx: c_int) bool {
     if (idx < 0 or @as(usize, @intCast(idx)) >= db.nrels) return true;
     const e = &db.rels[@intCast(idx)];
-    if (e.kind == dx.RELK_VARIADIC) return false; // variadic kinds are untracked (G5)
-    const rel: ?*const relation_mod.Relation = @ptrCast(@alignCast(e.rel));
-    return relation_mod.rel_count(rel) == 0;
+    if (e.kind == dl.RELK_VARIADIC) return false; // variadic kinds are untracked (G5)
+    return relation_mod.rel_count(e.rel) == 0;
 }
 
-fn db_get_interner(db: *dx.dl_db) ?*dx.interner {
+fn db_get_interner(db: *dl.DlDb) ?*anyopaque {
     return db.ir;
 }
 
 /// M6-permsel: distinct-tuple estimate for the perm-selection cost gate.
-fn db_rel_card_est(db: *dx.dl_db, idx: c_int) u64 {
+fn db_rel_card_est(db: *dl.DlDb, idx: c_int) u64 {
     if (idx < 0 or @as(usize, @intCast(idx)) >= db.nrels) return 0;
-    if (db.rels[@intCast(idx)].kind == dx.RELK_VARIADIC)
-        return vrelation.vrel_count(@ptrCast(@alignCast(db.rels[@intCast(idx)].vrel)));
-    return relation_mod.rel_count_subtree(@ptrCast(@alignCast(db.rels[@intCast(idx)].rel)));
+    if (db.rels[@intCast(idx)].kind == dl.RELK_VARIADIC)
+        return vrelation.vrel_count(db.rels[@intCast(idx)].vrel);
+    return relation_mod.rel_count_subtree(db.rels[@intCast(idx)].rel);
 }
 
-fn db_rel_card(db: *dx.dl_db, idx: c_int) u64 {
+fn db_rel_card(db: *dl.DlDb, idx: c_int) u64 {
     if (idx < 0 or @as(usize, @intCast(idx)) >= db.nrels) return 0;
-    if (db.rels[@intCast(idx)].kind == dx.RELK_VARIADIC)
-        return vrelation.vrel_count(@ptrCast(@alignCast(db.rels[@intCast(idx)].vrel)));
-    return relation_mod.rel_count(@ptrCast(@alignCast(db.rels[@intCast(idx)].rel)));
+    if (db.rels[@intCast(idx)].kind == dl.RELK_VARIADIC)
+        return vrelation.vrel_count(db.rels[@intCast(idx)].vrel);
+    return relation_mod.rel_count(db.rels[@intCast(idx)].rel);
 }
 
-fn db_rel_is_variadic(db: *dx.dl_db, idx: c_int) c_int {
+fn db_rel_is_variadic(db: *dl.DlDb, idx: c_int) c_int {
     if (idx < 0 or @as(usize, @intCast(idx)) >= db.nrels) return 0;
-    return if (db.rels[@intCast(idx)].kind == dx.RELK_VARIADIC) 1 else 0;
+    return if (db.rels[@intCast(idx)].kind == dl.RELK_VARIADIC) 1 else 0;
 }
 
 // ─── Variable slot tracking ────────────────────────────────────────────────
@@ -478,7 +453,7 @@ fn mark_token_vars_bound(t: ?*const parser.token, vt: *v_tab, bound_vars: []c_in
 
 // ─── Parse a constant from a token ─────────────────────────────────────────
 
-fn token_const(db: *dx.dl_db, t: ?*const parser.token, out: *u32) c_int {
+fn token_const(db: *dl.DlDb, t: ?*const parser.token, out: *u32) c_int {
     const tt = t orelse return -1;
     if (tt.kind == parser.TOK_INT) {
         out.* = tt.ival;
@@ -550,7 +525,7 @@ fn token_const(db: *dx.dl_db, t: ?*const parser.token, out: *u32) c_int {
 
 // ─── List-pattern destructuring emission ───────────────────────────────────
 
-fn emit_pattern(db: *dx.dl_db, pat: *const parser.token, src_slot: u8, vt: *v_tab, ib: *i_buf, cc: *c_int, head_pred: [*c]const u8) c_int {
+fn emit_pattern(db: *dl.DlDb, pat: *const parser.token, src_slot: u8, vt: *v_tab, ib: *i_buf, cc: *c_int, head_pred: [*c]const u8) c_int {
     var cur: u8 = src_slot;
     var i: c_int = 0;
     while (i < pat.nchildren) : (i += 1) {
@@ -607,7 +582,7 @@ fn emit_pattern(db: *dx.dl_db, pat: *const parser.token, src_slot: u8, vt: *v_ta
 
 /// Emit post-join arg handling for atom a: each non-var arg is a constant
 /// filter (OP_EQ_CONST) or a list pattern (destructured from slots[j]).
-fn emit_const_or_pattern(db: *dx.dl_db, a: *const parser.atom, slots: [*]const u8, vt: *v_tab, ib: *i_buf, cc: *c_int, head_pred: [*c]const u8) c_int {
+fn emit_const_or_pattern(db: *dl.DlDb, a: *const parser.atom, slots: [*]const u8, vt: *v_tab, ib: *i_buf, cc: *c_int, head_pred: [*c]const u8) c_int {
     var j: c_int = 0;
     while (j < a.nargs) : (j += 1) {
         const t = a.args.?[@intCast(j)] orelse return 0;
@@ -769,7 +744,7 @@ fn range_operand_ok(t: ?*const parser.token) bool {
     return tt.kind == parser.TOK_VAR or tt.kind == parser.TOK_INT;
 }
 
-fn range_builtin_valid(db: *dx.dl_db, a: *const parser.atom) c_int {
+fn range_builtin_valid(db: *dl.DlDb, a: *const parser.atom) c_int {
     if (a.pred == null) return 0;
     if (a.nargs != 4) return 0;
     if (a.args.?[0].?.kind != parser.TOK_VAR) return 0;
@@ -851,7 +826,7 @@ fn expr_vars_bound(e: ?*const parser.expr, vt: *v_tab, bound_vars: []const c_int
 }
 
 /// Lower an expr tree postorder into bytecode.  Returns the slot index.
-fn lower_expr(db: *dx.dl_db, e: ?*const parser.expr, vt: *v_tab, ib: *i_buf, cc: *c_int, tc: *c_int, body_idx: c_int) c_int {
+fn lower_expr(db: *dl.DlDb, e: ?*const parser.expr, vt: *v_tab, ib: *i_buf, cc: *c_int, tc: *c_int, body_idx: c_int) c_int {
     var cname: [16]u8 = undefined;
     const ee = e orelse return -1;
     switch (ee.kind) {
@@ -888,7 +863,7 @@ fn lower_expr(db: *dx.dl_db, e: ?*const parser.expr, vt: *v_tab, ib: *i_buf, cc:
 }
 
 /// Resolve a comparison operand to a slot.
-fn cmp_operand_slot(db: *dx.dl_db, t: ?*const parser.token, vt: *v_tab, ib: *i_buf, cc: *c_int, allow_list: c_int) c_int {
+fn cmp_operand_slot(db: *dl.DlDb, t: ?*const parser.token, vt: *v_tab, ib: *i_buf, cc: *c_int, allow_list: c_int) c_int {
     const tt = t orelse return -1;
     if (tt.kind == parser.TOK_LIST and allow_list == 0) {
         cerr(g_rule_off, "compile error: list literal not allowed in this position (lists have no meaningful order; use = / != via variables)\n", .{});
@@ -985,7 +960,7 @@ const Edge = struct {
     is_neg: c_int,
 };
 
-fn compute_strata(db: *dx.dl_db, rules: [*]?*parser.rule, n_rules: c_int, out_strata: [*]c_int, out_recursive: [*]c_int, out_max: c_int) c_int {
+fn compute_strata(db: *dl.DlDb, rules: [*]?*parser.rule, n_rules: c_int, out_strata: [*]c_int, out_recursive: [*]c_int, out_max: c_int) c_int {
     const nrels = db_rel_count(db);
     if (nrels == 0 or out_max < 1) return 0;
 
@@ -1350,9 +1325,7 @@ fn compute_strata(db: *dx.dl_db, rules: [*]?*parser.rule, n_rules: c_int, out_st
     // Seed recursion from ALREADY-COMPILED rules (carry recursion across
     // dl_load_rules batches).
     if (db.crules != null) {
-        // translate-c maps `compiled_rule **` to `[*c][*c]compiled_rule`; cast
-        // to a many-item pointer of optional single-item pointers for indexing.
-        const crules: [*]?*dx.compiled_rule = @ptrCast(db.crules);
+        const crules = db.crules.?;
         i = 0;
         while (i < db.n_crules) : (i += 1) {
             const pcr = crules[@intCast(i)] orelse continue;
@@ -1438,7 +1411,7 @@ const BUSHY_MAX_CUT = 2;
 const BUSHY_MAX_ATOMS = 16;
 
 const emit_ctx = struct {
-    db: *dx.dl_db,
+    db: *dl.DlDb,
     r: *const parser.rule,
     bri: [*]const c_int,
     pat_idx: [*]const u8,
@@ -1551,7 +1524,7 @@ fn mask_to_slots(m: u64, out: [*]u8) c_int {
     return n;
 }
 
-fn reorder_pos_atoms(db: *dx.dl_db, bri: [*]const c_int, mask: [*]const u64, order: [*]c_int, n: c_int) void {
+fn reorder_pos_atoms(db: *dl.DlDb, bri: [*]const c_int, mask: [*]const u64, order: [*]c_int, n: c_int) void {
     const m = if (n > 0) @as(usize, @intCast(n)) else 1;
     const used: [*]c_int = @ptrCast(@alignCast(c.calloc(m, @sizeOf(c_int)) orelse return));
     const res: [*]c_int = @ptrCast(@alignCast(c.malloc(m * @sizeOf(c_int)) orelse {
@@ -1593,7 +1566,7 @@ fn pack_perm(perm: [*]const u8, arity: u8) u32 {
     return p;
 }
 
-fn emit_nonleading_join(db: *dx.dl_db, r: *const parser.rule, curr: *const parser.atom, rel_id: c_int, sc: [*]const c_int, recursive: ?[*]const c_int, vt: *v_tab, ib: *i_buf, cc: *c_int, ip: *vm_instr, bi: c_int) c_int {
+fn emit_nonleading_join(db: *dl.DlDb, r: *const parser.rule, curr: *const parser.atom, rel_id: c_int, sc: [*]const c_int, recursive: ?[*]const c_int, vt: *v_tab, ib: *i_buf, cc: *c_int, ip: *vm_instr, bi: c_int) c_int {
     var perm_arr: [8]u8 = undefined;
     var n_join: u8 = 0;
     var n_other: u8 = 0;
@@ -1618,7 +1591,7 @@ fn emit_nonleading_join(db: *dx.dl_db, r: *const parser.rule, curr: *const parse
     var perm_id: c_int = -1;
 
     if (recursive != null and recursive.?[@intCast(rel_id)] != 0) {
-        perm_id = dx.dl_db_declare_perm(db, rel_id, @intCast(curr.nargs), &perm_arr);
+        perm_id = dl.dl_db_declare_perm(db, rel_id, @intCast(curr.nargs), &perm_arr);
         if (perm_id < 0) {
             cerr(r.off, "compile error: too many permutation indices (rule '{s}')\n", .{cs(r.head.?.pred)});
             return -1;
@@ -1627,12 +1600,12 @@ fn emit_nonleading_join(db: *dx.dl_db, r: *const parser.rule, curr: *const parse
     } else if (gPermSelectRef().* == 0) {
         use_perm = 0;
     } else {
-        const existing = dx.dl_db_find_perm(db, rel_id, @intCast(curr.nargs), &perm_arr);
+        const existing = dl.dl_db_find_perm(db, rel_id, @intCast(curr.nargs), &perm_arr);
         if (existing >= 0) {
             perm_id = existing;
             use_perm = 1;
         } else if (db_rel_card_est(db, rel_id) >= @as(u64, @intCast(gPermCardThresholdRef().*))) {
-            perm_id = dx.dl_db_declare_perm(db, rel_id, @intCast(curr.nargs), &perm_arr);
+            perm_id = dl.dl_db_declare_perm(db, rel_id, @intCast(curr.nargs), &perm_arr);
             if (perm_id >= 0) use_perm = 1;
         }
     }
@@ -1659,7 +1632,7 @@ fn emit_nonleading_join(db: *dx.dl_db, r: *const parser.rule, curr: *const parse
     return 0;
 }
 
-fn emit_pos_atom(db: *dx.dl_db, r: *const parser.rule, bi: c_int, bri: [*]const c_int, pat_idx: [*]const u8, pat_col: [*]const u8, bound: u64, is_first: c_int, vt: *v_tab, ib: *i_buf, cc: *c_int, recursive: ?[*]const c_int) c_int {
+fn emit_pos_atom(db: *dl.DlDb, r: *const parser.rule, bi: c_int, bri: [*]const c_int, pat_idx: [*]const u8, pat_col: [*]const u8, bound: u64, is_first: c_int, vt: *v_tab, ib: *i_buf, cc: *c_int, recursive: ?[*]const c_int) c_int {
     const curr = r.body.?[@intCast(bi)] orelse return -1;
     var sc: [8]c_int = [_]c_int{0} ** 8;
     var k: c_int = 0;
@@ -1928,7 +1901,7 @@ fn emit_bushy_tree(ec: *emit_ctx, atoms: [*]const c_int, n: c_int, iface_slots: 
 
 // ─── Compile one rule ──────────────────────────────────────────────────────
 
-fn compile_one(db: *dx.dl_db, r: *parser.rule, rel_strata: ?[*]const c_int, recursive: ?[*]const c_int) ?*compiled_rule {
+fn compile_one(db: *dl.DlDb, r: *parser.rule, rel_strata: ?[*]const c_int, recursive: ?[*]const c_int) ?*compiled_rule {
     g_rule_off = r.off;
 
     var vt: v_tab = std.mem.zeroes(v_tab);
@@ -2076,7 +2049,7 @@ fn compile_one(db: *dx.dl_db, r: *parser.rule, rel_strata: ?[*]const c_int, recu
             cerr(r.off, "compile error: head arity {d} for '{s}'\n", .{ r.head.?.nargs, cs(r.head.?.pred) });
             return null;
         }
-        if (dx.dl_declare_relation(db, cs(r.head.?.pred), @intCast(r.head.?.nargs)) != 0) {
+        if (dl.dl_declare_relation(db, cs(r.head.?.pred), @intCast(r.head.?.nargs)) != 0) {
             cerr(r.off, "compile error: cannot declare '{s}/{d}'\n", .{ cs(r.head.?.pred), r.head.?.nargs });
             return null;
         }
@@ -2087,7 +2060,7 @@ fn compile_one(db: *dx.dl_db, r: *parser.rule, rel_strata: ?[*]const c_int, recu
             cerr(r.off, "compile error: head arity {d} for variadic '{s}'\n", .{ r.head.?.nargs, cs(r.head.?.pred) });
             return null;
         }
-        if (dx.dl_ensure_variant(db, head_ri, @intCast(r.head.?.nargs)) == null) {
+        if (dl.dl_ensure_variant(db, head_ri, @intCast(r.head.?.nargs)) == null) {
             cerr(r.off, "compile error: cannot materialize variant {d} of variadic '{s}'\n", .{ r.head.?.nargs, cs(r.head.?.pred) });
             return null;
         }
@@ -3122,20 +3095,17 @@ fn colTypeKind(tag: c_int) u8 {
 /// Column kind lookup: schema-declared > cache > RECORDED.  No content
 /// inference anywhere — a stored u32's value space is not observable (the
 /// shared interner resolves small raw ints as symbols and vice versa).
-fn relColKind(db: *dx.dl_db, cache: [*][HOMOG_MAX_ARITY]u8, ri: c_int, col: u8, arity: u8) u8 {
+fn relColKind(db: *dl.DlDb, cache: [*][HOMOG_MAX_ARITY]u8, ri: c_int, col: u8, arity: u8) u8 {
     if (ri < 0 or col >= HOMOG_MAX_ARITY or arity > HOMOG_MAX_ARITY or arity == 0) return KIND_UNKNOWN;
     const rix: usize = @intCast(ri);
     if (rix >= db.nrels or rix >= HOMOG_MAX_RELS) return KIND_UNKNOWN;
     const e = &db.rels[rix];
-    if (e.kind == dx.RELK_VARIADIC) return KIND_UNKNOWN;
+    if (e.kind == dl.RELK_VARIADIC) return KIND_UNKNOWN;
 
     // attached schema: the DECLARED kind is authoritative for relations it
     // declares (and keeps the typed path at least as strict as before).
-    // db.schema is the opaque dl_internal mirror of schema.zig's concrete
-    // dl_schema (same layout).
     if (db.schema) |schm| {
-        const schm_typed: ?*const schema.dl_schema = @ptrCast(@alignCast(schm));
-        if (schema.dl_schema_find(schm_typed, e.name)) |rd| {
+        if (schema.dl_schema_find(schm, e.name)) |rd| {
             if (col < rd.arity)
                 return colTypeKind(rd.cols[col].tag);
             return KIND_UNKNOWN;
@@ -3147,7 +3117,7 @@ fn relColKind(db: *dx.dl_db, cache: [*][HOMOG_MAX_ARITY]u8, ri: c_int, col: u8, 
     // the RECORDED kind (S2): established at insert time, persisted in
     // rels.txt — visible through every eval clone because clones alias the
     // relation pointers (Relation tail field).
-    const rel_concrete: ?*const relation_mod.Relation = @ptrCast(@alignCast(e.rel));
+    const rel_concrete: ?*const relation_mod.Relation = e.rel;
     return relation_mod.rel_col_kind(rel_concrete, col);
 }
 
@@ -3168,7 +3138,7 @@ fn relColKind(db: *dx.dl_db, cache: [*][HOMOG_MAX_ARITY]u8, ri: c_int, col: u8, 
 /// c:no-kind and a downstream `q(N):-c(N),f(N).` over symbols silently
 /// answered the id-collision join (MEASURED pre-S3c: rc=0, q={2} where the
 /// standard is {}).
-fn propagateHeadKinds(db: *dx.dl_db, rules: [*]?*parser.rule, n_rules: c_int, cache: [*][HOMOG_MAX_ARITY]u8) c_int {
+fn propagateHeadKinds(db: *dl.DlDb, rules: [*]?*parser.rule, n_rules: c_int, cache: [*][HOMOG_MAX_ARITY]u8) c_int {
     // G2: cross-rule MIXED-HEAD conflict.  A head column that is INT in one
     // rule and SYM in another is itself the defect — the shared u32 value
     // space makes the two derivations dedupe against each other (MEASURED:
@@ -3191,7 +3161,7 @@ fn propagateHeadKinds(db: *dx.dl_db, rules: [*]?*parser.rule, n_rules: c_int, ca
             if (head.nargs < 1 or head.nargs > HOMOG_MAX_ARITY) continue;
             const hri = db_find_rel(db, cs(head.pred));
             if (hri < 0 or hri >= HOMOG_MAX_RELS) continue;
-            if (db.rels[@intCast(hri)].kind == dx.RELK_VARIADIC) continue;
+            if (db.rels[@intCast(hri)].kind == dl.RELK_VARIADIC) continue;
             // var -> joined kind from body atoms (positive, relational)
             var vnames: [MAX_VARS]?[*c]const u8 = undefined;
             var vkinds: [MAX_VARS]u8 = undefined;
@@ -3432,7 +3402,7 @@ fn exprSymVar(e: ?*const parser.expr, names: []const ?[*c]const u8, kinds: []con
 /// S3c: the RESULT vars of aggregate / arithmetic atoms get a kind in the
 /// RELATIONAL-table build too, so a downstream rule joining them is checked
 /// (the head-propagation side lives in propagateHeadKinds).
-fn checkRuleVarKinds(db: *dx.dl_db, cache: [*][HOMOG_MAX_ARITY]u8, r: *parser.rule, rule_no: c_int) c_int {
+fn checkRuleVarKinds(db: *dl.DlDb, cache: [*][HOMOG_MAX_ARITY]u8, r: *parser.rule, rule_no: c_int) c_int {
     const VN: usize = MAX_VARS; // compile_one rejects >64 distinct vars outright, so this table never truncates
     var vnames: [VN]?[*c]const u8 = undefined;
     var vint_rel: [VN]?[*c]const u8 = undefined;
@@ -3712,9 +3682,9 @@ fn checkRuleVarKinds(db: *dx.dl_db, cache: [*][HOMOG_MAX_ARITY]u8, r: *parser.ru
 /// a goal head's column kind is only derivable through its defining rules
 /// (the relation itself is empty at that point), exactly like the
 /// compile-time check.  Returns the kind, or KIND_UNKNOWN.
-pub fn relKindWithRulesPub(db: *dx.dl_db, ri: c_int, col: u8, arity: u8) u8 {
+pub fn relKindWithRulesPub(db: *dl.DlDb, ri: c_int, col: u8, arity: u8) u8 {
     var cache = [_][HOMOG_MAX_ARITY]u8{[_]u8{0} ** HOMOG_MAX_ARITY} ** HOMOG_MAX_RELS;
-    const resident: ?[*]?*parser.rule = @ptrCast(@constCast(db.ast_rules));
+    const resident: ?[*]?*parser.rule = db.ast_rules;
     if (propagateHeadKinds(db, resident orelse return KIND_UNKNOWN, db.n_ast_rules, &cache) != 0) return KIND_UNKNOWN;
     return relColKind(db, &cache, ri, col, arity);
 }
@@ -3728,9 +3698,9 @@ pub fn relKindWithRulesPub(db: *dx.dl_db, ri: c_int, col: u8, arity: u8) u8 {
 /// conflict), so this never overwrites what loaded facts established.  Runs
 /// on the REAL db (never an eval clone): eval clones alias relation
 /// POINTERS, so the record lands in the one shared Relation.
-pub fn recordHeadKindsPub(db: *dx.dl_db) void {
+pub fn recordHeadKindsPub(db: *dl.DlDb) void {
     if (db.n_ast_rules <= 0) return;
-    const resident: ?[*]?*parser.rule = @ptrCast(@constCast(db.ast_rules));
+    const resident: ?[*]?*parser.rule = db.ast_rules;
     if (resident == null) return;
 
     var cache = [_][HOMOG_MAX_ARITY]u8{[_]u8{0} ** HOMOG_MAX_ARITY} ** HOMOG_MAX_RELS;
@@ -3742,8 +3712,8 @@ pub fn recordHeadKindsPub(db: *dx.dl_db) void {
         // already declare it (relColKind prefers the schema; the Relation
         // tail would carry a shadow copy the schema overrides anyway).
         const e = &db.rels[ri];
-        if (e.kind == dx.RELK_VARIADIC) continue;
-        const rel: ?*relation_mod.Relation = @ptrCast(@alignCast(e.rel));
+        if (e.kind == dl.RELK_VARIADIC) continue;
+        const rel: ?*relation_mod.Relation = e.rel;
         if (rel == null) continue;
         const ar = relation_mod.rel_arity(rel);
         if (ar == 0 or ar > HOMOG_MAX_ARITY) continue;
@@ -3796,7 +3766,7 @@ const KindAtomIterator = struct {
 /// CONSTANT whose kind contradicts its column.  Symmetric (int-vs-sym-col
 /// and sym-vs-int-col both fire).  Returns 0, or -1 after cerr() on the
 /// first mismatch.
-pub fn checkAllRuleConstKinds(db: *dx.dl_db, rules: [*]?*parser.rule, n_rules: c_int) c_int {
+pub fn checkAllRuleConstKinds(db: *dl.DlDb, rules: [*]?*parser.rule, n_rules: c_int) c_int {
     if (n_rules <= 0) return 0;
     // Fresh check, fresh sink: every caller (compile_rules, the SH2 merged
     // re-check in dl_load_rules, the G1 fact-load recheck) runs this as an
@@ -3853,7 +3823,7 @@ pub fn checkAllRuleConstKinds(db: *dx.dl_db, rules: [*]?*parser.rule, n_rules: c
 // ─── Public API ────────────────────────────────────────────────────────────
 
 /// int compile_rules(dl_db*, rule**, int, compiled_rule***, int*)
-pub export fn compile_rules(db: ?*dx.dl_db, rules: ?[*]?*parser.rule, n_rules: c_int, out_rules: ?*?[*]?*compiled_rule, out_n: ?*c_int) c_int {
+pub export fn compile_rules(db: ?*dl.DlDb, rules: ?[*]?*parser.rule, n_rules: c_int, out_rules: ?*?[*]?*compiled_rule, out_n: ?*c_int) c_int {
     compile_has_err = 0;
     compile_err_off = 0;
     compile_err_msg[0] = 0;
@@ -3870,7 +3840,7 @@ pub export fn compile_rules(db: ?*dx.dl_db, rules: ?[*]?*parser.rule, n_rules: c
                 cerr(r.off, "compile error: head arity {d} for '{s}'\n", .{ r.head.?.nargs, cs(r.head.?.pred) });
                 return -1;
             }
-            if (dx.dl_declare_relation(d, cs(r.head.?.pred), @intCast(r.head.?.nargs)) != 0) {
+            if (dl.dl_declare_relation(d, cs(r.head.?.pred), @intCast(r.head.?.nargs)) != 0) {
                 cerr(r.off, "compile error: cannot declare '{s}/{d}'\n", .{ cs(r.head.?.pred), r.head.?.nargs });
                 return -1;
             }
@@ -4011,21 +3981,21 @@ fn testRmRf(path: [*:0]const u8) void {
 }
 
 /// Fresh writable db at `path` (removed first so card counts are exact).
-fn testOpenDb(path: [*:0]const u8) *dx.dl_db {
+fn testOpenDb(path: [*:0]const u8) *dl.DlDb {
     testRmRf(path);
-    return dx.dl_open(path) orelse @panic("dl_open failed");
+    return dl.dl_open(path) orelse @panic("dl_open failed");
 }
 
-fn testCloseDb(db: *dx.dl_db, path: [*:0]const u8) void {
-    dx.dl_close(db);
+fn testCloseDb(db: *dl.DlDb, path: [*:0]const u8) void {
+    dl.dl_close(db);
     testRmRf(path);
 }
 
 /// Add `n` facts row-major `cols` (arity `ar` each) to `rel`.
-fn testAddFacts(db: *dx.dl_db, rel: [*:0]const u8, cols: []const u32, ar: u8, n: usize) void {
+fn testAddFacts(db: *dl.DlDb, rel: [*:0]const u8, cols: []const u32, ar: u8, n: usize) void {
     var i: usize = 0;
     while (i < n) : (i += 1) {
-        const rc = dx.dl_add_fact(db, rel, cols.ptr + i * ar, ar);
+        const rc = dl.dl_add_fact(db, rel, cols.ptr + i * ar, ar);
         if (rc != 1) @panic("dl_add_fact failed");
     }
 }
@@ -4039,7 +4009,7 @@ fn testResetToggles() void {
 }
 
 /// Compile `src` against `db` and return the compiled_rule** array (n out).
-fn testCompile(db: *dx.dl_db, src: [*:0]const u8, n_out: *c_int) ?[*]?*compiled_rule {
+fn testCompile(db: *dl.DlDb, src: [*:0]const u8, n_out: *c_int) ?[*]?*compiled_rule {
     const pd = testParse(src) orelse return null;
     defer testParseFree(pd);
     var arr: ?[*]?*compiled_rule = null;
@@ -4070,7 +4040,7 @@ test "compile_rules: fact + simple rule bytecode shape (SCAN/PROJECT/HALT)" {
     var ops_buf: [16]u8 = undefined;
 
     // The "fact" half: two ground facts in the EDB relation the rule reads.
-    try testing.expectEqual(@as(c_int, 0), dx.dl_declare_relation(db, "edge", 2));
+    try testing.expectEqual(@as(c_int, 0), dl.dl_declare_relation(db, "edge", 2));
     testAddFacts(db, "edge", &.{ 1, 2, 2, 3 }, 2, 2);
 
     var n: c_int = 0;
@@ -4125,8 +4095,8 @@ test "reorder toggle: 0 restores v1 body order; 1 reorders small-rel-first" {
     defer testCloseDb(db, path);
     var ops_buf: [16]u8 = undefined;
 
-    try testing.expectEqual(@as(c_int, 0), dx.dl_declare_relation(db, "big", 2));
-    try testing.expectEqual(@as(c_int, 0), dx.dl_declare_relation(db, "small", 2));
+    try testing.expectEqual(@as(c_int, 0), dl.dl_declare_relation(db, "big", 2));
+    try testing.expectEqual(@as(c_int, 0), dl.dl_declare_relation(db, "small", 2));
     testAddFacts(db, "big", &.{ 1, 1, 2, 2, 3, 3, 4, 4, 5, 5 }, 2, 5);
     // small stays EMPTY: the reorder hint db_rel_card() = rel_count() is the
     // DAFSA final-state count, and same-arity keys all share the terminator
@@ -4188,8 +4158,8 @@ test "perm_select toggle: OP_LOOKUP_PERM vs OP_HASH_JOIN fallback" {
     defer testCloseDb(db, path);
     var ops_buf: [16]u8 = undefined;
 
-    try testing.expectEqual(@as(c_int, 0), dx.dl_declare_relation(db, "r0", 2));
-    try testing.expectEqual(@as(c_int, 0), dx.dl_declare_relation(db, "s", 2));
+    try testing.expectEqual(@as(c_int, 0), dl.dl_declare_relation(db, "r0", 2));
+    try testing.expectEqual(@as(c_int, 0), dl.dl_declare_relation(db, "s", 2));
     testAddFacts(db, "r0", &.{ 1, 2 }, 2, 1);
     // 5 facts >= perm_card_threshold (4): perm index deemed worth it.
     testAddFacts(db, "s", &.{ 1, 1, 2, 2, 3, 3, 4, 4, 5, 5 }, 2, 5);
@@ -4240,7 +4210,7 @@ test "bushy toggle: left-deep when 0, MAT_BEGIN/MAT_JOIN plan when 1" {
     var ops_buf: [16]u8 = undefined;
 
     inline for (.{ "a", "b", "c", "d" }) |rel| {
-        try testing.expectEqual(@as(c_int, 0), dx.dl_declare_relation(db, rel, 2));
+        try testing.expectEqual(@as(c_int, 0), dl.dl_declare_relation(db, rel, 2));
         testAddFacts(db, rel, &.{ 1, 1 }, 2, 1);
     }
 
@@ -4306,7 +4276,7 @@ test "SCC stratification: recursive tc gets stratum 0 + is_recursive" {
     defer testCloseDb(db, path);
     var ops_buf: [16]u8 = undefined;
 
-    try testing.expectEqual(@as(c_int, 0), dx.dl_declare_relation(db, "edge", 2));
+    try testing.expectEqual(@as(c_int, 0), dl.dl_declare_relation(db, "edge", 2));
     testAddFacts(db, "edge", &.{ 1, 2, 2, 3 }, 2, 2);
 
     var n: c_int = 0;
@@ -4357,8 +4327,8 @@ test "stratified negation: NEG_CHECK filter inside the scan frame + stratum 1" {
     defer testCloseDb(db, path);
     var ops_buf: [16]u8 = undefined;
 
-    try testing.expectEqual(@as(c_int, 0), dx.dl_declare_relation(db, "edge", 2));
-    try testing.expectEqual(@as(c_int, 0), dx.dl_declare_relation(db, "blocked", 1));
+    try testing.expectEqual(@as(c_int, 0), dl.dl_declare_relation(db, "edge", 2));
+    try testing.expectEqual(@as(c_int, 0), dl.dl_declare_relation(db, "blocked", 1));
     testAddFacts(db, "edge", &.{ 1, 2 }, 2, 1);
     testAddFacts(db, "blocked", &.{2}, 1, 1);
 
@@ -4391,8 +4361,8 @@ test "unsafe negation rejected: message + rule-head offset" {
     const db = testOpenDb(path);
     defer testCloseDb(db, path);
 
-    try testing.expectEqual(@as(c_int, 0), dx.dl_declare_relation(db, "edge", 1));
-    try testing.expectEqual(@as(c_int, 0), dx.dl_declare_relation(db, "q", 1));
+    try testing.expectEqual(@as(c_int, 0), dl.dl_declare_relation(db, "edge", 1));
+    try testing.expectEqual(@as(c_int, 0), dl.dl_declare_relation(db, "q", 1));
 
     const src = "p(X):-edge(X),!q(Y).\n";
     const pd = testParse(src) orelse return error.TestUnexpectedResult;
@@ -4416,7 +4386,7 @@ test "compile_last_error offset fidelity: error in the THIRD rule of a program" 
     const db = testOpenDb(path);
     defer testCloseDb(db, path);
 
-    try testing.expectEqual(@as(c_int, 0), dx.dl_declare_relation(db, "edge", 1));
+    try testing.expectEqual(@as(c_int, 0), dl.dl_declare_relation(db, "edge", 1));
 
     // "r(X):-edge(X).\n" = 15 bytes, "s(X):-edge(X).\n" = 15 -> the bad
     // rule's head 't' sits at byte offset 30.
@@ -4441,7 +4411,7 @@ test "unstratifiable program rejected: negation through a recursion cycle" {
     const db = testOpenDb(path);
     defer testCloseDb(db, path);
 
-    try testing.expectEqual(@as(c_int, 0), dx.dl_declare_relation(db, "move", 2));
+    try testing.expectEqual(@as(c_int, 0), dl.dl_declare_relation(db, "move", 2));
     testAddFacts(db, "move", &.{ 1, 2 }, 2, 1);
 
     const src = "win(X):-move(X,Y),!win(Y).\n";
@@ -4463,16 +4433,10 @@ test "extern struct layouts match src/compiler.h (LP64, pinned offsets)" {
     try testing.expectEqual(@as(usize, 4), @offsetOf(vm_instr, "imm"));
     try testing.expectEqual(@as(usize, 8), @offsetOf(vm_instr, "slots"));
     try testing.expectEqual(@as(usize, 16), @offsetOf(vm_instr, "body_idx"));
-    try testing.expectEqual(@sizeOf(dx.vm_instr), @sizeOf(vm_instr));
-    try testing.expectEqual(@offsetOf(dx.vm_instr, "imm"), @offsetOf(vm_instr, "imm"));
-    try testing.expectEqual(@offsetOf(dx.vm_instr, "slots"), @offsetOf(vm_instr, "slots"));
-    try testing.expectEqual(@offsetOf(dx.vm_instr, "body_idx"), @offsetOf(vm_instr, "body_idx"));
 
     // var_info: char* name + u8 slot, align 8.
     try testing.expectEqual(@as(usize, 16), @sizeOf(var_info));
     try testing.expectEqual(@as(usize, 8), @offsetOf(var_info, "slot"));
-    try testing.expectEqual(@sizeOf(dx.var_info), @sizeOf(var_info));
-    try testing.expectEqual(@offsetOf(dx.var_info, "slot"), @offsetOf(var_info, "slot"));
 
     // compiled_rule: 5 pointers + 4 ints interleaved with two u8s.
     try testing.expectEqual(@as(usize, 0), @offsetOf(compiled_rule, "head_pred"));
@@ -4487,7 +4451,4 @@ test "extern struct layouts match src/compiler.h (LP64, pinned offsets)" {
     try testing.expectEqual(@as(usize, 52), @offsetOf(compiled_rule, "n_patterns"));
     try testing.expectEqual(@as(usize, 56), @offsetOf(compiled_rule, "patterns"));
     try testing.expectEqual(@as(usize, 64), @sizeOf(compiled_rule));
-    try testing.expectEqual(@sizeOf(dx.compiled_rule), @sizeOf(compiled_rule));
-    try testing.expectEqual(@offsetOf(dx.compiled_rule, "stratum"), @offsetOf(compiled_rule, "stratum"));
-    try testing.expectEqual(@offsetOf(dx.compiled_rule, "patterns"), @offsetOf(compiled_rule, "patterns"));
 }

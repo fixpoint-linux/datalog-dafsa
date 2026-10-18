@@ -31,25 +31,19 @@ const parser = @import("parser.zig");
 const compiler = @import("compiler.zig");
 const tupleset = @import("tupleset.zig");
 const magic = @import("magic.zig");
-
-// dl_internal.h pulls in dl.h/intern.h/relation.h/.../compiler.h/regexwalk.h —
-// supplying dl_db, dl_tuple_cb, dl_db_get_perm (permindex.h), and the extern
-// decls for every still-C function this unit calls.
-// dl_internal.h: dl_db + dl_* externs.  The datalog engine is now Zig;
-// dl_internal.zig hand-declares the C-layout structs + extern ABI in place of
-// the removed @cImport("dl_internal.h").
-const dx = @import("dl_abi.zig");
+const relation = @import("relation.zig");
+const dl = @import("dl.zig");
 
 const vm_instr = compiler.vm_instr;
 const compiled_rule = compiler.compiled_rule;
 const tuple_set = tupleset.tuple_set;
-const DlTupleCb = dx.dl_tuple_cb;
+const DlTupleCb = relation.RelEnumCb;
 
-// vm_exec_rule is vm.zig's `pub export fn`; declare it against OUR @cImport'd
-// dl_db (each module's translate-c produces a distinct type for the same C
-// struct).
+// vm_exec_rule is vm.zig's `pub export fn`.  It stays on the extern path
+// because `vm_override` is duplicated here (byte-identical to vm.zig's) and
+// unifying the two would force a cast or a deleted declaration.
 extern "c" fn vm_exec_rule(
-    db: ?*dx.dl_db,
+    db: ?*dl.DlDb,
     cr: ?*const compiler.compiled_rule,
     ov: ?[*]const vm_override,
     n_ov: c_int,
@@ -139,7 +133,7 @@ const td_consumer = struct { rule: c_int, body: c_int };
 const consumer_vec = struct { v: ?[*]td_consumer, n: c_int, cap: c_int };
 
 const td_ctx = struct {
-    edb: ?*dx.dl_db,
+    edb: ?*dl.DlDb,
     crules: ?[*]?*compiled_rule,
     n_crules: c_int,
 
@@ -467,7 +461,7 @@ fn fireRule(cctx: *td_ctx, ri: c_int, guard_ts: *const tuple_set, delta_body: c_
 
         const op = m.op_at.?[@intCast(j)];
         if (op == OP_LOOKUP_PERM) {
-            const perm = dx.dl_db_get_perm(cctx.edb.?, m.rel_at.?[@intCast(j)], m.perm_at.?[@intCast(j)]);
+            const perm = dl.dl_db_get_perm(cctx.edb.?, m.rel_at.?[@intCast(j)], m.perm_at.?[@intCast(j)]);
             if (perm == null or src.arity > 8) return -1;
             const sh = &shadows[@intCast(n_ov)];
             if (buildPermShadow(src, perm, src.arity, sh) != 0) {
@@ -759,7 +753,7 @@ fn tdFree(cctx: *td_ctx) void {
 // ─── Public entry ───────────────────────────────────────────────────────────
 
 pub export fn td_eval(
-    edb: ?*dx.dl_db,
+    edb: ?*dl.DlDb,
     prog: ?*const magic.magic_program,
     crules: ?[*]?*compiled_rule,
     n_crules: c_int,
@@ -835,20 +829,20 @@ fn testRmRf(path: [*:0]const u8) void {
     _ = system(cmd.ptr);
 }
 
-fn testOpenDb(path: [*:0]const u8) *dx.dl_db {
+fn testOpenDb(path: [*:0]const u8) *dl.DlDb {
     testRmRf(path);
-    return dx.dl_open(path) orelse @panic("dl_open failed");
+    return dl.dl_open(path) orelse @panic("dl_open failed");
 }
 
-fn testCloseDb(db: *dx.dl_db, path: [*:0]const u8) void {
-    dx.dl_close(db);
+fn testCloseDb(db: *dl.DlDb, path: [*:0]const u8) void {
+    dl.dl_close(db);
     testRmRf(path);
 }
 
-fn testAddFacts(db: *dx.dl_db, rel: [*:0]const u8, cols: []const u32, ar: u8, n: usize) void {
+fn testAddFacts(db: *dl.DlDb, rel: [*:0]const u8, cols: []const u32, ar: u8, n: usize) void {
     var i: usize = 0;
     while (i < n) : (i += 1) {
-        const rc = dx.dl_add_fact(db, rel, cols.ptr + i * ar, ar);
+        const rc = dl.dl_add_fact(db, rel, cols.ptr + i * ar, ar);
         if (rc != 1) @panic("dl_add_fact failed");
     }
 }
@@ -867,15 +861,15 @@ test "td_eval: cyclic TC matches the full-fixpoint magic oracle" {
     const db = testOpenDb(path);
     defer testCloseDb(db, path);
 
-    _ = dx.dl_declare_relation(db, "edge", 2);
+    _ = dl.dl_declare_relation(db, "edge", 2);
     testAddFacts(db, "edge", &.{ 1, 2, 2, 3, 3, 4, 4, 5, 5, 1 }, 2, 5);
-    _ = dx.dl_load_rules(db, "tc(X,Y):-edge(X,Y).\ntc(X,Y):-edge(X,Z),tc(Z,Y).\n");
+    _ = dl.dl_load_rules(db, "tc(X,Y):-edge(X,Y).\ntc(X,Y):-edge(X,Z),tc(Z,Y).\n");
 
     var a = std.mem.zeroes(tuple_set);
     var b = std.mem.zeroes(tuple_set);
     const vals = [1]u32{1};
-    const rc1 = dx.dl_query_topdown_adorn(db, "tc", "bf", @ptrCast(&vals), 1, testCollectCb, &a);
-    const rc2 = dx.dl_query_magic_adorn(db, "tc", "bf", @ptrCast(&vals), 1, testCollectCb, &b);
+    const rc1 = dl.dl_query_topdown_adorn(db, "tc", "bf", @ptrCast(&vals), 1, testCollectCb, &a);
+    const rc2 = dl.dl_query_magic_adorn(db, "tc", "bf", @ptrCast(&vals), 1, testCollectCb, &b);
     try testing.expect(rc1 > 0);
     try testing.expectEqual(rc2, rc1);
     ts_sort(&a);

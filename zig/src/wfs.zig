@@ -73,11 +73,10 @@ const c = std.c;
 const parser = @import("parser.zig");
 const compiler = @import("compiler.zig");
 const tupleset = @import("tupleset.zig");
-
-// dl_internal.zig: the shared C-layout mirror of dl_db — the same import
-// vm.zig/topdown.zig use (each module's view of the C struct is a distinct
-// Zig type over identical bytes; dl.zig holds the comptime layout gate).
-const dx = @import("dl_abi.zig");
+const relation = @import("relation.zig");
+const dl = @import("dl.zig");
+const vm = @import("vm.zig");
+const permindex = @import("permindex.zig");
 
 // ─── Public C-ABI constants (mirrored in src/dl.h) ─────────────────────────
 
@@ -108,7 +107,7 @@ const WFS_ROUND_BOUND: c_int = 10000;
 const WFS_COMPLEMENT_CAP: c_long = 1 << 20;
 
 const MAX_ARITY: u8 = 8;
-const MAX_HEADS: usize = 64; // dx.dl_db.rels is [64]
+const MAX_HEADS: usize = 64; // dl.DlDb.rels is [64]
 const RELK_FIXED: u8 = 0;
 const RELK_VARIADIC: u8 = 1;
 
@@ -119,31 +118,6 @@ extern "c" fn ts_init(ts: ?*tupleset.tuple_set, arity: u8) c_int;
 extern "c" fn ts_free(ts: ?*tupleset.tuple_set) void;
 extern "c" fn ts_add(ts: ?*tupleset.tuple_set, cols: ?[*]const u32) c_int;
 extern "c" fn ts_sort(ts: ?*tupleset.tuple_set) void;
-
-// compiler.zig / vm.zig / permindex.zig export fns against dx.dl_db.
-extern "c" fn compile_rules(
-    db: ?*dx.dl_db,
-    rules: ?[*]?*parser.rule,
-    n_rules: c_int,
-    out_rules: ?*?[*]?*compiler.compiled_rule,
-    out_n: ?*c_int,
-) c_int;
-extern "c" fn vm_execute(db: ?*dx.dl_db, rules: ?[*]?*compiler.compiled_rule, n_rules: c_int) c_int;
-extern "c" fn permindex_free_all(db: ?*dx.dl_db) void;
-
-// relation.zig export fns reached through dx's opaque relation type.
-extern "c" fn rel_create(arity: u8) ?*dx.relation;
-extern "c" fn rel_free(rel: ?*dx.relation) void;
-extern "c" fn rel_arity(rel: ?*const dx.relation) u8;
-extern "c" fn rel_prefix(
-    rel: ?*const dx.relation,
-    leading: ?[*]const u32,
-    k: u8,
-    cb: dx.rel_enum_cb,
-    user: ?*anyopaque,
-) c_long;
-extern "c" fn ts_sink_cb(cols: ?[*]const u32, arity: u8, user: ?*anyopaque) c_int;
-extern "c" fn rel_build_from_tupleset(rel: ?*dx.relation, ts: ?*const tupleset.tuple_set) c_int;
 
 extern "c" fn strdup(s: [*:0]const u8) ?[*:0]u8;
 // The INSERTING intern (intern.zig's intern_str): what the compiler's
@@ -262,10 +236,10 @@ fn tsIntersect(a: *const tupleset.tuple_set, b: *const tupleset.tuple_set) ?tupl
 }
 
 /// Snapshot a relation's view into a fresh sorted ts.
-fn snapRel(rel: ?*const dx.relation, arity: u8) ?tupleset.tuple_set {
+fn snapRel(rel: ?*const relation.Relation, arity: u8) ?tupleset.tuple_set {
     var ts: tupleset.tuple_set = undefined;
     if (ts_init(&ts, arity) != 0) return null;
-    if (rel_prefix(rel, null, 0, ts_sink_cb, &ts) < 0) {
+    if (relation.rel_prefix(rel, null, 0, relation.ts_sink_cb, &ts) < 0) {
         ts_free(&ts);
         return null;
     }
@@ -275,7 +249,7 @@ fn snapRel(rel: ?*const dx.relation, arity: u8) ?tupleset.tuple_set {
 
 // ─── eval-clone helpers (local mirrors of dl.zig's evalDb*) ────────────────
 
-fn cloneFindRel(db: *const dx.dl_db, name: [*:0]const u8) c_int {
+fn cloneFindRel(db: *const dl.DlDb, name: [*:0]const u8) c_int {
     var i: usize = 0;
     while (i < db.nrels) : (i += 1) {
         if (db.rels[i].name != null and strEqZ(@ptrCast(db.rels[i].name.?), name))
@@ -285,12 +259,12 @@ fn cloneFindRel(db: *const dx.dl_db, name: [*:0]const u8) c_int {
 }
 
 /// rel_create-based in-memory declare into the clone (dir stays NULL).
-fn cloneDeclareInmem(db: *dx.dl_db, name: [*:0]const u8, arity: u8) c_int {
+fn cloneDeclareInmem(db: *dl.DlDb, name: [*:0]const u8, arity: u8) c_int {
     if (db.nrels >= MAX_HEADS) return -1;
     if (cloneFindRel(db, name) >= 0) return -1;
-    const rel = rel_create(arity) orelse return -1;
+    const rel = relation.rel_create(arity) orelse return -1;
     const nm = strdup(name) orelse {
-        rel_free(rel);
+        relation.rel_free(rel);
         return -1;
     };
     db.rels[db.nrels].name = @ptrCast(nm);
@@ -304,22 +278,22 @@ fn cloneDeclareInmem(db: *dx.dl_db, name: [*:0]const u8, arity: u8) c_int {
 
 /// Deep-copy a relation's view into a fresh in-memory relation (a head that
 /// collides with an existing relation is evaluated into the copy).
-fn cloneDeepcopyView(src: ?*const dx.relation, arity: u8) ?*dx.relation {
-    const dst = rel_create(arity) orelse return null;
+fn cloneDeepcopyView(src: ?*const relation.Relation, arity: u8) ?*relation.Relation {
+    const dst = relation.rel_create(arity) orelse return null;
     var ts: tupleset.tuple_set = undefined;
     if (ts_init(&ts, arity) != 0) {
-        rel_free(dst);
+        relation.rel_free(dst);
         return null;
     }
-    if (rel_prefix(src, null, 0, ts_sink_cb, &ts) < 0) {
+    if (relation.rel_prefix(src, null, 0, relation.ts_sink_cb, &ts) < 0) {
         ts_free(&ts);
-        rel_free(dst);
+        relation.rel_free(dst);
         return null;
     }
     ts_sort(&ts);
-    if (rel_build_from_tupleset(dst, &ts) != 0) {
+    if (relation.rel_build_from_tupleset(dst, &ts) != 0) {
         ts_free(&ts);
-        rel_free(dst);
+        relation.rel_free(dst);
         return null;
     }
     ts_free(&ts);
@@ -328,15 +302,15 @@ fn cloneDeepcopyView(src: ?*const dx.relation, arity: u8) ?*dx.relation {
 
 /// Free the eval clone: the clone's perm indexes, its fresh relations +
 /// names (idx >= n_aliased), and the deep-copied collision heads (owned).
-fn cloneFree(db: *dx.dl_db, n_aliased: usize, owned: *const [MAX_HEADS]u8) void {
-    permindex_free_all(db);
+fn cloneFree(db: *dl.DlDb, n_aliased: usize, owned: *const [MAX_HEADS]u8) void {
+    permindex.permindex_free_all(db);
     var i: usize = 0;
     while (i < db.nrels) : (i += 1) {
         if (i >= n_aliased) {
-            if (db.rels[i].rel) |r| rel_free(r);
+            if (db.rels[i].rel) |r| relation.rel_free(r);
             if (db.rels[i].name) |n| c.free(@ptrCast(n));
         } else if (owned[i] != 0) {
-            if (db.rels[i].rel) |r| rel_free(r);
+            if (db.rels[i].rel) |r| relation.rel_free(r);
             // name borrowed from the live db — not freed
         }
     }
@@ -425,17 +399,17 @@ fn checkSubset(rules: [*]?*parser.rule, n_rules: c_int) c_int {
 /// derives heads only from these values; safety makes every rewritten
 /// complement atom a bound lookup over a subset of Active^arity, so the
 /// complement content outside Active^arity is never probed.
-fn buildDomain(db: *const dx.dl_db, rules: [*]?*parser.rule, n_rules: c_int, dom: *tupleset.tuple_set) c_int {
+fn buildDomain(db: *const dl.DlDb, rules: [*]?*parser.rule, n_rules: c_int, dom: *tupleset.tuple_set) c_int {
     if (ts_init(dom, 1) != 0) return -1;
     var ri: usize = 0;
     while (ri < db.nrels) : (ri += 1) {
         if (db.rels[ri].kind != RELK_FIXED) continue; // variadic values are never probed (S1)
         const rel = db.rels[ri].rel orelse continue;
-        const ar = rel_arity(rel);
+        const ar = relation.rel_arity(rel);
         if (ar == 0) continue;
         var ts: tupleset.tuple_set = undefined;
         if (ts_init(&ts, ar) != 0) return -1;
-        if (rel_prefix(rel, null, 0, ts_sink_cb, &ts) < 0) {
+        if (relation.rel_prefix(rel, null, 0, relation.ts_sink_cb, &ts) < 0) {
             ts_free(&ts);
             return -1;
         }
@@ -542,7 +516,7 @@ const HeadSnap = struct {
 };
 
 const WfsState = struct {
-    edb: *dx.dl_db,
+    edb: *dl.DlDb,
     n_aliased: usize,
     owned: [MAX_HEADS]u8,
     dom: tupleset.tuple_set,
@@ -594,17 +568,17 @@ fn teardown(st: *WfsState) void {
 /// after (they must not be reused).
 ///
 /// `db_opaque` is dl.zig's *DlDb passed as anyopaque — the same byte layout
-/// as dx.dl_db (dl.zig holds the comptime gate).
+/// as dl.DlDb (abi_witness.zig holds the layout gate).
 pub fn wfs_eval_query(
     db_opaque: ?*anyopaque,
     rules: ?[*]?*parser.rule,
     n_rules: c_int,
     goal_rel: [*c]const u8,
     truth: c_int,
-    cb: dx.dl_tuple_cb,
+    cb: relation.RelEnumCb,
     user: ?*anyopaque,
 ) c_long {
-    const d: *dx.dl_db = @ptrCast(@alignCast(db_opaque orelse return -1));
+    const d: *dl.DlDb = @ptrCast(@alignCast(db_opaque orelse return -1));
     const rs = rules orelse return -1;
     if (n_rules <= 0 or cb == null) return -1;
 
@@ -639,7 +613,7 @@ pub fn wfs_eval_query(
     }
 
     // ── shallow clone (dir NULL: the VM/compile path cannot touch disk)
-    var edb: dx.dl_db = std.mem.zeroes(dx.dl_db);
+    var edb: dl.DlDb = std.mem.zeroes(dl.DlDb);
     edb.ir = d.ir;
     edb.terms = d.terms;
     edb.lock_fd = -1;
@@ -801,7 +775,7 @@ pub fn wfs_eval_query(
     }
 
     // ── compile the positive rewrite
-    if (compile_rules(&edb, rs, n_rules, &st.crules, &st.n_crules) != 0) {
+    if (compiler.compile_rules(&edb, rs, n_rules, &st.crules, &st.n_crules) != 0) {
         wfsErr("dl_query_wfs_ro: compile of the rewritten program failed\n", .{});
         return -1;
     }
@@ -861,7 +835,7 @@ pub fn wfs_eval_query(
                     fi += 1;
                 }
                 ts_sort(&cts);
-                const rc = rel_build_from_tupleset(edb.rels[@intCast(cp.comp_idx)].rel, &cts);
+                const rc = relation.rel_build_from_tupleset(edb.rels[@intCast(cp.comp_idx)].rel, &cts);
                 ts_free(&cts);
                 ts_free(&pv);
                 if (rc != 0) {
@@ -871,7 +845,7 @@ pub fn wfs_eval_query(
             }
 
             // Γ(S_k) from scratch: vm_execute resets head views to base
-            if (vm_execute(&edb, st.crules, st.n_crules) != 0) {
+            if (vm.vm_execute(&edb, st.crules, st.n_crules) != 0) {
                 wfsErr("dl_query_wfs_ro: evaluation failed\n", .{});
                 return -1;
             }
@@ -968,7 +942,7 @@ pub fn wfs_eval_query(
             // non-head goal: an existing relation's stored facts — the VM
             // never writes it; every stored tuple is plainly TRUE.
             const e = &edb.rels[@intCast(gi)];
-            emitted = rel_prefix(e.rel, null, 0, cb, user);
+            emitted = relation.rel_prefix(e.rel, null, 0, cb, user);
         } else {
             var out_ts: tupleset.tuple_set = undefined;
             var out_owned = false;

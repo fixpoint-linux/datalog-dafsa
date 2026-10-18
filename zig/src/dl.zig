@@ -45,15 +45,12 @@ const wfs = @import("wfs.zig");
 const reactive = @import("reactive.zig");
 const intern_mod = @import("intern.zig");
 
-// dl_internal.h pulls in dl.h/intern.h/relation.h/vrelation.h/snapshot.h/
-// permindex.h/termstore.h/compiler.h/parser.h/regexwalk.h — the reference
-// layout of dl_db/rel_entry/txn/txn_op/view_cache_slot/perm_index_entry and
-// the opaque relation/vrelation/interner/termstore/tuple_set types.
-// dl_internal.h: dl_db/rel_entry/txn/perm_index_entry/view_cache_slot layout,
-// verified here against our native DlDb/RelEntry/... at comptime below.
-// The datalog engine is now Zig; dl_internal.zig hand-declares the C-layout
-// structs in place of the removed @cImport("dl_internal.h").
-const dx = @import("dl_abi.zig");
+// dl.zig OWNS the authoritative Zig layouts of dl_db/rel_entry/txn/txn_op/
+// view_cache_slot/perm_index_entry (DlDb/RelEntry/Txn/TxnOp/ViewCacheSlot/
+// PermIndexEntry below) and the dl.h/db_* public entry points.  The C-shaped
+// mirror in dl_abi.zig exists ONLY for the out-of-library executables
+// (dl_cli.zig/dlp.zig) and the abi_witness comptime oracle — the in-library
+// modules name these owner types and call these functions directly.
 
 // dafsa_internal.h: struct dafsa/dafsa_view + dafsa_save/dafsa_view_open/
 // dafsa_view_close.  The engine is now Zig; dafsa_c.zig hand-declares the
@@ -193,13 +190,13 @@ extern "c" fn fputs(s: [*:0]const u8, stream: *c.FILE) c_int;
 
 // ─── Constants (mirror src/dl_internal.h / dl.h / compiler.h / txnwal.h) ───
 
-const MAX_RELS: usize = 64;
+pub const MAX_RELS: usize = 64;
 const MAX_VAR_ARITY: u8 = 8;
 const MAX_PERMS: usize = 64;
-const DL_VIEW_CACHE_SZ: usize = 8;
+pub const DL_VIEW_CACHE_SZ: usize = 8;
 
-const RELK_FIXED: u8 = 0;
-const RELK_VARIADIC: u8 = 1;
+pub const RELK_FIXED: u8 = 0;
+pub const RELK_VARIADIC: u8 = 1;
 
 const TXN_ADD: c_int = 1;
 const TXN_DEL: c_int = 2;
@@ -233,7 +230,7 @@ const ZERO_OWNED = [_]u8{0} ** MAX_RELS;
 /// dl_tuple_cb == rel_enum_cb — identical C signature, shared type identity
 /// with relation.zig so rel_prefix/vrel_prefix calls need no cast.
 const DlTupleCb = relation.RelEnumCb;
-const DlRelationCb = ?*const fn (name: [*c]const u8, arity: u8, idb: c_int, user: ?*anyopaque) callconv(.c) c_int;
+pub const DlRelationCb = ?*const fn (name: [*c]const u8, arity: u8, idb: c_int, user: ?*anyopaque) callconv(.c) c_int;
 const DlTraverseCb = ?*const fn (node_sym: u32, depth: u8, user: ?*anyopaque) callconv(.c) c_int;
 const DlStrCb = ?*const fn (s: [*c]const u8, user: ?*anyopaque) callconv(.c) c_int;
 const FaultHook = ?*const fn (fp: c_int, user: ?*anyopaque) callconv(.c) c_int;
@@ -364,41 +361,9 @@ pub const DlDb = extern struct {
 /// Marker for "not yet serialized by any publish of this process".
 const SAVED_REV_NONE: u64 = std.math.maxInt(u64);
 
-// Comptime gate: our extern layouts must be byte-identical to the C header.
-comptime {
-    std.debug.assert(@sizeOf(RelEntry) == @sizeOf(dx.rel_entry));
-    std.debug.assert(@offsetOf(RelEntry, "rel") == @offsetOf(dx.rel_entry, "rel"));
-    std.debug.assert(@sizeOf(TxnOp) == @sizeOf(dx.txn_op));
-    std.debug.assert(@offsetOf(TxnOp, "cols") == @offsetOf(dx.txn_op, "cols"));
-    // Txn deliberately does NOT assert size equality: dl.zig's Txn carries
-    // Zig-only rollback-snapshot fields past the C header's 3 fields.  C
-    // never dereferences txn (dl_internal.h holds it as an opaque pointer),
-    // and the buffer is allocated/freed exclusively by the Zig side.
-    std.debug.assert(@offsetOf(Txn, "ops") == @offsetOf(dx.txn, "ops"));
-    std.debug.assert(@sizeOf(ViewCacheSlot) == @sizeOf(dx.view_cache_slot));
-    std.debug.assert(@sizeOf(PermIndexEntry) == @sizeOf(dx.perm_index_entry));
-
-    // ─── selfreg-dl-storage: the C-prefix must stay byte-identical, but DlDb now
-    // carries Zig-only fields PAST C's sizeof (the facade pattern relation.zig
-    // uses for the overlay).  C allocates from its own sizeof; the Zig side
-    // allocates the larger struct and C never sees the tail.
-    std.debug.assert(@offsetOf(DlDb, "compact_checks") >= @sizeOf(dx.dl_db));
-    std.debug.assert(@offsetOf(DlDb, "rels") == @offsetOf(dx.dl_db, "rels"));
-    std.debug.assert(@offsetOf(DlDb, "nrels") == @offsetOf(dx.dl_db, "nrels"));
-    std.debug.assert(@offsetOf(DlDb, "lock_fd") == @offsetOf(dx.dl_db, "lock_fd"));
-    std.debug.assert(@offsetOf(DlDb, "read_only") == @offsetOf(dx.dl_db, "read_only"));
-    std.debug.assert(@offsetOf(DlDb, "snap_version") == @offsetOf(dx.dl_db, "snap_version"));
-    std.debug.assert(@offsetOf(DlDb, "vcache") == @offsetOf(dx.dl_db, "vcache"));
-    std.debug.assert(@offsetOf(DlDb, "perms") == @offsetOf(dx.dl_db, "perms"));
-    std.debug.assert(@offsetOf(DlDb, "ast_rules") == @offsetOf(dx.dl_db, "ast_rules"));
-    std.debug.assert(@offsetOf(DlDb, "delta_pending") == @offsetOf(dx.dl_db, "delta_pending"));
-    std.debug.assert(@offsetOf(DlDb, "del_pending") == @offsetOf(dx.dl_db, "del_pending"));
-    // selfreg-dl-storage: the C-prefix must stay byte-identical, but DlDb now
-    // carries Zig-only fields PAST C's sizeof (the facade pattern relation.zig
-    // uses for the overlay).  C allocates from its own sizeof; the Zig side
-    // allocates the larger struct and C never sees the tail.
-    std.debug.assert(@offsetOf(DlDb, "compact_checks") >= @sizeOf(dx.dl_db));
-}
+// The owner-vs-mirror layout assertions live in abi_witness.zig (imported only
+// from tests.zig so the single @cImport("dl_internal.h") stays out of the
+// lib/exe module graphs).
 
 // ─── Ported-module extern bindings (callees whose db type is a private ────
 // ─── @cImport'd dl_db, or whose module-private types are opaque) ────────────
@@ -440,7 +405,7 @@ extern "c" fn rule_free(r: ?*parser.rule) void;
 extern "c" fn expr_free(e: ?*parser.expr) void;
 extern "c" fn expr_clone(e: ?*const parser.expr) ?*parser.expr;
 
-// compiler.zig — compile_rules takes compiler.zig's private dx.dl_db.
+// compiler.zig — compile_rules is its `pub export fn` (takes ?*DlDb).
 extern "c" fn compile_rules(db: ?*DlDb, rules: ?[*]?*parser.rule, n_rules: c_int, out_rules: ?*?[*]?*compiler.compiled_rule, out_n: ?*c_int) c_int;
 
 // typecheck.zig.
@@ -468,7 +433,7 @@ extern "c" fn vcache_invalidate(vcache: [*c]ViewCacheSlot) void;
 extern "c" fn view_open_cached(vcache: [*c]ViewCacheSlot, rel_name: [*c]const u8, sdir: [*c]const u8) ?*anyopaque;
 extern "c" fn manifest_find_rel_ex(sdir: [*c]const u8, rel_name: [*c]const u8, arity_out: [*c]u8, variadic_out: [*c]c_int) c_int;
 extern "c" fn manifest_find_variants(sdir: [*c]const u8, rel_name: [*c]const u8, present: [*]u8) void;
-extern "c" fn manifest_enumerate_rels(sdir: [*c]const u8, cb: dx.dl_relation_cb, user: ?*anyopaque) c_long;
+extern "c" fn manifest_enumerate_rels(sdir: [*c]const u8, cb: DlRelationCb, user: ?*anyopaque) c_long;
 extern "c" fn snapshot_query_scan(db_dir: [*c]const u8, snap_version: c_uint, vcache: [*c]ViewCacheSlot, goal_rel: [*c]const u8, leading: ?[*]const u32, k: u8, cb: DlTupleCb, user: ?*anyopaque) c_long;
 extern "c" fn view_filter_col(view_handle: ?*anyopaque, arity: u8, col: u8, set: ?*const regexwalk.sym_set, cb: DlTupleCb, user: ?*anyopaque) c_long;
 extern "c" fn view_rank(view_handle: ?*anyopaque, arity: u8, cols: ?[*]const u32) u64;
@@ -2067,13 +2032,12 @@ fn relHasPendingTxnAdd(db: *DlDb, idx: usize) bool {
 /// trigger), 0 otherwise, or -1 on the definite conflict.
 fn kindNoteRaw(db: *DlDb, idx: usize, cols: [*c]const u32, arity: u8) c_int {
     const rel = db.rels[idx].rel orelse return 0;
-    const ir_x: ?*dx.interner = @ptrCast(@alignCast(db.ir));
-    const bound = intern_mod.liveSymBound(ir_x);
+    const bound = intern_mod.liveSymBound(db.ir);
     var newly: c_int = 0;
     var i: usize = 0;
     while (i < arity) : (i += 1) {
         const v = cols[i];
-        const resolves = v > 0 and v < bound and intern_mod.intern_str_of(@ptrCast(@alignCast(ir_x)), v) != null;
+        const resolves = v > 0 and v < bound and intern_str_of(db.ir, v) != null;
         if (resolves) continue; // ambiguous: neither records nor rejects
         const prev = relation.rel_col_kind(rel, @intCast(i));
         if (prev == relation.KIND_SYM) {
@@ -2116,9 +2080,8 @@ fn kindNoteRaw(db: *DlDb, idx: usize, cols: [*c]const u32, arity: u8) c_int {
 fn kindRecheckAfterLoad(db: *DlDb) c_int {
     if (db.n_ast_rules <= 0) return 0;
     const ars = db.ast_rules orelse return 0;
-    const dxi: *dx.dl_db = @ptrCast(db); // DlDb and dx.dl_db share the C layout
     compiler.compile_clear_error();
-    return compiler.checkAllRuleConstKinds(dxi, ars, db.n_ast_rules);
+    return compiler.checkAllRuleConstKinds(db, ars, db.n_ast_rules);
 }
 
 /// True if any column in `cols[0..arity)` was newly recorded this load.
@@ -3493,8 +3456,7 @@ pub export fn dl_load_rules(db: ?*DlDb, dl_source: [*c]const u8) c_int {
             const merged: [*]?*parser.rule = @ptrCast(@alignCast(merged_mem));
             if (nres > 0) @memcpy(merged[0..nres], d.ast_rules.?[0..nres]);
             @memcpy(merged[nres..total], rules.?[0..@intCast(n_rules)]);
-            const dxi: *dx.dl_db = @ptrCast(d); // DlDb and dx.dl_db share the C layout
-            const bad = compiler.checkAllRuleConstKinds(dxi, merged, @intCast(total));
+            const bad = compiler.checkAllRuleConstKinds(d, merged, @intCast(total));
             c.free(merged_mem);
             if (bad != 0) {
                 freeRulesAndParser(rules, n_rules, p);
@@ -4079,18 +4041,16 @@ pub export fn dl_query_magic_adorn(db: ?*DlDb, goal_rel: [*c]const u8, adorn: [*
     // next_id resolves too whenever any symbol is interned — and MUST NOT
     // reject (pre-S1 it answered 0 rows, not an error).
     {
-        const dxi: *dx.dl_db = @ptrCast(d); // DlDb and dx.dl_db share the C layout
-        const ir_x: ?*dx.interner = @ptrCast(@alignCast(d.ir));
         var bi2: usize = 0;
         var vi2: usize = 0;
         while (bi2 < alen) : (bi2 += 1) {
             if (adorn[bi2] != 'b') continue;
             const v = vals.?[vi2];
             vi2 += 1;
-            const colk = compiler.relKindWithRulesPub(dxi, goal_idx, @intCast(bi2), goal_arity);
+            const colk = compiler.relKindWithRulesPub(d, goal_idx, @intCast(bi2), goal_arity);
             if (colk != 2) continue; // int/unknown/mixed: nothing observable
-            const resolves = v > 0 and v < intern_mod.liveSymBound(ir_x) and
-                intern_mod.intern_str_of(@ptrCast(@alignCast(ir_x)), v) != null;
+            const resolves = v > 0 and v < intern_mod.liveSymBound(d.ir) and
+                intern_str_of(d.ir, v) != null;
             if (!resolves) {
                 dlErr("dl_query_magic: column kind mismatch in {s}/{d}: bound value {d} is an integer but column holds symbols\n", .{
                     goal_rel, bi2, v,
