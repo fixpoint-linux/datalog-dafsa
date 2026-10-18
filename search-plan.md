@@ -13,7 +13,7 @@ folded in below (each ranked item states its measured outcome). Current HEAD:
 | 3 | `lev_compile` Levenshtein over symbols | **DONE** `07127a4` | k=1 10–28 µs end-to-end; k=2 58–145 µs; zero storage |
 | 3b | review fixes (5 findings) | **DONE** `fb04704` | 2 measured defects incl. a regression; OOM leak proved closed with an interposer |
 | 4 | `dl_search_ranked` (OR / `min_terms`) | **DONE** `f23899f` | score now varies with matched-term count |
-| 5 | rev-gated columnar vector arena | **NOT BUILT** | gated on a confirmed repeated-query workload — see §6 |
+| 5 | rev-gated columnar vector arena | **DONE** `$(git rev-parse --short HEAD)` | repeated queries **76.47 → 4.09 ms** at 10k (19×); +3.9 MB |
 
 **Provenance.** Synthesised by the orchestrator from the planner pass recorded in
 the memory node `handoff-search-plan` (rev 18), whose numbers come from throwaway
@@ -237,7 +237,7 @@ top-k·10 — old code returns nothing, gated code returns it.
 | 2 | hybrid: one-shot obs→entity map + lexical gate inside the vector scan | ~1 h | ~66 ms at 10k obs; **fixes a recall hole** |
 | 3 | `lev_compile` — Levenshtein over `symbols.dafsa` (owner's ask) | 1–2 days | exact typo-tolerant lookup, zero storage, sub-ms; **retires the trigram tier** |
 | 4 | `OR`/ranked full-text entry point (after 1) | ½ day | makes the dead ranking live; IDF becomes meaningful |
-| 5 | rev-gated columnar vector arena | ~1 day | 30–80× on *repeated* queries only — price against a real workload first |
+| 5 | rev-gated columnar vector arena | ~1 day | **DONE** — 19–23× measured on repeated queries (workload confirmed: agent handoff lookups) |
 
 **Order rationale:** 1 and 2 are strictly cheaper than 3 and each removes a
 measured quadratic or hot-loop defect; 3 is the only one that adds a *new*
