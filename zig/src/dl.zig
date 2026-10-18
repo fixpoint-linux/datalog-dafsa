@@ -3948,6 +3948,11 @@ fn nowNs() u64 {
     return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
 }
 
+/// Nanoseconds as (fractional) milliseconds, for the DL_PUB_TIMING report.
+fn nsToMs(v: u64) f64 {
+    return @as(f64, @floatFromInt(v)) / 1e6;
+}
+
 /// void dl_publish_timing_get(dl_publish_timing_out *out)
 pub export fn dl_publish_timing_get(out: ?*dl_publish_timing_out) void {
     const o = out orelse return;
@@ -4430,7 +4435,29 @@ fn materializeSnapshot(d: *DlDb) c_int {
     if (mkdir(&tmp_dir, @as(posix.mode_t, 0o755)) != 0)
         return -1;
 
-    // 4a. Save interner
+    // 4a. Save interner.
+    //
+    // The forward DAFSA is a PURE DERIVED CACHE of symbols.array: nothing ever
+    // reads <snapshot>/symbols.dafsa as the source of truth (intern_load builds
+    // the interner from symbols.array alone and ensureFwd rebuilds the forward
+    // DAFSA from it — intern.zig), and the only consumer of the file is the
+    // mmap'd pattern/regex walk, which needs exactly the key set the array
+    // describes.  So when the freshly serialized array is byte-identical to the
+    // previous snapshot's, that snapshot's two files already describe exactly
+    // the key set this build would produce — a DAFSA of the same keys, whose
+    // state numbering a fresh save might emit in another order, which nothing
+    // reads (dafsa_view surfaces keys, never state ids).  The pair can then be
+    // hardlinked instead of paying a full ensureFwd rebuild + dafsa_save
+    // re-serialization on EVERY publish.
+    //
+    // MEASURED (agent store: 166,745 symbols / 44 MB array): the unconditional
+    // path costs 11.7 s rebuild + 17.5 s save = ~29 s per publish, which at
+    // ~0.3 s of actual query work is the entire cost of a Datalog query.  The
+    // gate replaces it with a 44 MB compare (~15 ms; the bytes are in page
+    // cache from intern_save) plus two hardlinks.  Snapshot files are immutable
+    // once renamed into place (only rmRf unlinks them), so the links are safe
+    // exactly as relSaveGated's are.  Falls back to the full save when there is
+    // no previous snapshot, the vocabulary changed, or a link fails.
     {
         var fwd: [4096:0]u8 = undefined;
         var rev: [4096:0]u8 = undefined;
@@ -4438,8 +4465,33 @@ fn materializeSnapshot(d: *DlDb) c_int {
         _ = snprintf(&rev, 4096, "%s/symbols.array", &tmp_dir);
         if (intern_save(d.ir, &fwd, &rev) != 0)
             return dlPublishFail(&tmp_dir, &new_dir, renamed);
-        if (dc.dafsa_save(@ptrCast(@alignCast(intern_fwd(d.ir))), &fwd) != 0)
-            return dlPublishFail(&tmp_dir, &new_dir, renamed);
+
+        var inherited = false;
+        if (prev_snap_dir[0] != 0) {
+            var prev_fwd: [4096:0]u8 = undefined;
+            var prev_rev: [4096:0]u8 = undefined;
+            _ = snprintf(&prev_fwd, 4096, "%s/symbols.dafsa", &prev_snap_dir);
+            _ = snprintf(&prev_rev, 4096, "%s/symbols.array", &prev_snap_dir);
+            if (filesIdentical(&rev, &prev_rev)) {
+                _ = posix.unlink(&rev);
+                if (posix.link(&prev_rev, &rev) == 0 and posix.link(&prev_fwd, &fwd) == 0) {
+                    inherited = true;
+                } else {
+                    // Half-made link or no previous dafsa: drop the links and
+                    // re-serialize rather than publish a directory that is
+                    // missing the derived file.
+                    _ = posix.unlink(&rev);
+                    _ = posix.unlink(&fwd);
+                    if (intern_save(d.ir, &fwd, &rev) != 0)
+                        return dlPublishFail(&tmp_dir, &new_dir, renamed);
+                }
+            }
+        }
+
+        if (!inherited) {
+            if (dc.dafsa_save(@ptrCast(@alignCast(intern_fwd(d.ir))), &fwd) != 0)
+                return dlPublishFail(&tmp_dir, &new_dir, renamed);
+        }
     }
     if (pub_timers_on) {
         pub_timers.t_intern_ns += nowNs() - t_mark;
@@ -4643,8 +4695,22 @@ pub export fn dl_publish_snapshot(db: ?*DlDb) c_int {
     pubTimersCheckEnv();
     const t_start = nowNs();
 
+    const t_cons = nowNs();
     if (consolidate(d) != 0) return -1;
+    const t_mat = nowNs();
     if (materializeSnapshot(d) != 0) return -1;
+    if (pub_timers_on) {
+        // DL_PUB_TIMING asked for timings: report this publish's split so the
+        // counters are readable without a dl_publish_timing_get() caller.
+        dlErr("pubtiming: consolidate={d:.1}ms materialize={d:.1}ms | intern={d:.1} terms={d:.1} rel_save={d:.1} rel_other={d:.1} fsync={d:.1} rename={d:.1} current={d:.1} prune={d:.1} ivm={d:.1}\n", .{
+            nsToMs(t_mat - t_cons),           nsToMs(nowNs() - t_mat),
+            nsToMs(pub_timers.t_intern_ns),   nsToMs(pub_timers.t_terms_ns),
+            nsToMs(pub_timers.t_rel_save_ns), nsToMs(pub_timers.t_rel_other_ns),
+            nsToMs(pub_timers.t_fsync_ns),    nsToMs(pub_timers.t_rename_ns),
+            nsToMs(pub_timers.t_current_ns),  nsToMs(pub_timers.t_prune_ns),
+            nsToMs(pub_timers.t_ivm_ns),
+        });
+    }
 
     if (pub_timers_on) {
         pub_timers.t_total_ns += nowNs() - t_start;
@@ -4747,6 +4813,50 @@ fn relSaveGated(
         }
     }
     return 0;
+}
+
+/// Read exactly dst.len bytes from fd (short reads are normal on files).
+fn readExact(fd: c_int, dst: []u8) bool {
+    var got: usize = 0;
+    while (got < dst.len) {
+        const n = posix.read(fd, dst[got..].ptr, dst.len - got);
+        if (n <= 0) return false;
+        got += @intCast(n);
+    }
+    return true;
+}
+
+/// Byte-identity of two files: size first, then a chunked memcmp.  The
+/// interner publish gate (materializeSnapshot step 4a) uses this to decide
+/// whether a snapshot's symbols.dafsa — a pure derived cache, so a function of
+/// symbols.array alone — can be inherited from the previous snapshot instead of
+/// being rebuilt and re-serialized.  Returns false on any I/O error, which the
+/// caller reads as "not identical" and falls back to the full save.
+fn filesIdentical(a: [*c]const u8, b: [*c]const u8) bool {
+    var sa: Stat = undefined;
+    var sb: Stat = undefined;
+    if (stat(a, &sa) != 0) return false;
+    if (stat(b, &sb) != 0) return false;
+    if (sa.st_size != sb.st_size or sa.st_size < 0) return false;
+
+    const fa = posix.open(a, posix.O_RDONLY);
+    if (fa < 0) return false;
+    defer _ = posix.close(fa);
+    const fb = posix.open(b, posix.O_RDONLY);
+    if (fb < 0) return false;
+    defer _ = posix.close(fb);
+
+    const CHUNK: usize = 1 << 16;
+    var buf_a: [CHUNK]u8 = undefined;
+    var buf_b: [CHUNK]u8 = undefined;
+    var left: i64 = sa.st_size;
+    while (left > 0) {
+        const want: usize = @intCast(@min(@as(i64, CHUNK), left));
+        if (!readExact(fa, buf_a[0..want]) or !readExact(fb, buf_b[0..want])) return false;
+        if (!std.mem.eql(u8, buf_a[0..want], buf_b[0..want])) return false;
+        left -= @intCast(want);
+    }
+    return true;
 }
 
 /// Perm-index variant of the gate: the index relation is freed and
