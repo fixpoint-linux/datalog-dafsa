@@ -1672,12 +1672,70 @@ fn candCb(cols: [*c]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_int 
 
 // ─── Non-recursive evaluation (M1 path) ────────────────────────────────────
 
+inline fn relBit(rel_id: c_int) u64 {
+    if (rel_id < 0 or rel_id >= MAX_RELS) return 0;
+    return @as(u64, 1) << @intCast(rel_id);
+}
+
+/// The relations this rule set may WRITE, as a bitmask over relation ids.
+/// Over-approximated on purpose: an extra bit only keeps MORE rules on the
+/// full iterate-to-fixpoint loop, never fewer.
+fn nonrecWrittenMask(rules: [*]?*compiler.compiled_rule, n: c_int) u64 {
+    var mask: u64 = 0;
+    var i: c_int = 0;
+    while (i < n) : (i += 1) {
+        const cr = rules[@intCast(i)] orelse continue;
+        mask |= relBit(@intCast(cr.head_rel_id));
+        var k: c_int = 0;
+        while (k < cr.n_instrs) : (k += 1) {
+            const in = &cr.instrs.?[@intCast(k)];
+            if (in.op == OP_PROJECT) mask |= relBit(@intCast(in.a));
+        }
+    }
+    return mask;
+}
+
+/// A rule whose body reads NOTHING this rule set writes reaches its final
+/// content in its first execution: its inputs are fixed for the whole call, so
+/// a later pass derives exactly the same candidates and every rel_add is a
+/// duplicate — execRule counts only NEW facts, so that pass adds 0 and cannot
+/// affect any other rule's inputs either.  Skipping it is therefore
+/// equivalent, and it is what the win/move round wasted half its rel_adds on
+/// (MEASURED, DL_WFS_STATS: 160,000 -> 80,000 at n=400).
+///
+/// Anything not POSITIVELY classified as settled — an aggregate, a
+/// materialized sub-plan, an unlisted op, a variadic store — returns false and
+/// keeps the caller on the full loop.
+fn nonrecRuleSettled(cr: *const compiler.compiled_rule, written: u64, variadic: bool) bool {
+    if (variadic) return false;
+    var k: c_int = 0;
+    while (k < cr.n_instrs) : (k += 1) {
+        const in = &cr.instrs.?[@intCast(k)];
+        switch (in.op) {
+            OP_SCAN, OP_LOOKUP, OP_NEG_CHECK, OP_WALK, OP_LOOKUP_PERM, OP_HASH_JOIN => {
+                if (written & relBit(@intCast(in.a)) != 0) return false;
+            },
+            OP_AGG_ACC, OP_AGG_EMIT, OP_MAT_BEGIN, OP_MAT_JOIN, OP_OPEN_REL, OP_RANGE => return false,
+            else => {},
+        }
+    }
+    return true;
+}
+
 fn evalNonrecursive(db: *dl.DlDb, rules: [*]?*compiler.compiled_rule, n: c_int) c_int {
+    // A non-recursive stratum still iterates because one rule may read
+    // another's head (a chain, or an unlucky emission order), and
+    // vm_dred_delete re-derives an arbitrary SUBSET of a stratum — in both
+    // cases the set passed here is all that runs, so "settled" is judged
+    // against exactly this set.
+    const written = nonrecWrittenMask(rules, n);
+    const variadic = dl.db_has_variadic(db) != 0;
     var pass: c_int = 0;
     while (pass <= n) : (pass += 1) {
         var changed: c_int = 0;
         var i: c_int = 0;
         while (i < n) : (i += 1) {
+            if (pass > 0 and nonrecRuleSettled(rules[@intCast(i)].?, written, variadic)) continue;
             const m = execRule(db, rules[@intCast(i)].?, null, 0, 0, null, null);
             if (m < 0) return -1;
             if (m > 0) changed = 1;
