@@ -3,6 +3,27 @@
 All notable changes to this project are documented in this file.
 
 ## [Unreleased]
+- **`dl similar` / `dl_fuzzy_lookup` no longer build the symbol DAFSA**
+  (2026-10-18, unit `fuzzy-fast`). The fuzzy lookup walked the live forward
+  DAFSA with a Levenshtein automaton, so the *first* call in a process
+  materialized the whole index: **MEASURED 10.3-19 s** on a 166,743-symbol store
+  (44 MB `symbols.array`), 96 % of the command, against a walk that cost 0-2 ms.
+  A proposed depth bound was evaluated and **refuted**: the automaton is already
+  depth-bounded by its own dead-row prune (`min_j dp[j] > k` ⇒ `DFA_DEAD`, and
+  `min_j dp[i][j]` is non-decreasing in `i`), so no state survives past depth
+  `|needle| + k` and the bound would have pruned nothing.
+  - Replaced with a **banded linear scan** of the interner's symbol table: a name
+    outside `[len-k, len+k]` cannot be within `k` edits, and each surviving
+    candidate is checked with `lev_distance_cap`. No index, hence no build.
+    **MEASURED 15-17 ms** for the same store, i.e. `dl similar` went from
+    **11.19-16.29 s to 0.39-0.47 s** (25-37×; store open alone is 0.37 s). The
+    6,885-symbol store went from 15.4-18.5 ms to 3.2-4.6 ms.
+  - Equivalence, not a rewrite of the semantics: the scan and the automaton walk
+    are compared as `(sym_id, distance)` sets by a new Zig unit test, and 52
+    battery invocations (k = 0/1/2, needles 1-20 bytes, a store with hand-built
+    `len-k`/`len+k`/transposition/no-neighbour cases) are byte-identical before
+    and after. The `~~` rule operator keeps the automaton walk — it is a query
+    over a relation and already pays for the DAFSA it needs.
 - **Snapshots no longer persist the derived symbol DAFSA** (2026-10-18, unit
   `derive-done`). `<snapshot>/symbols.dafsa` is a pure derived cache of
   `<snapshot>/symbols.array` (the source of truth — `intern_load` rebuilds the

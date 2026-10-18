@@ -5134,56 +5134,50 @@ pub export fn dl_pattern(db: ?*DlDb, rel_name: [*c]const u8, col: u8, dfa: ?*con
 
 // ─── Fuzzy (Levenshtein) symbol lookup ─────────────────────────────────────
 
-const FuzzyCtx = struct {
-    ir: ?*anyopaque, // interner*
-    needle: [*c]const u8,
-    needle_len: usize,
-    k: u32,
-    cb: DlFuzzyCb,
-    user: ?*anyopaque,
-};
-
-/// symbols_dfa_walk callback: resolve the sym_id to its string, confirm the
-/// automaton's promise with an independent distance computation, and hand the
-/// name + distance to the caller.
-fn fuzzySymCb(sym_id: u32, user: ?*anyopaque) callconv(.c) c_int {
-    const ctx: *FuzzyCtx = @ptrCast(@alignCast(user orelse return -1));
-    const name = intern_str_of(ctx.ir, sym_id) orelse return 0;
-    const nm: [*]const u8 = @ptrCast(name);
-    const nlen = strlen(nm);
-    const dist = regexwalk.lev_distance_cap(ctx.needle, ctx.needle_len, nm, nlen, ctx.k);
-    if (dist > ctx.k) return 0; // unreachable unless the automaton is wrong
-    return ctx.cb.?(sym_id, name, nlen, dist, ctx.user);
-}
-
 /// long dl_fuzzy_lookup(dl_db *db, const char *needle, uint32_t k,
 ///                      dl_fuzzy_cb cb, void *user)
 ///
-/// Byte edit-distance lookup over the live interner forward DAFSA (keys:
-/// name, NUL, sym_id_u32BE).  The automaton is a plain regex_dfa, so the
-/// existing symbol walker does the product DFS — zero index storage, and a
-/// version read stays correct for the same reason dl_pattern's does (sym-ids
-/// are append-only, so the live symbol set is a superset of any snapshot's).
+/// Byte edit-distance lookup — a BANDED LINEAR SCAN over the live symbol table
+/// (the interner's reverse array), needing no index at all.
+///
+/// WHY NOT A DAFSA WALK (MEASURED at 3dd4ae0, 166,743-symbol store): the
+/// product DFS over the symbol DAFSA is ALREADY depth-bounded by the automaton
+/// itself — a Levenshtein row whose minimum entry exceeds k is DFA_DEAD, and
+/// min_j dp[i][j] is non-decreasing in the row index i, so no state is alive
+/// deeper than |needle| + k; the walk costs 0-2 ms and a depth bound would
+/// prune nothing it has not already pruned.  The cost of `dl similar` was
+/// `intern_fwd()` MATERIALIZING that DAFSA from symbols.array on first use:
+/// 10-19 s (≈60 µs per symbol) against 0.4 s to open the store.  The scan
+/// below is ~15 ms on the same store, so it is what makes the command fast at
+/// scale; fuzzy lookup is the one symbol query that cannot use the index
+/// cheaply enough to pay for building it.
+///
+/// The band prune is exact, not heuristic: every edit costs at least one byte
+/// of length, so a name outside [m-k, m+k] cannot be within k edits.  It also
+/// bounds the DP to O((m+k)·(m+k)) per surviving candidate.
 pub export fn dl_fuzzy_lookup(db: ?*DlDb, needle: [*c]const u8, k: u32, cb: DlFuzzyCb, user: ?*anyopaque) c_long {
     const d = db orelse return -1;
     if (needle == null or cb == null) return -1;
     if (k > 2) return -1; // refuse loudly; lev_compile would too
+    if (needle[0] == 0) return -1; // lev_compile: "lev: empty pattern"
+    const m: usize = strlen(needle);
+    if (m > regexwalk.LEV_PATTERN_MAX) return -1; // lev_compile: "pattern too long"
 
-    const dfa = regexwalk.lev_compile(needle, k) orelse return -1;
-    defer regexwalk.regex_dfa_free(dfa);
-    if (dfa.errmsg != null) return -1;
-
-    const fwd = intern_fwd(d.ir) orelse return -1;
-    var ctx = FuzzyCtx{
-        .ir = d.ir,
-        .needle = needle,
-        .needle_len = strlen(needle),
-        .k = k,
-        .cb = cb,
-        .user = user,
-    };
-    const n = regexwalk.symbols_dfa_walk(@ptrCast(@alignCast(fwd)), dfa, fuzzySymCb, &ctx);
-    return n;
+    const kk: usize = @intCast(k);
+    const bound = intern_mod.liveSymBound(d.ir);
+    var count: c_long = 0;
+    var id: u32 = 1;
+    while (id < bound) : (id += 1) {
+        const name = intern_str_of(d.ir, id) orelse continue;
+        const nm: [*]const u8 = @ptrCast(name);
+        const nlen = strlen(nm);
+        if (nlen + kk < m or nlen > m + kk) continue; // band: cannot be within k
+        const dist = regexwalk.lev_distance_cap(needle, m, nm, nlen, k);
+        if (dist > k) continue;
+        count +%= 1;
+        if (cb.?(id, name, nlen, dist, user) != 0) break;
+    }
+    return count;
 }
 
 // ─── Graph traversal (Tier-2) ───────────────────────────────────────────────
@@ -5709,4 +5703,134 @@ test "dl_open_ro never writes" {
     const b = [2]u32{ 3, 3 };
     try testing.expectEqual(@as(c_int, -1), dl_add_fact(ro, "edge", &b, 2));
     try testing.expectEqual(@as(u32, 0), dl_intern_str(ro, "new-sym"));
+}
+
+// ─── dl_fuzzy_lookup: the scan vs the Levenshtein automaton walk ───────────
+
+const FuzzyRec = struct { id: u32, dist: u32 };
+
+const FuzzyRecCtx = struct {
+    recs: [64]FuzzyRec = undefined,
+    n: usize = 0,
+};
+
+fn fuzzyRecCb(sym_id: u32, name: [*c]const u8, name_len: usize, dist: u32, user: ?*anyopaque) callconv(.c) c_int {
+    _ = name;
+    _ = name_len;
+    const self: *FuzzyRecCtx = @ptrCast(@alignCast(user.?));
+    self.recs[self.n] = .{ .id = sym_id, .dist = dist };
+    self.n += 1;
+    return 0;
+}
+
+/// The walk reports ids only; the distance is recomputed from the name.
+fn fuzzyWalkCb(sym_id: u32, user: ?*anyopaque) callconv(.c) c_int {
+    const self: *FuzzyRecCtx = @ptrCast(@alignCast(user.?));
+    self.recs[self.n] = .{ .id = sym_id, .dist = 0 };
+    self.n += 1;
+    return 0;
+}
+
+fn fuzzyRecLess(_: void, a: FuzzyRec, b: FuzzyRec) bool {
+    return a.id < b.id;
+}
+
+/// Distance recorded for `name`, or null when it is not among the records.
+fn fuzzyRecDist(ctx: *const FuzzyRecCtx, db: ?*DlDb, name: [*:0]const u8) ?u32 {
+    const id = intern_str_find(db.?.ir, name);
+    if (id == 0) return null;
+    for (ctx.recs[0..ctx.n]) |r| {
+        if (r.id == id) return r.dist;
+    }
+    return null;
+}
+
+test "dl_fuzzy_lookup: scan agrees with the lev automaton walk, id+dist for id+dist" {
+    const dir = "/tmp/datalog_zig_u11_fuzzy";
+    rmrfTestDir(dir);
+    defer rmrfTestDir(dir);
+
+    const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+    defer dl_close(db);
+
+    // Boundary corpus for needle "abcdef" (m = 6): m-1 and m+1 are distance 1,
+    // m-2 and m+2 are distance 2, a transposition is 2, "abcdefghij" is 4 —
+    // the first two are exactly the edges a LENGTH/DEPTH bound could miscut.
+    const corpus = [_][*:0]const u8{
+        "abcdef", "abcde", "abcdefg", "abcdefgh", "abcdefghij", "abcd",
+        "abcdeg", "abxdef", "xabcdef", "abdcef",   "Abcdef",     "zqxjvw",
+        "alice",  "alise", "alica",   "bob",       "a",          "ab",
+        "abc",    "abcdefghijklmnop",
+    };
+    for (corpus) |s| _ = intern_str(db.ir, s);
+
+    // The walk arm needs the forward DAFSA, which the scan deliberately never
+    // builds — building it here is what lets the two mechanisms be compared.
+    const fwd = intern_fwd(db.ir) orelse return error.TestUnexpectedResult;
+
+    const needles = [_][*:0]const u8{ "abcdef", "abcde", "alice", "ab", "zqxjvw" };
+    for (needles) |needle| {
+        const m = strlen(needle);
+        for ([_]u32{ 0, 1, 2 }) |k| {
+            // ── arm A: the production scan ──
+            var scan = FuzzyRecCtx{};
+            const ns = dl_fuzzy_lookup(db, needle, k, fuzzyRecCb, &scan);
+            try testing.expectEqual(@as(c_long, @intCast(scan.n)), ns);
+
+            // ── arm B: the Levenshtein automaton product walk over the DAFSA ──
+            var walk = FuzzyRecCtx{};
+            const dfa = regexwalk.lev_compile(needle, k) orelse return error.TestUnexpectedResult;
+            defer regexwalk.regex_dfa_free(dfa);
+            try testing.expect(dfa.errmsg == null);
+            _ = symbols_dfa_walk(fwd, dfa, fuzzyWalkCb, &walk);
+            for (walk.recs[0..walk.n]) |*r| {
+                const nm = intern_str_of(db.ir, r.id) orelse return error.TestUnexpectedResult;
+                r.dist = regexwalk.lev_distance_cap(needle, m, nm, strlen(nm), k);
+            }
+
+            // Same matches, same distances — set equality, no order dependence.
+            std.mem.sort(FuzzyRec, scan.recs[0..scan.n], {}, fuzzyRecLess);
+            std.mem.sort(FuzzyRec, walk.recs[0..walk.n], {}, fuzzyRecLess);
+            try testing.expectEqualSlices(FuzzyRec, walk.recs[0..walk.n], scan.recs[0..scan.n]);
+
+            // …and the boundary cases really are in the answer.
+            if (std.mem.eql(u8, std.mem.span(needle), "abcdef")) {
+                try testing.expectEqual(@as(?u32, 0), fuzzyRecDist(&scan, db, "abcdef"));
+                switch (k) {
+                    0 => try testing.expectEqual(@as(?u32, null), fuzzyRecDist(&scan, db, "abcde")),
+                    1 => {
+                        try testing.expectEqual(@as(?u32, 1), fuzzyRecDist(&scan, db, "abcde")); // len m-1
+                        try testing.expectEqual(@as(?u32, 1), fuzzyRecDist(&scan, db, "abcdefg")); // len m+1
+                        try testing.expectEqual(@as(?u32, 1), fuzzyRecDist(&scan, db, "abcdeg"));
+                        try testing.expectEqual(@as(?u32, 1), fuzzyRecDist(&scan, db, "Abcdef"));
+                        try testing.expectEqual(@as(?u32, null), fuzzyRecDist(&scan, db, "abcdefgh"));
+                        try testing.expectEqual(@as(?u32, null), fuzzyRecDist(&scan, db, "abcd")); // len m-2
+                    },
+                    else => {
+                        try testing.expectEqual(@as(?u32, 2), fuzzyRecDist(&scan, db, "abcdefgh")); // len m+2
+                        try testing.expectEqual(@as(?u32, 2), fuzzyRecDist(&scan, db, "abcd")); // len m-2
+                        try testing.expectEqual(@as(?u32, 2), fuzzyRecDist(&scan, db, "abdcef")); // transposition
+                        try testing.expectEqual(@as(?u32, 1), fuzzyRecDist(&scan, db, "abcde"));
+                        try testing.expectEqual(@as(?u32, null), fuzzyRecDist(&scan, db, "abcdefghij"));
+                    },
+                }
+            }
+        }
+    }
+
+    // Refusals are the lev_compile contract, kept by the scan.
+    const cb = fuzzyRecCb;
+    try testing.expectEqual(@as(c_long, -1), dl_fuzzy_lookup(db, "alice", 3, cb, null));
+    try testing.expectEqual(@as(c_long, -1), dl_fuzzy_lookup(null, "alice", 1, cb, null));
+    try testing.expectEqual(@as(c_long, -1), dl_fuzzy_lookup(db, null, 1, cb, null));
+    try testing.expectEqual(@as(c_long, -1), dl_fuzzy_lookup(db, "alice", 1, null, null));
+    try testing.expectEqual(@as(c_long, -1), dl_fuzzy_lookup(db, "", 1, cb, null));
+    {
+        var long_needle: [600:0]u8 = undefined;
+        @memset(long_needle[0..600], 'a');
+        try testing.expectEqual(@as(c_long, -1), dl_fuzzy_lookup(db, &long_needle, 1, cb, null));
+        long_needle[512] = 0; // the cap is inclusive: 512 is accepted
+        var ctx2 = FuzzyRecCtx{};
+        try testing.expectEqual(@as(c_long, 0), dl_fuzzy_lookup(db, &long_needle, 0, cb, &ctx2));
+    }
 }

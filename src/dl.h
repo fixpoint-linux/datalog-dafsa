@@ -497,17 +497,23 @@ typedef int (*dl_fuzzy_cb)(uint32_t sym_id, const char *name, size_t name_len,
                            uint32_t dist, void *user);
 
 /* Enumerate every interned symbol whose name is within edit distance k of
- * `needle`, in DAFSA walk order.  Zero index storage: the edit-distance
- * automaton is compiled per call and walked product-wise over the live
- * interner forward DAFSA.
+ * `needle`, in symbol-id order.  Zero index storage and no index BUILD: the
+ * candidates come from a banded linear scan of the live symbol table (a name
+ * outside [len-k, len+k] cannot be within k edits), each one checked with
+ * lev_distance_cap.  (A walk of the symbol DAFSA was measured 500-1000x slower
+ * at 166k symbols, because the lazily-built forward DAFSA costs 10-19 s to
+ * materialize and the edit-distance automaton needs no index at all — see
+ * docs/datalog-dafsa-fuzzy-lookup.md.)
  *
  * k is 0..2; k >= 3 is REFUSED with -1 (the DP-row determinisation explodes).
+ * An empty needle and a needle longer than 512 bytes are REFUSED with -1 —
+ * the same two refusals lev_compile applies (see regexwalk.h).
  *
- * BYTE DISTANCE, not codepoint distance: the walk consumes bytes, so a
+ * BYTE DISTANCE, not codepoint distance: the comparison is over bytes, so a
  * non-ASCII codepoint costs one edit per UTF-8 byte ('é' = 2).  Correct for
  * ASCII; over-counts non-ASCII.
  *
- * Returns the number of matches, or -1 on error (NULL args, k > 2, OOM). */
+ * Returns the number of matches, or -1 on error (NULL args, k > 2, bad needle). */
 long dl_fuzzy_lookup(dl_db *db, const char *needle, uint32_t k,
                      dl_fuzzy_cb cb, void *user);
 

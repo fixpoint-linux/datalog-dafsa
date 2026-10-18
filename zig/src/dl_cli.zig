@@ -886,9 +886,10 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
 
     if (eq(cmd, "similar")) {
         // dl similar '<name>' [--k N] — typo-tolerant entity-name lookup.
-        // Zero index storage: the edit-distance automaton is compiled per call
-        // and walked product-wise over the symbol DAFSA.  BYTE distance (ASCII
-        // exact; a non-ASCII codepoint costs one edit per UTF-8 byte).
+        // No index and no index BUILD: the engine scans the live symbol table
+        // with a length band (|len - k| .. len + k) and a capped edit distance.
+        // BYTE distance (ASCII exact; a non-ASCII codepoint costs one edit per
+        // UTF-8 byte).
         const needle = requirePositional(argv, &argp);
 
         var k: u32 = 1;

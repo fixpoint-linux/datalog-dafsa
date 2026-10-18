@@ -16,7 +16,7 @@ the smoke step (the four vector/embed suites left with the tier).
 |---|---|---|---|
 | 1 | full-text `IntSet` → O(1) membership | **DONE** `4416161` | 20k × 3 terms **306 → 3.74 ms**; linear, not quadratic |
 | 2 | hybrid hot loop + lexical gate | **DONE** `e08ee86`, **REMOVED** 2026-08-11 (tier deleted) | `dl_prefix` calls **100 → 1**; recall hole closed via `dl_vector_search_gated` — the whole `vhybrid` path is gone now |
-| 3 | `lev_compile` Levenshtein over symbols | **DONE** `07127a4` | k=1 10–28 µs end-to-end; k=2 58–145 µs; zero storage |
+| 3 | `lev_compile` Levenshtein over symbols | **DONE** `07127a4`; `dl_fuzzy_lookup` mechanism replaced 2026-10-18 (unit `fuzzy-fast`) | k=1 10–28 µs end-to-end; k=2 58–145 µs; zero storage. **CORRECTION (2026-10-18):** those figures are IN-PROCESS with a warm DAFSA. A cold `dl similar` run was 11.19–16.29 s on a 166,743-symbol store, 96 % of it the lazy `ensureFwd` build; the API is now a banded scan (no index) at 15–17 ms and 0.39–0.47 s wall clock. See CHANGELOG + docs/datalog-dafsa-fuzzy-lookup.md |
 | 3b | review fixes (5 findings) | **DONE** `fb04704` | 2 measured defects incl. a regression; OOM leak proved closed with an interposer |
 | 4 | `dl_search_ranked` (OR / `min_terms`) | **DONE** `f23899f` | score now varies with matched-term count |
 | 5 | rev-gated columnar vector arena | **REMOVED** 2026-08-11 (arena deleted with the tier) | repeated queries **76.47 → 4.09 ms** at 10k (19×); +3.9 MB — measured, then moot: `vector.zig` and its arena are gone |

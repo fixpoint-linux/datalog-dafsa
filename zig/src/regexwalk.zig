@@ -64,7 +64,9 @@ const MAX_WORD_LEN: usize = 65536; // dafsa_internal.h MAX_WORD_LEN
 /// the DP-row determinisation explodes there: the row alphabet is k+2 wide per
 /// pattern position, so state count grows like m^(k+1).
 pub const LEV_MAX_K: u32 = 2;
-const LEV_PATTERN_MAX: usize = 512;
+/// Longest needle lev_compile will build — the same cap dl_fuzzy_lookup's
+/// scan enforces, so the two entry points refuse the same patterns.
+pub const LEV_PATTERN_MAX: usize = 512;
 const FNV_OFFSET: u64 = 14695981039346656037;
 const FNV_PRIME: u64 = 1099511628211;
 

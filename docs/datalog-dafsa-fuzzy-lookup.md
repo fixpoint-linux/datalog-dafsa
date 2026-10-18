@@ -1,4 +1,4 @@
-# Fuzzy entity-name lookup: Levenshtein over `symbols.dafsa`
+# Fuzzy entity-name lookup: Levenshtein over the symbol table
 
 **Status:** IMPLEMENTED. `lev_compile` (zig/src/regexwalk.zig), the `~~` atom
 operator (zig/src/parser.zig + compiler.zig), `dl_fuzzy_lookup` (src/dl.h +
@@ -6,7 +6,14 @@ zig/src/dl.zig), `dl similar` (zig/src/dl_cli.zig), and the oracle suite
 tests/test_fuzzy.c. Nothing was added to the on-disk format, and no relation,
 index or build step was introduced.
 
-## Why this is cheap
+**Two mechanisms, two callers (2026-10-18).** `dl_fuzzy_lookup` / `dl similar`
+no longer walk any index: they run a **banded linear scan** over the interner's
+symbol table (§ *Why the scan, not the walk*). The Levenshtein automaton below
+is still the mechanism for the `~~` rule operator, whose walk is a *query* over
+a relation and is untouched. Both were measured to agree id-for-id and
+distance-for-distance (a Zig unit test compares them on the same corpus).
+
+## The Levenshtein automaton (`~~` rules, and the walk the scan replaced)
 
 A Levenshtein automaton for `(term, k)` is an **ordinary DFA**: its states are
 edit-distance DP rows, its start row is `[0,1,...,m]`, a transition on byte `c`
@@ -41,6 +48,42 @@ Two construction economies, both behaviour-preserving:
   the class determines exactly. This is ~`nclass`× cheaper and is *load-bearing*:
   measured build time is comparable to the walk time, so the naive 256-wide build
   would double-plus the per-call cost. Same struct, same walker, no API change.
+
+## Why the scan, not the walk (MEASURED 2026-10-18, commit 3dd4ae0)
+
+The hypothesis that motivated this rewrite was that the symbol product DFS
+(`symProdDfs`) explores an unbounded depth and that a depth bound of
+`|needle| + k` would prune it. **That hypothesis is refuted, and the proposed
+bound would have pruned nothing:**
+
+1. The automaton is *already* depth-bounded by its own dead-state prune. A row
+   with `min_j dp[j] > k` is `DFA_DEAD`, and `min_j dp[i][j]` is non-decreasing in
+   `i`, so no state survives past depth `|needle| + k`. MEASURED over a battery
+   of needles (lengths 1-20, `k = 0/1/2`) on a 166,743-symbol store: the walk
+   costs **0-2 ms** in every case.
+2. The cost was never the walk. `dl_fuzzy_lookup` called `intern_fwd()`, which
+   **materializes** the whole symbol DAFSA from `symbols.array` on first use
+   (symbols.dafsa is no longer persisted — it is a derived cache). MEASURED:
+   **10.3-19 s** for 166,743 symbols (≈60 µs/symbol), against 0.37 s to open the
+   store: the command was 96 % index build.
+3. The earlier "10-28 µs" figure was an *in-process, warm-DAFSA* measurement of
+   `dl_fuzzy_lookup`, while the 13.6-14.1 s figure was a *cold CLI run*. The two
+   were not comparable; that comparison is what made an index-build cost look
+   like a walk cost.
+
+A scan needs no index at all, so the cliff disappears. On a warm DAFSA it is the
+slower of the two (see the measured table) — but a warm symbol DAFSA is exactly
+what a fresh process does not have, and every other consumer that builds it
+(`dl pattern` in-memory, `~` rules, `~~` rules) pays the same 10-19 s. Fuzzy
+lookup was the only consumer that paid it for a query that costs 15 ms without
+it.
+
+**The band is exact, not heuristic:** every edit costs at least one byte of
+length, so a name whose length is outside `[m-k, m+k]` cannot be within distance
+`k` of a needle of length `m`. The scan skips those before any DP, which also
+bounds the DP itself to `O((m+k)²)` per surviving candidate. A match at exactly
+`len-k` (deletion) and exactly `len+k` (insertion) is *inside* the band and is
+covered by tests/test_fuzzy.c, the Zig unit test, and the CLI battery.
 
 ## Grammar: `atom ~~ k [col] 'term'`
 
@@ -107,14 +150,31 @@ of the symbol space where entity lookup does not live.
 | `typographical` (13) | 14 | 52, 23 µs | 186, 95 µs |
 
 Walk over a 6,885-symbol DAFSA: 0.3–0.5 µs (k=0), 5–7 µs (k=1), 35–55 µs (k=2).
+These are WARM (DAFSA already built) numbers — the condition under which the walk
+is the cheaper mechanism.
 
-End-to-end `dl_fuzzy_lookup` on that db (build + walk + per-hit distance, mean of
-200 calls): **k=0 2–6 µs, k=1 10–28 µs, k=2 58–145 µs** — i.e. sub-millisecond,
-exact, with **zero index storage**. For comparison, a brute-force scan is
-`N × len²` DP cells (≈ 900 k cells for this vocabulary) with no prune.
+The banded scan of `dl_fuzzy_lookup` (MEASURED 2026-10-18, in-process, ReleaseFast):
 
-**INTERPRETATION:** build is roughly half the k=1/k=2 cost at these term lengths,
-which is why the equivalence-class optimization is in v1 rather than deferred.
+| symbol table | store bytes | scan, k=1 | scan, k=2 | DAFSA build it replaces |
+|---|---|---|---|---|
+| 6,885 symbols | 0.2 MB | 0.18 ms | 0.11–0.27 ms | ≈12 ms |
+| 166,743 symbols | 44 MB | 15.7 ms | 15.1–16.7 ms | 10.3–19 s |
+
+CLI end-to-end (`dl similar '<word>' --k N`, wall clock, store open included —
+open alone is 0.37 s on the 166,743-symbol store and 5 ms on the 6,885-symbol one):
+
+| store | before | after | speed-up |
+|---|---|---|---|
+| 166,743 symbols | 11.19–16.29 s | 0.39–0.47 s | 25–37× |
+| 6,885 symbols | 15.4–18.5 ms | 3.2–4.6 ms | 4.5–5.5× |
+| 10-symbol synthetic | 2.6–3.4 ms | 2.5–3.8 ms | unchanged (±0.4 ms) |
+
+**INTERPRETATION:** the scan is `O(N)` in the symbol table with a band that keeps
+the DP per candidate at `O((m+k)²)`, and it is the *whole* cost — there is no
+index to build. The trade is explicit: on a warm DAFSA the walk wins by 10–20×
+(tens of µs vs a fraction of a ms); when the DAFSA would have to be materialized,
+the scan wins by 500–1000×. A separate process that already built the DAFSA for a
+pattern query can still use it — `~~` rule evaluation does, and pays nothing.
 
 ## API
 
@@ -130,11 +190,12 @@ uint32_t lev_distance_cap(const uint8_t *a, size_t alen,
 
 CLI: `dl similar '<name>' [--k N]` prints `distance<TAB>name`, nearest first.
 
-**Time travel is free:** the walk resolves against the LIVE interner DAFSA.
-Sym-ids are append-only and never reused, so the live symbol set is a superset of
-any snapshot's; rows still come from the version's relation view, so a superset
-filter can only be applied to rows that exist in that version. No version
-entry point is needed.
+**Time travel is free:** both mechanisms resolve against the LIVE symbol space
+(the scan reads the interner's symbol table directly; the `~~` walk reads the
+live forward DAFSA). Sym-ids are append-only and never reused, so the live symbol
+set is a superset of any snapshot's; rows still come from the version's relation
+view, so a superset filter can only be applied to rows that exist in that
+version. No version entry point is needed.
 
 ## Verification
 
@@ -156,9 +217,23 @@ each case named with what would make it fail:
    200-iteration compile/free loop whose arena growth is asserted (the leak
    check: a missing `trans` free would show as ~20 MB).
 
-Plus Zig unit tests in zig/src/regexwalk.zig: an **exhaustive** agreement check
+Plus a Zig unit test in zig/src/regexwalk.zig: an **exhaustive** agreement check
 (every string over `{a,b,c}` up to length 4 × every pattern over `{a,b}` up to
 length 4 × k ∈ {0,1,2}) against `lev_distance_cap`.
+
+And a Zig unit test in zig/src/dl.zig (`dl_fuzzy_lookup: scan agrees with the lev
+automaton walk`): the banded scan and the Levenshtein-automaton product walk are
+run over the same corpus and compared as `(sym_id, distance)` SETS for 5 needles ×
+3 values of k, plus explicit assertions that the `len-m±1` neighbours are present
+(the edges a length/depth bound could cut) and the `len-m±2` ones only at k=2.
+The two mechanisms are independent code paths, so this is a differential, not a
+tautology.
+
+CLI differential (2026-10-18): `dl similar` output captured for 52 invocations —
+a 10-symbol synthetic store with hand-built `len-k`/`len+k`/transposition/no-
+neighbour cases, the 6,885-symbol store, and the 166,743-symbol store, over
+`k ∈ {0,1,2}` and needle lengths 1-20 — **before and after the change, byte
+identical stdout, stderr and exit codes** (including the `--k 3` refusal).
 
 **Asymmetry proof (the tests can fail):** flipping the accept test from
 `<= k` to `< k` fails 7 of the 8 C cases (including the brute-force oracle, the
