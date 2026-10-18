@@ -340,6 +340,310 @@ const noopCb = struct {
     }
 }.cb;
 
+// ─── Rev-gated columnar arena (search item 5) ─────────────────────────────
+//
+// A repeated-query loop re-pays the DAFSA row materialisation on EVERY query
+// (MEASURED at 10k vectors / 960k rows: ~97 ms LIVE, of which the DAFSA walk
+// is 70-90% and the int8 arithmetic is free).  The stored vectors do not change
+// between queries, so the relation-VISIBLE payload is materialised once into
+// one contiguous columnar arena and reused while the relation's content
+// revision (`Relation.rev`, relation.zig rel_rev) is unchanged.
+//
+// INVALIDATION IS THE CONTENT REVISION, not the query.  `rev` is bumped by
+// every mutation that changes the view — add / delete / overlay consolidation
+// / view reset / rebuild (relation.zig) — so a snapshot tagged with the rev it
+// was built at is used ONLY while that rev still holds:
+//   - an ADD after a query bumps rev -> the next query rebuilds, and sees it;
+//   - a DELETE bumps rev -> the next query rebuilds from the SHRUNKEN relation
+//     (it never reads past a stale end);
+//   - a publish/consolidate that folds the hot-write overlay bumps rev ->
+//     rebuild (no stale read across a consolidation).
+// A build that observed the rev move WHILE it enumerated (rev0 != rev1) is
+// DISCARDED, never published: a torn snapshot must not be cached.  The query
+// that hit that case still answers from its own scan, so it is never wrong.
+//
+// LIVE MODE ONLY.  VERSION reads keep going through dl_query_bound_version and
+// never touch the arena (the LIVE-vs-VERSION discipline predates this cache);
+// the version branch does not even read `Relation.cache`.
+//
+// The arena FILTERS NOTHING.  Liveness and the caller's gate are still applied
+// per entity here, exactly as in the scan path: the arena supplies the vectors,
+// the gate/liveness test filters the candidates.
+
+/// One materialised vector: sym + the two query-INDEPENDENT norms (|v|^2 and
+/// its integer isqrt) + the 384 int8 lanes in chunk-major order.  Columnar so
+/// the rank loop streams the lanes linearly.
+const VecArena = struct {
+    // The Relation.rev this snapshot was built at.  0 is NOT a sentinel: a
+    // never-mutated relation legitimately sits at rev 0.  "Not built" is the
+    // null cache slot on the Relation, and an installed snapshot is trusted
+    // only while its rev still equals the relation's.
+    rev: u64 = 0,
+    n: usize = 0,
+    cap: usize = 0,
+    sym: ?[*]u32 = null,
+    norm2: ?[*]u32 = null,
+    norm: ?[*]u32 = null,
+    vec: ?[*]i8 = null,
+
+    fn deinit(self: *VecArena) void {
+        c.free(@ptrCast(self.sym));
+        c.free(@ptrCast(self.norm2));
+        c.free(@ptrCast(self.norm));
+        c.free(@ptrCast(self.vec));
+        c.free(@ptrCast(self));
+    }
+};
+
+/// Release a `Relation.cache` slot (relation.zig calls it with whatever is
+/// there — null included — at teardown).
+fn vecArenaFree(p: ?*anyopaque) void {
+    if (p) |q| {
+        const a: *VecArena = @ptrCast(@alignCast(q));
+        a.deinit();
+    }
+}
+
+/// Build counter — the invalidation-proof instrument: a test asserts that a
+/// mutation REALLY rebuilt the snapshot, not merely that the results look right.
+var arena_builds: u64 = 0;
+
+/// Grow the columnar arrays to hold at least `need` entries.  Each
+/// c.realloc keeps the old block valid on failure, so a failed growth leaves
+/// the arena consistent (the caller aborts the build and frees it).
+fn arenaGrow(a: *VecArena, need: usize) bool {
+    if (need <= a.cap) return true;
+    var nc: usize = if (a.cap != 0) a.cap else 64;
+    while (nc < need) nc *= 2;
+    const ns = c.realloc(@ptrCast(a.sym), nc * @sizeOf(u32)) orelse return false;
+    a.sym = @ptrCast(@alignCast(ns));
+    const n2 = c.realloc(@ptrCast(a.norm2), nc * @sizeOf(u32)) orelse return false;
+    a.norm2 = @ptrCast(@alignCast(n2));
+    const nr = c.realloc(@ptrCast(a.norm), nc * @sizeOf(u32)) orelse return false;
+    a.norm = @ptrCast(@alignCast(nr));
+    const nv = c.realloc(@ptrCast(a.vec), nc * VEC_D) orelse return false;
+    a.vec = @ptrCast(@alignCast(nv));
+    a.cap = nc;
+    return true;
+}
+
+/// Arena build state.  `slot` maps sym -> arena index for the build only (it is
+/// freed when the build ends), and `cur_*` is the same one-entry cache the scan
+/// uses — a repeat of the previous row's sym skips the map probe.  It caches
+/// the SLOT INDEX, never a pointer into the arena, because growing the arena
+/// reallocs its buffers.
+const ArenaFill = struct {
+    a: *VecArena,
+    slot: *std.AutoHashMap(u32, u32),
+    cur_sym: u32 = 0,
+    cur_slot: u32 = 0,
+    cur_hit: bool = false,
+    error_occurred: bool = false,
+};
+
+fn arenaFillCb(cols: ?[*]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_int {
+    _ = arity;
+    const f: *ArenaFill = @ptrCast(@alignCast(user.?));
+    const sym = cols.?[0];
+    const chunk = cols.?[1];
+    // Malformed row: ignored BEFORE the map touch, exactly as scanChunkCb
+    // does — a sym whose only rows are malformed must not become a candidate.
+    if (chunk >= VEC_IVEC_WORDS) return 0;
+    const packed_bits = cols.?[2];
+    const a = f.a;
+
+    if (!f.cur_hit or f.cur_sym != sym) {
+        const gop = f.slot.getOrPut(sym) catch {
+            f.error_occurred = true;
+            return 1;
+        };
+        if (!gop.found_existing) {
+            if (!arenaGrow(a, a.n + 1)) {
+                f.error_occurred = true;
+                return 1;
+            }
+            const slot: u32 = @intCast(a.n);
+            a.n += 1;
+            a.sym.?[slot] = sym;
+            a.norm2.?[slot] = 0;
+            // Absent chunks are zeros in the scan path; make that explicit.
+            @memset(a.vec.?[@as(usize, slot) * VEC_D ..][0..VEC_D], 0);
+            gop.value_ptr.* = slot;
+        }
+        f.cur_slot = gop.value_ptr.*;
+        f.cur_sym = sym;
+        f.cur_hit = true;
+    }
+
+    const base = a.vec.? + @as(usize, f.cur_slot) * VEC_D + @as(usize, chunk) * 4;
+    var norm2: u32 = 0;
+    var lane: usize = 0;
+    while (lane < 4) : (lane += 1) {
+        const b: i8 = @bitCast(@as(u8, @truncate(packed_bits >> @truncate(8 * lane))));
+        base[lane] = b;
+        norm2 += @intCast(@as(i32, b) * @as(i32, b));
+    }
+    a.norm2.?[f.cur_slot] += norm2;
+    return 0;
+}
+
+/// Trim the columnar arrays to exactly `n` entries.  The doubling growth leaves
+/// up to 2x slack (at 10k vectors: cap 16384 = 6.3 MB of lanes for 3.84 MB of
+/// payload) and the arena is immutable after the build, so the exact size is
+/// final.  c.realloc (not malloc+copy) so a large shrink usually happens in
+/// place and does not fault in fresh pages.  `cap` is lowered FIRST and a failed
+/// realloc leaves the original (larger) block valid, so `cap` never overstates
+/// what is actually allocated.
+fn arenaFit(a: *VecArena) void {
+    const n = a.n;
+    if (n == 0 or a.cap == n) return;
+    a.cap = n;
+    if (c.realloc(@ptrCast(a.vec), n * VEC_D)) |p| a.vec = @ptrCast(@alignCast(p));
+    if (c.realloc(@ptrCast(a.sym), n * @sizeOf(u32))) |p| a.sym = @ptrCast(@alignCast(p));
+    if (c.realloc(@ptrCast(a.norm2), n * @sizeOf(u32))) |p| a.norm2 = @ptrCast(@alignCast(p));
+    if (c.realloc(@ptrCast(a.norm), n * @sizeOf(u32))) |p| a.norm = @ptrCast(@alignCast(p));
+}
+
+/// Materialise `vrel`'s visible rows into a fresh arena, or null (OOM / torn
+/// rev — both make the caller fall back to the plain scan, never wrong).
+fn arenaBuild(vrel: *relation.Relation) ?*VecArena {
+    const mem = c.malloc(@sizeOf(VecArena)) orelse return null;
+    const a: *VecArena = @ptrCast(@alignCast(mem));
+    a.* = .{};
+
+    // A read of this relation consolidates the hot-write overlay (rel_prefix
+    // does it at its top anyway).  Doing it BEFORE the rev read means the rev
+    // describes exactly the content the enumeration below will see.
+    _ = relation.rel_overlay_flush(vrel);
+    const rev0 = relation.rel_rev(vrel);
+
+    var slot = std.AutoHashMap(u32, u32).init(std.heap.c_allocator);
+    defer slot.deinit();
+    var f = ArenaFill{ .a = a, .slot = &slot };
+
+    if (relation.rel_prefix(vrel, null, 0, arenaFillCb, &f) < 0 or f.error_occurred) {
+        a.deinit();
+        return null;
+    }
+
+    var i: usize = 0;
+    while (i < a.n) : (i += 1) a.norm.?[i] = isqrtU64(a.norm2.?[i]);
+    arenaFit(a);
+
+    if (relation.rel_rev(vrel) != rev0) { // mutated mid-build: do not publish
+        a.deinit();
+        return null;
+    }
+    a.rev = rev0;
+    arena_builds += 1;
+    return a;
+}
+
+/// Install `a` as `vrel`'s snapshot, dropping any previous one.
+fn arenaInstall(vrel: *relation.Relation, a: *VecArena) void {
+    if (vrel.cache) |old| vecArenaFree(old);
+    vrel.cache = a;
+    vrel.cache_free = &vecArenaFree;
+}
+
+/// Rank the arena against `q`, applying the SAME liveness + gate tests the scan
+/// path applies per entity.
+fn arenaRank(a: *const VecArena, q: *const [VEC_D]i32, live: *const VecFilterSet, gate: *const VecGate) ?CandSet {
+    if (a.n == 0) return CandSet{};
+    const raw = c.calloc(a.n, @sizeOf(RankCand)) orelse return null;
+    const rc: [*]RankCand = @ptrCast(@alignCast(raw));
+    var cs = CandSet{ .rc = rc, .n = 0 };
+    const syms = a.sym.?;
+    const vec = a.vec.?;
+    var e: usize = 0;
+    while (e < a.n) : (e += 1) {
+        const sym = syms[e];
+        if (!fsContains(live, sym)) continue;
+        if (gate.active and !fsContains(&gate.set, sym)) continue;
+        const base = vec + e * VEC_D;
+        var dot: i32 = 0;
+        var d: usize = 0;
+        while (d < VEC_D) : (d += 1) dot += @as(i32, base[d]) * q[d];
+        rc[cs.n] = .{
+            .sym = sym,
+            .dot = dot,
+            .norm2 = a.norm2.?[e],
+            .norm = a.norm.?[e],
+        };
+        cs.n += 1;
+    }
+    return cs;
+}
+
+/// Candidates from the rev-gated arena, building it on a miss.  Null means the
+/// arena path is NOT usable here (no such relation / wrong arity / OOM / a rev
+/// that moved mid-build) — the caller then takes the one-pass scan, which
+/// answers identically.
+fn arenaCands(vrel: *relation.Relation, q: *const [VEC_D]i32, live: *const VecFilterSet, gate: *const VecGate) ?CandSet {
+    const rev = relation.rel_rev(vrel);
+    if (vrel.cache) |p| {
+        const a: *VecArena = @ptrCast(@alignCast(p));
+        if (a.rev == rev) return arenaRank(a, q, live, gate);
+    }
+    const a = arenaBuild(vrel) orelse return null;
+    const cs = arenaRank(a, q, live, gate) orelse {
+        a.deinit();
+        return null;
+    };
+    arenaInstall(vrel, a);
+    return cs;
+}
+
+// ─── Candidate assembly ───────────────────────────────────────────────────
+
+/// An owned RankCand array.  `n == 0` is a valid empty result (no candidates);
+/// `rc == null` only ever accompanies n == 0.
+const CandSet = struct {
+    rc: ?[*]RankCand = null,
+    n: usize = 0,
+
+    fn deinit(self: *const CandSet) void {
+        c.free(@ptrCast(self.rc));
+    }
+};
+
+/// The one-pass scan path: score every stored vector in ONE enumeration, then
+/// reconcile the sym-keyed accumulators against liveness + the gate.  Used by
+/// VERSION mode always, and by LIVE mode when the arena is unusable.
+fn scanCands(rd: *const VecReader, corpus: *const DlVecCorpus, q: *const [VEC_D]i32, live: *const VecFilterSet, gate: *const VecGate, err: *bool) ?CandSet {
+    var acc = std.AutoHashMap(u32, VecAccum).init(std.heap.c_allocator);
+    defer acc.deinit();
+    var sc = ScanCtx{ .q = q, .m = &acc };
+    if (vecReadPrefix(rd, corpus.vec_rel, null, 0, scanChunkCb, &sc, err) < 0 or sc.error_occurred)
+        return null;
+
+    // rank: one RankCand per LIVE entity that had at least one chunk (the map
+    // may also hold dead syms — append-only vector rows — so it is an upper
+    // bound on the candidate count).
+    const n_scanned = acc.count();
+    if (n_scanned == 0) return CandSet{};
+    const rc_raw = c.calloc(n_scanned, @sizeOf(RankCand)) orelse return null;
+    const rc: [*]RankCand = @ptrCast(@alignCast(rc_raw));
+    var cs = CandSet{ .rc = rc, .n = 0 };
+
+    var it = acc.iterator();
+    while (it.next()) |e| {
+        if (!fsContains(live, e.key_ptr.*)) continue;
+        // Second membership test (only when the caller gated the search): the
+        // rank set is the INTERSECTION, so truncating the scan is unnecessary.
+        if (gate.active and !fsContains(&gate.set, e.key_ptr.*)) continue;
+        const norm2 = e.value_ptr.norm2;
+        rc[cs.n] = .{
+            .sym = e.key_ptr.*,
+            .dot = e.value_ptr.dot,
+            .norm2 = norm2,
+            .norm = isqrtU64(norm2),
+        };
+        cs.n += 1;
+    }
+    return cs;
+}
+
 // ─── Shared search body (LIVE / VERSION differ only in the read primitive) ──
 
 fn vectorSearchImpl(rd: *const VecReader, corpus: *const DlVecCorpus, q_in: ?[*]const u32, gate_syms: ?[*]const u32, n_gate: usize, k: c_int, cb: DlVecCb, user: ?*anyopaque) c_long {
@@ -372,47 +676,32 @@ fn vectorSearchImpl(rd: *const VecReader, corpus: *const DlVecCorpus, q_in: ?[*]
         return -1;
     fsSortDedup(&live);
 
-    // scan: score every stored vector in ONE pass.
-    var acc = std.AutoHashMap(u32, VecAccum).init(std.heap.c_allocator);
-    defer acc.deinit();
-    var sc = ScanCtx{ .q = &q, .m = &acc };
-    if (vecReadPrefix(rd, corpus.vec_rel, null, 0, scanChunkCb, &sc, &err) < 0 or sc.error_occurred)
-        return -1;
+    // candidates: the rev-gated arena in LIVE mode (a repeated-query loop
+    // re-reads the same stored vectors), else the one-pass scan.  The arena is
+    // consulted ONLY on the live branch — a VERSION read never sees it.
+    var cands: CandSet = blk: {
+        if (!rd.use_version) {
+            if (dl.relFixedByName(rd.db, corpus.vec_rel)) |vrel| {
+                // Only the arity-3 __vec_q__-shaped row layout is materialised;
+                // anything else falls through to the scan unchanged.
+                if (relation.rel_arity(vrel) == 3) {
+                    if (arenaCands(vrel, &q, &live, &gate)) |cs| break :blk cs;
+                }
+            }
+        }
+        break :blk scanCands(rd, corpus, &q, &live, &gate, &err) orelse return -1;
+    };
+    defer cands.deinit();
+    if (cands.n == 0) return 0;
+    const rc = cands.rc.?;
 
-    // rank: one RankCand per LIVE entity that had at least one chunk (the map
-    // may also hold dead syms — append-only vector rows — so it is an upper
-    // bound on the candidate count).
-    const n_scanned = acc.count();
-    if (n_scanned == 0) return 0;
-    const rc_raw = c.calloc(n_scanned, @sizeOf(RankCand)) orelse return -1;
-    const rc: [*]RankCand = @ptrCast(@alignCast(rc_raw));
-    defer c.free(rc_raw);
-
-    var n_cand: usize = 0;
-    var it = acc.iterator();
-    while (it.next()) |e| {
-        if (!fsContains(&live, e.key_ptr.*)) continue;
-        // Second membership test (only when the caller gated the search): the
-        // rank set is the INTERSECTION, so truncating the scan is unnecessary.
-        if (gate.active and !fsContains(&gate.set, e.key_ptr.*)) continue;
-        const norm2 = e.value_ptr.norm2;
-        rc[n_cand] = .{
-            .sym = e.key_ptr.*,
-            .dot = e.value_ptr.dot,
-            .norm2 = norm2,
-            .norm = isqrtU64(norm2),
-        };
-        n_cand += 1;
-    }
-    if (n_cand == 0) return 0;
-
-    std.mem.sort(RankCand, rc[0..n_cand], {}, rankCandLt);
+    std.mem.sort(RankCand, rc[0..cands.n], {}, rankCandLt);
 
     // emit at most k, highest cosine first (counted before the cb so an early
     // stop still counts the row it saw).
     var emitted: c_long = 0;
     var i: usize = 0;
-    while (i < n_cand and emitted < k) : (i += 1) {
+    while (i < cands.n and emitted < k) : (i += 1) {
         emitted += 1;
         if (cb.?(rc[i].sym, @intCast(rc[i].dot), user) != 0) break;
     }
@@ -764,6 +1053,188 @@ test "dl_vector_rerank: int8 cosine order via integer cross-multiply" {
     try testing.expectEqual(@as(c_long, -1), dl_vector_rerank(db, &q_int8, &cands, 0, 10, collectSymCb, &got));
     try testing.expectEqual(@as(c_long, -1), dl_vector_rerank(db, &q_int8, &cands, 2, 0, collectSymCb, &got));
     try testing.expectEqual(@as(c_long, -1), dl_vector_rerank(null, &q_int8, &cands, 2, 10, collectSymCb, &got));
+}
+
+// ─── Arena invalidation tests (the cache is only worth having if a STALE one
+// can never answer: each test below FAILS if the invalidation is removed) ───
+
+/// The installed arena for `rel` (test-only reach-in: the arena is a private
+/// detail of this file, so its proof lives here rather than at the ABI).
+fn testArenaFor(db: ?*dl.DlDb, rel: [*:0]const u8) ?*VecArena {
+    const vrel = dl.relFixedByName(db, rel) orelse return null;
+    const p = vrel.cache orelse return null;
+    return @ptrCast(@alignCast(p));
+}
+
+test "arena: an ADD after materialisation is visible to the next query" {
+    const path = "/tmp/datalog_zig_u19_vec_arena_add";
+    const db = testOpenDb(path);
+    defer testCloseDb(db, path);
+
+    try testing.expectEqual(@as(c_int, 0), dl.dl_declare_relation(db, "entity", 2));
+    try testing.expectEqual(@as(c_int, 0), dl.dl_declare_relation(db, "__vec_q__", 3));
+    try testing.expectEqual(@as(c_int, 1), dl.dl_add_fact(db, "entity", &[_]u32{ 10, 1 }, 2));
+    try testing.expectEqual(@as(c_int, 1), dl.dl_add_fact(db, "entity", &[_]u32{ 11, 1 }, 2));
+    // Off-axis vectors: cosines are DISTINCT (10 > 11), so the assertions
+    // below test the ranking rather than the sym tiebreak.
+    // (the integer ranking uses isqrt(NORM), so the off-axis component must be
+    // big enough that truncation does not collapse the two cosines into a tie)
+    try testing.expectEqual(@as(c_int, 1), dl.dl_add_fact(db, "__vec_q__", &[_]u32{ 10, 0, pack4(8, 9, 0, 0) }, 3));
+    try testing.expectEqual(@as(c_int, 1), dl.dl_add_fact(db, "__vec_q__", &[_]u32{ 11, 0, pack4(4, 9, 0, 0) }, 3));
+
+    var q: [VEC_IVEC_WORDS]u32 = [_]u32{0} ** VEC_IVEC_WORDS;
+    q[0] = pack4(1, 0, 0, 0);
+
+    const builds0 = arena_builds;
+
+    var got: std.ArrayList(u64) = .empty;
+    defer got.deinit(testing.allocator);
+    try testing.expectEqual(@as(c_long, 2), dl_vector_search(db, &q, 10, collectSymCb, &got));
+    try testing.expectEqual(@as(u64, 10), got.items[0] >> 32);
+
+    // MATERIALISED, and the snapshot is the relation's: 2 vectors, tagged with
+    // the relation's current rev.
+    try testing.expectEqual(builds0 + 1, arena_builds);
+    const a0 = testArenaFor(db, "__vec_q__") orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 2), a0.n);
+    const rev0 = a0.rev;
+    try testing.expectEqual(relation.rel_rev(dl.relFixedByName(db, "__vec_q__")), rev0);
+
+    // A second query with the relation untouched REUSES it (no rebuild).
+    var got2: std.ArrayList(u64) = .empty;
+    defer got2.deinit(testing.allocator);
+    try testing.expectEqual(@as(c_long, 2), dl_vector_search(db, &q, 10, collectSymCb, &got2));
+    try testing.expectEqual(builds0 + 1, arena_builds);
+
+    // MUTATE: add a third vector AFTER the arena exists.  Without rev-gating
+    // the next query answers from the stale snapshot and misses sym 12 (the
+    // whole point of the test).
+    try testing.expectEqual(@as(c_int, 1), dl.dl_add_fact(db, "entity", &[_]u32{ 12, 1 }, 2));
+    try testing.expectEqual(@as(c_int, 1), dl.dl_add_fact(db, "__vec_q__", &[_]u32{ 12, 0, pack4(127, 0, 0, 0) }, 3));
+
+    var got3: std.ArrayList(u64) = .empty;
+    defer got3.deinit(testing.allocator);
+    try testing.expectEqual(@as(c_long, 3), dl_vector_search(db, &q, 10, collectSymCb, &got3));
+    try testing.expectEqual(@as(u64, 12), got3.items[0] >> 32); // cosine 1.0
+    try testing.expectEqual(@as(u64, 10), got3.items[1] >> 32);
+    try testing.expectEqual(@as(u64, 11), got3.items[2] >> 32);
+
+    // The REBUILD is real, not decorative: a fresh snapshot with one more
+    // entry, tagged with the NEW rev.
+    try testing.expectEqual(builds0 + 2, arena_builds);
+    const a1 = testArenaFor(db, "__vec_q__") orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 3), a1.n);
+    try testing.expect(a1.rev != rev0);
+}
+
+test "arena: a DELETE rebuilds from the shrunken relation (never reads past its end)" {
+    const path = "/tmp/datalog_zig_u19_vec_arena_del";
+    const db = testOpenDb(path);
+    defer testCloseDb(db, path);
+
+    try testing.expectEqual(@as(c_int, 0), dl.dl_declare_relation(db, "entity", 2));
+    try testing.expectEqual(@as(c_int, 0), dl.dl_declare_relation(db, "__vec_q__", 3));
+
+    // Three live entities, one chunk row each (a row is the whole vector here).
+    var sym: u32 = 20;
+    while (sym < 23) : (sym += 1) {
+        try testing.expectEqual(@as(c_int, 1), dl.dl_add_fact(db, "entity", &[_]u32{ sym, 1 }, 2));
+        // [10, k] with k = sym-19: cosine 10/sqrt(100+k^2) is strictly
+        // DECREASING in sym, so the ranking is 20, 21, 22 (no tiebreak).
+        try testing.expectEqual(@as(c_int, 1), dl.dl_add_fact(db, "__vec_q__", &[_]u32{ sym, 0, pack4(10, @intCast(sym - 19), 0, 0) }, 3));
+    }
+
+    var q: [VEC_IVEC_WORDS]u32 = [_]u32{0} ** VEC_IVEC_WORDS;
+    q[0] = pack4(1, 0, 0, 0);
+
+    const builds0 = arena_builds;
+    var got: std.ArrayList(u64) = .empty;
+    defer got.deinit(testing.allocator);
+    try testing.expectEqual(@as(c_long, 3), dl_vector_search(db, &q, 10, collectSymCb, &got));
+    try testing.expectEqual(@as(u64, 20), got.items[0] >> 32);
+    try testing.expectEqual(@as(u64, 22), got.items[2] >> 32);
+    try testing.expectEqual(@as(usize, 3), (testArenaFor(db, "__vec_q__") orelse return error.TestUnexpectedResult).n);
+
+    // Delete the WHOLE vector of 22 (its only row): the relation shrinks.
+    try testing.expectEqual(@as(c_int, 1), dl.dl_delete_fact(db, "__vec_q__", &[_]u32{ 22, 0, pack4(10, 3, 0, 0) }, 3));
+
+    var got2: std.ArrayList(u64) = .empty;
+    defer got2.deinit(testing.allocator);
+    try testing.expectEqual(@as(c_long, 2), dl_vector_search(db, &q, 10, collectSymCb, &got2));
+    try testing.expectEqual(@as(u64, 20), got2.items[0] >> 32);
+    try testing.expectEqual(@as(u64, 21), got2.items[1] >> 32);
+
+    const a = testArenaFor(db, "__vec_q__") orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(builds0 + 2, arena_builds); // rebuilt after the delete
+    try testing.expectEqual(@as(usize, 2), a.n); // and re-derived, not truncated
+
+    // A liveness-only change must NOT rebuild (the vector payload is identical;
+    // the filter is applied per query, so the cache survives).
+    try testing.expectEqual(@as(c_int, 1), dl.dl_delete_fact(db, "entity", &[_]u32{ 21, 1 }, 2));
+    var got3: std.ArrayList(u64) = .empty;
+    defer got3.deinit(testing.allocator);
+    try testing.expectEqual(@as(c_long, 1), dl_vector_search(db, &q, 10, collectSymCb, &got3));
+    try testing.expectEqual(@as(u64, 20), got3.items[0] >> 32);
+    try testing.expectEqual(builds0 + 2, arena_builds); // no rebuild: filters, not cache
+}
+
+test "arena: VERSION reads never materialise or consult it" {
+    const path = "/tmp/datalog_zig_u19_vec_arena_version";
+    const db = testOpenDb(path);
+    defer testCloseDb(db, path);
+
+    try testing.expectEqual(@as(c_int, 0), dl.dl_declare_relation(db, "entity", 2));
+    try testing.expectEqual(@as(c_int, 0), dl.dl_declare_relation(db, "__vec_q__", 3));
+    try testing.expectEqual(@as(c_int, 1), dl.dl_add_fact(db, "entity", &[_]u32{ 10, 1 }, 2));
+    try testing.expectEqual(@as(c_int, 1), dl.dl_add_fact(db, "entity", &[_]u32{ 11, 1 }, 2));
+    // [8,5] > [4,5] > (absent), and the added [127,0] outranks both.
+    try testing.expectEqual(@as(c_int, 1), dl.dl_add_fact(db, "__vec_q__", &[_]u32{ 10, 0, pack4(8, 5, 0, 0) }, 3));
+    try testing.expectEqual(@as(c_int, 1), dl.dl_add_fact(db, "__vec_q__", &[_]u32{ 11, 0, pack4(4, 5, 0, 0) }, 3));
+
+    try testing.expectEqual(@as(c_int, 0), dl.dl_publish_snapshot(db));
+    var vers: [8]u32 = undefined;
+    const nv = dl.dl_snapshot_versions(db, &vers, 8);
+    try testing.expect(nv >= 1);
+    const V = vers[@intCast(nv - 1)];
+
+    var q: [VEC_IVEC_WORDS]u32 = [_]u32{0} ** VEC_IVEC_WORDS;
+    q[0] = pack4(1, 0, 0, 0);
+
+    // Version reads FIRST: they must leave the cache slot empty — the arena is
+    // a LIVE-mode structure and the version path does not touch it.
+    const builds0 = arena_builds;
+    var vgot: std.ArrayList(u64) = .empty;
+    defer vgot.deinit(testing.allocator);
+    try testing.expectEqual(@as(c_long, 2), dl_vector_search_version(db, V, &q, 10, collectSymCb, &vgot));
+    try testing.expectEqual(@as(usize, 2), vgot.items.len);
+    try testing.expect(testArenaFor(db, "__vec_q__") == null);
+    try testing.expectEqual(builds0, arena_builds);
+
+    // A LIVE query materialises it...
+    var lgot: std.ArrayList(u64) = .empty;
+    defer lgot.deinit(testing.allocator);
+    try testing.expectEqual(@as(c_long, 2), dl_vector_search(db, &q, 10, collectSymCb, &lgot));
+    try testing.expect(testArenaFor(db, "__vec_q__") != null);
+
+    // ...and a later VERSION read of the OLD version still answers from the
+    // version, not from the (mutable) live snapshot: mutate live, then the
+    // version must neither see the added vector nor rebuild the arena.
+    try testing.expectEqual(@as(c_int, 1), dl.dl_add_fact(db, "entity", &[_]u32{ 12, 1 }, 2));
+    try testing.expectEqual(@as(c_int, 1), dl.dl_add_fact(db, "__vec_q__", &[_]u32{ 12, 0, pack4(127, 0, 0, 0) }, 3));
+
+    var vgot2: std.ArrayList(u64) = .empty;
+    defer vgot2.deinit(testing.allocator);
+    try testing.expectEqual(@as(c_long, 2), dl_vector_search_version(db, V, &q, 10, collectSymCb, &vgot2));
+    try testing.expectEqual(@as(u64, 10), vgot2.items[0] >> 32);
+
+    // The LIVE search does see sym 12 — and that is where the arena rebuild
+    // happens (the version reads above neither rebuilt nor consumed it).
+    const builds1 = arena_builds;
+    var lgot2: std.ArrayList(u64) = .empty;
+    defer lgot2.deinit(testing.allocator);
+    try testing.expectEqual(@as(c_long, 3), dl_vector_search(db, &q, 10, collectSymCb, &lgot2));
+    try testing.expectEqual(@as(u64, 12), lgot2.items[0] >> 32);
+    try testing.expectEqual(builds1 + 1, arena_builds);
 }
 
 test "corpus layout gate: struct matches vector.h, constants survive" {

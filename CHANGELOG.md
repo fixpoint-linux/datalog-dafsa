@@ -3,6 +3,28 @@
 All notable changes to this project are documented in this file.
 
 ## [Unreleased]
+- **Rev-gated columnar vector arena** (2026-10-18, `search-plan.md` §3 / §6
+  item 5): a repeated-query loop stops re-paying DAFSA row materialisation.
+  - The finding: a LIVE vector search spends 70–90% of its time walking
+    `__vec_q__`'s 960k rows at 10k vectors (**MEASURED** 97–140 ms/query here),
+    while the int8 arithmetic is free — and a loop that re-queries pays it every
+    time even though the stored vectors did not change.
+  - `vector.zig` now materialises the relation-visible payload ONCE into one
+    contiguous columnar arena (per sym: `sym`, `|v|^2`, `isqrt(|v|^2)`, 384 int8
+    lanes) and reuses it while the relation's content revision (`Relation.rev`)
+    is unchanged. **MEASURED** at 10k vectors: first query 92–112 ms (unchanged
+    — the build is the same enumeration), subsequent queries 3.4–3.8 ms median,
+    **~30–37×**; VERSION reads unchanged (194–241 ms, they never touch it).
+    Arena cost **MEASURED** +3.87 MB allocator heap (3.96 MB = 10k × 396 B).
+  - Invalidation is the rev, and it is tested: an ADD after materialisation is
+    seen by the next query, a DELETE re-derives from the shrunken relation, and
+    a build that observes the rev move mid-enumeration is discarded rather than
+    published. Disabling the gate makes exactly those three tests fail.
+  - LIVE mode only — `dl_vector_search_version` / `_gated_version` still read
+    through `dl_query_bound_version` and never look at the arena; a version
+    read on a never-queried-live relation leaves the cache slot empty (tested).
+    Liveness and the caller's gate are still applied per entity at rank time, so
+    the arena supplies vectors and the gate filters candidates, unchanged.
 - **Ranked / partial-match (`OR`) full-text entry point** (2026-10-18,
   `search-plan.md` §4(2) / §6 item 4): the full-text tier's ranking stops being
   structurally dead.
