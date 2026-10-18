@@ -6,7 +6,7 @@
 # a link error); the suite asserts are the behavioral oracle.  Mirrors
 # tests/run_all.sh conditions exactly:
 #   - cwd = repo root (suites use relative "build-tmp/..." paths)
-#   - build-tmp/ exists
+#   - build-tmp/ exists (symlink to a tmpfs scratch root — see "Scratch root")
 #   - ./dl at the repo root is the CLI under test (test_m4_review popen()s it,
 #     test_vector_cli execv()s it, smoke.sh runs it) — the repo-root ./dl is
 #     shadowed by the Zig-linked one for the duration and restored afterwards
@@ -19,6 +19,7 @@ set -u
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd) || exit 1
 cd "$ROOT" || exit 1
+START_SECONDS=$SECONDS
 
 LIBDIR=zig-out/lib
 ZIGDL=zig-out/bin/dl
@@ -27,6 +28,56 @@ SAVED_DL=$TMP/dl.c-saved
 
 export ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-/tmp/zigcache-host}"
 export TMPDIR="$ROOT/$TMP"
+
+# ─── Scratch root: tmpfs, not the in-repo build-tmp ────────────────────────
+# MEASURED: of the matrix's ~11m25s only ~2m04s is CPU.  The suites hardcode
+# relative "build-tmp/..." paths and fsync a WAL constantly; this repo sits on
+# ZFS where fsync costs ~9 ms, so ~95% of the wall time is blocked on I/O.
+# Same suites on tmpfs: test_ivm 42.5s -> 0.25s, test_m8_magic 67.7s -> 1.7s.
+# $TMP stays the RELATIVE name "build-tmp" so every "$TMP/..." use below is
+# unchanged; only what that name resolves to moves.
+TMPFS_ROOT=${DL_BUILD_TMP:-/tmp/datalog-dafsa-build-tmp}
+TMPFS_OK=
+if [ -d /tmp ] && [ -w /tmp ]; then
+    case "$TMPFS_ROOT" in
+        /|/tmp|/tmp/) TMPFS_OK= ;;   # never wipe a shared root (DL_BUILD_TMP)
+        /*) TMPFS_OK=1 ;;
+    esac
+fi
+
+if [ -n "$TMPFS_OK" ]; then
+    # Fresh scratch every run: a stale one silently degrades the matrix
+    # (MEASURED test_ivm 43s on a clean dir, 123s on the second, accumulated run).
+    if [ -f "$TMPFS_ROOT/dl.c-saved" ] && [ ! -e ./dl ]; then
+        # A killed run can leave the shadowed ./dl here; the wipe would eat it.
+        mv -f "$TMPFS_ROOT/dl.c-saved" ./dl
+    fi
+    rm -rf "$TMPFS_ROOT" && mkdir -p "$TMPFS_ROOT" || {
+        echo "FAIL: cannot reset $TMPFS_ROOT"; exit 1;
+    }
+    # Point ./build-tmp at it, replacing either the plain scratch dir or a
+    # symlink left over from a previous DL_BUILD_TMP.
+    if [ -L "$ROOT/$TMP" ]; then
+        [ "$(readlink "$ROOT/$TMP")" = "$TMPFS_ROOT" ] || rm -f "$ROOT/$TMP"
+    elif [ -d "$ROOT/$TMP" ]; then
+        # Destructive but safe: build-tmp/ is gitignored scratch (.gitignore:2)
+        # and holds nothing durable.  Assert that what we are about to remove is
+        # EXACTLY the relative name build-tmp under $ROOT — never any other path.
+        [ "$ROOT/$TMP" = "$ROOT/build-tmp" ] && [ ! -L "$ROOT/$TMP" ] || {
+            echo "FAIL: refusing to remove $ROOT/$TMP"; exit 1;
+        }
+        rm -rf "$ROOT/$TMP" || { echo "FAIL: cannot remove $ROOT/$TMP"; exit 1; }
+    fi
+    [ -L "$ROOT/$TMP" ] || ln -s "$TMPFS_ROOT" "$ROOT/$TMP" || {
+        echo "FAIL: cannot symlink $ROOT/$TMP -> $TMPFS_ROOT"; exit 1;
+    }
+    echo "scratch root: $TMPFS_ROOT (tmpfs, via ./$TMP symlink)"
+else
+    # Fall back to the previous in-repo behaviour: correct, just ~5x slower.
+    echo "scratch root: $ROOT/$TMP (in-repo; /tmp missing or not writable)"
+    [ -L "$ROOT/$TMP" ] && rm -f "$ROOT/$TMP"
+    mkdir -p "$ROOT/$TMP" || { echo "FAIL: cannot create $ROOT/$TMP"; exit 1; }
+fi
 
 # ─── Restore the repo-root ./dl no matter how we exit ──────────────────────
 restore_dl() {
@@ -165,6 +216,8 @@ run_one "smoke" sh tests/smoke.sh
 # ─── Summary ───────────────────────────────────────────────────────────────
 echo ""
 echo "ZIG HYBRID ORACLE: $PASSED/$TOTAL passed (C suites re-linked against Zig-built libdatalog.so)"
+ELAPSED=$((SECONDS - START_SECONDS))
+echo "wall time: ${ELAPSED}s (scratch root: $TMP -> $(readlink "$TMP" 2>/dev/null || echo "$ROOT/$TMP"))"
 if [ -n "$FAILED" ]; then
     echo "FAILED:$FAILED"
     exit 1
