@@ -34,7 +34,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 // Engine C ABI (libdatalog.so exports) + the rule/regex_dfa extern structs.
-const dx = @import("dl_internal.zig");
+const dx = @import("dl_abi.zig");
 // Concrete dl_schema/dl_reldef/dl_colspec layouts (byte-identical to
 // src/schema.h; also exported from the .so by this very module).
 const schema_mod = @import("schema.zig");

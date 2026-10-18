@@ -53,7 +53,7 @@ const intern_mod = @import("intern.zig");
 // verified here against our native DlDb/RelEntry/... at comptime below.
 // The datalog engine is now Zig; dl_internal.zig hand-declares the C-layout
 // structs in place of the removed @cImport("dl_internal.h").
-const dx = @import("dl_internal.zig");
+const dx = @import("dl_abi.zig");
 
 // dafsa_internal.h: struct dafsa/dafsa_view + dafsa_save/dafsa_view_open/
 // dafsa_view_close.  The engine is now Zig; dafsa_c.zig hand-declares the

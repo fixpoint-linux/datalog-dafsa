@@ -38,7 +38,7 @@ const magic = @import("magic.zig");
 // dl_internal.h: dl_db + dl_* externs.  The datalog engine is now Zig;
 // dl_internal.zig hand-declares the C-layout structs + extern ABI in place of
 // the removed @cImport("dl_internal.h").
-const dx = @import("dl_internal.zig");
+const dx = @import("dl_abi.zig");
 
 const vm_instr = compiler.vm_instr;
 const compiled_rule = compiler.compiled_rule;

@@ -22,7 +22,7 @@ const snapshot = @import("snapshot.zig");
 // dl_internal.h: dl_db, rel_entry, RELK_VARIADIC.  The datalog engine is now
 // Zig; dl_internal.zig hand-declares the C-layout structs + extern ABI in
 // place of the removed @cImport("dl_internal.h").
-const dx = @import("dl_internal.zig");
+const dx = @import("dl_abi.zig");
 
 // dafsa_internal.h: struct dafsa/State/Edge, trans_find, dafsa_view,
 // view_trans_find, view_edge_next, dafsa_view_open/close.  The engine is now

@@ -53,7 +53,7 @@ const std = @import("std");
 const c = std.c;
 
 const tupleset = @import("tupleset.zig");
-const dx = @import("dl_internal.zig");
+const dx = @import("dl_abi.zig");
 
 // ─── Public C-ABI constants (mirrored in src/dl.h) ─────────────────────────
 

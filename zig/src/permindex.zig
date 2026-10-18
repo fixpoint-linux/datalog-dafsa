@@ -22,7 +22,7 @@ const tupleset = @import("tupleset.zig");
 // now Zig; dl_internal.zig hand-declares the C-layout structs + extern ABI
 // (db_rel_at_arity_ro is dl.zig's export, reached via extern "c") in place of
 // the removed @cImport("dl_internal.h").
-const dx = @import("dl_internal.zig");
+const dx = @import("dl_abi.zig");
 
 // ts_* are `export fn`s in tupleset.zig (C ABI); link against them directly.
 extern "c" fn ts_init(ts: ?*tupleset.tuple_set, arity: u8) c_int;

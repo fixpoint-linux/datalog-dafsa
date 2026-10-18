@@ -28,7 +28,7 @@ const std = @import("std");
 // dl_db struct and the whole engine extern ABI (dl_*/intern_*/term_*/regex_*/
 // index.zig's tokenize/dl_search_top/dl_index_observations/aux_index_*), so
 // dl_db type identity is shared with libdatalog's own modules.
-const c = @import("dl_internal.zig");
+const c = @import("dl_abi.zig");
 
 // ─── libc decls — byte fidelity to the C oracle means using libc itself ────
 extern "c" fn printf(fmt: [*:0]const u8, ...) c_int;

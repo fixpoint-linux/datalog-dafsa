@@ -31,6 +31,10 @@ test {
     _ = @import("index.zig"); // U14: src/index.c
     _ = @import("vector.zig"); // U14: src/vector.c
     _ = @import("analyze.zig"); // U14: src/analyze.c
+    // U1: dl_abi.zig comptime witness — one @cImport("dl_internal.h") pins
+    // the hand-declared C-layout structs field-for-field (test-only, never
+    // in the lib/exe graphs).
+    _ = @import("abi_witness.zig");
     // U15: dafsa Zig engine (abi.zig) — supplies dafsa_*/crc32_*/trans_find
     // symbols the ported modules' @cImport'd extern decls link against.
     _ = @import("dafsa_abi");

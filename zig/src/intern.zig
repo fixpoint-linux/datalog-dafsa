@@ -21,7 +21,7 @@
 const std = @import("std");
 const c = std.c;
 const util = @import("util.zig");
-const dx = @import("dl_internal.zig");
+const dx = @import("dl_abi.zig");
 
 /// dafsa_internal.h: MAX_WORD_LEN guard (intern-side, on str \0 id_u32BE).
 const MAX_WORD_LEN: usize = 65536;

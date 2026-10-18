@@ -77,7 +77,7 @@ const tupleset = @import("tupleset.zig");
 // dl_internal.zig: the shared C-layout mirror of dl_db — the same import
 // vm.zig/topdown.zig use (each module's view of the C struct is a distinct
 // Zig type over identical bytes; dl.zig holds the comptime layout gate).
-const dx = @import("dl_internal.zig");
+const dx = @import("dl_abi.zig");
 
 // ─── Public C-ABI constants (mirrored in src/dl.h) ─────────────────────────
 
