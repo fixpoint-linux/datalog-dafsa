@@ -3,6 +3,80 @@
 All notable changes to this project are documented in this file.
 
 ## [Unreleased]
+- **Version reads: damaged/diverged vocabularies were silently wrong in BOTH
+  directions — closed, and each half pinned by a test that fails when reverted**
+  (2026-10-19, unit `revfixes`; the findings of the `verintern` (4727cb2) and
+  `anchors` (94fd4f7) reviews that were not blockers).
+  - **A1 — a PRESENT, READABLE but DAMAGED snapshot `symbols.array` was a
+    SILENTLY EMPTY vocabulary.** MEASURED (fresh 2-row store whose snapshot
+    records `D:symbols:9:62:…`): truncating `snapshots/1/symbols.array` to its
+    first 3 lines made EVERY version search answer `(no results)` **exit 0** —
+    `red`, `doc1` (whose id is still inside the truncated prefix) and `brown`
+    alike; a DIRECTORY
+    placed at that path did the same (the readability probe's `fopen` succeeds
+    on a directory, `getline` then answers `EISDIR`, so `intern_load` yields an
+    empty interner).  The comment claiming this was an unavoidable limit
+    ("only a whole-file check could catch that") was false: `D:symbols` records
+    `<count>:<bytes>:<h0>:<h1>`, so an **O(1)** check exists.  `snapshotInterner`
+    now rejects a directory (`S_ISDIR`) and requires `st_size ==
+    D:symbols:bytes` **and** parsed-count == `D:symbols:count` — the same pair
+    `inheritSymbolsArray` uses to refuse a "truncated or padded snapshot file".
+    Legacy snapshots with no `D:symbols` line skip the gate (nothing to compare
+    against).  A damaged array is now an explicit error, never an empty
+    vocabulary.
+  - **A2 — the CLI rewiring had no test that fails when reverted.** Every
+    `cli_diff` version case ran against an INTACT store, and no golden rewrote
+    `symbols.array`, so reverting `dl_cli`'s versioned term interning to the
+    live map left 97/97 Zig tests and `cli_diff` BYTE-GREEN.  `cli_diff.sh` now
+    has a **diverged-store arm**: it copies the built db, rewrites the db-ROOT
+    `symbols.array` with two pairs of equal-length term lines swapped
+    (`red`↔`fox`, `doc1`↔`doc2`; the file is unlinked and rewritten, since a
+    publish hardlinks the snapshot's array), asserts the root array really no
+    longer equals the current snapshot's (non-vacuity guard), and re-runs three
+    version reads whose goldens are the INTACT answers: `search red --version 1`
+    (r21), `pattern observation "^doc1$"` (r22), `bound observation 2` (r23).
+    MEASURED asymmetry: with the CLI reverted, r21 answers `3`/`9` where the
+    intact store answers `3`/`7`, r22/r23 print `doc2 …` where the intact store
+    prints `doc1 …` — `cli_diff.sh` exits 1 with 3 findings; with the fix it is
+    BYTE-GREEN (77 full-corpus + 21 persistence commands).
+  - **A3 — the id→string half of a version read still resolved through the LIVE
+    interner (same defect class, mirror direction).** `dl_pattern` is a VERSION
+    read whenever `snap_version > 0` (true for every published store): it
+    filters the SNAPSHOT's rows by the SNAPSHOT's sym ids, and the CLI rendered
+    those ids with `printValue` → `intern_str_of(db->ir)` — the live map.
+    MEASURED on the diverged store: `pattern observation '^doc1$'` printed
+    `doc2 red fox jumps over the lazy dog` — the RIGHT row under the WRONG
+    NAME, exit 0 (`bound observation 2` likewise).  New entry point
+    `const char *dl_intern_str_of_version(dl_db *, uint32_t version, uint32_t
+    sym_id)` (lookup-only; NULL for version 0, id 0, an id that snapshot never
+    assigned, or a damaged array — a printer then renders the raw number rather
+    than a name from the other map).  The CLI now prints through a `PrintCtx`
+    carrying the map the rows belong to: version-aware for `pattern`, `query`,
+    `bound` (all snapshot-backed when a snapshot is published), live for
+    `prefix`.  On an intact store the two maps agree, so no golden moved.
+  - **Where.** `zig/src/dl.zig` (`snapshotInterner` gate +
+    `dl_intern_str_of_version`), `zig/src/dl_cli.zig` (`PrintCtx`/`printValue`/
+    `printList`/`printTuple` + the four call sites), `zig/src/dl_abi.zig`,
+    `src/dl.h`, `zig/tests/cli_diff.sh` + 9 new goldens (`r21`-`r23`).
+  - **Tests that can fail.** `dl_intern_str_version: a DAMAGED snapshot array is
+    an error, not an empty vocabulary` — a healthy control (both terms resolve),
+    a manifest assertion that the `D:symbols` stamp is really there (else the
+    gate is skipped and the arms are vacuous), then truncation (both the term
+    past the cut AND the term still inside it are `-1`), restore-to-healthy (the
+    gate tracks the FILE, not the open), and a directory in place of the file.
+    MEASURED pre-fix: the truncation arm answers `0` with `*sym_out` = the
+    snapshot's id, i.e. a silently empty vocabulary.
+  - **B1/B2 — the two documentation corrections from the `anchors` review.**
+    `cli_diff.sh`'s note about `c56`/`c57`/`r17` taught a wrong model of the
+    engine (see the corrected paragraph above); `src/regexwalk.h` (the
+    ABI-facing header a C embedder reads) documented the regex subset without
+    `^`/`$`: it now states that they are anchors only at the pattern's ends, a
+    hard compile error anywhere else, the escape route, the class meanings, the
+    pre-existing "escaped caret as a class's first element is read as the
+    negator" quirk, and that `lev_compile` (`~~`) is exempt.
+  - Gates: `zig build test` exit 0 (115/115), release build exit 0,
+    `test_binding.py` exit 0, `cli_diff.sh` BYTE-GREEN (exit 0), and the
+    diverged arm exits 1 on the reverted tree.
 - **`^` / `$` in a pattern silently matched NOTHING — now real anchors, and a
   loud parse error anywhere they cannot mean anything** (2026-10-19, unit
   `anchors`).
@@ -41,16 +115,22 @@ All notable changes to this project are documented in this file.
     the unanchored pin test passes; on this tree 105/105 pass. A 20-pattern
     unanchored battery is pinned to masks MEASURED on the pre-anchor engine, so
     any drift in unanchored matching fails the suite.
-  - **Goldens.** None of the 95 existing `cli_diff` goldens moved (the
-    unanchored differential at the CLI level). 8 new ones: `c51`-`c55`,
+  - **Goldens.** None of the 88 existing `cli_diff` goldens moved (the
+    unanchored differential at the CLI level). 7 new ones: `c51`-`c55`,
     `r18`-`r19` — `pattern observation "^doc[12]$"` and `"^doc1$"` now return
     rows, `pattern observation 1 "^.*barks$"` returns `doc3`, and the middle
     anchor `"doc^1"` is `dl: bad pattern` / exit 1 on both the in-memory and
     the snapshot path. **NOTE:** `c56`/`c57`/`r17` (`pattern edge '^[12]$'`)
-    stay `(no results)` and are NOT evidence about anchors — the `edge`
-    relation's columns are raw `u32` ints, not interned strings, so
-    `pattern edge '<anything>'` is empty by construction (`pattern edge 0 '.*'`
-    is also `(no results)`); a comment in `cli_diff.sh` records this.
+    stay `(no results)` and are NOT evidence about anchors — but the reason
+    first recorded here was WRONG: the `edge` relation's columns being raw
+    `u32` ints does not make `pattern edge` empty.  MEASURED: `pattern` builds
+    the sym set from the interner NAMES and then filters rows by sym-id
+    MEMBERSHIP (`relation.zig` `rel_filter_col`), with no column-kind check, so
+    `pattern edge 0 '.*'` returns ALL FIVE edge rows, each printed under the
+    name of the sym id its integer collides with.  `'^[12]$'` is empty because
+    no interned NAME is `1` or `2`.  A comment in `cli_diff.sh` records the
+    corrected mechanism, and CHANGELOG anchors-review unit `regexwalk.h` now
+    documents the anchor syntax for C embedders.
 - **`search --version N` resolved its query terms in the LIVE interner — silent
   wrong answers across a vocabulary divergence** (2026-10-19, unit `verintern`;
   the defect the `fix-idreuse` review recorded as its "NEW FINDING, SAME DEFECT

@@ -114,16 +114,36 @@ fn cliParseValue(db: [*c]c.dl_db, s: [*c]const u8) u32 {
 
 // ─── Value / tuple printing (byte-exact reverse-mapping heuristics) ────────
 
+/// What a printed tuple's ids MEAN: the live term store, plus the SYMBOL MAP
+/// they belong to.  `version != 0` means the rows came from snapshot
+/// `version` (dl_pattern / dl_query / dl_query_bound all route to the snapshot
+/// whenever one is published), so names must resolve in THAT snapshot's
+/// vocabulary — the live interner maps some of those ids onto other strings on
+/// a store whose db-root array has diverged from the snapshot's, which printed
+/// the right rows under the WRONG NAME with exit code 0.  `version == 0` is the
+/// live in-memory relation (prefix and friends).
+const PrintCtx = struct {
+    db: [*c]c.dl_db,
+    version: u32,
+};
+
 /// Print a column value: resolve list handles (EXACT, first), then string
 /// symbols (reverse-map heuristic), then raw ints.  Lists are first so list
 /// printing is exact even though int-vs-symbol stays heuristic (B6).
-fn printValue(db: [*c]c.dl_db, v: u32, depth: c_int) void {
-    const ir = db.*.ir;
+fn printValue(ctx: *const PrintCtx, v: u32, depth: c_int) void {
+    const db = ctx.db;
     if (c.term_is_list(db.*.terms, v) != 0) {
-        printList(db, v, depth);
+        printList(ctx, v, depth);
         return;
     }
-    const s = c.intern_str_of(ir, v);
+    // A version read resolves in the snapshot's map; a version whose array is
+    // missing/damaged answers NULL, and the raw id is printed — never a name
+    // from the other map (the version arms of dl_pattern/dl_query have already
+    // failed loudly in that case; this is the fallback for a raw int column).
+    const s = if (ctx.version != 0)
+        c.dl_intern_str_of_version(db, ctx.version, v)
+    else
+        c.intern_str_of(db.*.ir, v);
     if (s != null and s[0] != 0) {
         _ = printf("%s", s);
     } else {
@@ -134,7 +154,8 @@ fn printValue(db: [*c]c.dl_db, v: u32, depth: c_int) void {
 /// Render a list handle recursively.  The DAG is well-founded (acyclic), so
 /// this terminates; the depth cap is a defensive bound against a pathological
 /// long list overflowing the CLI stack.
-fn printList(db: [*c]c.dl_db, h_in: u32, depth: c_int) void {
+fn printList(ctx: *const PrintCtx, h_in: u32, depth: c_int) void {
+    const db = ctx.db;
     var h = h_in;
     if (depth > 4096) {
         _ = printf("[...]");
@@ -142,20 +163,21 @@ fn printList(db: [*c]c.dl_db, h_in: u32, depth: c_int) void {
     }
     _ = printf("[");
     while (h != c.TERM_NIL) {
-        printValue(db, c.term_car(db.*.terms, h), depth + 1);
+        printValue(ctx, c.term_car(db.*.terms, h), depth + 1);
         h = c.term_cdr(db.*.terms, h);
         if (h != c.TERM_NIL) _ = printf(", ");
     }
     _ = printf("]");
 }
 
-/// Callback for dl_prefix: print one tuple.
+/// Callback for dl_prefix / dl_query / dl_query_bound / dl_pattern: print one
+/// tuple.  `user` is a *PrintCtx (see it for the live-vs-version map rule).
 fn printTuple(cols: [*c]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_int {
-    const db: [*c]c.dl_db = @ptrCast(@alignCast(user.?));
+    const ctx: *const PrintCtx = @ptrCast(@alignCast(user.?));
     var i: u8 = 0;
     while (i < arity) : (i += 1) {
         if (i > 0) _ = printf(" ");
-        printValue(db, cols[i], 0);
+        printValue(ctx, cols[i], 0);
     }
     _ = printf("\n");
     return 0;
@@ -647,7 +669,9 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
             argp += 1;
         }
 
-        const n = c.dl_prefix(db, rel_name.ptr, &leading, k, if (raw) printTupleRaw else printTuple, db);
+        // LIVE relation: the ids are the live interner's (version 0).
+        var pctx = PrintCtx{ .db = db, .version = 0 };
+        const n = c.dl_prefix(db, rel_name.ptr, &leading, k, if (raw) printTupleRaw else printTuple, @ptrCast(&pctx));
         if (n < 0) {
             _ = fprintf(stderr, "dl: prefix query failed\n");
             return 1;
@@ -695,7 +719,11 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
             return 1;
         }
 
-        const n = c.dl_query(db, goal_rel.ptr, printTuple, db);
+        // A published store makes this a VERSION read (dl_query scans the
+        // snapshot whenever snap_version > 0), so render its ids in that
+        // snapshot's vocabulary.
+        var qctx = PrintCtx{ .db = db, .version = db.*.snap_version };
+        const n = c.dl_query(db, goal_rel.ptr, printTuple, @ptrCast(&qctx));
         if (n < 0) {
             _ = fprintf(stderr, "dl: query failed\n");
             return 1;
@@ -747,7 +775,9 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
             argp += 1;
         }
 
-        const n = c.dl_query_bound(db, rel_name.ptr, &leading, k, printTuple, db);
+        // VERSION read whenever a snapshot is published (same rule as query).
+        var bctx = PrintCtx{ .db = db, .version = db.*.snap_version };
+        const n = c.dl_query_bound(db, rel_name.ptr, &leading, k, printTuple, @ptrCast(&bctx));
         if (n < 0) {
             _ = fprintf(stderr, "dl: bound query failed\n");
             return 1;
@@ -781,7 +811,12 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
             return 1;
         }
 
-        const n = c.dl_pattern(db, rel_name.ptr, col, dfa, printTuple, db);
+        // `pattern` on a published store filters the SNAPSHOT's rows by the
+        // SNAPSHOT's sym ids (dl_pattern), so the names must come from that
+        // snapshot's vocabulary too — the live map printed the right rows under
+        // another string's name on a diverged store.
+        var pctx = PrintCtx{ .db = db, .version = db.*.snap_version };
+        const n = c.dl_pattern(db, rel_name.ptr, col, dfa, printTuple, @ptrCast(&pctx));
         c.regex_dfa_free(dfa);
         if (n < 0) {
             _ = fprintf(stderr, "dl: pattern query failed\n");

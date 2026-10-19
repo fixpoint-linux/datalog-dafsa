@@ -158,11 +158,17 @@ build_corpus() {
     run_cmd "$out" c48 "$db" bound tc 1
     run_cmd "$out" c49 "$db" bound edge 1
     run_cmd "$out" c50 "$db" bound nosuchrel
-    # Anchors ('^' … '$').  NOTE the edge relation below holds RAW u32 ints,
-    # not interned strings, so `pattern edge '<anything>'` is "(no results)" by
-    # construction (the symbol DAFSA walk can only see interned names) — c56,
-    # c57 and r17 are NOT evidence about anchor handling.  c51-c55 exercise
-    # anchors where they are observable: observation's interned string columns.
+    # Anchors ('^' … '$').  c56, c57, c58 and r17 are NOT evidence about anchor
+    # handling.  `pattern` matches the SYMBOL NAMES in the interner and then
+    # filters the relation rows by sym_id MEMBERSHIP (relation.zig
+    # rel_filter_col) — it never looks at the column kind, so a raw-u32 column
+    # matches whenever its value happens to equal a live sym_id:
+    # `pattern edge 0 .*` returns ALL FIVE edge rows on this corpus (MEASURED),
+    # each printed under the name of the sym id its integer collides with
+    # (ids 1-4 are --raw, doc1, "red fox jumps over the lazy dog", doc2).
+    # `^[12]$` is empty simply because no interned NAME is "1" or "2", which is
+    # why it says nothing about anchors.  c51-c55 exercise anchors where they
+    # are observable: observation, whose columns ARE interned names.
     run_cmd "$out" c51 "$db" pattern observation "^doc[12]$"
     run_cmd "$out" c52 "$db" pattern observation "doc[12]"
     run_cmd "$out" c53 "$db" pattern observation 1 "^.*barks$"
@@ -219,6 +225,57 @@ read_corpus() {
     run_cmd "$out" r18 "$db" pattern observation "^doc[12]$"
     run_cmd "$out" r19 "$db" pattern observation "doc^1"
     run_cmd "$out" r20 "$db" txn
+    # r21-r23 double as the DIVERGED-STORE arm's tags (see diverged_corpus):
+    # their goldens below are the INTACT answers; the arm re-runs exactly these
+    # three commands against a copy whose db-ROOT vocabulary has been swapped
+    # and requires byte-identical output.  They must not PUBLISH (`query`
+    # publishes, which would make the divergence self-heal).
+    run_cmd "$out" r21 "$db" search "red" --version 1
+    run_cmd "$out" r22 "$db" pattern observation "^doc1$"
+    run_cmd "$out" r23 "$db" bound observation 2
+}
+
+# diverged_corpus <dbdir> <outdir> — the VERSION-vocabulary arm.
+#
+# Every version read answers in THAT SNAPSHOT's vocabulary, in both directions:
+#   * term  → id   (`search --version N` interns the term in snapshot N's
+#     symbols.array — dl_intern_str_version), and
+#   * id    → name (`pattern` / `bound` / `query` filter the SNAPSHOT's rows by
+#     the SNAPSHOT's sym ids, so the CLI must render them from that snapshot's
+#     array — dl_intern_str_of_version, not the live map).
+# A store whose db-root array names other strings than its snapshots do (a
+# restored/copied/edited array) is exactly where the two maps disagree, and
+# BOTH mistakes are silent: right rows, wrong doc / wrong name, exit 0.
+#
+# The intact read corpus cannot see either: on an intact store the root and
+# snapshot arrays agree, so reverting either half stays BYTE-GREEN.  This arm
+# is the differential that fails when either half is reverted.
+#
+# No `query` here: it publishes, which rewrites a snapshot from the diverged
+# live interner and would make the divergence self-heal.
+diverged_corpus() {
+    local db=$1 out=$2
+    mkdir -p "$out"
+    run_cmd "$out" r21 "$db" search "red" --version 1
+    run_cmd "$out" r22 "$db" pattern observation "^doc1$"
+    run_cmd "$out" r23 "$db" bound observation 2
+}
+
+# diverge_vocab <dbdir> — swap two pairs of EQUAL-LENGTH term lines ('red' with
+# 'fox', 'doc1' with 'doc2') in the db-ROOT symbols.array, so the live map names
+# a different string at those ids than the snapshots do.  The file is unlinked
+# and rewritten rather than edited in place: a publish hardlinks the previous
+# snapshot's array (inheritSymbolsArray), so an in-place write could follow the
+# link and mutate the snapshot too — leaving nothing diverged.
+diverge_vocab() {
+    local arr=$1/symbols.array
+    awk '$0=="red"{print "fox"; next}
+         $0=="fox"{print "red"; next}
+         $0=="doc1"{print "doc2"; next}
+         $0=="doc2"{print "doc1"; next}
+         {print}' "$arr" > "$arr.swapped" || return 1
+    rm -f "$arr"
+    mv "$arr.swapped" "$arr"
 }
 
 # tree_manifest <dir> — file list + sha256 of every regular file AND symlink
@@ -246,6 +303,18 @@ build_corpus "$WORK/db" "$WORK/out"
 cp -r "$WORK/db" "$WORK/db_read"
 read_corpus "$WORK/db_read" "$WORK/outr"
 tree_manifest "$WORK/db" > "$WORK/tree.manifest"
+
+note "running the diverged-store arm (version reads against a diverged vocabulary)"
+rm -rf "$WORK/db_div" "$WORK/outd"
+cp -r "$WORK/db_read" "$WORK/db_div"
+diverge_vocab "$WORK/db_div" || bad "could not rewrite the diverged db-root symbols.array"
+# Non-vacuity guard: the mutation must actually have made the root array differ
+# from the CURRENT snapshot's, or the three cases below prove nothing.
+CUR_SNAP=$(cat "$WORK/db_div/snapshots/CURRENT" 2>/dev/null | tr -d '\n')
+if [ -n "$CUR_SNAP" ] && cmp -s "$WORK/db_div/symbols.array" "$WORK/db_div/snapshots/$CUR_SNAP/symbols.array"; then
+    bad "diverged arm is vacuous: the root array still equals snapshots/$CUR_SNAP/symbols.array"
+fi
+diverged_corpus "$WORK/db_div" "$WORK/outd"
 
 NC=$(ls "$WORK/out"/*.out | wc -l)
 NR=$(ls "$WORK/outr"/*.out | wc -l)
@@ -296,6 +365,20 @@ for g in "$GOLDEN"/*.out "$GOLDEN"/*.err "$GOLDEN"/*.rc; do
             ;;
     esac
 done
+
+# The diverged arm: byte-identical to the INTACT store's output for the same
+# three commands.  A version read that consults the live vocabulary (in either
+# direction) prints the other string's row/name here and nowhere else.
+if [ "$RECORD" = 0 ]; then
+    for tag in r21 r22 r23; do
+        for ext in out err rc; do
+            if ! cmp -s "$WORK/outr/$tag.$ext" "$WORK/outd/$tag.$ext"; then
+                bad "$tag diverged-store $ext differs from the intact store (a version read used the LIVE vocabulary)"
+                diff "$WORK/outr/$tag.$ext" "$WORK/outd/$tag.$ext" | head -5
+            fi
+        done
+    done
+fi
 
 if ! cmp -s "$GOLDEN/tree.manifest" "$WORK/tree.manifest"; then
     bad "db-dir tree differs from golden"

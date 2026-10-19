@@ -7,6 +7,17 @@
  * Regex subset: literals (incl. \\, \xHH, \0), ., [abc]/[a-z]/[^abc],
  * *, +, ?, |, ().  NO backrefs, {n,m}, lookaround.
  *
+ * Anchors: matching is whole-key (implicit ^...$), so a '^' as the pattern's
+ * FIRST character and a '$' as its LAST are accepted and constrain nothing
+ * (^p$ == ^p == p$ == p); any other UNESCAPED '^' or '$' is a hard COMPILE
+ * ERROR (errmsg set, n_states == 0).  '\^' and '\$' are the literal bytes.
+ * Inside [...] the class meanings hold: a leading '^' negates the class and
+ * '$' is a literal byte.  NOTE (pre-existing): a caret as the FIRST element of
+ * a class is consumed as the negator even when it is escaped — [\^] and [\x5e]
+ * are errors, so put it elsewhere ([a\^]) or escape differently.  This whole
+ * paragraph does NOT apply to lev_compile (the '~~' edit-distance operator),
+ * where '^' and '$' are ordinary bytes.
+ *
  * Walker:
  *   regex_dfa_walk       — in-memory (iterates via trans_arr_c)
  */
@@ -53,6 +64,7 @@ typedef struct regex_dfa {
  *     REGEX_DFA_ABORT_EARLY for pathological patterns)
  *   - Memory allocation failure
  *   - Syntax errors (unbalanced brackets, etc.)
+ *   - A bare '^' or '$' anywhere but the pattern's own ends (see Anchors)
  */
 regex_dfa *regex_compile(const char *pattern);
 

@@ -2999,6 +2999,33 @@ pub export fn dl_intern_str_of(db: ?*DlDb, sym_id: u32) ?[*:0]const u8 {
     return intern_str_of(d.ir, sym_id);
 }
 
+/// const char *dl_intern_str_of_version(dl_db *db, uint32_t version,
+///                                      uint32_t sym_id)
+///
+/// The id → string half of a VERSION read: resolve `sym_id` in snapshot
+/// `version`'s OWN symbols.array (snapshotInterner), never in the live
+/// interner.  A version read returns THAT snapshot's ids — a row's column, or
+/// a sym_set the pattern path built from the snapshot's names — so resolving
+/// them through the live map names another string on any store whose root and
+/// snapshot arrays diverge (the same restored/copied/edited store
+/// dl_intern_str_version exists for, in the mirror direction): MEASURED before
+/// this fix, on a store whose root array had `doc1`/`doc2` swapped against its
+/// snapshot's, `dl pattern observation '^doc1$'` printed
+/// `doc2 red fox jumps over the lazy dog` — the right row under the wrong name,
+/// exit 0.
+///
+/// Returns NULL for version == 0 (the LIVE path — use dl_intern_str_of), for
+/// sym_id == 0, for an id this snapshot never assigned, and for a snapshot
+/// whose array is missing/unreadable/damaged; a caller printing ids then
+/// renders the raw number, which is what it already does for an id past the
+/// live interner's bound.  LOOKUP-ONLY, like dl_intern_str_version.
+pub export fn dl_intern_str_of_version(db: ?*DlDb, version: u32, sym_id: u32) ?[*:0]const u8 {
+    const d = db orelse return null;
+    if (version == 0 or sym_id == 0) return null;
+    const ir = snapshotInterner(d, version) orelse return null;
+    return intern_str_of(ir, sym_id);
+}
+
 pub export fn dl_intern_fwd_mutable(db: ?*DlDb) ?*anyopaque {
     const d = db orelse return null;
     if (d.ir == null) return null;
@@ -5376,9 +5403,10 @@ fn symsetAddCb(sym_id: u32, user: ?*anyopaque) callconv(.c) c_int {
 /// "id → the string THIS snapshot means by it", and neither may use the live
 /// interner.
 ///
-/// Returns null when the snapshot's array is missing or unreadable; every
-/// caller turns that into an explicit ERROR.  A damaged snapshot is not an
-/// empty vocabulary, and it is not a licence to fall back to the live
+/// Returns null when the snapshot's array is missing, unreadable, a directory,
+/// or DISAGREES with the size/count the snapshot's own manifest recorded for
+/// it; every caller turns that into an explicit ERROR.  A damaged snapshot is
+/// not an empty vocabulary, and it is not a licence to fall back to the live
 /// interner — that fallback IS the defect (see snapshotSymSet).
 fn snapshotInterner(d: *DlDb, version: u32) ?*anyopaque {
     if (d.snap_sym_ir != null and d.snap_sym_version == version) return d.snap_sym_ir;
@@ -5388,23 +5416,46 @@ fn snapshotInterner(d: *DlDb, version: u32) ?*anyopaque {
     }
     d.snap_sym_version = 0;
     if (d.dir == null or version == 0) return null;
+    var sdir: [16384:0]u8 = undefined;
+    _ = snprintf(&sdir, 16384, "%s/snapshots/%u", d.dir.?, version);
     var arr_path: [16384:0]u8 = undefined;
-    _ = snprintf(&arr_path, 16384, "%s/snapshots/%u/symbols.array", d.dir.?, version);
+    _ = snprintf(&arr_path, 16384, "%s/symbols.array", &sdir);
     var ast: Stat = undefined;
     if (stat(&arr_path, &ast) != 0) return null;
+    // A DIRECTORY passes the fopen probe below (open(2) accepts O_RDONLY on a
+    // directory) and getline then answers EISDIR, so intern_load would hand
+    // back an EMPTY interner — every term absent, every query silently empty.
+    if (posix.S_ISDIR(ast.st_mode)) return null;
     // stat() says it EXISTS; prove it can be READ.  intern_load answers an
     // unopenable path with an EMPTY interner ("no file: start empty", intern.zig),
     // which would turn a permissions/IO failure into "this snapshot has no
     // symbols" — i.e. every term absent and every query silently empty.  One
     // extra open/close per version (the parse, not the open, is the cost).
-    // LIMIT, stated rather than claimed away: a read that fails MIDWAY still
-    // yields a short interner; only a whole-file check could catch that, and
-    // this read is the same trust boundary the snapshot's relation views take.
     {
         const probe = c.fopen(&arr_path, "r") orelse return null;
         _ = c.fclose(probe);
     }
+    // DAMAGED-ARRAY GATE (O(1), no extra pass over the file).  The snapshot's
+    // own manifest records D:symbols:<count>:<bytes>:<h0>:<h1>, and
+    // inheritSymbolsArray already refuses to inherit a file whose SIZE
+    // disagrees with it.  Without this gate a truncated or padded array — or a
+    // read that failed midway — parses into a SHORTER vocabulary: every term
+    // past the cut becomes "absent" and a version query over it answers "no
+    // matches" with rc 0.  That is the silent-wrong shape this module exists to
+    // prevent, so it is an ERROR here.  A legacy snapshot with no stamp has
+    // nothing to compare against and skips the gate.
+    var stamp: SymStampOnDisk = undefined;
+    const have_stamp = readSymStamp(&sdir, &stamp);
     const ir = intern_load(null, &arr_path) orelse return null;
+    if (have_stamp) {
+        const bytes = fileSize(&arr_path);
+        if (bytes == null or bytes.? != stamp.bytes or
+            intern_mod.liveSymBound(ir) -% 1 != stamp.count)
+        {
+            intern_free(ir);
+            return null;
+        }
+    }
     d.snap_sym_ir = ir;
     d.snap_sym_version = version;
     return ir;
@@ -7019,6 +7070,152 @@ test "dl_intern_str_version: an UNREADABLE snapshot array is an error, not an em
     try testing.expectEqual(@as(c_int, -1), dl_intern_str_version(db, 1, "blue", &sym));
     try testing.expectEqual(@as(c_int, -1), dl_intern_str_version(db, 1, "zilch", &sym));
     try testing.expectEqual(@as(u32, 99), sym);
+}
+
+test "dl_intern_str_of_version: id -> name resolves in the SNAPSHOT's map, not the live one" {
+    // The MIRROR direction of the version-intern contract.  A version read
+    // returns THAT snapshot's sym ids (dl_pattern/dl_query/dl_query_bound filter
+    // the snapshot's rows by them), so naming them through the live interner
+    // prints the right row under ANOTHER STRING'S NAME with exit 0.  This is the
+    // half no test covered: the store is intact, only the db-ROOT array diverges
+    // from the snapshot's.
+    const dir = "/tmp/datalog_zig_verintern_of";
+    rmrfTestDir(dir);
+    defer rmrfTestDir(dir);
+
+    var rootbuf: [512:0]u8 = undefined;
+    const root_path = std.fmt.bufPrintZ(&rootbuf, "{s}/symbols.array", .{dir}) catch unreachable;
+
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "e", 2));
+        try testing.expectEqual(@as(u32, 1), intern_str(db.ir, "red"));
+        try testing.expectEqual(@as(u32, 2), intern_str(db.ir, "blue"));
+        const row = [2]u32{ 1, 2 };
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "e", &row, 2));
+        try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db)); // v1
+        dl_close(db);
+    }
+    // The db-ROOT array now names different strings at the same ids: id 1 is
+    // `blue` and id 2 is `red`, while snapshot 1 says id 1 `red`, id 2 `blue`.
+    try testing.expect(arraySymbolCount(root_path) == 2);
+    try testing.expect(writeFileRaw(root_path, "blue\nred\n"));
+
+    const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+    defer dl_close(db);
+    const live1 = dl_intern_str_of(db, 1) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("blue", std.mem.span(live1));
+    // …and the snapshot's own map still says `red` at that id.
+    const v1 = dl_intern_str_of_version(db, 1, 1) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("red", std.mem.span(v1));
+    const v2 = dl_intern_str_of_version(db, 1, 2) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("blue", std.mem.span(v2));
+    // The two maps really disagree — otherwise this test proves nothing.
+    try testing.expect(!std.mem.eql(u8, std.mem.span(live1), std.mem.span(v1)));
+
+    // Refusals: the LIVE path (version 0), id 0, an id this snapshot never
+    // assigned, a nonexistent version, and NULL db.  A caller printing ids
+    // then renders the raw number instead of a name from another map.
+    try testing.expect(dl_intern_str_of_version(db, 0, 1) == null);
+    try testing.expect(dl_intern_str_of_version(db, 1, 0) == null);
+    try testing.expect(dl_intern_str_of_version(db, 1, 99) == null);
+    try testing.expect(dl_intern_str_of_version(db, 99, 1) == null);
+    try testing.expect(dl_intern_str_of_version(null, 1, 1) == null);
+}
+
+test "dl_intern_str_version: a DAMAGED snapshot array is an error, not an empty vocabulary" {
+    // PRESENT and READABLE is not the same as INTACT.  A truncated array parses
+    // into a SHORT vocabulary (every term past the cut reads as "absent") and a
+    // DIRECTORY in its place parses into an EMPTY one (open(2) accepts O_RDONLY
+    // on a directory, getline then answers EISDIR) — either way a version query
+    // answers "(no results)" with rc 0, which is the silent-wrong shape this
+    // module exists to prevent.  snapshotInterner therefore checks the file
+    // against the size/count the snapshot's OWN manifest recorded for it:
+    // D:symbols:<count>:<bytes>:<h0>:<h1>, the same pair inheritSymbolsArray
+    // uses to refuse a "truncated or padded snapshot file".
+    const dir = "/tmp/datalog_zig_verintern_damaged";
+    rmrfTestDir(dir);
+    defer rmrfTestDir(dir);
+
+    var snapbuf: [512:0]u8 = undefined;
+    const snap_arr = std.fmt.bufPrintZ(&snapbuf, "{s}/snapshots/1/symbols.array", .{dir}) catch unreachable;
+    var sdirbuf: [512:0]u8 = undefined;
+    const sdir = std.fmt.bufPrintZ(&sdirbuf, "{s}/snapshots/1", .{dir}) catch unreachable;
+
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "e", 2));
+        try testing.expectEqual(@as(u32, 1), intern_str(db.ir, "blue"));
+        try testing.expectEqual(@as(u32, 2), intern_str(db.ir, "nyc"));
+        const row = [2]u32{ 1, 2 };
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "e", &row, 2));
+        try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db)); // v1
+        dl_close(db);
+    }
+
+    // HEALTHY CONTROL: both terms resolve in the snapshot's vocabulary…
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        var sym: u32 = 99;
+        try testing.expectEqual(@as(c_int, 0), dl_intern_str_version(db, 1, "blue", &sym));
+        try testing.expectEqual(@as(u32, 1), sym);
+        try testing.expectEqual(@as(c_int, 0), dl_intern_str_version(db, 1, "nyc", &sym));
+        try testing.expectEqual(@as(u32, 2), sym);
+    }
+    // …and the manifest really does carry the stamp the gate reads.  Without
+    // this the gate would be skipped (legacy snapshot) and the damaged arms
+    // below would pass for the wrong reason.
+    var stamp: SymStampOnDisk = undefined;
+    try testing.expect(readSymStamp(sdir, &stamp));
+    try testing.expectEqual(@as(u32, 2), stamp.count);
+    try testing.expectEqual(fileSize(snap_arr).?, stamp.bytes);
+
+    // Save the intact bytes: the arms below damage the file in place.
+    const intact = readFileAlloc(snap_arr);
+    defer c.free(@ptrCast(intact.ptr));
+    try testing.expect(intact.len != 0);
+
+    // ARM 1 — TRUNCATION (the reviewer's measurement: an 8-line array on a
+    // 20-symbol snapshot made every version search answer "(no results)").
+    {
+        const nl = std.mem.indexOfScalar(u8, intact, '\n') orelse return error.TestUnexpectedResult;
+        try testing.expect(writeFileRaw(snap_arr, intact[0 .. nl + 1]));
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        var sym: u32 = 99;
+        // The term PAST the cut (absent from the short parse)…
+        try testing.expectEqual(@as(c_int, -1), dl_intern_str_version(db, 1, "nyc", &sym));
+        // …and the term still inside it: the file is DAMAGED, not a shorter
+        // snapshot, so the whole vocabulary is refused.
+        try testing.expectEqual(@as(c_int, -1), dl_intern_str_version(db, 1, "blue", &sym));
+        try testing.expectEqual(@as(u32, 99), sym);
+    }
+
+    // The gate tracks the FILE, not the open: restoring the bytes restores the
+    // answers (and proves arm 1 failed because of the damage, not the reopen).
+    try testing.expect(writeFileRaw(snap_arr, intact));
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        var sym: u32 = 99;
+        try testing.expectEqual(@as(c_int, 0), dl_intern_str_version(db, 1, "nyc", &sym));
+        try testing.expectEqual(@as(u32, 2), sym);
+    }
+
+    // ARM 2 — A DIRECTORY IN PLACE OF THE FILE (fopen succeeds, getline EISDIR,
+    // intern_load yields an EMPTY interner: every term absent, silently).
+    {
+        try testing.expect(posix.unlink(snap_arr) == 0);
+        try testing.expect(posix.mkdir(snap_arr, 0o755) == 0);
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        var sym: u32 = 99;
+        try testing.expectEqual(@as(c_int, -1), dl_intern_str_version(db, 1, "blue", &sym));
+        try testing.expectEqual(@as(c_int, -1), dl_intern_str_version(db, 1, "nyc", &sym));
+        try testing.expectEqual(@as(u32, 99), sym);
+    }
+    try testing.expect(posix.rmdir(snap_arr) == 0);
 }
 // ─── Cross-batch stratification battery ───────────────────────────────────
 //

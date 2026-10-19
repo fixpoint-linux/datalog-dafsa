@@ -707,6 +707,24 @@ int         dl_intern_str_version(dl_db *db, uint32_t version, const char *str,
 /* Look up a sym_id → string.  Returns NULL if id is out of range. */
 const char *dl_intern_str_of(dl_db *db, uint32_t sym_id);
 
+/* The id → string half of a VERSION read: resolve sym_id in snapshot
+ * `version`'s OWN symbols.array, never in the live interner.  Every version
+ * read (dl_pattern, dl_query, dl_query_bound, dl_intern_str_version) returns
+ * ids as-of THAT snapshot; resolving them with dl_intern_str_of names another
+ * string on a store whose db-root array has diverged from the snapshot's (a
+ * restored/copied/edited store — the same store dl_intern_str_version exists
+ * for, in the mirror direction).  MEASURED before this entry point existed: on
+ * a store whose root array had `doc1`/`doc2` swapped against its snapshot's,
+ * `dl pattern observation '^doc1$'` printed `doc2 ...` — right row, wrong name,
+ * exit code 0.
+ *
+ * Returns NULL for version == 0 (the LIVE path), sym_id == 0, an id this
+ * snapshot never assigned, and a snapshot whose array is
+ * missing/unreadable/damaged (its recorded size/count disagree).  A caller
+ * that prints ids then renders the raw number.  Lookup-only: mints no symbol,
+ * grows no interner, and therefore works on a read-only handle. */
+const char *dl_intern_str_of_version(dl_db *db, uint32_t version, uint32_t sym_id);
+
 /* Return the interner's forward DAFSA as a MUTABLE handle, lazily materializing
  * it if absent.  After this, dl_intern_str GROWS the DAFSA in place on new
  * symbols (instead of freeing it), so interning stays off the linear rev[]
