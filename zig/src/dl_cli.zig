@@ -362,23 +362,60 @@ fn runSearch(db: [*c]c.dl_db, terms_str: [:0]const u8, opts: SearchParams) c_int
         return 1;
     }
 
-    // Intern all tokens
+    // Intern all tokens.
+    //
+    // LIVE-vs-VERSION READ DISCIPLINE: a `--version N` search matches ids
+    // against THAT SNAPSHOT's __postings__, so the terms must be resolved in
+    // that snapshot's vocabulary (dl_intern_str_version — lookup-only).  The
+    // live interner is not that map: on a store whose db-root symbols.array
+    // diverges from the snapshot's (a legacy store, a restored/edited root
+    // array) an id it hands out names ANOTHER string as-of that snapshot, so
+    // `search "blue" --version 1` answered with the "red" row.  A term the
+    // snapshot does not contain resolves to 0 = absent -> no matches, never a
+    // freshly minted id.
+    const versioned = version != 0;
     const term_syms = malloc(n_tokens * 4);
     if (term_syms == null) {
         c.token_free(tokens);
         return 1;
     }
     const syms: [*]u32 = @ptrCast(@alignCast(term_syms.?));
+    var absent_from_version = false;
     for (0..n_tokens) |i| {
-        syms[i] = c.dl_intern_str(db, tokens[i]);
-        if (syms[i] == 0) {
-            _ = fprintf(stderr, "dl: intern failed for term '%s'\n", tokens[i]);
-            free(term_syms);
-            c.token_free(tokens);
-            return 1;
+        if (versioned) {
+            var sym: u32 = 0;
+            if (c.dl_intern_str_version(db, @intCast(version), tokens[i], &sym) != 0) {
+                // Missing/damaged snapshot vocabulary is an ERROR, not an
+                // empty term set (same message as a failed version read).
+                _ = fprintf(stderr, "dl: search failed\n");
+                free(term_syms);
+                c.token_free(tokens);
+                return 1;
+            }
+            if (sym == 0) absent_from_version = true;
+            syms[i] = sym;
+        } else {
+            syms[i] = c.dl_intern_str(db, tokens[i]);
+            if (syms[i] == 0) {
+                _ = fprintf(stderr, "dl: intern failed for term '%s'\n", tokens[i]);
+                free(term_syms);
+                c.token_free(tokens);
+                return 1;
+            }
         }
     }
     c.token_free(tokens);
+
+    // A term that snapshot's vocabulary does not contain has no postings
+    // as-of that version: the AND is empty.  Not an error — the same answer a
+    // live search for an unknown term gives — and it is decided by the
+    // vocabulary alone, without consulting that version's __postings__ (or
+    // creating it in the live store, which the pre-fix path did).
+    if (absent_from_version) {
+        _ = printf("(no results)\n");
+        free(term_syms);
+        return 0;
+    }
 
     // Ensure postings relation exists
     if (c.aux_index_ensure_postings(db) != 0) {

@@ -2950,6 +2950,48 @@ pub export fn dl_intern_str_find(db: ?*DlDb, str: [*c]const u8) u32 {
     return intern_str_find(d.ir, str);
 }
 
+/// int dl_intern_str_version(dl_db *db, uint32_t version, const char *str,
+///                           uint32_t *sym_out)
+///
+/// VERSION-side interning: resolve `str` against snapshot `version`'s OWN
+/// symbols.array.  LOOKUP-ONLY — it never creates a symbol, never grows the
+/// live interner, never marks it dirty, and therefore also works on a
+/// read-only handle.
+///
+/// THE LIVE vs VERSION DISCIPLINE, stated once here and referenced from the
+/// callers: a term used on a LIVE read (dl_search / dl_search_top /
+/// dl_intern_str) is interned by the LIVE interner; a term used on a VERSION
+/// read (dl_search_version / dl_search_top_version / dl_query_bound_version)
+/// must be interned by THIS function.  Sym ids are not stable across a
+/// publish: the live interner numbers strings from the db-ROOT symbols.array,
+/// which can diverge from a snapshot's (a legacy store written before publish
+/// persisted the root array; a restored/copied/edited root array).  On such a
+/// store the same id names a different string in each map, so an id interned
+/// live and matched against a snapshot's __postings__ selects another string's
+/// rows.
+///
+/// Returns 0 on success (*sym_out = that snapshot's id, or 0 when the snapshot
+/// has no such string: the not-found sentinel — the term has no postings
+/// as-of that version, so queries over it match nothing, and NO id is minted).
+/// Returns -1 on NULL db/str/sym_out, version == 0 (the LIVE path — use
+/// dl_intern_str), a nonexistent version, or a snapshot whose symbols.array is
+/// missing/unreadable: a damaged snapshot is an ERROR, never an empty
+/// vocabulary and never a fallback to the live interner.
+pub export fn dl_intern_str_version(db: ?*DlDb, version: u32, str: [*c]const u8, sym_out: ?*u32) c_int {
+    const d = db orelse return -1;
+    const out = sym_out orelse return -1;
+    if (str == null or version == 0) return -1;
+    const ir = snapshotInterner(d, version) orelse return -1;
+    // NON-MUTATING: intern_str_find's lookup never allocates a symbol.  It uses
+    // the forward DAFSA only if this cached interner already has one current
+    // (a VERSION pattern query built it), else the rev[] scan — deliberately
+    // NOT intern_fwd(): materializing the DAFSA for a handful of query terms is
+    // the cost that made dl_fuzzy_lookup drop it (MEASURED 10-19 s at 166k
+    // symbols), while the scan is O(symbols) strcmp per term.
+    out.* = intern_str_find(ir, str);
+    return 0;
+}
+
 pub export fn dl_intern_str_of(db: ?*DlDb, sym_id: u32) ?[*:0]const u8 {
     const d = db orelse return null;
     if (d.ir == null) return null;
@@ -5200,6 +5242,51 @@ fn symsetAddCb(sym_id: u32, user: ?*anyopaque) callconv(.c) c_int {
     return regexwalk.symset_add(set, sym_id);
 }
 
+/// Load (or reuse) the interner built from snapshot `version`'s OWN
+/// <snapshots/version>/symbols.array — THE SNAPSHOT'S VOCABULARY, never the
+/// live interner.  Cached in DlDb per version (snap_sym_ir / snap_sym_version:
+/// freed by dl_close, replaced when a different version is asked for), so a
+/// process pays the array read once per version it reads.
+///
+/// TWO READERS SHARE IT, which is why it is one function: the VERSION pattern
+/// path (snapshotSymSet, when that snapshot has no symbols.dafsa) and VERSION
+/// term interning (dl_intern_str_version).  Both need the mapping "id → the
+/// string THIS snapshot means by it", and neither may use the live interner.
+///
+/// Returns null when the snapshot's array is missing or unreadable; every
+/// caller turns that into an explicit ERROR.  A damaged snapshot is not an
+/// empty vocabulary, and it is not a licence to fall back to the live
+/// interner — that fallback IS the defect (see snapshotSymSet).
+fn snapshotInterner(d: *DlDb, version: u32) ?*anyopaque {
+    if (d.snap_sym_ir != null and d.snap_sym_version == version) return d.snap_sym_ir;
+    if (d.snap_sym_ir) |old| {
+        intern_free(old);
+        d.snap_sym_ir = null;
+    }
+    d.snap_sym_version = 0;
+    if (d.dir == null or version == 0) return null;
+    var arr_path: [16384:0]u8 = undefined;
+    _ = snprintf(&arr_path, 16384, "%s/snapshots/%u/symbols.array", d.dir.?, version);
+    var ast: Stat = undefined;
+    if (stat(&arr_path, &ast) != 0) return null;
+    // stat() says it EXISTS; prove it can be READ.  intern_load answers an
+    // unopenable path with an EMPTY interner ("no file: start empty", intern.zig),
+    // which would turn a permissions/IO failure into "this snapshot has no
+    // symbols" — i.e. every term absent and every query silently empty.  One
+    // extra open/close per version (the parse, not the open, is the cost).
+    // LIMIT, stated rather than claimed away: a read that fails MIDWAY still
+    // yields a short interner; only a whole-file check could catch that, and
+    // this read is the same trust boundary the snapshot's relation views take.
+    {
+        const probe = c.fopen(&arr_path, "r") orelse return null;
+        _ = c.fclose(probe);
+    }
+    const ir = intern_load(null, &arr_path) orelse return null;
+    d.snap_sym_ir = ir;
+    d.snap_sym_version = version;
+    return ir;
+}
+
 /// Symbol set for a VERSION pattern query: walk the snapshot's own derived
 /// symbols.dafsa when it is present (every snapshot published before the
 /// derived file stopped being written, plus anything published with
@@ -5241,29 +5328,19 @@ fn symsetAddCb(sym_id: u32, user: ?*anyopaque) callconv(.c) c_int {
 /// forward maps (the live one and this one); sharing the live map is exactly
 /// the assumption that broke, and proving the two maps agree for every id a
 /// snapshot references costs a full array comparison on every query.
-fn snapshotSymSet(d: *DlDb, sdir: [*c]const u8, dfa: ?*const regexwalk.regex_dfa, set: *regexwalk.sym_set) c_long {
+fn snapshotSymSet(d: *DlDb, version: u32, dfa: ?*const regexwalk.regex_dfa, set: *regexwalk.sym_set) c_long {
+    if (d.dir == null) return -1;
     var sym_path: [16384:0]u8 = undefined;
-    _ = snprintf(&sym_path, 16384, "%s/symbols.dafsa", sdir);
+    _ = snprintf(&sym_path, 16384, "%s/snapshots/%u/symbols.dafsa", d.dir.?, version);
     if (dc.dafsa_view_open(&sym_path)) |v| {
         defer dc.dafsa_view_close(v);
         return symbols_dfa_walk_view(@ptrCast(v), dfa, symsetAddCb, set);
     }
-    if (d.snap_sym_ir == null or d.snap_sym_version != d.snap_version) {
-        if (d.snap_sym_ir) |old| {
-            intern_free(old);
-            d.snap_sym_ir = null;
-        }
-        var arr_path: [16384:0]u8 = undefined;
-        _ = snprintf(&arr_path, 16384, "%s/symbols.array", sdir);
-        var ast: Stat = undefined;
-        // A snapshot without symbols.dafsa normally has symbols.array; a
-        // missing one is a damaged store, not an empty vocabulary — say so
-        // instead of answering "no symbols match" from an empty interner.
-        if (stat(&arr_path, &ast) != 0) return -1;
-        d.snap_sym_ir = intern_load(null, &arr_path) orelse return -1;
-        d.snap_sym_version = d.snap_version;
-    }
-    const fwd = intern_fwd(d.snap_sym_ir) orelse return -1;
+    // A snapshot without symbols.dafsa normally has symbols.array; a missing
+    // one is a damaged store, not an empty vocabulary — say so instead of
+    // answering "no symbols match" from an empty interner.
+    const sir = snapshotInterner(d, version) orelse return -1;
+    const fwd = intern_fwd(sir) orelse return -1;
     return symbols_dfa_walk(@ptrCast(fwd), dfa, symsetAddCb, set);
 }
 
@@ -5283,7 +5360,7 @@ pub export fn dl_pattern(db: ?*DlDb, rel_name: [*c]const u8, col: u8, dfa: ?*con
 
         var set: regexwalk.sym_set = std.mem.zeroes(regexwalk.sym_set);
         if (regexwalk.symset_init(&set) != 0) return -1;
-        const ns = snapshotSymSet(d, &sdir, dfa, &set);
+        const ns = snapshotSymSet(d, d.snap_version, dfa, &set);
         if (ns < 0) {
             regexwalk.symset_free(&set);
             return -1;
@@ -6713,4 +6790,102 @@ test "dl_fuzzy_lookup: scan agrees with the lev automaton walk, id+dist for id+d
         var ctx2 = FuzzyRecCtx{};
         try testing.expectEqual(@as(c_long, 0), dl_fuzzy_lookup(db, &long_needle, 0, cb, &ctx2));
     }
+}
+
+test "dl_intern_str_version: lookup-only, explicit errors, and never the live map" {
+    // The CONTRACT half of the version-interning entry point: it resolves in
+    // the snapshot's own vocabulary, mints nothing, and treats a damaged
+    // snapshot as an error rather than as an empty vocabulary (the shape that
+    // would answer "no rows" for a term the snapshot does contain).
+    const dir = "/tmp/datalog_zig_verintern_api";
+    rmrfTestDir(dir);
+    defer rmrfTestDir(dir);
+
+    var snapbuf: [512:0]u8 = undefined;
+    const snap_arr = std.fmt.bufPrintZ(&snapbuf, "{s}/snapshots/1/symbols.array", .{dir}) catch unreachable;
+
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "e", 2));
+        try testing.expectEqual(@as(u32, 1), intern_str(db.ir, "blue"));
+        try testing.expectEqual(@as(u32, 2), intern_str(db.ir, "nyc"));
+        const row = [2]u32{ 1, 2 };
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "e", &row, 2));
+        try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db)); // v1
+
+        var sym: u32 = 99;
+        // version 0 IS the live path: rejected, and *sym_out untouched.
+        try testing.expectEqual(@as(c_int, -1), dl_intern_str_version(db, 0, "blue", &sym));
+        try testing.expectEqual(@as(u32, 99), sym);
+        // NULL arguments.
+        try testing.expectEqual(@as(c_int, -1), dl_intern_str_version(null, 1, "blue", &sym));
+        try testing.expectEqual(@as(c_int, -1), dl_intern_str_version(db, 1, null, &sym));
+        try testing.expectEqual(@as(c_int, -1), dl_intern_str_version(db, 1, "blue", null));
+        // A nonexistent version (no snapshot dir, so no vocabulary to read).
+        try testing.expectEqual(@as(c_int, -1), dl_intern_str_version(db, 99, "blue", &sym));
+
+        // The snapshot's id, in that snapshot's vocabulary.
+        try testing.expectEqual(@as(c_int, 0), dl_intern_str_version(db, 1, "blue", &sym));
+        try testing.expectEqual(@as(u32, 1), sym);
+
+        // LOOKUP-ONLY: a term the snapshot lacks resolves to the not-found
+        // sentinel, and NOTHING was minted in the live interner — so the next
+        // live id is still 3.
+        try testing.expectEqual(@as(c_int, 0), dl_intern_str_version(db, 1, "quiz", &sym));
+        try testing.expectEqual(@as(u32, 0), sym);
+        try testing.expectEqual(@as(u32, 0), intern_str_find(db.ir, "quiz"));
+        try testing.expectEqual(@as(u32, 3), intern_str(db.ir, "quiz"));
+        dl_close(db);
+    }
+
+    // A snapshot whose symbols.array is GONE is an explicit error — not an
+    // absent term and not an empty vocabulary.
+    try testing.expect(posix.unlink(snap_arr) == 0);
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        var sym: u32 = 99;
+        try testing.expectEqual(@as(c_int, -1), dl_intern_str_version(db, 1, "blue", &sym));
+        try testing.expectEqual(@as(c_int, -1), dl_intern_str_version(db, 1, "quiz", &sym));
+        try testing.expectEqual(@as(u32, 99), sym);
+    }
+}
+
+test "dl_intern_str_version: an UNREADABLE snapshot array is an error, not an empty vocabulary" {
+    // intern_load answers an unopenable path with an EMPTY interner ("no file:
+    // start empty"), so a permissions fault would otherwise read as "this
+    // snapshot has no symbols" — every term absent, every query silently empty.
+    // The entry point probes readability first and reports -1.
+    const dir = "/tmp/datalog_zig_verintern_unreadable";
+    rmrfTestDir(dir);
+    defer rmrfTestDir(dir);
+
+    var rootbuf: [512:0]u8 = undefined;
+    const root_path = std.fmt.bufPrintZ(&rootbuf, "{s}/symbols.array", .{dir}) catch unreachable;
+    var snapbuf: [512:0]u8 = undefined;
+    const snap_arr = std.fmt.bufPrintZ(&snapbuf, "{s}/snapshots/1/symbols.array", .{dir}) catch unreachable;
+
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "e", 2));
+        try testing.expectEqual(@as(u32, 1), intern_str(db.ir, "blue"));
+        const row = [2]u32{ 1, 1 };
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "e", &row, 2));
+        try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db)); // v1
+        dl_close(db);
+    }
+    // root-only copy of the array survives a later publish, so the reopen still
+    // loads a live interner; the SNAPSHOT's array is the one made unreadable.
+    try testing.expect(arraySymbolCount(root_path) == 1);
+    try testing.expect(posix.chmod(snap_arr, 0) == 0);
+    defer _ = posix.chmod(snap_arr, 0o644);
+    // Root can read anything, so this arm can only discriminate unprivileged.
+    if (posix.geteuid() == 0) return error.SkipZigTest;
+
+    const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+    defer dl_close(db);
+    var sym: u32 = 99;
+    try testing.expectEqual(@as(c_int, -1), dl_intern_str_version(db, 1, "blue", &sym));
+    try testing.expectEqual(@as(c_int, -1), dl_intern_str_version(db, 1, "zilch", &sym));
+    try testing.expectEqual(@as(u32, 99), sym);
 }

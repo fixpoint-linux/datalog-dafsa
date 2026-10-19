@@ -3,6 +3,94 @@
 All notable changes to this project are documented in this file.
 
 ## [Unreleased]
+- **`search --version N` resolved its query terms in the LIVE interner — silent
+  wrong answers across a vocabulary divergence** (2026-10-19, unit `verintern`;
+  the defect the `fix-idreuse` review recorded as its "NEW FINDING, SAME DEFECT
+  CLASS, NOT FIXED").
+  - **The defect, MEASURED through the CLI.** `dl_cli.zig` interned every search
+    term with `dl_intern_str` (the LIVE map) and then matched those ids against
+    that SNAPSHOT's `__postings__`. Sym ids are not stable across a publish: the
+    live interner numbers strings from the db-ROOT `symbols.array`, which can
+    diverge from a snapshot's (a legacy store written before `materializeSnapshot`
+    persisted the root array, or a restored / copied / edited root array). On a
+    store whose root array names id 9 `fox` and id 10 `red` while snapshot 1
+    names id 9 `red` and id 10 `fox`: `search "red" --version 1` answered
+    **`2` and `8`** — the FOX observations (`2`/`8` are `doc1` and `doc4`) —
+    and `search "fox" --version 1` answered the RED ones, i.e. each term
+    returned the other term's documents. The intact store answers `2`/`6` and
+    `2`/`8` respectively. `fix-idreuse`'s Fix 2 stops new stores reaching that
+    state; legacy and restored-root stores stay exposed.
+  - **New entry point: `int dl_intern_str_version(dl_db*, uint32_t version,
+    const char *str, uint32_t *sym_out)`** (`dl.zig`, declared in `dl.h`).
+    Resolves `str` against THAT SNAPSHOT's own `<snapshots/N>/symbols.array`
+    using the per-version cache `fix-idreuse` added (`snap_sym_ir` /
+    `snap_sym_version`, now loaded by one shared `snapshotInterner()` that the
+    VERSION pattern path uses too). **LOOKUP-ONLY by contract:** it calls
+    `intern_str_find` and never `intern_str`, so it cannot create a symbol,
+    grow the live interner or mark it dirty — and it is therefore valid on a
+    read-only handle. A term that snapshot's vocabulary does not contain
+    resolves to **0 (the not-found sentinel, which yields NO matches for that
+    term)**, never a freshly minted id that could be another string's id in
+    that snapshot. `version == 0` is rejected (-1): that is the LIVE path.
+    A snapshot whose `symbols.array` is missing or unreadable is an explicit
+    **-1**, never an empty vocabulary and never a live fallback. Return contract
+    is `int` + out-param precisely because the error case must be
+    distinguishable from "absent" — an all-`uint32_t` signature would have
+    conflated them.
+  - **Call sites rewired.** `dl search --version N` (`dl_cli.zig`) interns via
+    `dl_intern_str_version`; an absent term prints `(no results)` and exits 0
+    (an AND over a term the snapshot does not contain is empty, not an error),
+    and a missing/damaged snapshot vocabulary prints `dl: search failed` and
+    exits 1. Live paths (`search` without `--version`, `--version 0`) keep using
+    `dl_intern_str` unchanged. Documented at every caller-facing surface that
+    takes caller-interned terms for a version read: `dl_search_version` /
+    `dl_search_top_version` (`index.h` + `index.zig` — their "sym_id space is
+    append-only/never-reused, no re-interning needed" comment was the false
+    premise and is replaced) and `dl_query_bound_version`'s `leading` sym ids
+    (`dl.h`). No signature changed (the engine cannot re-intern ids it is only
+    handed), so these are documented preconditions, not enforced ones; the
+    python binding exposes neither search entry.
+  - **Coverage that can fail.** Three new Zig tests. (1) `dl_search_version:
+    terms resolve in the SNAPSHOT's vocabulary, not the live interner`: a
+    published v1, then a same-count/different-bytes root array (id 1 `red`,
+    id 2 `blue`), then a reopen — the snapshot-resolved terms return their own
+    rows (`doc1` for `blue`, `doc2` for `red`), the LIVE ids passed to the same
+    engine call return the swapped rows (which pins the mechanism, not just the
+    fix), and a term v1 lacks is `0` with the live interner untouched (next live
+    id still 5). (2) `dl_intern_str_version: lookup-only, explicit errors, and
+    never the live map`: version 0 / NULL args / nonexistent version / a v1
+    whose `symbols.array` was deleted (all -1, `*sym_out` untouched) and the
+    lookup-only pin. (3) `... an UNREADABLE snapshot array is an error, not an
+    empty vocabulary` (chmod 000, skipped under root): without the readability
+    probe `intern_load` answers an unopenable path with an EMPTY interner, i.e.
+    every term absent and every query silently empty — MEASURED to fail
+    (`expected -1, found 0`) with the probe removed.
+  - **Per-test asymmetry, MEASURED by mutation.** The new entry point does not
+    exist pre-fix, so the test-level discriminator is reverting ITS resolution
+    to the live map (`d.ir`): the diverged-vocabulary test then fails
+    (`expected 1, found 2`) together with the two error-contract tests, i.e. 3
+    of 97. Restored: 97/97.
+  - **Asymmetry, MEASURED against `869d3e7` built in a /tmp worktree** (the
+    user-visible CLI surface): pre-fix `search "red" --version 1` -> `2`,`8`
+    (the fox rows) and `search "fox" --version 1` -> `2`,`6`; fixed binary ->
+    `2`,`6` and `2`,`8`, byte-identical to the intact store. Pre-fix
+    `search "zzz" --version 1` also MINTED the term in the live interner (root
+    `symbols.array` 20 -> 21 lines on exit); the fixed binary leaves it at 20,
+    which is the lookup-only property at CLI level. With
+    `snapshots/1/symbols.array` deleted, pre-fix still answered the wrong rows
+    (`2`,`8`, exit 0) while the fixed binary reports `dl: search failed`
+    (exit 1).
+  - **Cost, MEASURED** on a 112,505-symbol store (1.6 MB array): `search TERM
+    --version 1` pays one snapshot-array read + a rev[] scan per term, +13-26 ms
+    over the live search (which pays neither); the version PATH already paid this
+    read for `dl_pattern`. Deliberately no `intern_fwd` (DAFSA build) for query
+    terms — see the comment at the call site; PROJECTION, not measured, for the
+    1.5 M-symbol store: ~0.4 s of array read, the same order as `dl_open`.
+  - Gates: `zig build test` exit 0 (97/97), release build exit 0,
+    `test_binding.py` exit 0, `cli_diff.sh` BYTE-GREEN (no golden changed —
+    the corpus has no diverged store and the version-search goldens `c21`/`c26`
+    are unchanged), `abi_audit` exit 0, `run_zig_suites.sh` exit 0 (38/38).
+
 - **`dl_search_ranked` duplicate sym_ids: a threshold in `(n_distinct, n_terms]`
   was SILENTLY EMPTY, and a document's score depended on `min_terms`**
   (2026-10-19, unit `ranked-fix`, found by the independent review of `f23899f`).

@@ -787,8 +787,10 @@ pub export fn dl_search_ranked_top(
 /// Version-aware search: same AND-intersect + rank logic as dl_search,
 /// but collects each term's obs_ids as-of a published snapshot `version` via
 /// dl_query_bound_version on the "__postings__" relation.
-/// Since the sym_id space is append-only/never-reused, pre-interned term
-/// sym_ids are valid across versions — no re-interning needed.
+/// The terms MUST be interned against that SAME snapshot's vocabulary
+/// (dl_intern_str_version) — NOT the live interner: sym ids are not stable
+/// across a publish, so a live-interned id can name another string as-of that
+/// snapshot (see dl_intern_str_version's contract in dl.zig).
 pub export fn dl_search_version(db: ?*dl.DlDb, version: u32, terms: ?[*]const u32, n_terms: c_int, cb: DlSearchCb, user: ?*anyopaque) c_long {
     if (db == null or version == 0 or terms == null or n_terms <= 0 or cb == null)
         return -1;
@@ -1253,4 +1255,92 @@ test "dl_index_observations: tokenize + intern + txn postings, short-circuit on 
     const db2 = testOpenDb(path2);
     defer testCloseDb(db2, path2);
     try testing.expectEqual(@as(c_long, 0), dl_index_observations(db2));
+}
+
+/// Overwrite a file with exactly `bytes` (tests only): the edited /
+/// restored db-root symbols.array a diverged store presents.
+fn writeFileRaw(path: [*:0]const u8, bytes: []const u8) bool {
+    const wf = c.fopen(path, "w") orelse return false;
+    const wrote = c.fwrite(bytes.ptr, 1, bytes.len, wf) == bytes.len;
+    return c.fclose(wf) == 0 and wrote;
+}
+
+test "dl_search_version: terms resolve in the SNAPSHOT's vocabulary, not the live interner" {
+    // THE DEFECT THIS PINS.  A version read matches ids against that
+    // snapshot's __postings__, so resolving the query term in the LIVE
+    // interner selects another string's rows whenever the two vocabularies
+    // have diverged (a legacy store written before publish persisted the root
+    // array, or a restored/copied/edited root array).  MEASURED by the reviewer
+    // on such a store: `search "blue" --version 1` answered with the "red"
+    // observation and `search "red" --version 1` answered with the same row.
+    //
+    // The fixture is the same-count/different-bytes divergence: after v1 is
+    // published, the db-root symbols.array is rewritten so id 1 is "red" and
+    // id 2 is "blue" — the swap no query can see, because both files hold the
+    // same number of symbols.
+    const path = "/tmp/datalog_zig_u14_verintern";
+    var root_buf: [256:0]u8 = undefined;
+    const root_path = std.fmt.bufPrintZ(&root_buf, "{s}/symbols.array", .{path}) catch unreachable;
+
+    {
+        const db = testOpenDb(path);
+        try testing.expectEqual(@as(c_int, 0), aux_index_ensure_postings(db));
+        // v1 vocabulary, in interning order: blue=1, red=2, doc1=3, doc2=4.
+        try testing.expectEqual(@as(u32, 1), dl.dl_intern_str(db, "blue"));
+        try testing.expectEqual(@as(u32, 2), dl.dl_intern_str(db, "red"));
+        try testing.expectEqual(@as(u32, 3), dl.dl_intern_str(db, "doc1"));
+        try testing.expectEqual(@as(u32, 4), dl.dl_intern_str(db, "doc2"));
+        try testing.expectEqual(@as(c_int, 1), aux_index_add_posting(db, 1, 3)); // blue -> doc1
+        try testing.expectEqual(@as(c_int, 1), aux_index_add_posting(db, 2, 4)); // red  -> doc2
+        try testing.expectEqual(@as(c_int, 0), dl.dl_publish_snapshot(db)); // v1
+        dl.dl_close(db);
+    }
+
+    // Same length, different bytes: from here the LIVE map says id 1 = "red".
+    try testing.expect(writeFileRaw(root_path, "red\nblue\ndoc1\ndoc2\n"));
+
+    // Reopen WITHOUT wiping (testOpenDb would delete the edited root array).
+    const db = dl.dl_open(path) orelse return error.TestUnexpectedResult;
+    defer testCloseDb(db, path);
+
+    // The live interner now disagrees with v1 about every id (this is the
+    // divergence itself, not a bug in the reopen).
+    const live_blue = dl.dl_intern_str(db, "blue");
+    const live_red = dl.dl_intern_str(db, "red");
+    try testing.expectEqual(@as(u32, 2), live_blue); // live: "blue" is id 2
+    try testing.expectEqual(@as(u32, 1), live_red); //  live: "red" is id 1
+
+    // The SNAPSHOT's vocabulary still says id 1 = "blue", id 2 = "red".
+    var snap_blue: u32 = 0;
+    var snap_red: u32 = 0;
+    try testing.expectEqual(@as(c_int, 0), dl.dl_intern_str_version(db, 1, "blue", &snap_blue));
+    try testing.expectEqual(@as(c_int, 0), dl.dl_intern_str_version(db, 1, "red", &snap_red));
+    try testing.expectEqual(@as(u32, 1), snap_blue);
+    try testing.expectEqual(@as(u32, 2), snap_red);
+
+    var ids: [4]u32 = undefined;
+    var scores: [4]c_int = undefined;
+
+    // FIXED: the snapshot-resolved term selects the snapshot's rows.
+    try testing.expectEqual(@as(c_int, 1), dl_search_top_version(db, 1, @as([*]const u32, @ptrCast(&snap_blue)), 1, &ids, &scores, 4));
+    try testing.expectEqual(@as(u32, 3), ids[0]); // doc1 = the "blue" observation
+    try testing.expectEqual(@as(c_int, 1), dl_search_top_version(db, 1, @as([*]const u32, @ptrCast(&snap_red)), 1, &ids, &scores, 4));
+    try testing.expectEqual(@as(u32, 4), ids[0]); // doc2 = the "red" observation
+
+    // ... and the LIVE id is what the pre-fix CLI passed in: the OTHER
+    // observation.  This arm pins the mechanism, not just the fix — the same
+    // engine call answers differently for the two maps.
+    try testing.expectEqual(@as(c_int, 1), dl_search_top_version(db, 1, @as([*]const u32, @ptrCast(&live_blue)), 1, &ids, &scores, 4));
+    try testing.expectEqual(@as(u32, 4), ids[0]); // "blue" resolved live -> the RED row
+    try testing.expectEqual(@as(c_int, 1), dl_search_top_version(db, 1, @as([*]const u32, @ptrCast(&live_red)), 1, &ids, &scores, 4));
+    try testing.expectEqual(@as(u32, 3), ids[0]); // and "red" resolved live -> the BLUE row
+
+    // A term that v1 does not contain is ABSENT (sym 0), never minted: the
+    // live interner is untouched by the version lookup, so the next live id
+    // is still 5 and "green" is not in the live map.
+    var absent: u32 = 12345;
+    try testing.expectEqual(@as(c_int, 0), dl.dl_intern_str_version(db, 1, "green", &absent));
+    try testing.expectEqual(@as(u32, 0), absent);
+    try testing.expectEqual(@as(u32, 0), dl.dl_intern_str_find(db, "green"));
+    try testing.expectEqual(@as(u32, 5), dl.dl_intern_str(db, "green"));
 }

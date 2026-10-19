@@ -76,8 +76,19 @@ int dl_search_top(dl_db *db, const uint32_t *terms, int n_terms,
 /* Version-aware search: same AND-intersect + rank logic as dl_search,
  * but collects each term's obs_ids as-of a published snapshot `version` via
  * dl_query_bound_version on the "__postings__" relation.
- * Since the sym_id space is append-only/never-reused, pre-interned term sym_ids
- * are valid across versions — no re-interning needed.
+ *
+ * LIVE-vs-VERSION READ DISCIPLINE — the ids you pass must come from the
+ * matching map.  This function MATCHES IDS against that snapshot's
+ * __postings__, so:
+ *   - for a VERSION read, intern the terms with dl_intern_str_version(db,
+ *     version, term, &sym), which resolves against THAT SNAPSHOT's vocabulary
+ *     and never creates a symbol;
+ *   - dl_intern_str (the LIVE interner) is correct only for the live form
+ *     (dl_search / dl_search_top).
+ * Sym ids are NOT stable across a publish: on a store whose db-root
+ * symbols.array diverges from a snapshot's (a legacy store, a restored or
+ * edited root array) the same id names a different string in each map, and a
+ * live-interned term selected another term's rows as-of that snapshot.
  *
  * Returns the number of results emitted, or -1 on error (NULL db, n_terms == 0,
  * version == 0, nonexistent version, or __postings__ relation absent from that

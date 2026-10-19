@@ -574,7 +574,11 @@ long dl_query_version(dl_db *db, uint32_t version, const char *goal_rel,
 
 /* As-of prefix query: bind the first k columns of `goal_rel` to `leading`
  * and stream matching tuples from snapshot `version`.  Same error contract
- * as dl_query_version. */
+ * as dl_query_version.
+ *
+ * `leading` holds SYM IDS, and they must be that snapshot's ids: on a store
+ * whose db-root symbols.array diverges from the snapshot's, a live-interned id
+ * names another string (see dl_intern_str_version). */
 long dl_query_bound_version(dl_db *db, uint32_t version, const char *goal_rel,
                             const uint32_t *leading, uint8_t k,
                             dl_tuple_cb cb, void *user);
@@ -629,6 +633,47 @@ uint32_t    dl_intern_str(dl_db *db, const char *str);
 /* NON-MUTATING lookup: sym_id for str if already interned, else 0.
  * Never grows the interner / never marks it dirty (unlike dl_intern_str). */
 uint32_t    dl_intern_str_find(dl_db *db, const char *str);
+
+/* VERSION-side interning: resolve `str` against the vocabulary of published
+ * snapshot `version` — that snapshot's OWN symbols.array — WITHOUT creating a
+ * symbol.  This is the entry point every VERSION-aware query must use to turn
+ * a term into an id; LIVE queries keep using dl_intern_str.
+ *
+ * WHY IT IS REQUIRED (LIVE-vs-VERSION read discipline).  A sym_id is NOT
+ * stable across a publish: the live interner numbers strings from the db-ROOT
+ * <db>/symbols.array, which can diverge from a snapshot's — a legacy store
+ * written before publish persisted the root array, or a restored / copied /
+ * edited root array.  On such a store the same id names a DIFFERENT string in
+ * each map, so a term interned live and then matched by a version read (which
+ * matches ids against that snapshot's __postings__) selects ANOTHER term's
+ * rows.  MEASURED on a diverged store: `search "blue" --version 1` returned
+ * the "red" observation and `search "red" --version 1` returned the same row,
+ * where the intact store returns the "blue" row for "blue".  Interning against
+ * the snapshot's array makes the id mean what that snapshot means by it.
+ *
+ * LOOKUP-ONLY, BY CONTRACT: never creates a symbol, never grows the live
+ * interner, never marks it dirty (so it is valid on a read-only handle).  A
+ * term that snapshot's vocabulary does NOT contain yields *sym_out == 0 — the
+ * not-found sentinel.  That term has no postings as-of that version, so a
+ * query over it matches NOTHING; it is never a freshly minted id, which could
+ * be another string's id in that snapshot.
+ *
+ * Returns 0 on success (*sym_out set), or -1 on error: NULL db / str / sym_out,
+ * version == 0 (that is the LIVE path — use dl_intern_str), a nonexistent
+ * version, or a snapshot whose symbols.array is missing or unreadable.  A
+ * damaged snapshot is an explicit ERROR, never an empty vocabulary and never a
+ * fallback to the live interner.
+ *
+ * The snapshot's interner is read once and cached per version (the same cache
+ * dl_pattern's version path uses); dl_close frees it.
+ *
+ * Example — search as-of a version:
+ *     uint32_t sym = 0;
+ *     if (dl_intern_str_version(db, v, "blue", &sym) != 0) return rc_error;
+ *     if (sym != 0)  // 0 = absent from that snapshot: no matches, not an id
+ *         dl_search_top_version(db, v, &sym, 1, ids, scores, n); */
+int         dl_intern_str_version(dl_db *db, uint32_t version, const char *str,
+                                  uint32_t *sym_out);
 
 /* Look up a sym_id → string.  Returns NULL if id is out of range. */
 const char *dl_intern_str_of(dl_db *db, uint32_t sym_id);

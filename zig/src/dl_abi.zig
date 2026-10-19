@@ -270,6 +270,7 @@ pub extern "c" fn dl_publish_snapshot(db: [*c]dl_db) c_int;
 pub extern "c" fn dl_snapshot_versions(db: [*c]const dl_db, out: [*c]u32, cap: usize) c_long;
 pub extern "c" fn dl_set_snapshot_retain(db: [*c]dl_db, n: c_uint) c_int;
 pub extern "c" fn dl_intern_str(db: [*c]dl_db, str: [*c]const u8) u32;
+pub extern "c" fn dl_intern_str_version(db: [*c]dl_db, version: u32, str: [*c]const u8, sym_out: [*c]u32) c_int;
 pub extern "c" fn dl_intern_str_of(db: [*c]dl_db, sym_id: u32) [*c]const u8;
 pub extern "c" fn dl_traverse(db: [*c]dl_db, start: [*c]const u8, depth: c_int, max_nodes: c_int, cb: dl_traverse_cb, user: ?*anyopaque) c_long;
 pub extern "c" fn dl_node_observations(db: [*c]dl_db, node: [*c]const u8, max_obs: c_int, cb: dl_str_cb, user: ?*anyopaque) c_long;
