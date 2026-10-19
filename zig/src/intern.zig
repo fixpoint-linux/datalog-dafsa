@@ -17,6 +17,15 @@
 //!
 //! Oracle: src/intern.c (never modified).  NULL ir/str inputs crash in C and
 //! are left unchecked here for the same reason.
+//!
+//! APPEND-ONLY (the publish gate's premise, MEASURED by reading this module):
+//! rev[] is written in exactly two places — the append at rev[id-1] for a
+//! NEWLY allocated id in intern_str, and the sequential refill at rev[i-1]
+//! while intern_load parses a symbols.array — plus the memset of the freshly
+//! realloc'd TAIL (indices >= rev_cap, always above every live id).  No path
+//! rewrites or frees an existing entry except intern_free (whole-interner
+//! destroy).  So the serialized array is a function of (count, content) only,
+//! which is what SymHash below tracks incrementally.
 
 const std = @import("std");
 const c = std.c;
@@ -56,6 +65,70 @@ const Interner = struct {
     fwd_path: ?[*:0]u8, // on-disk path of the fwd DAFSA (kept, unused)
     fwd_ro: c_int, // 1 if fwd must NOT be mutated
     fwd_gen: u32, // next_id the in-memory fwd was built from
+    sym_hash: SymHash, // running hash of symbols.array's canonical bytes
+    sym_hashed: u32, // rev[] slots already fed to sym_hash (lazy catch-up)
+};
+
+/// The content stamp a publish compares to decide whether a snapshot's
+/// symbols.array can be inherited (dl.zig inheritSymbolsArray): the number of
+/// symbols and a 128-bit hash of the canonical encoding intern_save writes.
+/// count is derived (next_id - 1) and is what the array file's line count is;
+/// the hash distinguishes two interners of equal count but different content —
+/// which is the case a bare count cannot see (the live rev[] may come from a
+/// db-root symbols.array that diverged from the previous SNAPSHOT's).
+pub const SymStamp = struct {
+    count: u32,
+    h0: u64,
+    h1: u64,
+};
+
+/// Streaming hash of the canonical symbols.array encoding (intern_save's byte
+/// stream: text with '\\'->"\\\\" and '\n'->"\\n", then a '\n' per symbol).
+/// Two independently seeded 64-bit Wyhashes = a 128-bit stamp.
+///
+/// LAZY and INCREMENTAL: the hash covers rev[] slots [0, sym_hashed) only.
+/// intern_str feeds each APPEND for free when the hash is caught up (the array
+/// is append-only, so earlier bytes never change) and symStamp catches up the
+/// rest in one sequential pass.  A read-only process therefore never hashes,
+/// and a publishing one hashes the pending prefix at most once, OUTSIDE its
+/// write path — MEASURED: hashing interleaved with intern_save's fputc loop
+/// costs ~37 ms on a 44 MB array vs ~25 ms for the sequential catch-up, so the
+/// write path deliberately does not fuse it.
+const SymHash = struct {
+    a: std.hash.Wyhash,
+    b: std.hash.Wyhash,
+
+    const seed_b: u64 = 0x9e3779b97f4a7c15;
+
+    fn init() SymHash {
+        return .{ .a = std.hash.Wyhash.init(0), .b = std.hash.Wyhash.init(seed_b) };
+    }
+
+    fn feed(self: *SymHash, bytes: []const u8) void {
+        self.a.update(bytes);
+        self.b.update(bytes);
+    }
+
+    /// Feed one rev[] slot in canonical encoding.  A null slot (an id consumed
+    /// by a strdup failure) encodes exactly as intern_save writes it: a bare
+    /// newline.
+    fn addSlot(self: *SymHash, s: ?[*:0]const u8) void {
+        const p = s orelse {
+            self.feed("\n");
+            return;
+        };
+        var start: usize = 0;
+        var i: usize = 0;
+        while (p[i] != 0) : (i += 1) {
+            if (p[i] == '\\' or p[i] == '\n') {
+                if (i > start) self.feed(p[start..i]);
+                self.feed(if (p[i] == '\\') "\\\\" else "\\n");
+                start = i + 1;
+            }
+        }
+        if (i > start) self.feed(p[start..i]);
+        self.feed("\n");
+    }
 };
 
 /// Local strlen (std.c does not re-export it).
@@ -119,6 +192,8 @@ pub export fn intern_create() ?*Interner {
         .fwd_path = null,
         .fwd_ro = 0,
         .fwd_gen = 0,
+        .sym_hash = SymHash.init(),
+        .sym_hashed = 0,
     };
 
     ir.fwd = dafsa_create() orelse {
@@ -263,6 +338,14 @@ pub export fn intern_str(ir: ?*Interner, str: ?[*:0]const u8) u32 {
     // Store string in reverse array.
     const dup = strdup(p);
     s.rev.?[id - 1] = dup;
+    // Feed the content stamp the slot just appended — but ONLY when the hash is
+    // caught up to this slot; otherwise the pending slots (unhashed since a
+    // load) are fed in order by symStamp's catch-up, this one included.  A
+    // failed strdup leaves a HOLE that serializes as a bare newline (addSlot).
+    if (s.sym_hashed == id - 1) {
+        s.sym_hash.addSlot(if (dup == null) null else p);
+        s.sym_hashed = id;
+    }
     if (dup == null) return 0;
 
     // Grow the forward-DAFSA cache instead of freeing it when the handle is
@@ -315,6 +398,36 @@ pub fn liveSymBound(ir: ?*const anyopaque) u32 {
     if (ir == null) return 0;
     const s: *const Interner = @ptrCast(@alignCast(ir.?));
     return s.next_id;
+}
+
+/// Zig-internal (NOT a C export): the interner's content stamp — symbol count
+/// plus the running 128-bit hash of symbols.array's canonical bytes.  The
+/// publish gate (dl.zig inheritSymbolsArray) compares it with the stamp the
+/// previous snapshot recorded to decide whether that snapshot's array is
+/// already byte-identical to what intern_save would write now — replacing an
+/// unconditional 44 MB write + read-back.
+///
+/// The hash is LAZY: intern_load hashes nothing (a read-only process must not
+/// pay a second pass over a 44 MB array it may never publish from), so the
+/// first call here feeds every slot loaded since — O(one pass over the array,
+/// once per process) — and later calls are O(1) until the next append.  A
+/// publish therefore pays ~20 ms of hashing instead of ~150 ms of fputc
+/// rewriting, and nothing else pays anything.  Wyhash.final() shallow-copies
+/// its state, so stamping is idempotent.
+pub fn symStamp(ir: ?*anyopaque) SymStamp {
+    if (ir == null) return .{ .count = 0, .h0 = 0, .h1 = 0 };
+    const s: *Interner = @ptrCast(@alignCast(ir.?));
+    // Catch up over slots appended since the last stamp (in load ORDER: the
+    // canonical byte stream is a concatenation, so order is not optional).
+    var i = s.sym_hashed;
+    while (i + 1 < s.next_id) : (i += 1) {
+        const slot: ?[*:0]const u8 = if (i < s.rev_cap) s.rev.?[i] else null;
+        s.sym_hash.addSlot(slot);
+    }
+    s.sym_hashed = i;
+    var a = s.sym_hash.a;
+    var b = s.sym_hash.b;
+    return .{ .count = s.next_id -% 1, .h0 = a.final(), .h1 = b.final() };
 }
 
 // ─── Accessors ───────────────────────────────────────────────────────────
@@ -419,6 +532,8 @@ pub export fn intern_load(fwd_path: ?[*:0]const u8, rev_path: ?[*:0]const u8) ?*
         .fwd_path = null,
         .fwd_ro = 0,
         .fwd_gen = 0,
+        .sym_hash = SymHash.init(),
+        .sym_hashed = 0,
     };
 
     if (fwd_path) |fp| {
@@ -664,4 +779,93 @@ test "rev array grows past initial capacity (doubling)" {
     try std.testing.expect(intern_str_of(ir, 301) == null);
     // Lookup works across the grown array (rev[] scan path after rebuild).
     try std.testing.expectEqual(@as(u32, 257), intern_str_find(ir, "sym257"));
+}
+
+test "content stamp: append-only hash survives a save/load round trip" {
+    const path = "/tmp/datalog_zig_u3_stamp.array";
+    defer _ = c.unlink(path);
+
+    const ir = intern_create() orelse return error.OutOfMemory;
+    defer intern_free(ir);
+
+    // Empty interner: count 0, a fixed (non-zero) hash of the empty stream.
+    const s0 = symStamp(ir);
+    try std.testing.expectEqual(@as(u32, 0), s0.count);
+
+    _ = intern_str(ir, "plain");
+    _ = intern_str(ir, "back\\slash"); // exercises the '\\'->"\\\\" escape
+    _ = intern_str(ir, "line1\nline2"); // exercises the '\n'->"\\n" escape
+    _ = intern_str(ir, "");
+    const s1 = symStamp(ir);
+    try std.testing.expectEqual(@as(u32, 4), s1.count);
+    try std.testing.expect(s1.h0 != s0.h0 or s1.h1 != s0.h1);
+
+    // Idempotent re-intern of an existing symbol must NOT move the stamp (no
+    // append happened, so no new bytes).
+    _ = intern_str(ir, "plain");
+    const s1b = symStamp(ir);
+    try std.testing.expectEqual(s1.count, s1b.count);
+    try std.testing.expectEqual(s1.h0, s1b.h0);
+    try std.testing.expectEqual(s1.h1, s1b.h1);
+
+    try std.testing.expectEqual(@as(c_int, 0), intern_save(ir, "/tmp/ignored.dafsa", path));
+
+    // THE INVARIANT THE PUBLISH GATE RESTS ON: an interner rebuilt from the
+    // serialized array stamps IDENTICALLY — so a fresh process that loaded the
+    // db's symbols.array and published without interning anything computes the
+    // same stamp the previous publisher recorded.
+    const ir2 = intern_load(null, path) orelse return error.OutOfMemory;
+    defer intern_free(ir2);
+    const s2 = symStamp(ir2);
+    try std.testing.expectEqual(s1.count, s2.count);
+    try std.testing.expectEqual(s1.h0, s2.h0);
+    try std.testing.expectEqual(s1.h1, s2.h1);
+
+    // An append moves the stamp (count and hash), which is what makes the gate
+    // fall back to the full write on a vocabulary change.
+    _ = intern_str(ir2, "later");
+    const s3 = symStamp(ir2);
+    try std.testing.expectEqual(@as(u32, 5), s3.count);
+    try std.testing.expect(s3.h0 != s2.h0 or s3.h1 != s2.h1);
+
+    // A DIFFERENT vocabulary of the SAME count stamps differently (the case a
+    // bare count cannot distinguish — my reason for hashing, not counting).
+    const ir3 = intern_create() orelse return error.OutOfMemory;
+    defer intern_free(ir3);
+    _ = intern_str(ir3, "plain");
+    _ = intern_str(ir3, "back\\slash");
+    _ = intern_str(ir3, "line1\nline2");
+    _ = intern_str(ir3, "changed");
+    const s4 = symStamp(ir3);
+    try std.testing.expectEqual(s1.count, s4.count);
+    try std.testing.expect(s4.h0 != s1.h0 or s4.h1 != s1.h1);
+
+    // ... and a GROWING prefix never collides with the shorter one.
+    try std.testing.expect(s3.h0 != s1.h0 or s3.h1 != s1.h1);
+
+    // A lone trailing backslash in the FILE decodes to a backslash whose
+    // canonical re-encoding differs from the input bytes: the stamp is over the
+    // canonical form (what a save writes), so a later save+load of the decoded
+    // content is stamp-stable from that point on.
+    {
+        const odd = "/tmp/datalog_zig_u3_stamp_odd.array";
+        defer _ = c.unlink(odd);
+        // "a\x" written NON-canonically as a lone backslash + 'x'.
+        {
+            const wf = c.fopen(odd, "w") orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(@as(usize, 4), c.fwrite("a\\x\n", 1, 4, wf));
+            try std.testing.expectEqual(@as(c_int, 0), c.fclose(wf));
+        }
+        const odd_ir = intern_load(null, odd) orelse return error.OutOfMemory;
+        defer intern_free(odd_ir);
+        try std.testing.expectEqualStrings("a\\x", std.mem.span(intern_str_of(odd_ir, 1).?));
+        const st_a = symStamp(odd_ir);
+        try std.testing.expectEqual(@as(c_int, 0), intern_save(odd_ir, "/tmp/ignored.dafsa", odd));
+        const odd_ir2 = intern_load(null, odd) orelse return error.OutOfMemory;
+        defer intern_free(odd_ir2);
+        const st_b = symStamp(odd_ir2);
+        try std.testing.expectEqual(st_a.count, st_b.count);
+        try std.testing.expectEqual(st_a.h0, st_b.h0);
+        try std.testing.expectEqual(st_a.h1, st_b.h1);
+    }
 }

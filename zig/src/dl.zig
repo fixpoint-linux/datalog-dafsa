@@ -4404,18 +4404,21 @@ fn pubDerivedCheckEnv() bool {
 }
 
 /// Write the staged snapshot's derived symbols.dafsa.  Hardlinks the previous
-/// snapshot's pair when the freshly saved symbols.array is byte-identical (it
-/// then describes the same key set, and a DAFSA of the same keys is
-/// answer-equivalent — dafsa_view surfaces keys, never state ids), else
-/// serializes the live forward DAFSA.  Returns 0 on success, -1 on failure.
-fn publishDerivedDafsa(d: *DlDb, rev: *[4096:0]u8, fwd: *[4096:0]u8, prev_snap_dir: [*c]const u8) c_int {
+/// snapshot's pair when the staged symbols.array is byte-identical to the
+/// previous snapshot's (it then describes the same key set, and a DAFSA of the
+/// same keys is answer-equivalent — dafsa_view surfaces keys, never state ids),
+/// else serializes the live forward DAFSA.  `rev_inherited` says the array was
+/// ALREADY hardlinked from the previous snapshot by inheritSymbolsArray, which
+/// makes the byte comparison a tautology — skip reading 44 MB to prove it.
+/// Returns 0 on success, -1 on failure.
+fn publishDerivedDafsa(d: *DlDb, rev: *[4096:0]u8, fwd: *[4096:0]u8, prev_snap_dir: [*c]const u8, rev_inherited: bool) c_int {
     var inherited = false;
     if (prev_snap_dir[0] != 0) {
         var prev_fwd: [4096:0]u8 = undefined;
         var prev_rev: [4096:0]u8 = undefined;
         _ = snprintf(&prev_fwd, 4096, "%s/symbols.dafsa", prev_snap_dir);
         _ = snprintf(&prev_rev, 4096, "%s/symbols.array", prev_snap_dir);
-        if (filesIdentical(rev, &prev_rev)) {
+        if (rev_inherited or filesIdentical(rev, &prev_rev)) {
             _ = posix.unlink(rev);
             if (posix.link(&prev_rev, rev) == 0 and posix.link(&prev_fwd, fwd) == 0) {
                 inherited = true;
@@ -4528,10 +4531,19 @@ fn materializeSnapshot(d: *DlDb) c_int {
         var rev: [4096:0]u8 = undefined;
         _ = snprintf(&fwd, 4096, "%s/symbols.dafsa", &tmp_dir);
         _ = snprintf(&rev, 4096, "%s/symbols.array", &tmp_dir);
-        if (intern_save(d.ir, &fwd, &rev) != 0)
+        // Steady-state path: the previous snapshot recorded the same (count,
+        // size, content-hash) stamp, so its array IS the byte stream
+        // intern_save would write — hardlink it instead of rewriting 44 MB.
+        // The decision itself is O(1); only the stamp's hash pass is O(array),
+        // at most once per process (see intern.zig symStamp).
+        // Every other case (first publish, vocabulary change, missing/old
+        // stamp, same count with different content, link failure) falls
+        // through to the full save.
+        const inherited = inheritSymbolsArray(d.ir, &rev, &prev_snap_dir);
+        if (!inherited and intern_save(d.ir, &fwd, &rev) != 0)
             return dlPublishFail(&tmp_dir, &new_dir, renamed);
 
-        if (pubDerivedCheckEnv() and publishDerivedDafsa(d, &rev, &fwd, &prev_snap_dir) != 0)
+        if (pubDerivedCheckEnv() and publishDerivedDafsa(d, &rev, &fwd, &prev_snap_dir, inherited) != 0)
             return dlPublishFail(&tmp_dir, &new_dir, renamed);
     }
     if (pub_timers_on) {
@@ -4559,6 +4571,23 @@ fn materializeSnapshot(d: *DlDb) c_int {
         var t_rel_mark: u64 = if (pub_timers_on) nowNs() else 0;
 
         _ = fprintf(mf, "# Datalog-DAFSA snapshot version %u\n", new_version);
+
+        // Symbols stamp for the NEXT publish's inheritance gate (see
+        // inheritSymbolsArray): the interner's content stamp (count + 128-bit
+        // hash of the canonical array bytes) plus the array FILE's size, which
+        // the gate stats for an O(1) integrity check.  A 'D:' directive line,
+        // so every manifest walker (manifest_find_rel/_ex/_variants/
+        // manifestParseLine) skips it exactly as it skips 'D:some-directive'.
+        {
+            const stamp = intern_mod.symStamp(d.ir);
+            var srev: [4096:0]u8 = undefined;
+            _ = snprintf(&srev, 4096, "%s/symbols.array", &tmp_dir);
+            const nbytes = fileSize(&srev) orelse {
+                _ = c.fclose(mf);
+                return dlPublishFail(&tmp_dir, &new_dir, renamed);
+            };
+            _ = fprintf(mf, "D:symbols:%u:%llu:%016llx:%016llx\n", stamp.count, nbytes, stamp.h0, stamp.h1);
+        }
 
         var i: usize = 0;
         while (i < d.nrels) : (i += 1) {
@@ -4898,6 +4927,114 @@ fn filesIdentical(a: [*c]const u8, b: [*c]const u8) bool {
         left -= @intCast(want);
     }
     return true;
+}
+
+/// What a snapshot records about its symbols.array: the interner's content
+/// stamp plus the array's byte size.  `bytes` is the O(1) integrity check on
+/// the FILE (the hash proves the CONTENT the live interner holds matches what
+/// was recorded; the size catches a truncated or appended-to snapshot file,
+/// which the count alone cannot — the count lives in the manifest, not in the
+/// array).
+const SymStampOnDisk = struct {
+    count: u32,
+    bytes: u64,
+    h0: u64,
+    h1: u64,
+};
+
+/// Read the symbols stamp a snapshot recorded in its manifest
+/// ('D:symbols:<count>:<bytes>:<h0>:<h1>', written by materializeSnapshot
+/// step 4b — a directive line every manifest walker already skips).  Returns
+/// false when the line is absent (a snapshot published before the stamp
+/// existed), which the caller reads as "cannot inherit, do the full save".
+fn readSymStamp(sdir: [*c]const u8, out: *SymStampOnDisk) bool {
+    var path: [8192:0]u8 = undefined;
+    _ = snprintf(&path, 8192, "%s/manifest.txt", sdir);
+    const f = c.fopen(&path, "r") orelse return false;
+    defer _ = c.fclose(f);
+
+    var line: ?[*]u8 = null;
+    var cap: usize = 0;
+    defer if (line) |lp| c.free(@ptrCast(lp));
+
+    const prefix = "D:symbols:";
+    var len: isize = getline(&line, &cap, f);
+    while (len > 0) : (len = getline(&line, &cap, f)) {
+        const buf = line.?;
+        var l: usize = @intCast(len);
+        while (l > 0 and (buf[l - 1] == '\n' or buf[l - 1] == '\r')) l -= 1;
+        const s = buf[0..l];
+        if (!std.mem.startsWith(u8, s, prefix)) continue;
+
+        var it = std.mem.splitScalar(u8, s[prefix.len..], ':');
+        const count_s = it.next() orelse return false;
+        const bytes_s = it.next() orelse return false;
+        const h0_s = it.next() orelse return false;
+        const h1_s = it.next() orelse return false;
+        out.count = std.fmt.parseInt(u32, count_s, 10) catch return false;
+        out.bytes = std.fmt.parseInt(u64, bytes_s, 10) catch return false;
+        out.h0 = std.fmt.parseInt(u64, h0_s, 16) catch return false;
+        out.h1 = std.fmt.parseInt(u64, h1_s, 16) catch return false;
+        return true;
+    }
+    return false;
+}
+
+/// Symbols-array publish gate (3dd4ae0/81f5581 removed the derived DAFSA and
+/// the gated vocabulary save; this removes the remaining fixed cost, the
+/// unconditional rewrite of the whole array).
+///
+/// The interner's rev[] is APPEND-ONLY (see intern.zig's module doc: only new
+/// ids are written, entries are never rewritten or freed before destroy), so
+/// for any given (count, content) the bytes intern_save would write are a pure
+/// function — and intern.zig maintains that function's 128-bit hash
+/// INCREMENTALLY as a running stamp over bytes it has already appended.
+///
+/// When the previous snapshot recorded the SAME stamp, its symbols.array holds
+/// exactly the byte stream intern_save would produce now, so it is hardlinked
+/// into the staged snapshot instead of rewritten.  MEASURED (88,000 symbols /
+/// 44 MB array, ReleaseFast, page-warm): step 4a went 138 ms ->
+/// 26 ms — and that 26 ms is the ONE content-hash pass the stamp needs, paid
+/// at most once per process; the decision itself is O(1) (a manifest read
+/// and a link).  The count compare short-circuits BEFORE the hash, so a
+/// vocabulary-changing publish never pays it for the decision.
+///
+/// Why a hash and not the count alone: the live rev[] is loaded from the db
+/// ROOT symbols.array (dlOpenCommon), not from the previous SNAPSHOT's copy, so
+/// equal counts do not by themselves prove equal content — a store whose two
+/// copies diverged (restored/copied/tampered root array) would then silently
+/// publish a snapshot with the WRONG bytes at the RIGHT count, and every
+/// symbol-id lookup in it would be wrong.  The hash is computed from the live
+/// content, so it sees that divergence and falls back to the full write.
+///
+/// Returns true when the link is in place (caller skips intern_save); false
+/// means "no previous stamp, stamp mismatch, or link failure — write it".
+fn inheritSymbolsArray(ir: ?*anyopaque, rev: [*c]const u8, prev_snap_dir: [*c]const u8) bool {
+    if (prev_snap_dir[0] == 0) return false;
+    var prev: SymStampOnDisk = undefined;
+    if (!readSymStamp(prev_snap_dir, &prev)) return false;
+    // Cheap key first: a vocabulary change moves the count, and then the answer
+    // is "write it" regardless of content — so the content hash (one pass over
+    // the whole array, the first time a process publishes) is never paid on the
+    // path that is about to rewrite the array anyway.
+    if (intern_mod.liveSymBound(ir) -% 1 != prev.count) return false;
+    // The file must be exactly the array the manifest recorded (O(1) stat):
+    // a truncated or padded snapshot file is never inherited.
+    var prev_rev: [4096:0]u8 = undefined;
+    _ = snprintf(&prev_rev, 4096, "%s/symbols.array", prev_snap_dir);
+    var stst: Stat = undefined;
+    if (stat(&prev_rev, &stst) != 0 or stst.st_size < 0 or @as(u64, @intCast(stst.st_size)) != prev.bytes)
+        return false;
+    const live = intern_mod.symStamp(ir);
+    if (prev.h0 != live.h0 or prev.h1 != live.h1) return false;
+    return posix.link(&prev_rev, rev) == 0;
+}
+
+/// Byte size of a file, or null when it cannot be stat'd.
+fn fileSize(path: [*c]const u8) ?u64 {
+    var st: Stat = undefined;
+    if (stat(path, &st) != 0 or st.st_size < 0) return null;
+    return @intCast(st.st_size);
 }
 
 /// Perm-index variant of the gate: the index relation is freed and
@@ -5469,6 +5606,30 @@ fn rmrfTestDir(path: [*:0]const u8) void {
     rmRf(path);
 }
 
+/// Read a whole file into a malloc'd buffer (tests only); the caller frees it
+/// with c.free.  Returns an empty slice on any error (the assertions then fail
+/// loudly on the empty content rather than reading uninitialised memory).
+fn readFileAlloc(path: [*c]const u8) []u8 {
+    var st: Stat = undefined;
+    if (stat(path, &st) != 0 or st.st_size < 0) return &[_]u8{};
+    const n: usize = @intCast(st.st_size);
+    const mem = c.malloc(n + 1) orelse return &[_]u8{};
+    const buf: [*]u8 = @ptrCast(mem);
+    const fd = posix.open(path, posix.O_RDONLY);
+    if (fd < 0) {
+        c.free(mem);
+        return &[_]u8{};
+    }
+    defer _ = posix.close(fd);
+    var got: usize = 0;
+    while (got < n) {
+        const r = posix.read(fd, buf + got, n - got);
+        if (r <= 0) break;
+        got += @intCast(r);
+    }
+    return buf[0..got];
+}
+
 const CollectCbCtx = struct {
     rows: [64][8]u32 = undefined,
     arities: [64]u8 = undefined,
@@ -5559,6 +5720,272 @@ test "dl txn commit + rollback" {
     var rev: u32 = 0;
     try testing.expectEqual(@as(c_int, 0), dl_rev_get(db, "ent", &rev));
     try testing.expectEqual(@as(u32, 5), rev);
+}
+
+test "publish inherits symbols.array in O(1) unless the vocabulary changed" {
+    const dir = "/tmp/datalog_zig_u3_symgate";
+    rmrfTestDir(dir);
+    defer rmrfTestDir(dir);
+
+    const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+    var db_closed = false;
+    defer if (!db_closed) dl_close(db);
+
+    try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "e", 2));
+    const pairs = [_][2][]const u8{ .{ "alice", "nyc" }, .{ "bob", "la" } };
+    for (pairs) |p| {
+        const ids = [2]u32{ intern_str(db.ir, p[0].ptr), intern_str(db.ir, p[1].ptr) };
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "e", &ids, 2));
+    }
+
+    // v1: no previous snapshot -> full write of symbols.array.
+    try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db));
+    // v2: nothing interned since v1 -> the array is INHERITED (O(1)).
+    try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db));
+
+    const P = struct {
+        fn array(buf: *[512:0]u8, db_dir: [*:0]const u8, v: u32) [*:0]const u8 {
+            return std.fmt.bufPrintZ(buf, "{s}/snapshots/{d}/symbols.array", .{ std.mem.span(db_dir), v }) catch unreachable;
+        }
+        fn sdir(buf: *[512:0]u8, db_dir: [*:0]const u8, v: u32) [*:0]const u8 {
+            return std.fmt.bufPrintZ(buf, "{s}/snapshots/{d}", .{ std.mem.span(db_dir), v }) catch unreachable;
+        }
+    };
+
+    var pa: [5][512:0]u8 = @splat(undefined);
+    const a1 = P.array(&pa[0], dir, 1);
+    const a2 = P.array(&pa[1], dir, 2);
+    const a3 = P.array(&pa[2], dir, 3);
+    const a4 = P.array(&pa[3], dir, 4);
+    const a5 = P.array(&pa[4], dir, 5);
+
+    // The gate's whole point: v2's array IS v1's bytes — proven by INODE
+    // identity (never rewritten) and by byte equality.
+    {
+        var s1: Stat = undefined;
+        var s2: Stat = undefined;
+        try testing.expectEqual(@as(c_int, 0), stat(a1, &s1));
+        try testing.expectEqual(@as(c_int, 0), stat(a2, &s2));
+        try testing.expectEqual(s1.st_ino, s2.st_ino);
+        try testing.expectEqual(s1.st_dev, s2.st_dev);
+    }
+    const bytes1 = readFileAlloc(a1);
+    defer c.free(@ptrCast(bytes1.ptr));
+    const bytes2 = readFileAlloc(a2);
+    defer c.free(@ptrCast(bytes2.ptr));
+    try testing.expectEqualSlices(u8, bytes1, bytes2);
+
+    // Both manifests stamp the same (count, bytes, hash), and the stamp the
+    // gate reads back from disk equals the live interner's.
+    var ps1: [512:0]u8 = undefined;
+    var ps2: [512:0]u8 = undefined;
+    var stamp1: SymStampOnDisk = undefined;
+    var stamp2: SymStampOnDisk = undefined;
+    try testing.expect(readSymStamp(P.sdir(&ps1, dir, 1), &stamp1));
+    try testing.expect(readSymStamp(P.sdir(&ps2, dir, 2), &stamp2));
+    try testing.expectEqual(@as(u32, 4), stamp1.count); // alice nyc bob la
+    try testing.expectEqual(stamp1.count, stamp2.count);
+    try testing.expectEqual(stamp1.bytes, stamp2.bytes);
+    try testing.expectEqual(@as(u64, bytes1.len), stamp1.bytes);
+    try testing.expectEqual(stamp1.h0, stamp2.h0);
+    try testing.expectEqual(stamp1.h1, stamp2.h1);
+    const live = intern_mod.symStamp(db.ir);
+    try testing.expectEqual(stamp1.h0, live.h0);
+    try testing.expectEqual(stamp1.h1, live.h1);
+
+    // Read-only resolution of the INHERITED snapshot's own array: every id
+    // resolves to the string the live db holds.
+    {
+        const snap_ir = intern_load(null, a2) orelse return error.TestUnexpectedResult;
+        defer intern_free(snap_ir);
+        try testing.expectEqual(@as(u32, 4), intern_mod.liveSymBound(snap_ir) - 1);
+        try testing.expectEqualStrings("alice", std.mem.span(intern_str_of(snap_ir, intern_str_find(db.ir, "alice")).?));
+        try testing.expectEqualStrings("la", std.mem.span(intern_str_of(snap_ir, intern_str_find(db.ir, "la")).?));
+        var i: u32 = 1;
+        while (i <= 4) : (i += 1) {
+            try testing.expectEqualStrings(
+                std.mem.span(intern_str_of(db.ir, i).?),
+                std.mem.span(intern_str_of(snap_ir, i).?),
+            );
+        }
+    }
+
+    // A TRUNCATED previous array must NOT be inherited even though its recorded
+    // COUNT still matches (the count lives in the manifest; the size does not).
+    {
+        const s2 = readFileAlloc(a2);
+        defer c.free(@ptrCast(s2.ptr));
+        try testing.expect(s2.len > 8);
+        const wf = c.fopen(a2, "w") orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(s2.len - 6, c.fwrite(s2.ptr, 1, s2.len - 6, wf));
+        try testing.expectEqual(@as(c_int, 0), c.fclose(wf));
+    }
+    try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db)); // v3
+    {
+        // A fresh write of the SAME vocabulary: different inode, same bytes.
+        var s2: Stat = undefined;
+        var s3: Stat = undefined;
+        try testing.expectEqual(@as(c_int, 0), stat(a2, &s2));
+        try testing.expectEqual(@as(c_int, 0), stat(a3, &s3));
+        try testing.expect(s2.st_ino != s3.st_ino);
+        const bytes3 = readFileAlloc(a3);
+        defer c.free(@ptrCast(bytes3.ptr));
+        try testing.expectEqualSlices(u8, bytes1, bytes3);
+        const snap_ir = intern_load(null, a3) orelse return error.TestUnexpectedResult;
+        defer intern_free(snap_ir);
+        try testing.expectEqual(@as(u32, 4), intern_mod.liveSymBound(snap_ir) - 1);
+        try testing.expectEqual(@as(u32, 3), intern_str_find(snap_ir, "bob"));
+    }
+
+    // v4: a NEW symbol -> count/hash move -> full write, fresh inode, and the
+    // new symbol resolves in the snapshot's array.
+    const carol = intern_str(db.ir, "carol");
+    const ids3 = [2]u32{ carol, intern_str(db.ir, "sf") };
+    try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "e", &ids3, 2));
+    try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db));
+    {
+        var s3: Stat = undefined;
+        var s4: Stat = undefined;
+        try testing.expectEqual(@as(c_int, 0), stat(a3, &s3));
+        try testing.expectEqual(@as(c_int, 0), stat(a4, &s4));
+        try testing.expect(s3.st_ino != s4.st_ino);
+    }
+    const bytes4 = readFileAlloc(a4);
+    defer c.free(@ptrCast(bytes4.ptr));
+    try testing.expect(bytes4.len > bytes1.len);
+    try testing.expect(!std.mem.eql(u8, bytes1, bytes4));
+    const bytes4_copy = c.malloc(bytes4.len) orelse return error.OutOfMemory;
+    defer c.free(bytes4_copy);
+    @memcpy(@as([*]u8, @ptrCast(bytes4_copy))[0..bytes4.len], bytes4);
+    {
+        const snap_ir = intern_load(null, a4) orelse return error.TestUnexpectedResult;
+        defer intern_free(snap_ir);
+        try testing.expectEqual(@as(u32, 6), intern_mod.liveSymBound(snap_ir) - 1);
+        try testing.expectEqualStrings("carol", std.mem.span(intern_str_of(snap_ir, carol).?));
+        try testing.expectEqualStrings("sf", std.mem.span(intern_str_of(snap_ir, 6).?));
+        try testing.expectEqual(carol, intern_str_find(snap_ir, "carol"));
+    }
+
+    // THE FAILURE MODE THE STAMP EXISTS TO CATCH: a db-root symbols.array that
+    // carries the right COUNT but different bytes (a restored/copied/edited
+    // root array — the interner loads from the root, not from the snapshot).
+    // A count-only gate would inherit the stale snapshot bytes here and publish
+    // a snapshot in which every symbol id resolves to the WRONG string.
+    {
+        var pr: [512:0]u8 = undefined;
+        const root_path = std.fmt.bufPrintZ(&pr, "{s}/symbols.array", .{dir}) catch unreachable;
+        const raw = readFileAlloc(root_path);
+        defer c.free(@ptrCast(raw.ptr));
+        const at = std.mem.indexOf(u8, raw, "bob") orelse return error.TestUnexpectedResult;
+        raw[at] = 'z'; // same length, different content: st_size unchanged
+        const wf = c.fopen(root_path, "w") orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(raw.len, c.fwrite(raw.ptr, 1, raw.len, wf));
+        try testing.expectEqual(@as(c_int, 0), c.fclose(wf));
+    }
+    dl_close(db);
+    db_closed = true;
+    {
+        const db2 = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db2);
+        try testing.expectEqual(@as(u32, 6), intern_mod.liveSymBound(db2.ir) - 1);
+        try testing.expectEqualStrings("zob", std.mem.span(intern_str_of(db2.ir, 3).?));
+        try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db2)); // v5
+        const bytes5 = readFileAlloc(a5);
+        defer c.free(@ptrCast(bytes5.ptr));
+        // NOT the stale v4 bytes: the gate fell back and wrote the live array.
+        try testing.expect(!std.mem.eql(u8, @as([*]const u8, @ptrCast(bytes4_copy))[0..bytes4.len], bytes5));
+        try testing.expectEqual(bytes4.len, bytes5.len);
+        try testing.expect(std.mem.indexOf(u8, bytes5, "zob") != null);
+        try testing.expect(std.mem.indexOf(u8, bytes5, "carol") != null);
+        // ... and the snapshot resolves exactly what the live db holds.
+        const snap_ir = intern_load(null, a5) orelse return error.TestUnexpectedResult;
+        defer intern_free(snap_ir);
+        var i: u32 = 1;
+        while (i <= 6) : (i += 1) {
+            try testing.expectEqualStrings(
+                std.mem.span(intern_str_of(db2.ir, i).?),
+                std.mem.span(intern_str_of(snap_ir, i).?),
+            );
+        }
+    }
+}
+
+test "publish gate: a steady publish inherits again right after a full write" {
+    // The alternating shape a real workload has (interning a symbol, publish,
+    // publish, intern, publish ...): after a FULL write the stamp must be
+    // caught up, so the publish that follows it inherits in O(1) instead of
+    // re-writing the array or falling through to a fresh write.
+    const dir = "/tmp/datalog_zig_u3_symgate_alt";
+    rmrfTestDir(dir);
+    defer rmrfTestDir(dir);
+
+    const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+    defer dl_close(db);
+    try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "e", 2));
+
+    var v: u32 = 0;
+    while (v < 6) : (v += 1) {
+        const odd = (v % 2) == 1;
+        var a = [2]u32{ 0, 0 };
+        if (odd) {
+            // vocabulary change: a new symbol pair
+            var buf: [32]u8 = undefined;
+            const s1 = std.fmt.bufPrintZ(&buf, "k{d}", .{v}) catch unreachable;
+            a = .{ intern_str(db.ir, s1.ptr), intern_str(db.ir, "const") };
+        } else {
+            // no vocabulary change: reuse the previous pair
+            a = .{ intern_str(db.ir, "k1"), intern_str(db.ir, "const") };
+        }
+        _ = dl_add_fact(db, "e", &a, 2);
+        try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db)); // version v+1
+    }
+    // Version map (v = loop counter, version = v+1): v=0 interns k1+const ->
+    // version 1 full write; v=1 and v=2 re-intern existing symbols -> versions
+    // 2 and 3 inherit; v=3 interns k3 -> version 4 full write; v=4 steady ->
+    // version 5 inherits; v=5 interns k5 -> version 6 full write.  So (1,2),
+    // (2,3) and (4,5) must be the SAME file, and includes the case this test
+    // exists for: the publish right after a FULL write inherits again.
+    const P = struct {
+        fn array(buf: *[512:0]u8, d: [*:0]const u8, ver: u32) [*:0]const u8 {
+            return std.fmt.bufPrintZ(buf, "{s}/snapshots/{d}/symbols.array", .{ std.mem.span(d), ver }) catch unreachable;
+        }
+    };
+    var pb: [2][512:0]u8 = @splat(undefined);
+    inline for (.{ .{ 1, 2 }, .{ 2, 3 }, .{ 4, 5 } }) |pair| {
+        var s1: Stat = undefined;
+        var s2: Stat = undefined;
+        const p1 = P.array(&pb[0], dir, pair[0]);
+        const p2 = P.array(&pb[1], dir, pair[1]);
+        try testing.expectEqual(@as(c_int, 0), stat(p1, &s1));
+        try testing.expectEqual(@as(c_int, 0), stat(p2, &s2));
+        try testing.expectEqual(s1.st_ino, s2.st_ino); // inherited, not rewritten
+        const b1 = readFileAlloc(p1);
+        defer c.free(@ptrCast(b1.ptr));
+        const b2 = readFileAlloc(p2);
+        defer c.free(@ptrCast(b2.ptr));
+        try testing.expectEqualSlices(u8, b1, b2);
+    }
+    // ... while the vocabulary-changing publishes each produced their own file.
+    var pv: [6][512:0]u8 = @splat(undefined);
+    const a6 = P.array(&pv[0], dir, 6);
+    const a5 = P.array(&pv[1], dir, 5);
+    const b6 = readFileAlloc(a6);
+    defer c.free(@ptrCast(b6.ptr));
+    const b5 = readFileAlloc(a5);
+    defer c.free(@ptrCast(b5.ptr));
+    try testing.expect(!std.mem.eql(u8, b5, b6));
+    // The snapshot resolves every live symbol.
+    const snap_ir = intern_load(null, a6) orelse return error.TestUnexpectedResult;
+    defer intern_free(snap_ir);
+    const n = intern_mod.liveSymBound(db.ir);
+    try testing.expectEqual(n, intern_mod.liveSymBound(snap_ir));
+    var i: u32 = 1;
+    while (i < n) : (i += 1) {
+        try testing.expectEqualStrings(
+            std.mem.span(intern_str_of(db.ir, i).?),
+            std.mem.span(intern_str_of(snap_ir, i).?),
+        );
+    }
 }
 
 test "dl_snapshot_relations enumerates a published manifest" {
