@@ -683,8 +683,17 @@ fn execRange(
                 }
                 const dfa = cr.patterns.?[@intCast(pat_idx)];
 
-                const r = dl.db_rel_at_arity_ro(db, in.a, in.b);
-                if (r == null) {
+                // The recursive driver substitutes its own idb/delta tupleset
+                // for a body atom (see driverFeeds); a pattern atom must take
+                // the same substitution, or it reads a RELATION that is EMPTY
+                // for the whole fixpoint and silently matches nothing.  The
+                // tupleset replaces only the ROW SOURCE: the pattern still
+                // filters the walked column, exactly as rel_filter_col does.
+                const ov_ts = findOv(@intCast(in.body_idx), ov, n_ov);
+                const use_ov = ov_ts != null and ov_ts.?.count > 0;
+
+                const r = if (use_ov) null else dl.db_rel_at_arity_ro(db, in.a, in.b);
+                if (!use_ov and r == null) {
                     ip = end;
                     break :blk;
                 }
@@ -705,7 +714,24 @@ fn execRange(
                     ip = end;
                     break :blk;
                 }
-                _ = relation.rel_filter_col(r, in.c, &set, tbufCb, &f.tuples);
+                if (use_ov) {
+                    const ts = ov_ts.?;
+                    var ci: c_long = 0;
+                    while (ci < ts.count) : (ci += 1) {
+                        const row = ts.data.? + @as(usize, @intCast(ci)) * @as(usize, ts.arity);
+                        // Same test rel_filter_col applies through filterCb,
+                        // including symset_contains' "symbol 0 never matches".
+                        if (in.c < ts.arity and regexwalk.symset_contains(&set, row[in.c]) != 0) {
+                            if (tbufCb(row, ts.arity, &f.tuples) != 0) {
+                                regexwalk.symset_free(&set);
+                                tbufFree(&f.tuples);
+                                return -1;
+                            }
+                        }
+                    }
+                } else {
+                    _ = relation.rel_filter_col(r, in.c, &set, tbufCb, &f.tuples);
+                }
                 regexwalk.symset_free(&set);
 
                 if (f.tuples.count == 0) {
@@ -1862,24 +1888,36 @@ fn rebuildPermShadows(db: *dl.DlDb, nr: c_int, rd: [*]RdT, perm_count: [*]c_int,
 /// The body-atom ops the recursive driver can FEED.  For each of these the
 /// driver may substitute its own idb/delta tupleset for the atom (the
 /// `overrides` array), and the handler consults that override (findOv) BEFORE
-/// the relation: the OP_SCAN, OP_LOOKUP, OP_LOOKUP_PERM and OP_HASH_JOIN
-/// handlers each call findOv.  An atom whose op is NOT listed keeps reading the
-/// RELATION for the whole fixpoint, and during a fixpoint the recursive head
-/// relations' views are EMPTY (they are written back only at the end), so such
-/// an atom silently matches nothing — the rule never fires and its head stays
-/// empty, with no error.  OP_WALK (pattern atoms) and OP_MAT_JOIN (bushy plans)
-/// have no findOv and are therefore NOT feedable; that is a pre-existing hole
-/// in the driver, not one a promotion introduces.
+/// the relation: the OP_SCAN, OP_LOOKUP, OP_LOOKUP_PERM, OP_HASH_JOIN and
+/// OP_WALK handlers each call findOv.  An atom whose op is NOT listed keeps
+/// reading the RELATION for the whole fixpoint, and during a fixpoint the
+/// recursive head relations' views are EMPTY (they are written back only at
+/// the end), so such an atom silently matches nothing — the rule never fires
+/// and its head stays empty, with no error.
 ///
-/// This matters because whether an atom is emitted as OP_LOOKUP_PERM or as
-/// OP_HASH_JOIN is a COMPILE-TIME decision (compiler.emit_nonleading_join
-/// forces a perm when the relation is recursive at compile time and otherwise
-/// picks a cost path).  A rule can be compiled non-recursive — hash join
-/// emitted — and then be promoted to recursive by a later batch's union
-/// stratification (dl.zig, is_recursive republish).  The op does not change on
-/// promotion, so the driver must be able to feed the op the rule already has.
+/// This matters because whether an atom is emitted as OP_LOOKUP_PERM, as
+/// OP_HASH_JOIN or as OP_WALK is a COMPILE-TIME decision (compiler.zig:
+/// emit_nonleading_join / emit_pos_atom).  A rule can be compiled
+/// non-recursive — hash join or pattern walk emitted — and then be promoted to
+/// recursive by a later batch's union stratification (dl.zig, is_recursive
+/// republish).  The op does not change on promotion, so the driver must be
+/// able to feed the op the rule already has.  OP_WALK needs the substitution
+/// even with NO promotion at all: a `~` pattern atom is emitted as OP_WALK
+/// whether or not its relation is recursive at compile time, so its rule is
+/// broken from the start if that relation is in its own stratum's recursive
+/// SCC.
+///
+/// OP_MAT_JOIN is deliberately NOT here.  It is not a body-atom op: its `a`
+/// and `b` are POOL BUFFER indices (compiler.zig emit_bushy_tree), not
+/// relation ids, and its `body_idx` is not an atom index — so feeding the
+/// driver's (body_idx -> tupleset) substitution from it would key an override
+/// on a buffer index and hand some unrelated atom another relation's idb.
+/// A bushy plan is fed through its LEAVES instead: every atom in a MAT_BEGIN
+/// sub-range is a normal body-atom op, and OP_MAT_BEGIN passes `ov` down into
+/// the sub-execution (see its handler), so the substitution reaches the leaves
+/// for free.
 fn driverFeeds(op: u8) bool {
-    return op == OP_SCAN or op == OP_LOOKUP or op == OP_LOOKUP_PERM or op == OP_HASH_JOIN;
+    return op == OP_SCAN or op == OP_LOOKUP or op == OP_LOOKUP_PERM or op == OP_HASH_JOIN or op == OP_WALK;
 }
 
 fn evalStratumRecursive(db: *dl.DlDb, rules: [*]?*compiler.compiled_rule, n: c_int, ivm: c_int) c_int {
@@ -1910,6 +1948,25 @@ fn evalStratumRecursive(db: *dl.DlDb, rules: [*]?*compiler.compiled_rule, n: c_i
 
     if (nr == 0)
         return evalNonrecursive(db, rules, n);
+
+    // The driver's override list needs one slot per INSTRUCTION of the rule it
+    // runs (n_ov counts feedable body atoms, and every atom is one
+    // instruction), so it is sized from the widest rule in the stratum.  A
+    // fixed [16] array overflowed the stack frame on a rule with more than 16
+    // recursive body atoms — MEASURED, a rule with 20 conjuncts over its own
+    // recursive relation panics "index out of bounds: index 16, len 16" in a
+    // bounds-checked build and CORRUPTS THE FRAME in ReleaseFast (the gate's
+    // build), where nothing checks.
+    var ov_cap: usize = 1;
+    i = 0;
+    while (i < n) : (i += 1) {
+        const cr = rules[@intCast(i)].?;
+        if (cr.n_instrs > 0 and @as(usize, @intCast(cr.n_instrs)) > ov_cap)
+            ov_cap = @intCast(cr.n_instrs);
+    }
+    const ovmem = c.malloc(ov_cap * @sizeOf(vm_override)) orelse return -1;
+    defer c.free(ovmem);
+    const override_buf: [*]vm_override = @ptrCast(@alignCast(ovmem));
 
     var need_idb_sort: c_int = 0;
     {
@@ -2235,7 +2292,7 @@ fn evalStratumRecursive(db: *dl.DlDb, rules: [*]?*compiler.compiled_rule, n: c_i
                     if (bdi < 0) continue;
                     if (rd[@intCast(bdi)].delta.count == 0) continue;
 
-                    var overrides: [16]vm_override = undefined;
+                    const overrides = override_buf;
                     var n_ov: c_int = 0;
                     var ji: c_int = 0;
                     while (ji < ni_instrs) : (ji += 1) {
@@ -2282,7 +2339,7 @@ fn evalStratumRecursive(db: *dl.DlDb, rules: [*]?*compiler.compiled_rule, n: c_i
 
                     var ctx = CandCtx{ .ts = &cand };
 
-                    const n_out = execRule(db, cr, &overrides, n_ov, 1, candCb, &ctx);
+                    const n_out = execRule(db, cr, overrides, n_ov, 1, candCb, &ctx);
                     if (n_out < 0) {
                         tupleset.ts_free(&cand);
                         permFreeAll(nr, perm_count, perm_ids, perm_cap, idb_perm_shadows);

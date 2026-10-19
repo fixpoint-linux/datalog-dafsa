@@ -7246,6 +7246,12 @@ const XFact = struct {
     rel: [*:0]const u8,
     arity: u8,
     cols: []const u32,
+    /// Symbol NAMES the row values refer to, interned immediately before this
+    /// fact's rows are added — the only way a pattern (`~` / `~~`) atom has
+    /// anything to match, since a walk matches symbol names, not ids.  `names`
+    /// is asserted to intern in order as 1..n, so a case's expected ids (and
+    /// hence its hand-computed answer) cannot drift silently.
+    names: ?[]const [*:0]const u8 = null,
 };
 
 const XRel = struct {
@@ -7271,8 +7277,17 @@ fn xRun(
     const db = dl_open(dbpath) orelse return error.TestUnexpectedResult;
     defer dl_close(db);
 
-    for (rels) |r| try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, r.rel, r.arity));
+    for (rels) |r| {
+        const rc = dl_declare_relation(db, r.rel, r.arity);
+        if (rc != 0) std.debug.print("xRun: declare_relation({s}/{d}) -> {d}\n", .{ r.rel, r.arity, rc });
+        try testing.expectEqual(@as(c_int, 0), rc);
+    }
     for (facts) |f| {
+        if (f.names) |names| {
+            for (names, 0..) |nm, k| {
+                try testing.expectEqual(@as(u32, @intCast(k + 1)), dl_intern_str(db, @constCast(nm)));
+            }
+        }
         const ntup = f.cols.len / f.arity;
         var k: usize = 0;
         while (k < ntup) : (k += 1) {
@@ -7781,6 +7796,13 @@ test "dl_load_rules: SPLIT == SINGLE for every batching, order and grouping" {
     // the HAND-COMPUTED answer, so agreement alone cannot pass a uniformly
     // wrong evaluator.
     //
+    // Cases E/F/G/H/I are the OP_WALK / OP_MAT_JOIN half of the same property
+    // (see each case's comment): a `~`/`~~` pattern atom over a recursive
+    // relation was SILENTLY EMPTY (h = {}, and a shorter-than-correct closure)
+    // until the walk handler took the driver's idb/delta substitution; a bushy
+    // plan was already fed through its leaves and is pinned here so that
+    // cannot regress quietly.
+    //
     // ── A: the 8ba09a0 blocker — promotion into the recursive driver.
     // s is recursive ONLY in the union (batch A alone has no cycle for s), so
     // compiling batch A alone makes s a NON-LEADING, PARTIALLY-bound body atom
@@ -7906,6 +7928,153 @@ test "dl_load_rules: SPLIT == SINGLE for every batching, order and grouping" {
         "p",
         1,
         &[_]u32{ 1, 2, 3 },
+    );
+
+    // ── E: the OP_WALK analogue of case A — a `~` PATTERN atom over a relation
+    // that is recursive only in the UNION (the driver must substitute its
+    // idb/delta for the walked relation AND still apply the sym-set filter).
+    // g = {(red=1,7),(blue=2,8)}; the walk keeps only column 0 matching /r.*/.
+    //   h(Z) :- b(X,Y), s(Z,Y)~'r.*'.   b(X,Y) :- g(X,Y).
+    //   s(X,Y) :- g(X,Y).               s(X,Y) :- h(X), g(X,Y).
+    // single batch: s = {(1,7),(2,8)}, walked -> {(1,7)}, join b on Y=7 -> h =
+    // {1}.  MEASURED on b66b208 (pre-fix): h = {} in EVERY batching — the walk
+    // read the RELATION, empty for the whole fixpoint.  NOT a promotion-only
+    // bug: a `~` atom is emitted as OP_WALK whether or not its relation is
+    // recursive at compile time, so the SINGLE-batch arm was silently wrong
+    // too (it is the split that makes the failure visible as a difference).
+    try xBattery(
+        "/tmp/datalog_zig_xbatch_prop_walk",
+        &[_]XRel{
+            .{ .rel = "g", .arity = 2 },
+            .{ .rel = "b", .arity = 2 },
+            .{ .rel = "h", .arity = 1 },
+            .{ .rel = "s", .arity = 2 },
+        },
+        &[_]XFact{.{ .rel = "g", .arity = 2, .cols = &[_]u32{ 1, 7, 2, 8 }, .names = &[_][*:0]const u8{ "red", "blue" } }},
+        &[_][*:0]const u8{
+            "h(Z) :- b(X,Y), s(Z,Y)~'r.*'.",
+            "b(X,Y) :- g(X,Y).",
+            "s(X,Y) :- g(X,Y).",
+            "s(X,Y) :- h(X), g(X,Y).",
+        },
+        "h",
+        1,
+        &[_]u32{1},
+    );
+
+    // ── F: a DIRECTLY recursive rule whose recursive atom carries the pattern,
+    // no promotion involved.  edge = 1->2->3->4 (names row1..row4), the walk
+    // keeps only sources /row[12]/:
+    //   reach(X,Y) :- edge(X,Y).
+    //   reach(X,Y) :- reach(X,Z)~0 'row[12]', edge(Z,Y).
+    // reach = the 6 pairs of {1..4} for sources 1 and 2.  MEASURED on b66b208:
+    // {(1,2),(2,3),(3,4)} — the recursive walk matched nothing, so only the
+    // base rule's 3 tuples survived (SILENTLY short, no error).
+    try xBattery(
+        "/tmp/datalog_zig_xbatch_prop_walkrec",
+        &[_]XRel{ .{ .rel = "edge", .arity = 2 }, .{ .rel = "reach", .arity = 2 } },
+        &[_]XFact{.{ .rel = "edge", .arity = 2, .cols = &[_]u32{ 1, 2, 2, 3, 3, 4 }, .names = &[_][*:0]const u8{ "row1", "row2", "row3", "row4" } }},
+        &[_][*:0]const u8{
+            "reach(X,Y) :- edge(X,Y).",
+            "reach(X,Y) :- reach(X,Z)~0 'row[12]', edge(Z,Y).",
+        },
+        "reach",
+        2,
+        &[_]u32{
+            1, 2, 1, 3, 1, 4,
+            2, 3, 2, 4,
+            3, 4,
+        },
+    );
+
+    // ── G: a BUSHY plan (MAT_BEGIN/MAT_JOIN, 4 positive atoms) over a relation
+    // that is recursive only in the UNION.  OP_MAT_JOIN is NOT a body-atom op
+    // — its operands are pool buffers — so the driver feeds the plan's LEAVES,
+    // which OP_MAT_BEGIN reaches by passing its override list into the
+    // sub-execution.  g = {(1,7),(2,8)}, m = {1,2}, n = {(7,5),(8,6)}, k = {5}.
+    //   q(Z) :- m(X), t(X,Y), n(Y,Z), k(Z).
+    //   t(X,Y) :- g(X,Y).   t(X,Y) :- q(X), g(X,Y).
+    // q = {5}.  MEASURED on b66b208: {5} in every batching — this shape was
+    // already fed (every leaf is a SCAN/LOOKUP/HJOIN), so bushy plans were NOT
+    // a silent-wrong path; the test pins that so a later op change cannot
+    // break it quietly.
+    try xBattery(
+        "/tmp/datalog_zig_xbatch_prop_bushy",
+        &[_]XRel{
+            .{ .rel = "g", .arity = 2 },
+            .{ .rel = "m", .arity = 1 },
+            .{ .rel = "n", .arity = 2 },
+            .{ .rel = "k", .arity = 1 },
+            .{ .rel = "q", .arity = 1 },
+            .{ .rel = "t", .arity = 2 },
+        },
+        &[_]XFact{
+            .{ .rel = "g", .arity = 2, .cols = &[_]u32{ 1, 7, 2, 8 } },
+            .{ .rel = "m", .arity = 1, .cols = &[_]u32{ 1, 2 } },
+            .{ .rel = "n", .arity = 2, .cols = &[_]u32{ 7, 5, 8, 6 } },
+            .{ .rel = "k", .arity = 1, .cols = &[_]u32{5} },
+        },
+        &[_][*:0]const u8{
+            "q(Z) :- m(X), t(X,Y), n(Y,Z), k(Z).",
+            "t(X,Y) :- g(X,Y).",
+            "t(X,Y) :- q(X), g(X,Y).",
+        },
+        "q",
+        1,
+        &[_]u32{5},
+    );
+
+    // ── H: the two holes combined — a PATTERN atom as a LEAF inside a bushy
+    // plan over a relation recursive only in the UNION.  k = {5,6}, so the
+    // walk is what discriminates: t's walk keeps column 0 /r.*/ = {1}, which
+    // pairs only with n(7,5) -> q = {5}; an unfed walk (or a dropped sym-set
+    // filter) answers {5,6}.
+    try xBattery(
+        "/tmp/datalog_zig_xbatch_prop_bushywalk",
+        &[_]XRel{
+            .{ .rel = "g", .arity = 2 },
+            .{ .rel = "m", .arity = 1 },
+            .{ .rel = "n", .arity = 2 },
+            .{ .rel = "k", .arity = 1 },
+            .{ .rel = "q", .arity = 1 },
+            .{ .rel = "t", .arity = 2 },
+        },
+        &[_]XFact{
+            .{ .rel = "g", .arity = 2, .cols = &[_]u32{ 1, 7, 2, 8 }, .names = &[_][*:0]const u8{ "red", "blue" } },
+            .{ .rel = "m", .arity = 1, .cols = &[_]u32{ 1, 2 } },
+            .{ .rel = "n", .arity = 2, .cols = &[_]u32{ 7, 5, 8, 6 } },
+            .{ .rel = "k", .arity = 1, .cols = &[_]u32{ 5, 6 } },
+        },
+        &[_][*:0]const u8{
+            "q(Z) :- m(X), t(X,Y)~0 'r.*', n(Y,Z), k(Z).",
+            "t(X,Y) :- g(X,Y).",
+            "t(X,Y) :- q(X), g(X,Y).",
+        },
+        "q",
+        1,
+        &[_]u32{5},
+    );
+
+    // ── I: the FUZZY variant of F (`~~`, the same OP_WALK handler walking a
+    // lev automaton), so the admitted-op path is pinned for both pattern
+    // constructors: ~~1 'row1' matches row1 (distance 0) and row2 (distance 1),
+    // so the closure is F's 6 pairs again.  MEASURED on b66b208: the 3 base
+    // tuples only.
+    try xBattery(
+        "/tmp/datalog_zig_xbatch_prop_walkfuzzy",
+        &[_]XRel{ .{ .rel = "edge", .arity = 2 }, .{ .rel = "reach", .arity = 2 } },
+        &[_]XFact{.{ .rel = "edge", .arity = 2, .cols = &[_]u32{ 1, 2, 2, 3, 3, 4 }, .names = &[_][*:0]const u8{ "row1", "row2", "row3", "row4" } }},
+        &[_][*:0]const u8{
+            "reach(X,Y) :- edge(X,Y).",
+            "reach(X,Y) :- reach(X,Z)~~1 'row1', edge(Z,Y).",
+        },
+        "reach",
+        2,
+        &[_]u32{
+            1, 2, 1, 3, 1, 4,
+            2, 3, 2, 4,
+            3, 4,
+        },
     );
 
     // ── D: an UNSTRATIFIABLE UNION is refused LOUDLY in every batching, with

@@ -409,11 +409,12 @@ int dl_attach_schema(dl_db *db, const dl_schema *schema);
  *     Two limits, both measured and both about cost rather than answers: the
  *     bytecode is compiled per batch, so a rule promoted to recursive by a
  *     later batch keeps the op the earlier compile chose (the recursive driver
- *     feeds every op it can emit — see vm.zig driverFeeds — so the answer is
- *     unaffected, but the plan, and therefore the cost, may differ from the
- *     single-batch plan); and because that forced-perm compile-time step is
- *     not re-run, a split program cannot be refused with "too many permutation
- *     indices" where the single-batch program would be.
+ *     feeds every BODY-ATOM op the compiler can emit — SCAN, LOOKUP,
+ *     LOOKUP_PERM, HASH_JOIN and the pattern WALK — see vm.zig driverFeeds, so
+ *     the answer is unaffected, but the plan, and therefore the cost, may
+ *     differ from the single-batch plan); and because that forced-perm
+ *     compile-time step is not re-run, a split program cannot be refused with
+ *     "too many permutation indices" where the single-batch program would be.
  *   - Previously derived relations are NOT kept: each evaluation resets the
  *     derived views and re-derives them from the EDB, so no tuple derived under
  *     an earlier rule set survives.
