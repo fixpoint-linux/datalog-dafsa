@@ -976,7 +976,15 @@ const Edge = struct {
 /// probe a program it intends to route elsewhere without printing an error
 /// about it.  The 1/-1 split is what lets a caller tell "genuinely
 /// non-stratified" apart from "this check failed" without reading stderr.
-fn compute_strata(db: *dl.DlDb, rules: [*]?*parser.rule, n_rules: c_int, out_strata: [*]c_int, out_recursive: [*]c_int, out_max: c_int, diagnose: bool) c_int {
+///
+/// PUBLIC because strata are a property of the PROGRAMME, not of one
+/// dl_load_rules batch: compile_rules stratifies its own rule set only, so
+/// dl_load_rules calls this again over the ACCUMULATED rule AST and publishes
+/// the result onto the retained compiled rules (see dl.zig's union block).
+/// Every rule in `rules` whose head relation is not declared yet is SKIPPED
+/// (no edge is added for it), so a caller spreading a programme across loads
+/// must pass an AST whose heads all exist.
+pub fn compute_strata(db: *dl.DlDb, rules: [*]?*parser.rule, n_rules: c_int, out_strata: [*]c_int, out_recursive: [*]c_int, out_max: c_int, diagnose: bool) c_int {
     const nrels = db_rel_count(db);
     if (nrels == 0 or out_max < 1) return 0;
 
@@ -1418,6 +1426,60 @@ fn compute_strata(db: *dl.DlDb, rules: [*]?*parser.rule, n_rules: c_int, out_str
     }
 
     c.free(@ptrCast(stratum));
+    return 0;
+}
+
+/// int checkUnionRecursion(dl_db*, rule**, int, const int *recursive)
+///
+/// The three shapes compile_rules REFUSES when a rule is recursive — apply the
+/// check to the ACCUMULATED rule set instead of one batch.  A rule compiled by
+/// an earlier batch becomes recursive only when a LATER batch closes the
+/// cycle, and the single-batch programme made of the same rules is refused
+/// loudly; the split one must be refused too, or the union-recursion flag
+/// dl_load_rules publishes (it re-derives is_recursive from the union AST)
+/// would route a rule through the recursive driver that the compiler never
+/// lets near it.  The three are, in compile_rules' own words: an aggregate in
+/// a recursive rule, a recursive rule over a variadic head, and a range atom
+/// over a recursive relation (OP_RANGE reads the IDB directly, which the
+/// fixpoint never updates).
+///
+/// `recursive` is compute_strata's per-relation out-array for the union (a
+/// non-zero entry marks an SCC member or a self-loop).  Returns 1 when the
+/// union must be refused, 0 when it may proceed; the diagnostic goes through
+/// the same compile_last_error sink as compile_rules', with offset 0 because
+/// a resident rule's AST offset indexes a source this process no longer has.
+/// Nothing is emitted or mutated.
+pub fn checkUnionRecursion(db: *dl.DlDb, rules: [*]?*parser.rule, n_rules: c_int, recursive: [*]const c_int) c_int {
+    const nrels = db_rel_count(db);
+    var i: c_int = 0;
+    while (i < n_rules) : (i += 1) {
+        const r = rules[@intCast(i)] orelse continue;
+        if (r.head == null or r.head.?.pred == null) continue;
+        const hid = db_find_rel(db, cs(r.head.?.pred));
+        if (hid < 0 or @as(usize, @intCast(hid)) >= nrels) continue;
+        if (recursive[@intCast(hid)] == 0) continue;
+        if (r.has_aggregate != 0) {
+            cerr(0, "compile error: aggregate in recursive rule not supported (rule '{s}')\n", .{cs(r.head.?.pred)});
+            return 1;
+        }
+        if (db_rel_is_variadic(db, hid) != 0) {
+            cerr(0, "compile error: recursive rule over a variadic head is not supported (rule '{s}')\n", .{cs(r.head.?.pred)});
+            return 1;
+        }
+        var bi: c_int = 0;
+        while (bi < r.nbody) : (bi += 1) {
+            const ba = r.body.?[@intCast(bi)] orelse continue;
+            if (is_range_builtin(ba) and ba.nargs >= 2 and
+                ba.args.?[1] != null and ba.args.?[1].?.kind == parser.TOK_IDENT)
+            {
+                const rr = db_find_rel(db, cs(ba.args.?[1].?.text));
+                if (rr >= 0 and @as(usize, @intCast(rr)) < nrels and recursive[@intCast(rr)] != 0) {
+                    cerr(0, "compile error: range over recursive relation '{s}' is not supported (OP_RANGE reads the idb directly, which the fixpoint never updates) (rule '{s}')\n", .{ cs(ba.args.?[1].?.text), cs(r.head.?.pred) });
+                    return 1;
+                }
+            }
+        }
+    }
     return 0;
 }
 

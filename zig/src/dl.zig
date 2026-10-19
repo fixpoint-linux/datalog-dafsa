@@ -3404,6 +3404,17 @@ fn freeRulesAndParser(rules: ?[*]?*parser.rule, n_rules: c_int, p: ?*anyopaque) 
     parse_free(p);
 }
 
+/// Free a batch of freshly compiled rules (compile_rules' out-params) — every
+/// dl_load_rules path that gives up after a successful compile needs exactly
+/// this, so it is not repeated at each failure site.
+fn freeNewCompiled(rules: ?[*]?*compiler.compiled_rule, n: c_int) void {
+    if (rules) |rs| {
+        var i: c_int = 0;
+        while (i < n) : (i += 1) compiler.compiled_rule_free(rs[@intCast(i)]);
+        c.free(@ptrCast(rs));
+    }
+}
+
 /// 1 if the parsed rules reference the reserved "rev" relation.
 fn rulesReferenceRev(rules: ?[*]?*parser.rule, n_rules: c_int) bool {
     var i: c_int = 0;
@@ -3485,6 +3496,64 @@ pub export fn dl_load_rules(db: ?*DlDb, dl_source: [*c]const u8) c_int {
         return -1;
     }
 
+    // ── Union stratification: strata are a property of the PROGRAMME ───────
+    //
+    // compile_rules stratifies only THIS batch, so a split programme's strata
+    // were a function of the batching.  MEASURED pre-fix over m =
+    // {(1,2),(2,3),(4,4)} with
+    //     batch1  r(X) :- m(X,Y), !q(Y).     batch2  q(X) :- m(X,Y), !s(Y).
+    // both heads landed in stratum 1, the non-recursive path's stable stratum
+    // sort (vm.zig ruleStratumOrder) fell back to BATCH order, and r was
+    // evaluated while q was still empty: r = {1,2,4} for r-then-q but r = {2}
+    // for q-then-r — a silent, order-dependent wrong answer (the single-batch
+    // programme containing the same two rules answers {2}).
+    //
+    // Fix: stratify the UNION (resident rule AST + this batch) and publish the
+    // result onto every retained compiled rule (below, after the append).
+    // Placed AFTER compile_rules — which declares this batch's head relations,
+    // and compute_strata skips a rule whose head is not declared yet — and
+    // BEFORE either append, so an unstratifiable UNION is refused loudly with
+    // nothing loaded: batch1 p(X) :- m(X,Y), !q(Y). plus batch2
+    // q(X) :- m(X,Y), !p(Y). is exactly the negation cycle the single-batch
+    // compiler rejects.  (The db is left with this batch's head declarations
+    // only, which is what a rejected single-batch load leaves too.)
+    var uni_strata: ?[*]c_int = null;
+    var uni_recursive: ?[*]c_int = null;
+    var uni_nrels: c_int = 0;
+    defer if (uni_strata) |sp| c.free(@ptrCast(sp));
+    defer if (uni_recursive) |rp| c.free(@ptrCast(rp));
+    {
+        const nres: usize = @intCast(d.n_ast_rules);
+        const total: usize = nres + @as(usize, @intCast(n_rules));
+        uni_nrels = @intCast(d.nrels);
+        if (total > 0 and uni_nrels > 0) {
+            const merged_mem = c.malloc(total * @sizeOf(?*parser.rule)) orelse {
+                freeNewCompiled(new_crules, n_compiled);
+                freeRulesAndParser(rules, n_rules, p);
+                return -1;
+            };
+            const merged: [*]?*parser.rule = @ptrCast(@alignCast(merged_mem));
+            if (nres > 0) @memcpy(merged[0..nres], d.ast_rules.?[0..nres]);
+            @memcpy(merged[nres..total], rules.?[0..@intCast(n_rules)]);
+            uni_strata = @ptrCast(@alignCast(c.calloc(@intCast(uni_nrels), @sizeOf(c_int))));
+            uni_recursive = @ptrCast(@alignCast(c.calloc(@intCast(uni_nrels), @sizeOf(c_int))));
+            var rc: c_int = if (uni_strata != null and uni_recursive != null)
+                compiler.compute_strata(d, merged, @intCast(total), uni_strata.?, uni_recursive.?, uni_nrels, true)
+            else
+                -1;
+            // The union can also make a RESIDENT rule recursive; the three
+            // shapes the compiler refuses in that case must be refused here too
+            // (see compiler.checkUnionRecursion).
+            if (rc == 0 and compiler.checkUnionRecursion(d, merged, @intCast(total), uni_recursive.?) != 0) rc = 1;
+            c.free(merged_mem);
+            if (rc != 0) {
+                freeNewCompiled(new_crules, n_compiled);
+                freeRulesAndParser(rules, n_rules, p);
+                return -1;
+            }
+        }
+    }
+
     // Retain a DEEP copy of the rule AST: dl_add_fact's constant-kind
     // recheck (compiler.checkAllRuleConstKinds) consults the resident rules.
     {
@@ -3543,6 +3612,38 @@ pub export fn dl_load_rules(db: ?*DlDb, dl_source: [*c]const u8) c_int {
         c.free(@ptrCast(new_crules));
         d.crules = merged_rules;
         d.n_crules = new_total;
+    }
+
+    // Publish the UNION stratification onto EVERY retained rule, resident
+    // batches included: two rules with the same head must agree on its
+    // stratum, and it must be the stratum the single-batch programme would
+    // have assigned — that is what makes the non-recursive path's stratum sort
+    // (vm.zig ruleStratumOrder) place a negating rule strictly after the
+    // relations it negates, no matter how the programme was batched.
+    //
+    // is_recursive is republished for the same reason, and it matters as much:
+    // a base rule loaded first and a recursive rule loaded second left the
+    // base rule flagged non-recursive, and the recursive driver's delta
+    // seeding then UNDER-DERIVED (MEASURED pre-fix: closure of the 4-edge chain
+    // 1->2->3->4->5 came to 8 of the 10 pairs when split, 10 as one batch).
+    // Both flags are now exactly what compiling the same rules as ONE batch
+    // yields.  The flag also steered TWO compile-time choices that are NOT
+    // re-run here: the perm-vs-hash join choice for a non-leading body atom
+    // (compiler.zig emit_nonleading_join — a cost choice, not a semantic one;
+    // the fixpoint shadows every perm declared on a recursive head whatever
+    // op reads it) and the three rejects checkUnionRecursion now applies to
+    // the union.  Making a rule count as recursive can only make the
+    // incremental-maintenance probes MORE conservative (a false "ineligible"
+    // falls back to a full re-evaluate, never to a wrong answer).
+    if (uni_strata) |strata| {
+        var i: c_int = 0;
+        while (i < d.n_crules) : (i += 1) {
+            const cr = d.crules.?[@intCast(i)] orelse continue;
+            const hid: c_int = @intCast(cr.head_rel_id);
+            if (hid >= uni_nrels) continue;
+            cr.stratum = strata[@intCast(hid)];
+            cr.is_recursive = uni_recursive.?[@intCast(hid)];
+        }
     }
 
     // IVM Slice 1: the rule set changed.
@@ -6888,4 +6989,515 @@ test "dl_intern_str_version: an UNREADABLE snapshot array is an error, not an em
     try testing.expectEqual(@as(c_int, -1), dl_intern_str_version(db, 1, "blue", &sym));
     try testing.expectEqual(@as(c_int, -1), dl_intern_str_version(db, 1, "zilch", &sym));
     try testing.expectEqual(@as(u32, 99), sym);
+}
+// ─── Cross-batch stratification battery ───────────────────────────────────
+//
+// The property: a programme's ANSWERS depend on its rules, not on how the
+// caller split them across dl_load_rules calls.  Strata used to be computed
+// per batch (compile_rules sees one batch), so two negatively-related heads
+// loaded in separate batches landed in the SAME stratum and the non-recursive
+// path's stable stratum sort (vm.zig ruleStratumOrder) fell back to batch
+// order — a SILENT, order-dependent wrong answer.  e39e204 fixed the
+// within-batch half of that; this battery is the cross-batch half.
+//
+// So every case runs the same rules three ways:
+//   (i)   ONE dl_load_rules (the reference answer — also varied by source
+//         order, since that must not matter either),
+//   (ii)  each rule as its OWN batch, in EVERY permutation,
+//   (iii) the two grouped splits 1|rest and rest|1,
+// each under BOTH fact-insertion orders, and every run must produce the
+// HAND-COMPUTED answer — cross-run agreement alone would pass a uniformly
+// wrong evaluator.
+//
+// PRE-FIX FAILURE (MEASURED by appending this same block to the 94fd4f7 tree
+// and running `zig build test` there): case 1 returns r={1,2,4} for the
+// r-then-q split (and {2} for q-then-r), case 2 returns t={2} instead of
+// {2,4}, case 5 (recursion) closes to 8 of 10, and case 7's unstratifiable
+// union is accepted silently instead of refused.
+
+const XFact = struct {
+    rel: [*:0]const u8,
+    arity: u8,
+    cols: []const u32,
+};
+
+const XRel = struct {
+    rel: [*:0]const u8,
+    arity: u8,
+};
+
+/// One evaluation: load `batches` (each entry is one dl_load_rules call) over
+/// a fresh copy of `facts`, then assert `goal`'s answer EXACTLY — every
+/// expected tuple present (dl_lookup) and no others (dl_count), plus the
+/// streamed row count as an independent witness.
+fn xRun(
+    dbpath: [*:0]const u8,
+    rels: []const XRel,
+    facts: []const XFact,
+    reverse_facts: bool,
+    batches: []const [:0]const u8,
+    goal: [*:0]const u8,
+    arity: u8,
+    expected_flat: []const u32,
+) !void {
+    rmrfTestDir(dbpath);
+    const db = dl_open(dbpath) orelse return error.TestUnexpectedResult;
+    defer dl_close(db);
+
+    for (rels) |r| try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, r.rel, r.arity));
+    for (facts) |f| {
+        const ntup = f.cols.len / f.arity;
+        var k: usize = 0;
+        while (k < ntup) : (k += 1) {
+            const t = if (reverse_facts) ntup - 1 - k else k;
+            try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, f.rel, f.cols.ptr + t * f.arity, f.arity));
+        }
+    }
+    for (batches) |src| try testing.expectEqual(@as(c_int, 0), dl_load_rules(db, src.ptr));
+    try testing.expectEqual(@as(c_int, 0), dl_compile(db));
+
+    const n_exp: usize = expected_flat.len / arity;
+    var got = CollectCbCtx{};
+    try testing.expectEqual(@as(c_long, @intCast(n_exp)), dl_query(db, goal, collectCb, &got));
+    try testing.expectEqual(@as(u64, @intCast(n_exp)), dl_count(db, goal));
+    try testing.expectEqual(n_exp, got.n);
+    var k: usize = 0;
+    while (k < expected_flat.len) : (k += arity) {
+        try testing.expectEqual(@as(c_int, 1), dl_lookup(db, goal, expected_flat.ptr + k, arity));
+    }
+}
+
+fn xJoinInto(buf: []u8, rules: []const [*:0]const u8, perm: []const usize) [:0]const u8 {
+    var len: usize = 0;
+    for (perm, 0..) |pi, k| {
+        if (k != 0) {
+            buf[len] = '\n';
+            len += 1;
+        }
+        const s = std.mem.span(rules[pi]);
+        @memcpy(buf[len .. len + s.len], s);
+        len += s.len;
+    }
+    buf[len] = 0;
+    return buf[0..len :0];
+}
+
+/// Lexicographic next permutation; false when the sequence is exhausted.
+fn xNextPerm(p: []usize) bool {
+    if (p.len < 2) return false;
+    var i = p.len - 1;
+    while (i > 0 and p[i - 1] >= p[i]) : (i -= 1) {}
+    if (i == 0) return false;
+    var j = p.len - 1;
+    while (p[j] <= p[i - 1]) : (j -= 1) {}
+    std.mem.swap(usize, &p[i - 1], &p[j]);
+    std.mem.reverse(usize, p[i..]);
+    return true;
+}
+
+fn xBattery(
+    dbpath: [*:0]const u8,
+    rels: []const XRel,
+    facts: []const XFact,
+    rules: []const [*:0]const u8,
+    goal: [*:0]const u8,
+    arity: u8,
+    expected_flat: []const u32,
+) !void {
+    var joinbuf: [4096]u8 = undefined;
+    var g1buf: [2048]u8 = undefined;
+    var g2buf: [2048]u8 = undefined;
+    var batchbuf: [8][1024]u8 = undefined;
+    var per: [8][:0]const u8 = undefined;
+    var perm: [8]usize = undefined;
+    for (0..rules.len) |k| perm[k] = k;
+
+    var runs: usize = 0;
+    while (true) {
+        const order = perm[0..rules.len];
+
+        const one = [_][:0]const u8{xJoinInto(&joinbuf, rules, order)};
+        for ([_]bool{ false, true }) |rev| {
+            try xRun(dbpath, rels, facts, rev, &one, goal, arity, expected_flat);
+            runs += 1;
+        }
+
+        for (order, 0..) |pi, k| {
+            const s = std.mem.span(rules[pi]);
+            @memcpy(batchbuf[k][0..s.len], s);
+            batchbuf[k][s.len] = 0;
+            per[k] = batchbuf[k][0..s.len :0];
+        }
+        for ([_]bool{ false, true }) |rev| {
+            try xRun(dbpath, rels, facts, rev, per[0..rules.len], goal, arity, expected_flat);
+            runs += 1;
+        }
+
+        // Grouped splits — a different batching SHAPE, not just a different
+        // order.  Only meaningful with 3+ rules (else it repeats (ii)).
+        if (rules.len >= 3) {
+            var ci: usize = 0;
+            while (ci < 2) : (ci += 1) {
+                const cut: usize = if (ci == 0) 1 else rules.len - 1;
+                const head = [_][:0]const u8{xJoinInto(&g1buf, rules, order[0..cut])};
+                const tail = [_][:0]const u8{xJoinInto(&g2buf, rules, order[cut..])};
+                const grouped = [2][:0]const u8{ head[0], tail[0] };
+                for ([_]bool{ false, true }) |rev| {
+                    try xRun(dbpath, rels, facts, rev, &grouped, goal, arity, expected_flat);
+                    runs += 1;
+                }
+            }
+        }
+
+        if (!xNextPerm(order)) break;
+    }
+    // 2 fact orders x (1 single-batch + n per-rule + 2 groupings) is the
+    // floor; a battery that ran one configuration would test nothing.
+    try testing.expect(runs >= 8);
+}
+
+test "dl_load_rules: cross-batch stratified negation is ORDER-INDEPENDENT" {
+    // ── Case 1: the reported cross-batch probe.  m = {(1,2),(2,3),(4,4)},
+    // s empty, so q(X) :- m(X,Y), !s(Y).  gives q = {1,2,4} and
+    // r(X) :- m(X,Y), !q(Y). survives only on Y=3: r = {2}.
+    // (q must be DECLARED here: a body predicate that is neither declared nor
+    // a head of some batch is "unknown predicate".)
+    try xBattery(
+        "/tmp/datalog_zig_xbatch_1",
+        &[_]XRel{ .{ .rel = "m", .arity = 2 }, .{ .rel = "s", .arity = 1 }, .{ .rel = "q", .arity = 1 }, .{ .rel = "r", .arity = 1 } },
+        &[_]XFact{.{ .rel = "m", .arity = 2, .cols = &[_]u32{ 1, 2, 2, 3, 4, 4 } }},
+        &[_][*:0]const u8{
+            "r(X) :- m(X,Y), !q(Y).",
+            "q(X) :- m(X,Y), !s(Y).",
+        },
+        "r",
+        1,
+        &[_]u32{2},
+    );
+    // ... and the same split programme's q, so the case is not passing by
+    // evaluating nothing.
+    try xBattery(
+        "/tmp/datalog_zig_xbatch_1q",
+        &[_]XRel{ .{ .rel = "m", .arity = 2 }, .{ .rel = "s", .arity = 1 }, .{ .rel = "q", .arity = 1 }, .{ .rel = "r", .arity = 1 } },
+        &[_]XFact{.{ .rel = "m", .arity = 2, .cols = &[_]u32{ 1, 2, 2, 3, 4, 4 } }},
+        &[_][*:0]const u8{
+            "r(X) :- m(X,Y), !q(Y).",
+            "q(X) :- m(X,Y), !s(Y).",
+        },
+        "q",
+        1,
+        &[_]u32{ 1, 2, 4 },
+    );
+
+    // ── Case 2: a THREE-batch chain — t negates r, r negates q, q negates s.
+    // One batch: q = {1,2,4}, r = {2}, t = {2,4}.  Splitting it used to put
+    // every head in stratum 1 (each batch saw only its own negation edge).
+    try xBattery(
+        "/tmp/datalog_zig_xbatch_2",
+        &[_]XRel{
+            .{ .rel = "m", .arity = 2 },
+            .{ .rel = "s", .arity = 1 },
+            .{ .rel = "q", .arity = 1 },
+            .{ .rel = "r", .arity = 1 },
+            .{ .rel = "t", .arity = 1 },
+        },
+        &[_]XFact{.{ .rel = "m", .arity = 2, .cols = &[_]u32{ 1, 2, 2, 3, 4, 4 } }},
+        &[_][*:0]const u8{
+            "t(X) :- m(X,Y), !r(Y).",
+            "r(X) :- m(X,Y), !q(Y).",
+            "q(X) :- m(X,Y), !s(Y).",
+        },
+        "t",
+        1,
+        &[_]u32{ 2, 4 },
+    );
+
+    // ── Case 3 (e39e204's chained case, now split): node = {1,2,3,4},
+    // m = {(1,2),(2,3),(3,1)}, banned = {3}
+    //   r1 = node \ banned = {1,2,4};  r2 = X of m with r1(Y) = {2};
+    //   r3 = node \ r2 = {1,3,4}.
+    try xBattery(
+        "/tmp/datalog_zig_xbatch_3",
+        &[_]XRel{
+            .{ .rel = "node", .arity = 1 },
+            .{ .rel = "m", .arity = 2 },
+            .{ .rel = "banned", .arity = 1 },
+            .{ .rel = "r1", .arity = 1 },
+            .{ .rel = "r2", .arity = 1 },
+            .{ .rel = "r3", .arity = 1 },
+        },
+        &[_]XFact{
+            .{ .rel = "node", .arity = 1, .cols = &[_]u32{ 1, 2, 3, 4 } },
+            .{ .rel = "m", .arity = 2, .cols = &[_]u32{ 1, 2, 2, 3, 3, 1 } },
+            .{ .rel = "banned", .arity = 1, .cols = &[_]u32{3} },
+        },
+        &[_][*:0]const u8{
+            "r3(X) :- node(X), !r2(X).",
+            "r2(X) :- m(X,Y), !r1(Y).",
+            "r1(X) :- node(X), !banned(X).",
+        },
+        "r3",
+        1,
+        &[_]u32{ 1, 3, 4 },
+    );
+
+    // ── Case 4 (e39e204's recursive case, now split): negation ABOVE a
+    // recursive stratum.  edge is the chain 1->2->3->4->5, so reach = {(i,j):
+    // i<j} (10 tuples) and nonreach = every remaining pair, i.e. a >= b.
+    try xBattery(
+        "/tmp/datalog_zig_xbatch_4",
+        &[_]XRel{
+            .{ .rel = "edge", .arity = 2 },
+            .{ .rel = "node", .arity = 1 },
+            .{ .rel = "reach", .arity = 2 },
+            .{ .rel = "nonreach", .arity = 2 },
+        },
+        &[_]XFact{
+            .{ .rel = "edge", .arity = 2, .cols = &[_]u32{ 1, 2, 2, 3, 3, 4, 4, 5 } },
+            .{ .rel = "node", .arity = 1, .cols = &[_]u32{ 1, 2, 3, 4, 5 } },
+        },
+        &[_][*:0]const u8{
+            "nonreach(X,Y) :- node(X), node(Y), !reach(X,Y).",
+            "reach(X,Y) :- edge(X,Y).",
+            "reach(X,Y) :- reach(X,Z), reach(Z,Y).",
+        },
+        "nonreach",
+        2,
+        &[_]u32{
+            1, 1,
+            2, 1, 2, 2,
+            3, 1, 3, 2, 3, 3,
+            4, 1, 4, 2, 4, 3, 4, 4,
+            5, 1, 5, 2, 5, 3, 5, 4, 5, 5,
+        },
+    );
+
+    // ── Case 5 (e39e204's aggregate case, now split): an AGGREGATE over a
+    // negated DERIVED relation.  m = {(1,2),(1,3),(1,4),(2,2)}, aged = {3}
+    // so old = {3} and cnt(X,N) :- m(X,Y), !old(Y), N = count() gives
+    // {(1,2),(2,1)}.
+    try xBattery(
+        "/tmp/datalog_zig_xbatch_5",
+        &[_]XRel{
+            .{ .rel = "m", .arity = 2 },
+            .{ .rel = "aged", .arity = 1 },
+            .{ .rel = "old", .arity = 1 },
+            .{ .rel = "cnt", .arity = 2 },
+            .{ .rel = "tot", .arity = 1 },
+        },
+        &[_]XFact{
+            .{ .rel = "m", .arity = 2, .cols = &[_]u32{ 1, 2, 1, 3, 1, 4, 2, 2 } },
+            .{ .rel = "aged", .arity = 1, .cols = &[_]u32{3} },
+        },
+        &[_][*:0]const u8{
+            "cnt(X,N) :- m(X,Y), !old(Y), N = count().",
+            "tot(N) :- m(X,Y), N = count().",
+            "old(X) :- aged(X).",
+        },
+        "cnt",
+        2,
+        &[_]u32{ 1, 2, 2, 1 },
+    );
+}
+
+test "dl_load_rules: cross-batch RECURSION closes to the single-batch answer" {
+    // The base rule and the recursive rule in separate batches: the batch that
+    // defines the base rule has no cycle for its head, so it compiled
+    // is_recursive = 0 and the recursive driver's delta seeding then
+    // UNDER-DERIVED (MEASURED pre-fix: 8 of the 10 pairs).  is_recursive is
+    // re-derived from the accumulated rules, so both flags now match the
+    // single-batch compile.  edge is the chain 1->2->3->4->5.
+    try xBattery(
+        "/tmp/datalog_zig_xbatch_6",
+        &[_]XRel{ .{ .rel = "edge", .arity = 2 }, .{ .rel = "reach", .arity = 2 } },
+        &[_]XFact{.{ .rel = "edge", .arity = 2, .cols = &[_]u32{ 1, 2, 2, 3, 3, 4, 4, 5 } }},
+        &[_][*:0]const u8{
+            "reach(X,Y) :- edge(X,Y).",
+            "reach(X,Y) :- reach(X,Z), reach(Z,Y).",
+        },
+        "reach",
+        2,
+        &[_]u32{
+            1, 2, 1, 3, 1, 4, 1, 5,
+            2, 3, 2, 4, 2, 5,
+            3, 4, 3, 5,
+            4, 5,
+        },
+    );
+
+    // Mutual recursion split across batches: two heads in one SCC, each batch
+    // acyclic on its own.  p = {1,2,3} either way; no batch may drop a cycle
+    // member from the fixpoint.
+    try xBattery(
+        "/tmp/datalog_zig_xbatch_7",
+        &[_]XRel{
+            .{ .rel = "seed", .arity = 1 },
+            .{ .rel = "hop", .arity = 1 },
+            .{ .rel = "p", .arity = 1 },
+            .{ .rel = "q", .arity = 1 },
+        },
+        &[_]XFact{
+            .{ .rel = "seed", .arity = 1, .cols = &[_]u32{ 1, 2, 3 } },
+            .{ .rel = "hop", .arity = 1, .cols = &[_]u32{1} },
+        },
+        &[_][*:0]const u8{
+            "p(X) :- seed(X).",
+            "p(X) :- q(X).",
+            "q(X) :- p(X), hop(X).",
+        },
+        "p",
+        1,
+        &[_]u32{ 1, 2, 3 },
+    );
+}
+
+test "dl_load_rules: a rule reading a later batch's RECURSION is stratified above it" {
+    // NO NEGATION — so this is not only a negation residual.  compute_strata
+    // lifts a rule that reads a recursive relation from a different SCC into a
+    // strictly higher stratum (the `out_recursive[from] and comp differs` bump
+    // in compiler.zig), which a per-batch stratification cannot see.  p was
+    // therefore in the SAME stratum as the recursion, ran inside the
+    // non-recursive pass loop while reach held only its base tuples, and was
+    // never re-fired: MEASURED pre-fix, p = {2} when p's batch came first and
+    // {2,3,4} when it came last (the single batch answers {2,3,4}).
+    //   edge = 1->2->3->4, start = {1}
+    //   reach = {(1,2),(1,3),(1,4),(2,3),(2,4),(3,4)}
+    //   p(Y) :- start(X), reach(X,Y)  ->  {2,3,4}
+    try xBattery(
+        "/tmp/datalog_zig_xbatch_8",
+        &[_]XRel{
+            .{ .rel = "edge", .arity = 2 },
+            .{ .rel = "start", .arity = 1 },
+            .{ .rel = "reach", .arity = 2 },
+            .{ .rel = "p", .arity = 1 },
+        },
+        &[_]XFact{
+            .{ .rel = "edge", .arity = 2, .cols = &[_]u32{ 1, 2, 2, 3, 3, 4 } },
+            .{ .rel = "start", .arity = 1, .cols = &[_]u32{1} },
+        },
+        &[_][*:0]const u8{
+            "p(Y) :- start(X), reach(X,Y).",
+            "reach(X,Y) :- edge(X,Y).",
+            "reach(X,Y) :- reach(X,Z), reach(Z,Y).",
+        },
+        "p",
+        1,
+        &[_]u32{ 2, 3, 4 },
+    );
+}
+
+test "dl_load_rules: an unstratifiable UNION is REFUSED, not silently evaluated" {
+    const dir = "/tmp/datalog_zig_xbatch_uns";
+    rmrfTestDir(dir);
+    defer rmrfTestDir(dir);
+
+    // The single-batch programme is the negation cycle the compiler refuses.
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "m", 2));
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "q", 1));
+        try testing.expectEqual(@as(c_int, -1), dl_load_rules(db, "p(X) :- m(X,Y), !q(Y).  q(X) :- m(X,Y), !p(Y)."));
+        const msg = compiler.compile_last_error(null);
+        try testing.expect(msg != null);
+        try testing.expect(std.mem.indexOf(u8, std.mem.span(msg.?), "unstratifiable") != null);
+    }
+
+    // Split, the same programme must be refused at the load that closes the
+    // cycle — the first batch alone is perfectly stratifiable.
+    rmrfTestDir(dir);
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "m", 2));
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "q", 1));
+        try testing.expectEqual(@as(c_int, 0), dl_load_rules(db, "p(X) :- m(X,Y), !q(Y)."));
+        try testing.expectEqual(@as(c_int, -1), dl_load_rules(db, "q(X) :- m(X,Y), !p(Y)."));
+        const msg = compiler.compile_last_error(null);
+        try testing.expect(msg != null);
+        try testing.expect(std.mem.indexOf(u8, std.mem.span(msg.?), "unstratifiable") != null);
+        // The refused batch loaded NOTHING: the first batch is still the whole
+        // programme, and it still evaluates.
+        const m1 = [2]u32{ 1, 2 };
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "m", &m1, 2));
+        try testing.expectEqual(@as(c_int, 0), dl_compile(db));
+        var got = CollectCbCtx{};
+        try testing.expectEqual(@as(c_long, 1), dl_query(db, "p", collectCb, &got));
+        try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "p", &[1]u32{1}, 1));
+    }
+}
+
+test "dl_load_rules: union recursion keeps the compiler's REJECTS" {
+    // cnt is an aggregate rule in batch 1; batch 2 makes cnt recursive.  The
+    // single-batch programme is refused ("aggregate in recursive rule"), so the
+    // split one must be too — otherwise the union-recursion flag would route a
+    // rule through the recursive driver the compiler never lets near it.
+    const dir = "/tmp/datalog_zig_xbatch_agg";
+    rmrfTestDir(dir);
+    defer rmrfTestDir(dir);
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "m", 2));
+        try testing.expectEqual(@as(c_int, -1), dl_load_rules(db, "cnt(N) :- m(X,Y), N = count().  cnt(X) :- cnt(X)."));
+        const msg = compiler.compile_last_error(null);
+        try testing.expect(msg != null);
+        try testing.expect(std.mem.indexOf(u8, std.mem.span(msg.?), "aggregate in recursive rule") != null);
+    }
+    rmrfTestDir(dir);
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "m", 2));
+        try testing.expectEqual(@as(c_int, 0), dl_load_rules(db, "cnt(N) :- m(X,Y), N = count()."));
+        try testing.expectEqual(@as(c_int, -1), dl_load_rules(db, "cnt(X) :- cnt(X)."));
+        const msg = compiler.compile_last_error(null);
+        try testing.expect(msg != null);
+        try testing.expect(std.mem.indexOf(u8, std.mem.span(msg.?), "aggregate in recursive rule") != null);
+    }
+}
+
+test "dl_load_rules: a later batch evaluates the ACCUMULATED rules, re-derived" {
+    // The contract the fix makes explicit: dl_load_rules ACCUMULATES (a query
+    // runs every retained rule), and each evaluation RE-DERIVES from the EDB
+    // (vmExecuteMode resets the head views), so no tuple derived under an
+    // earlier, differently-stratified programme survives.
+    const dir = "/tmp/datalog_zig_xbatch_acc";
+    rmrfTestDir(dir);
+    defer rmrfTestDir(dir);
+
+    const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+    defer dl_close(db);
+
+    try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "m", 2));
+    try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "s", 1));
+    try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "q", 1));
+    const f = [_]u32{ 1, 2, 2, 3, 4, 4 };
+    var i: usize = 0;
+    while (i < 3) : (i += 1)
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "m", f[i * 2 ..].ptr, 2));
+
+    // One rule in the db: q = {1,2,4} (s is empty).
+    try testing.expectEqual(@as(c_int, 0), dl_load_rules(db, "q(X) :- m(X,Y), !s(Y)."));
+    try testing.expectEqual(@as(c_int, 0), dl_compile(db));
+    try testing.expectEqual(@as(u64, 3), dl_count(db, "q"));
+
+    // A second batch: BOTH rules now participate, and r is {2} — not the
+    // {1,2,4} a per-batch stratification would have produced.
+    try testing.expectEqual(@as(c_int, 0), dl_load_rules(db, "r(X) :- m(X,Y), !q(Y)."));
+    try testing.expectEqual(@as(c_int, 0), dl_compile(db));
+    try testing.expectEqual(@as(u64, 3), dl_count(db, "q"));
+    try testing.expectEqual(@as(u64, 1), dl_count(db, "r"));
+    try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "r", &[1]u32{2}, 1));
+
+    // q's derived view is RE-DERIVED when a new base fact arrives: the new
+    // (7,8) makes q = {1,2,4,7} and r gains 7 (r keeps 2 — 8 is not in q).
+    const nf = [2]u32{ 7, 8 };
+    try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "m", &nf, 2));
+    try testing.expectEqual(@as(c_int, 0), dl_compile(db));
+    try testing.expectEqual(@as(u64, 4), dl_count(db, "q"));
+    try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "q", &[1]u32{7}, 1));
+    try testing.expectEqual(@as(u64, 2), dl_count(db, "r"));
+    try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "r", &[1]u32{2}, 1));
+    try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "r", &[1]u32{7}, 1));
 }

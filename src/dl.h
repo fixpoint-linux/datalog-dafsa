@@ -391,7 +391,28 @@ int dl_attach_schema(dl_db *db, const dl_schema *schema);
  * Rules may reference existing relations (must match arity) or declare
  * new derived relations.  Returns 0 on success, -1 on error (message to
  * stderr).  The compiled program is stored internally; subsequent calls
- * to dl_compile append to it. */
+ * to dl_compile append to it.
+ *
+ * ACCUMULATION CONTRACT — a program may be loaded in several batches, and the
+ * batches are ONE program, not several:
+ *   - Which rules participate: every retained rule.  dl_compile / dl_query /
+ *     the fact-propagation path evaluate the accumulated rule set, and a query
+ *     after the second dl_load_rules sees both batches' rules.
+ *   - Stratification and recursion are computed over the ACCUMULATED rule set
+ *     (strata are a property of the program, not of a batch), so the answer
+ *     does not depend on how the rules were grouped: loading {A,B} as one call
+ *     and as two calls give the same result.  A batch that closes an
+ *     unstratifiable cycle, or that makes an existing rule a recursive
+ *     aggregate / a recursive rule over a variadic head / a range over a
+ *     recursive relation, is REFUSED (returns -1) exactly as the single-batch
+ *     program of the same rules is.
+ *   - Previously derived relations are NOT kept: each evaluation resets the
+ *     derived views and re-derives them from the EDB, so no tuple derived under
+ *     an earlier rule set survives.
+ * Trailing asymmetry worth knowing: a body predicate that is neither declared
+ * nor a head of the SAME batch is "unknown predicate", so a batch that reads a
+ * relation a later batch will define must have that relation declared first
+ * (dl_declare_relation), which is also how an EDB is introduced. */
 int dl_load_rules(dl_db *db, const char *dl_source);
 
 /* Compile all previously loaded rules into bytecode and run them against
