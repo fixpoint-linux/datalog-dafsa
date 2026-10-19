@@ -179,6 +179,9 @@ build_corpus() {
     run_cmd "$out" c94 "$db" search
     run_cmd "$out" c95 "$db" versions extra
     run_cmd "$out" c96 "$db" frobnicate
+    # --with-derived is the CLI binding of DL_PUB_DERIVED=1: the snapshot gets
+    # its own symbols.dafsa, so the tree manifest below proves it was written.
+    run_cmd "$out" c97 "$db" publish --with-derived
 }
 
 # read_corpus <dbdir> <outdir> — the read-only persistence corpus (queries

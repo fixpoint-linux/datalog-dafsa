@@ -608,7 +608,11 @@ int dl_set_snapshot_retain(dl_db *db, unsigned n);
 typedef enum {
     DL_FPOINT_AFTER_REL_SAVE,
     DL_FPOINT_AFTER_RENAME,
-    DL_FPOINT_TXN_BEFORE_MARKER   /* txn commit: after data records, before COMMIT marker */
+    DL_FPOINT_TXN_BEFORE_MARKER,  /* txn commit: after data records, before COMMIT marker */
+    DL_FPOINT_DERIVED_SAVE        /* opt-in derived symbols.dafsa (DL_PUB_DERIVED=1):
+                                   * fired before the file is written; a non-zero
+                                   * return simulates the write failing (ENOSPC,
+                                   * EACCES, ...) and aborts the publish */
 } dl_fpoint;
 
 /* Set a fault-injection hook.  At each fpoint during publish, if hook is

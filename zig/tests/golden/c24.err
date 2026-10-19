@@ -3,7 +3,7 @@ Usage:
   @PROG@ [-d <dir>] lookup <rel> <val> [<val> ...]
   @PROG@ [-d <dir>] prefix <rel> [<val> ...]
   @PROG@ [-d <dir>] query '<rule>' | <file.dl> <goal-rel>
-  @PROG@ [-d <dir>] publish [--keep N]
+  @PROG@ [-d <dir>] publish [--keep N] [--with-derived]
   @PROG@ [-d <dir>] bound <rel> <val> [<val> ...]
   @PROG@ [-d <dir>] pattern <rel> [<col>] '<regex>'
   @PROG@ [-d <dir>] similar '<name>' [--k N]  (edit distance, k = 0..2, default 1)

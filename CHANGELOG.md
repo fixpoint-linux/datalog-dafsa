@@ -3,6 +3,65 @@
 All notable changes to this project are documented in this file.
 
 ## [Unreleased]
+- **Sym-id reuse across a publish — silent wrong answers in VERSION pattern
+  queries (BLOCKER, 2026-10-19, unit `fix-idreuse`).** Found by reviewing
+  `3dd4ae0` and reproduced through the public API only.
+  - **The defect, MEASURED both directions.** `snapshotSymSet` answered a
+    version pattern query from the LIVE interner when the snapshot had no
+    `symbols.dafsa`. Publish wrote only `<snapshot>/symbols.array`, and
+    `intern_save` clears the interner's dirty flag, so the `dl_add_fact` /
+    `dl_close` root `<db>/symbols.array` save was skipped: `intern -> publish ->
+    add_fact -> publish -> close` left the root array **2 lines** against the v3
+    array's **3** (id 3 = `zzz`). A reopen loads `next_id` from the root array,
+    so id 3 was free again. `dl_pattern(e,0,"zzz")` then answered **0 rows**
+    (dropping the row the snapshot holds) and `dl_pattern(e,0,"qqq")` answered
+    **1 row** — a row whose id the reopened interner had just reused for
+    `qqq` (pre-fix answers: 1 row and 0 rows). `DL_PUB_DERIVED=1` reproduced
+    the pre-fix answers, isolating the fallback. A second repro needs no
+    `dl_intern_str` at all: a rule with a string literal interns it
+    (`compiler.zig`), nothing saves the root array, and the same drop hits the
+    rules path.
+  - **Fix 1 (the read path).** The fallback now reads the snapshot's OWN
+    `<sdir>/symbols.array` (`intern_load(null, …)` + `intern_fwd`, cached per
+    snapshot version in `DlDb.snap_sym_ir`, freed by `dl_close`). Cost is one
+    array read on top of the same `ensureFwd` rebuild the live path already
+    paid. A missing `symbols.array` on a `symbols.dafsa`-less snapshot is
+    reported as -1 instead of being answered as an empty vocabulary.
+  - **Fix 2 (the root cause).** `materializeSnapshot` now also persists the db
+    ROOT `symbols.array` whenever the interner was dirty at entry, so a reopened
+    interner can never mint an id a published snapshot already uses. Chosen over
+    "stop clearing `dirty` for a snapshot-only save" because that variant only
+    defers the write to the next save (a crash, or a process that publishes and
+    exits, still leaves the root short) and would redefine `intern_save`'s flag
+    by call-site. The check is O(1) and **adds no write on the steady path**:
+    not-dirty means a previous `dl_add_fact`/`dl_close` already wrote the live
+    bytes, so only a publish that interned symbols since the last root save
+    pays it. That write is one `intern_save` of the live array — **MEASURED 6.3 /
+    6.6 / 6.4 ms** for 200,000 symbols (2.0 MB array), i.e. the same write the
+    snapshot half already pays; on the 1.5 M-symbol / 44 MB store it is the
+    ~100 ms order the inherit-gate comment measures for that write (PROJECTION
+    from the array size, not re-measured here).
+  - **Coverage that can fail.** The unit test the earlier commit added could not
+    fail (both arms walked the same key set — the "file-backed" arm wrote the
+    LIVE map into the snapshot dir). Replaced by arms that genuinely differ:
+    a post-publish symbol absent from the older snapshot's answer; a lagging
+    root array (drop direction, the id-reuse repro); a same-count,
+    different-bytes root array (keep direction); the rule-literal repro; and the
+    root array's own count after publish. Verified by asymmetry: against
+    `e39e204`'s engine 4 of them fail (`expected 3, found 2` / `expected 1,
+    found 0`), and all pass after.
+  - **Opt-in path covered** (`publishDerivedDafsa` had zero tests, and it is the
+    only thing that can hand the read path a snapshot-local map): the inherit
+    branch (both files hardlinked by inode), half-link recovery (previous
+    snapshot has the array but no derived file -> both re-serialized, fresh
+    array inode, same bytes), and the failure path via a new fault point
+    `DL_FPOINT_DERIVED_SAVE` (a failing derived save aborts the publish, CURRENT
+    unchanged, no `<v>` dir and no `<v>.tmp` left behind).
+  - **`dl publish --with-derived`** now exists as the CLI binding of
+    `DL_PUB_DERIVED=1`. The `3dd4ae0` message advertised such a flag while only
+    the environment variable existed; the flag is what the CLI documents now, is
+    covered by a pinned golden command (`c97`), and the golden db tree proves
+    the snapshot really carries `symbols.dafsa`.
 - **`dl similar` / `dl_fuzzy_lookup` no longer build the symbol DAFSA**
   (2026-10-18, unit `fuzzy-fast`). The fuzzy lookup walked the live forward
   DAFSA with a Levenshtein automaton, so the *first* call in a process
@@ -34,18 +93,24 @@ All notable changes to this project are documented in this file.
   writes only `symbols.array`, the relation files and the manifest, so a
   content write is **0.22 s** and a snapshot is **43 MB instead of 328 MB**.
   - Read path: `dl_pattern`'s VERSION route (`zig/src/dl.zig`, `snapshotSymSet`)
-    walks the file when it is present and the LIVE in-memory forward map when it
-    is absent. Sound because sym-ids are append-only and never reused, so the
-    live key set is a superset of any snapshot's: extra ids only widen a set
-    that is then intersected with that snapshot's own rows. The same argument
-    `dl_fuzzy_lookup` and the VM's `~` operator already rely on. Verified by
-    102 + 12 pattern observations, byte-identical between the two sources.
+    walks the file when it is present and, when it is absent, builds the map
+    from that SAME snapshot's `symbols.array`. **Correction (2026-10-19, unit
+    `fix-idreuse`): the fallback first shipped as a read of the LIVE forward
+    map, argued from "sym-ids are append-only and never reused, so the live key
+    set is a superset". That premise is FALSE across a publish — see the
+    `fix-idreuse` entry below, which also restates what soundness actually
+    requires: `dl_pattern` filters BY SYM-ID, so the map must send every id the
+    snapshot's rows reference to the SAME string; a superset is neither
+    necessary nor sufficient.** The 102 + 12 "byte-identical" observations
+    compared the two sources only on stores where they agree by construction.
   - Trade-off: a cold process issuing a version pattern query against a
-    file-less snapshot pays the lazy `ensureFwd` rebuild once (measured 12-17 s
-    vs 4.3 s file-backed on the 1.5 M-symbol store).
+    file-less snapshot pays one `symbols.array` read plus the lazy `ensureFwd`
+    rebuild (12-17 s vs 4.3 s file-backed on the 1.5 M-symbol store), cached
+    per snapshot version.
   - Old snapshots that already contain the file are untouched and still read
-    normally — no migration, no deletion. `DL_PUB_DERIVED=1` restores the old
-    behaviour for a self-contained read-only snapshot.
+    normally — no migration, no deletion. `DL_PUB_DERIVED=1` (or the equivalent
+    `dl publish --with-derived`) restores the old behaviour for a
+    self-contained read-only snapshot.
 - **Vector/embedding tier REMOVED** (2026-08-11): the semantic half of the
   search stack is deleted, not superseded.
   - The decision: agents author the handoff data and query it with the SAME

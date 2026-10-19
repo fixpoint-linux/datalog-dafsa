@@ -209,6 +209,7 @@ const TXNWAL_OP_DEL: u8 = 2;
 const DL_FPOINT_AFTER_REL_SAVE: c_int = 0;
 const DL_FPOINT_AFTER_RENAME: c_int = 1;
 const DL_FPOINT_TXN_BEFORE_MARKER: c_int = 2;
+const DL_FPOINT_DERIVED_SAVE: c_int = 3; // opt-in derived symbols.dafsa, before the write
 
 // compiler.h opcodes consulted by db_has_list_builtin / db_has_range_builtin.
 const OP_LIST_CONS: u8 = 20;
@@ -350,6 +351,13 @@ pub const DlDb = extern struct {
     // trigger fires when sum(rel_wal_appended) - watermark >= budget.
     snapshot_budget_bytes: u64 = 0,
     wal_appended_at_snapshot: u64 = 0,
+    // ─── VERSION pattern queries on a symbol-DFA-less snapshot (beyond C) ──
+    // The snapshot's OWN interner, rebuilt from its symbols.array on first use
+    // and reused while snap_version is unchanged (freed by dl_close, replaced
+    // when snap_version moves).  Never the live interner: sym ids are reused
+    // across a publish, so the live map is not the snapshot's map.
+    snap_sym_ir: ?*anyopaque = null,
+    snap_sym_version: u32 = 0,
 };
 
 /// Marker for "not yet serialized by any publish of this process".
@@ -1108,6 +1116,10 @@ pub export fn dl_close(db: ?*DlDb) void {
             rule_free(ars[i]);
         c.free(@ptrCast(ars));
     }
+
+    // VERSION pattern queries may hold a private interner built from a
+    // snapshot's symbols.array (snapshotSymSet); dl_close owns it.
+    if (d.snap_sym_ir) |sir| intern_free(sir);
 
     intern_free(d.ir);
     term_free(d.terms);
@@ -4403,6 +4415,14 @@ fn pubDerivedCheckEnv() bool {
     return pub_derived_on;
 }
 
+/// Test hook (not exported): the environment is read once per PROCESS, so a
+/// test cannot flip the switch with setenv after another test has published.
+/// Sets the cached decision directly; tests restore it when they are done.
+fn pubDerivedForce(on: bool) void {
+    pub_derived_on = on;
+    pub_derived_env_checked = true;
+}
+
 /// Write the staged snapshot's derived symbols.dafsa.  Hardlinks the previous
 /// snapshot's pair when the staged symbols.array is byte-identical to the
 /// previous snapshot's (it then describes the same key set, and a DAFSA of the
@@ -4412,6 +4432,12 @@ fn pubDerivedCheckEnv() bool {
 /// makes the byte comparison a tautology — skip reading 44 MB to prove it.
 /// Returns 0 on success, -1 on failure.
 fn publishDerivedDafsa(d: *DlDb, rev: *[4096:0]u8, fwd: *[4096:0]u8, prev_snap_dir: [*c]const u8, rev_inherited: bool) c_int {
+    // Test hook: this file is the one optional publish product, and it is the
+    // reason the read path has two sources, so its failure path needs to be
+    // reachable deterministically (a full filesystem is not).
+    if (d.fault_hook) |hook| {
+        if (hook(DL_FPOINT_DERIVED_SAVE, d.fault_user) != 0) return -1;
+    }
     var inherited = false;
     if (prev_snap_dir[0] != 0) {
         var prev_fwd: [4096:0]u8 = undefined;
@@ -4540,8 +4566,30 @@ fn materializeSnapshot(d: *DlDb) c_int {
         // stamp, same count with different content, link failure) falls
         // through to the full save.
         const inherited = inheritSymbolsArray(d.ir, &rev, &prev_snap_dir);
+        // A dirty interner at entry means the ROOT <db>/symbols.array lags the
+        // live one (every save path clears the flag).  Snapshot-only persistence
+        // is NOT enough: a reopen loads next_id from the root array, so a short
+        // root hands the ids this snapshot already assigned to other strings —
+        // sym-id reuse, which dl_pattern's VERSION route then reads as a
+        // different symbol.  Publish therefore establishes the invariant
+        // itself: after it, the root array equals the live serialization.  The
+        // check is O(1) and the write is skipped on the steady path (not dirty
+        // means some earlier save already wrote the live bytes — dl_add_fact
+        // and dl_close both do it, and a vocabulary-changing publish is always
+        // preceded by such an append).
+        const root_lagged = intern_is_dirty(d.ir) != 0;
         if (!inherited and intern_save(d.ir, &fwd, &rev) != 0)
             return dlPublishFail(&tmp_dir, &new_dir, renamed);
+        if (root_lagged) {
+            const root_fwd = makePath(d, "symbols", ".dafsa") orelse
+                return dlPublishFail(&tmp_dir, &new_dir, renamed);
+            defer c.free(@ptrCast(root_fwd));
+            const root_rev = makePath(d, "symbols", ".array") orelse
+                return dlPublishFail(&tmp_dir, &new_dir, renamed);
+            defer c.free(@ptrCast(root_rev));
+            if (intern_save(d.ir, root_fwd, root_rev) != 0)
+                return dlPublishFail(&tmp_dir, &new_dir, renamed);
+        }
 
         if (pubDerivedCheckEnv() and publishDerivedDafsa(d, &rev, &fwd, &prev_snap_dir, inherited) != 0)
             return dlPublishFail(&tmp_dir, &new_dir, renamed);
@@ -5155,27 +5203,44 @@ fn symsetAddCb(sym_id: u32, user: ?*anyopaque) callconv(.c) c_int {
 /// Symbol set for a VERSION pattern query: walk the snapshot's own derived
 /// symbols.dafsa when it is present (every snapshot published before the
 /// derived file stopped being written, plus anything published with
-/// DL_PUB_DERIVED=1), otherwise the LIVE in-memory forward DAFSA.
+/// DL_PUB_DERIVED=1), otherwise build the map from that SAME snapshot's
+/// symbols.array.
 ///
-/// SOUNDNESS OF THE FALLBACK — the same argument dl_fuzzy_lookup and the VM's
-/// `~` operator already rely on: sym-ids are append-only and never reused, so
-/// the live forward map's key set is a SUPERSET of the snapshot's.  A regex
-/// walked over the superset can only emit EXTRA sym-ids — ids the snapshot
-/// never interned — and such an id occurs in none of that snapshot's relation
-/// rows, so view_filter_col drops every row it could have matched.  The
-/// filtered result is therefore byte-identical to what the snapshot's own
-/// DAFSA yields (extra ids only widen a set that is then intersected with the
-/// rows).
+/// WHAT SOUNDNESS REQUIRES HERE.  dl_pattern filters BY SYM-ID
+/// (view_filter_col): the map decides which ids are in the set, and the rows
+/// decide which ids exist.  The result is therefore correct exactly when the
+/// map sends every id the snapshot's rows reference to the SAME string the
+/// snapshot's own array does.  It is NOT enough for the map's key set to be a
+/// superset of the snapshot's:
 ///
-/// The converse cannot arise: the interner this reads is the one publish
-/// serialized into symbols.array, and a snapshot's array is a prefix of the
-/// live one (ids are appended in order and never reused), so every sym-id a
-/// snapshot row references is present in the live map.
+///  - an id the map assigns to a DIFFERENT string keeps a row whose snapshot
+///    string does not match (a false positive);
+///  - an id the map is missing drops a row that does match (a false negative).
 ///
-/// Cost shift: a process that did NOT build the snapshot pays the lazy
-/// ensureFwd rebuild (intern.zig) on its first version pattern query instead of
-/// mmap'ing the file.  That rebuild is already paid by the in-memory pattern
-/// path, by dl_fuzzy_lookup, and by any `~` rule evaluation.
+/// A live interner read is neither of those, because SYM-IDS ARE REUSED ACROSS
+/// A PUBLISH: publish writes only <snapshot>/symbols.array and intern_save
+/// clears the interner's dirty flag (intern.zig), so dl_add_fact / dl_close
+/// skip the ROOT <db>/symbols.array save; a reopen then loads a SHORTER root
+/// array, intern_load sets next_id = root_count + 1, and ids the snapshot
+/// already assigned are free to be handed to other strings.  MEASURED before
+/// this fix: `intern -> publish -> add_fact -> publish -> close` left the root
+/// array 2 lines against the v3 array's 3 (id 3 = "zzz"); after reopen,
+/// dl_pattern("zzz") answered 0 rows (dropping the row the snapshot holds) and
+/// dl_pattern("qqq") answered 1 row (a row whose id 3 the reopened interner
+/// had just reused for "qqq").  Reading the snapshot's OWN array makes both
+/// impossible regardless of what the root array or the live interner holds.
+///
+/// materializeSnapshot now also persists the root array, so the reuse itself
+/// is closed; this read is the boundary that does not depend on that
+/// discipline holding (an old store, a restored/copied root array, a crashed
+/// process).
+///
+/// Cost: one symbols.array read + the same ensureFwd rebuild the live path
+/// paid, cached per snapshot version (so repeated queries pay it once).  A
+/// process that publishes AND issues a VERSION pattern query then holds two
+/// forward maps (the live one and this one); sharing the live map is exactly
+/// the assumption that broke, and proving the two maps agree for every id a
+/// snapshot references costs a full array comparison on every query.
 fn snapshotSymSet(d: *DlDb, sdir: [*c]const u8, dfa: ?*const regexwalk.regex_dfa, set: *regexwalk.sym_set) c_long {
     var sym_path: [16384:0]u8 = undefined;
     _ = snprintf(&sym_path, 16384, "%s/symbols.dafsa", sdir);
@@ -5183,7 +5248,22 @@ fn snapshotSymSet(d: *DlDb, sdir: [*c]const u8, dfa: ?*const regexwalk.regex_dfa
         defer dc.dafsa_view_close(v);
         return symbols_dfa_walk_view(@ptrCast(v), dfa, symsetAddCb, set);
     }
-    const fwd = intern_fwd(d.ir) orelse return -1;
+    if (d.snap_sym_ir == null or d.snap_sym_version != d.snap_version) {
+        if (d.snap_sym_ir) |old| {
+            intern_free(old);
+            d.snap_sym_ir = null;
+        }
+        var arr_path: [16384:0]u8 = undefined;
+        _ = snprintf(&arr_path, 16384, "%s/symbols.array", sdir);
+        var ast: Stat = undefined;
+        // A snapshot without symbols.dafsa normally has symbols.array; a
+        // missing one is a damaged store, not an empty vocabulary — say so
+        // instead of answering "no symbols match" from an empty interner.
+        if (stat(&arr_path, &ast) != 0) return -1;
+        d.snap_sym_ir = intern_load(null, &arr_path) orelse return -1;
+        d.snap_sym_version = d.snap_version;
+    }
+    const fwd = intern_fwd(d.snap_sym_ir) orelse return -1;
     return symbols_dfa_walk(@ptrCast(fwd), dfa, symsetAddCb, set);
 }
 
@@ -6053,8 +6133,32 @@ test "dl_snapshot_relations enumerates a published manifest" {
     try testing.expectEqual(@as(c_long, -1), dl_snapshot_relations(db, 1, null, &got));
 }
 
-test "version pattern: file-backed and live-map (fallback) answers agree" {
-    const dir = "/tmp/datalog_zig_u11_derived";
+/// Overwrite a file with exactly `bytes` (tests only).  Builds the divergent
+/// db-root symbols.array a restored/copied/edited store presents.
+fn writeFileRaw(path: [*c]const u8, bytes: []const u8) bool {
+    const wf = c.fopen(path, "w") orelse return false;
+    const wrote = c.fwrite(bytes.ptr, 1, bytes.len, wf) == bytes.len;
+    return c.fclose(wf) == 0 and wrote;
+}
+
+/// Number of symbols a symbols.array holds (one line per symbol).
+fn arraySymbolCount(path: [*c]const u8) usize {
+    const bytes = readFileAlloc(path);
+    if (bytes.len == 0) return 0;
+    defer c.free(@ptrCast(bytes.ptr));
+    var n: usize = 0;
+    for (bytes) |ch| {
+        if (ch == '\n') n += 1;
+    }
+    return n;
+}
+
+test "version pattern: a symbol interned after the publish is not in that snapshot's answer" {
+    // The VERSION route must answer from the v1 key set.  A symbol interned
+    // AFTER v1 (with a row that matches the regex) belongs to no published
+    // snapshot: it must not appear in the v1 answer, and it must appear once
+    // v2 is published — which also exercises the per-version cache rebuild.
+    const dir = "/tmp/datalog_zig_u11_pat_live";
     rmrfTestDir(dir);
     defer rmrfTestDir(dir);
 
@@ -6067,40 +6171,389 @@ test "version pattern: file-backed and live-map (fallback) answers agree" {
         const ids = [2]u32{ intern_str(db.ir, f[0].ptr), intern_str(db.ir, f[1].ptr) };
         try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "e", &ids, 2));
     }
-    try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db));
+    try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db)); // v1
 
     var snapbuf: [256]u8 = undefined;
     const sdir = std.fmt.bufPrintZ(&snapbuf, "{s}/snapshots/1", .{dir}) catch unreachable;
     var fbuf: [512]u8 = undefined;
     const fpath = std.fmt.bufPrintZ(&fbuf, "{s}/symbols.dafsa", .{sdir}) catch unreachable;
-
-    // Default publish does NOT persist the derived cache, so the pattern query
-    // below can only be answered by the live in-memory forward map.
     var st: Stat = undefined;
-    try testing.expect(stat(fpath, &st) != 0);
+    try testing.expect(stat(fpath, &st) != 0); // default publish writes no derived file
 
     const dfa = regexwalk.regex_compile(".*a.*");
     defer regexwalk.regex_dfa_free(dfa);
-    try testing.expect(dfa != null);
-    try testing.expect(dfa.?.errmsg == null);
+    try testing.expect(dfa != null and dfa.?.errmsg == null);
 
-    var fallback = CollectCbCtx{};
-    try testing.expectEqual(@as(c_long, 2), dl_pattern(db, "e", 0, dfa, collectCb, &fallback));
+    // Unanchored: this walk's DFA accepts only at the NUL terminator, so `^`
+    // and `$` never match (MEASURED: "zzz" -> 1 row, "^zzz$" -> 0 on the same
+    // store; the pinned golden for `pattern edge "^[12]$"` is "(no results)").
+    var v1 = CollectCbCtx{};
+    try testing.expectEqual(@as(c_long, 2), dl_pattern(db, "e", 0, dfa, collectCb, &v1));
 
-    // Now give the SAME snapshot its own derived DAFSA and re-ask: the file
-    // path must answer identically (this arm is what proves the fallback's
-    // superset argument on a real DAFSA rather than only in prose).
-    const fwd = intern_fwd(db.ir) orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(@as(c_int, 0), dc.dafsa_save(@ptrCast(@alignCast(fwd)), fpath));
+    // Interned AND given a row, but NOT published: matches the regex, at an id
+    // the v1 snapshot never assigned.
+    const zeta = intern_str(db.ir, "zeta");
+    try testing.expect(zeta > 6);
+    const zrow = [2]u32{ zeta, 2 };
+    try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "e", &zrow, 2));
 
-    var file_backed = CollectCbCtx{};
-    try testing.expectEqual(@as(c_long, 2), dl_pattern(db, "e", 0, dfa, collectCb, &file_backed));
+    // The row IS in the live relation (dl_add_fact returned 1) and must NOT be
+    // in the v1 answer.  dl_query is not the live view here: with a snapshot
+    // published it routes to the snapshot, so it reports v1's 3 rows either way.
+    var v1_again = CollectCbCtx{};
+    try testing.expectEqual(@as(c_long, 2), dl_pattern(db, "e", 0, dfa, collectCb, &v1_again));
+    for (v1_again.rows[0..v1_again.n]) |r| try testing.expect(r[0] != zeta);
 
-    try testing.expectEqual(fallback.n, file_backed.n);
-    for (fallback.rows[0..fallback.n], file_backed.rows[0..file_backed.n]) |fr, br| {
-        try testing.expectEqual(fr[0], br[0]);
-        try testing.expectEqual(fr[1], br[1]);
+    // v2 publishes that symbol: the cache must follow the new version.
+    try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db)); // v2
+    var v2 = CollectCbCtx{};
+    try testing.expectEqual(@as(c_long, 3), dl_pattern(db, "e", 0, dfa, collectCb, &v2));
+    var seen_zeta = false;
+    for (v2.rows[0..v2.n]) |r| {
+        if (r[0] == zeta) seen_zeta = true;
     }
+    try testing.expect(seen_zeta);
+}
+
+test "publish persists the db-root symbols.array, so a reopen cannot reuse an id" {
+    // MEASURED BLOCKER (root cause): `intern -> publish -> add -> publish ->
+    // close` left the db-root symbols.array SHORTER than the snapshot's, because
+    // publish wrote only the snapshot copy and intern_save cleared the dirty
+    // flag.  A reopen then restarted next_id below ids the snapshot had already
+    // assigned — the same id handed to a different string.
+    const dir = "/tmp/datalog_zig_u11_pat_root";
+    rmrfTestDir(dir);
+    defer rmrfTestDir(dir);
+
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "e", 2));
+        const first = [2]u32{ intern_str(db.ir, "alice"), intern_str(db.ir, "nyc") };
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "e", &first, 2));
+        try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db)); // v1
+        const zzz = intern_str(db.ir, "zzz"); // creates the lag
+        try testing.expectEqual(@as(u32, 3), zzz);
+        try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db)); // v2
+        // The interner is clean after a publish, so this add used to skip the
+        // root save entirely (dl_add_fact only saves when dirty).
+        const zrow = [2]u32{ zzz, first[1] };
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "e", &zrow, 2));
+        try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db)); // v3
+    }
+    var rootbuf: [512:0]u8 = undefined;
+    const root_path = std.fmt.bufPrintZ(&rootbuf, "{s}/symbols.array", .{dir}) catch unreachable;
+    var snapbuf: [512:0]u8 = undefined;
+    const v3_path = std.fmt.bufPrintZ(&snapbuf, "{s}/snapshots/3/symbols.array", .{dir}) catch unreachable;
+    try testing.expectEqual(@as(usize, 3), arraySymbolCount(v3_path));
+    // THE FIX: the root array covers every id the snapshot assigned.
+    try testing.expectEqual(@as(usize, 3), arraySymbolCount(root_path));
+
+    const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+    defer dl_close(db);
+    try testing.expectEqual(@as(u32, 3), intern_str_find(db.ir, "zzz"));
+    // ... so no id is handed out twice.
+    try testing.expectEqual(@as(u32, 4), intern_str(db.ir, "qqq"));
+}
+
+test "version pattern: a lagging db-root array cannot drop a snapshot row" {
+    // The blocker's READ half.  The root array is written here by hand to the
+    // pre-fix shape (2 symbols) so this test isolates the read path from the
+    // publish fix above: whatever the root array says, the v3 answer must be
+    // the v3 key set.
+    const dir = "/tmp/datalog_zig_u11_pat_lag";
+    rmrfTestDir(dir);
+    defer rmrfTestDir(dir);
+
+    var rootbuf: [512:0]u8 = undefined;
+    const root_path = std.fmt.bufPrintZ(&rootbuf, "{s}/symbols.array", .{dir}) catch unreachable;
+
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "e", 2));
+        const first = [2]u32{ intern_str(db.ir, "alice"), intern_str(db.ir, "nyc") };
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "e", &first, 2));
+        const zzz = intern_str(db.ir, "zzz");
+        try testing.expectEqual(@as(u32, 3), zzz);
+        const zrow = [2]u32{ zzz, first[1] };
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "e", &zrow, 2));
+        try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db)); // v1
+    }
+    // The pre-fix on-disk state: the root array stopped at 2 symbols while the
+    // snapshot holds 3 (id 3 = "zzz").
+    try testing.expect(writeFileRaw(root_path, "alice\nnyc\n"));
+
+    const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+    defer dl_close(db);
+    // The reuse is real: this id is FREE in the reopened interner and is
+    // exactly what the live map hands out (the old fallback read it).
+    try testing.expectEqual(@as(u32, 3), intern_str(db.ir, "qqq"));
+
+    const dzzz = regexwalk.regex_compile("zzz");
+    defer regexwalk.regex_dfa_free(dzzz);
+    var got = CollectCbCtx{};
+    try testing.expectEqual(@as(c_long, 1), dl_pattern(db, "e", 0, dzzz, collectCb, &got));
+    try testing.expectEqual(@as(usize, 1), got.n);
+    try testing.expectEqual(@as(u32, 3), got.rows[0][0]);
+    try testing.expectEqual(@as(u32, 2), got.rows[0][1]);
+}
+
+test "version pattern: a same-count, different-bytes root array cannot keep a snapshot row" {
+    // The state dl.zig's inherit-gate test constructs (a restored/copied/edited
+    // root array).  "the live key set is a superset" is the wrong predicate
+    // here: the COUNT is unchanged, but id 3 names another string in each map,
+    // so a regex matching the live string KEEPS a row the snapshot does not
+    // match, and one matching the snapshot string DROPS it.
+    const dir = "/tmp/datalog_zig_u11_pat_diverge";
+    rmrfTestDir(dir);
+    defer rmrfTestDir(dir);
+
+    var rootbuf: [512:0]u8 = undefined;
+    const root_path = std.fmt.bufPrintZ(&rootbuf, "{s}/symbols.array", .{dir}) catch unreachable;
+
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "e", 2));
+        const first = [2]u32{ intern_str(db.ir, "alice"), intern_str(db.ir, "nyc") };
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "e", &first, 2));
+        const bob = intern_str(db.ir, "bob"); // id 3
+        try testing.expectEqual(@as(u32, 3), bob);
+        const brow = [2]u32{ bob, first[1] };
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "e", &brow, 2));
+        try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db));
+    }
+    // same length, different bytes: id 3 means "zob" in the root from now on
+    try testing.expect(writeFileRaw(root_path, "alice\nnyc\nzob\n"));
+
+    const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+    defer dl_close(db);
+    try testing.expectEqualStrings("zob", std.mem.span(intern_str_of(db.ir, 3).?));
+
+    const dbob = regexwalk.regex_compile("bob"); // the SNAPSHOT's string
+    defer regexwalk.regex_dfa_free(dbob);
+    var got = CollectCbCtx{};
+    // The snapshot's row (1,3) holds id 3, whose snapshot string is "bob":
+    // the answer cannot be emptied by what the live root array says.
+    try testing.expectEqual(@as(c_long, 1), dl_pattern(db, "e", 0, dbob, collectCb, &got));
+    try testing.expectEqual(@as(usize, 1), got.n);
+
+    const dzob = regexwalk.regex_compile("zob"); // the LIVE string
+    defer regexwalk.regex_dfa_free(dzob);
+    var wrong = CollectCbCtx{};
+    // ... and it cannot be widened by it either.
+    try testing.expectEqual(@as(c_long, 0), dl_pattern(db, "e", 0, dzob, collectCb, &wrong));
+}
+
+test "publish persists the db-root symbols.array (rule-interned literal path)" {
+    // The second, more ordinary repro: a RULE with a string literal interns it
+    // via the compiler and nothing saves the root array, so `publish -> close
+    // -> reopen` used to restart next_id below the literal's id.
+    const dir = "/tmp/datalog_zig_u11_pat_rules";
+    rmrfTestDir(dir);
+    defer rmrfTestDir(dir);
+
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "e", 2));
+        const first = [2]u32{ intern_str(db.ir, "alice"), intern_str(db.ir, "nyc") };
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "e", &first, 2));
+        try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db)); // v1
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "r", 2));
+        try testing.expectEqual(@as(c_int, 0), dl_load_rules(db, "r(X, \"const\") :- e(X, Y)."));
+        const lit = intern_str_find(db.ir, "const");
+        try testing.expectEqual(@as(u32, 3), lit);
+        try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db)); // v2
+    }
+    var rootbuf: [512:0]u8 = undefined;
+    const root_path = std.fmt.bufPrintZ(&rootbuf, "{s}/symbols.array", .{dir}) catch unreachable;
+    var snapbuf: [512:0]u8 = undefined;
+    const v2_path = std.fmt.bufPrintZ(&snapbuf, "{s}/snapshots/2/symbols.array", .{dir}) catch unreachable;
+    try testing.expectEqual(@as(usize, 3), arraySymbolCount(v2_path));
+    try testing.expectEqual(@as(usize, 3), arraySymbolCount(root_path));
+
+    const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+    defer dl_close(db);
+    // No id reuse: the reopened interner still knows the literal.
+    try testing.expectEqual(@as(u32, 3), intern_str_find(db.ir, "const"));
+    try testing.expectEqual(@as(u32, 4), intern_str(db.ir, "fresh"));
+
+    const d = regexwalk.regex_compile("const");
+    defer regexwalk.regex_dfa_free(d);
+    var got = CollectCbCtx{};
+    try testing.expectEqual(@as(c_long, 1), dl_pattern(db, "r", 1, d, collectCb, &got));
+    try testing.expectEqual(@as(usize, 1), got.n);
+    try testing.expectEqual(@as(u32, 3), got.rows[0][1]);
+}
+
+test "DL_PUB_DERIVED: derived file, hardlink inheritance and half-link recovery" {
+    // The opt-in path is the ONLY thing that can hand a pattern query a
+    // snapshot-local symbol map, and it had no coverage at all.  The switch is
+    // forced in-process (pubDerivedForce): the env var is read once per
+    // process, so setenv from a test would race every other test.
+    const P = struct {
+        fn file(buf: *[512:0]u8, d: [*:0]const u8, v: u32, name: []const u8) [*:0]const u8 {
+            return std.fmt.bufPrintZ(buf, "{s}/snapshots/{d}/{s}", .{ std.mem.span(d), v, name }) catch unreachable;
+        }
+    };
+    const dfa = regexwalk.regex_compile(".*a.*");
+    defer regexwalk.regex_dfa_free(dfa);
+
+    // ─── (a) derived file written, then inherited by inode ────────────────
+    {
+        const dir = "/tmp/datalog_zig_u11_derived_on";
+        rmrfTestDir(dir);
+        defer rmrfTestDir(dir);
+
+        pubDerivedForce(true);
+        defer pubDerivedForce(false);
+
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "e", 2));
+        const facts = [_][2][]const u8{ .{ "alice", "nyc" }, .{ "bob", "la" }, .{ "carol", "sf" } };
+        for (facts) |f| {
+            const ids = [2]u32{ intern_str(db.ir, f[0].ptr), intern_str(db.ir, f[1].ptr) };
+            try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "e", &ids, 2));
+        }
+
+        var pb: [4][512:0]u8 = @splat(undefined);
+        const a1 = P.file(&pb[0], dir, 1, "symbols.array");
+        const f1 = P.file(&pb[1], dir, 1, "symbols.dafsa");
+        const a2 = P.file(&pb[2], dir, 2, "symbols.array");
+        const f2 = P.file(&pb[3], dir, 2, "symbols.dafsa");
+
+        try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db)); // v1: full write
+        var st: Stat = undefined;
+        try testing.expectEqual(@as(c_int, 0), stat(f1, &st));
+        try testing.expect(st.st_size > 0);
+        var file_arm = CollectCbCtx{};
+        try testing.expectEqual(@as(c_long, 2), dl_pattern(db, "e", 0, dfa, collectCb, &file_arm));
+
+        // No vocabulary change -> the staged array is byte-identical, so BOTH
+        // files are hardlinked from v1 (the inherit branch).
+        try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db)); // v2
+        var s1: Stat = undefined;
+        var s2: Stat = undefined;
+        try testing.expectEqual(@as(c_int, 0), stat(a1, &s1));
+        try testing.expectEqual(@as(c_int, 0), stat(a2, &s2));
+        try testing.expectEqual(s1.st_ino, s2.st_ino);
+        try testing.expectEqual(@as(c_int, 0), stat(f1, &s1));
+        try testing.expectEqual(@as(c_int, 0), stat(f2, &s2));
+        try testing.expectEqual(s1.st_ino, s2.st_ino);
+        var file_arm2 = CollectCbCtx{};
+        try testing.expectEqual(@as(c_long, 2), dl_pattern(db, "e", 0, dfa, collectCb, &file_arm2));
+    }
+
+    // ─── (b) half-link recovery ───────────────────────────────────────────
+    // Previous snapshot has symbols.array but NO symbols.dafsa (the state every
+    // default publish leaves): the branch unlinks the staged array, links the
+    // previous one, then fails to link a derived file that is not there — and
+    // must re-serialize BOTH rather than publish one half of the pair.
+    {
+        const dir = "/tmp/datalog_zig_u11_derived_half";
+        rmrfTestDir(dir);
+        defer rmrfTestDir(dir);
+
+        pubDerivedForce(false);
+        {
+            const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+            defer dl_close(db);
+            try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "e", 2));
+            const ids = [2]u32{ intern_str(db.ir, "alice"), intern_str(db.ir, "nyc") };
+            try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "e", &ids, 2));
+            try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db)); // v1: array only
+        }
+        var pb: [6][512:0]u8 = @splat(undefined);
+        const a1 = P.file(&pb[0], dir, 1, "symbols.array");
+        const f1 = P.file(&pb[1], dir, 1, "symbols.dafsa");
+        const a2 = P.file(&pb[2], dir, 2, "symbols.array");
+        const f2 = P.file(&pb[3], dir, 2, "symbols.dafsa");
+        var st: Stat = undefined;
+        try testing.expect(stat(f1, &st) != 0); // default publish wrote none
+
+        pubDerivedForce(true);
+        defer pubDerivedForce(false);
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db)); // v2, same vocabulary
+
+        var s1: Stat = undefined;
+        var s2: Stat = undefined;
+        try testing.expectEqual(@as(c_int, 0), stat(f2, &s1)); // the derived half exists
+        try testing.expect(s1.st_size > 0);
+        try testing.expectEqual(@as(c_int, 0), stat(a2, &s2));
+        try testing.expectEqual(@as(c_int, 0), stat(a1, &s1));
+        // The array was REWRITTEN (a fresh inode), not the half-linked one...
+        try testing.expect(s2.st_ino != s1.st_ino);
+        // ... with the same symbols v1 published.
+        try testing.expectEqual(@as(usize, 2), arraySymbolCount(a2));
+        try testing.expectEqual(@as(usize, 2), arraySymbolCount(a1));
+        var got = CollectCbCtx{};
+        try testing.expectEqual(@as(c_long, 1), dl_pattern(db, "e", 0, dfa, collectCb, &got));
+    }
+}
+
+test "DL_PUB_DERIVED: a failing derived save aborts the publish with nothing half-published" {
+    // ENOSPC / EACCES on the one optional publish product.  The failure is
+    // injected at DL_FPOINT_DERIVED_SAVE (a full filesystem cannot be arranged
+    // deterministically in a test) and hits exactly the code path that
+    // dafsa_save/intern_save returning -1 does.
+    const dir = "/tmp/datalog_zig_u11_derived_fail";
+    rmrfTestDir(dir);
+    defer rmrfTestDir(dir);
+
+    pubDerivedForce(true);
+    defer pubDerivedForce(false);
+
+    const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+    defer dl_close(db);
+    try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "e", 2));
+    const ids = [2]u32{ intern_str(db.ir, "alice"), intern_str(db.ir, "nyc") };
+    try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "e", &ids, 2));
+    try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db)); // v1
+
+    dl_set_fault_hook(db, rejectDerivedSave, null);
+    // A vocabulary change forces the full path (not the inherit branch).
+    const extra = [2]u32{ intern_str(db.ir, "zeta"), ids[1] };
+    try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "e", &extra, 2));
+    try testing.expectEqual(@as(c_int, -1), dl_publish_snapshot(db));
+
+    // Nothing half-published: CURRENT still names v1, no v2 dir, no staged dir.
+    var cur: [512:0]u8 = undefined;
+    const cur_path = std.fmt.bufPrintZ(&cur, "{s}/snapshots/CURRENT", .{dir}) catch unreachable;
+    const cbytes = readFileAlloc(cur_path);
+    defer c.free(@ptrCast(cbytes.ptr));
+    try testing.expectEqualStrings("1\n", cbytes[0..2]);
+
+    var pb: [3][512:0]u8 = @splat(undefined);
+    const v2arr = std.fmt.bufPrintZ(&pb[0], "{s}/snapshots/2/symbols.array", .{dir}) catch unreachable;
+    const tmpdir = std.fmt.bufPrintZ(&pb[1], "{s}/snapshots/2.tmp", .{dir}) catch unreachable;
+    var st: Stat = undefined;
+    try testing.expect(stat(v2arr, &st) != 0);
+    try testing.expect(stat(tmpdir, &st) != 0);
+
+    const dfa = regexwalk.regex_compile("alice");
+    defer regexwalk.regex_dfa_free(dfa);
+    var got = CollectCbCtx{};
+    try testing.expectEqual(@as(c_long, 1), dl_pattern(db, "e", 0, dfa, collectCb, &got));
+
+    // Clear the hook: the same publish now succeeds and v2 appears.
+    dl_set_fault_hook(db, null, null);
+    try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db));
+    const v2bytes = readFileAlloc(v2arr);
+    defer c.free(@ptrCast(v2bytes.ptr));
+    try testing.expect(v2bytes.len > 0);
+    const cbytes2 = readFileAlloc(cur_path);
+    defer c.free(@ptrCast(cbytes2.ptr));
+    try testing.expectEqualStrings("2\n", cbytes2[0..2]);
+}
+
+fn rejectDerivedSave(fp: c_int, user: ?*anyopaque) callconv(.c) c_int {
+    _ = user;
+    return if (fp == DL_FPOINT_DERIVED_SAVE) 1 else 0;
 }
 
 test "dl_open_ro never writes" {

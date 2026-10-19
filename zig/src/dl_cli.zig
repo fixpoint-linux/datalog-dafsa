@@ -44,6 +44,7 @@ extern "c" fn exit(status: c_int) noreturn;
 extern "c" fn strtoul(nptr: [*c]const u8, endptr: [*c][*c]u8, base: c_int) c_ulong;
 extern "c" fn strtol(nptr: [*c]const u8, endptr: [*c][*c]u8, base: c_int) c_long;
 extern "c" fn __errno_location() *c_int;
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 /// glibc's unbuffered stderr stream global (same symbol the C oracle uses).
 extern "c" var stderr: *std.c.FILE;
@@ -224,7 +225,7 @@ fn usage(prog: [*:0]const u8) noreturn {
         \\  %s [-d <dir>] lookup <rel> <val> [<val> ...]
         \\  %s [-d <dir>] prefix <rel> [<val> ...]
         \\  %s [-d <dir>] query '<rule>' | <file.dl> <goal-rel>
-        \\  %s [-d <dir>] publish [--keep N]
+        \\  %s [-d <dir>] publish [--keep N] [--with-derived]
         \\  %s [-d <dir>] bound <rel> <val> [<val> ...]
         \\  %s [-d <dir>] pattern <rel> [<col>] '<regex>'
         \\  %s [-d <dir>] similar '<name>' [--k N]  (edit distance, k = 0..2, default 1)
@@ -650,13 +651,22 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
     }
 
     if (eq(cmd, "publish")) {
-        // Optional --keep N: retain only the N most-recent snapshots, pruning
-        // older ones after this publish (opt-in; 0 disables retention).
+        // Optional flags, in any order:
+        //   --keep N        retain only the N most-recent snapshots, pruning
+        //                   older ones after this publish (0 = keep every one)
+        //   --with-derived  also persist <snapshot>/symbols.dafsa (the same
+        //                   switch as DL_PUB_DERIVED=1: a self-contained
+        //                   snapshot that answers a pattern query with no
+        //                   live interner, at one dafsa_save per vocabulary
+        //                   change)
         var keep: c_uint = 0;
-        if (argp < argv.len) {
+        while (argp < argv.len) {
             if (argv.len - argp == 2 and eq(argv[argp], "--keep")) {
                 keep = @intCast(strtoul(argv[argp + 1].ptr, null, 10));
                 argp += 2;
+            } else if (eq(argv[argp], "--with-derived")) {
+                _ = setenv("DL_PUB_DERIVED", "1", 1);
+                argp += 1;
             } else {
                 usage(argv[0].ptr);
             }

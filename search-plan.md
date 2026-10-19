@@ -113,7 +113,12 @@ table, ~20× cheaper, same struct, no walker change.
    `datalog-dafsa-regex-on-symbols.md`.
 8. New oracle suite `tests/test_fuzzy.c`.
 
-**Time travel is free (a finding, not a gap).** `vm.zig:696` resolves the pattern
+**Time travel is free (a finding, not a gap).** *(Correction 2026-10-19, unit
+`fix-idreuse`: the premise "sym-ids are ... never reused" is MEASURED FALSE
+across a publish — see the correction in `docs/datalog-dafsa-fuzzy-lookup.md`
+and the CHANGELOG entry; `search --version` was measured returning another
+term's postings on a diverged db-root array. The conclusion below holds only
+while the live map agrees with the snapshot's.)* `vm.zig:696` resolves the pattern
 set against the LIVE interner DAFSA. That stays correct for a version read because
 sym-ids are append-only and never reused: the live symbol set is a superset of any
 snapshot's, and rows still come from the version's relation view, so a superset

@@ -75,13 +75,32 @@ primitives** (used by the raw-DAFSA engine tests), not as the `~` path.
 > `symbols.array`, and re-serializing it whenever the vocabulary changed cost
 > ~22-31 s of publish CPU and ~285 MB per snapshot on a 1.5 M-symbol store.
 > The snapshot pattern path now walks the file **when present** (old snapshots,
-> and anything published with `DL_PUB_DERIVED=1`) and the LIVE `ir->fwd`
-> otherwise — `snapshotSymSet` in `zig/src/dl.zig`. That is sound because
-> sym-ids are append-only, so the live key set is a superset of any snapshot's
-> and extra ids can only widen a set that is then intersected with the
-> snapshot's own rows. Measured: 102 small-store and 12 large-store pattern
-> observations byte-identical between the two sources. Risk 2 below is
-> therefore no longer a requirement.
+> and anything published with `DL_PUB_DERIVED=1`) and, when it is absent,
+> builds the map from **that same snapshot's `symbols.array`** —
+> `snapshotSymSet` in `zig/src/dl.zig`. Risk 2 below is therefore no longer a
+> requirement.
+>
+> **Correction (2026-10-19, unit `fix-idreuse`): what soundness requires, and a
+> fallback that broke it.** The fallback first shipped as a read of the LIVE
+> `ir->fwd`, argued from "sym-ids are append-only and never reused, so the live
+> key set is a superset of any snapshot's". Both halves of that premise are
+> false across a publish, and the second is the wrong predicate to begin with:
+> `dl_pattern` filters **by sym-id**, so the answer is correct exactly when the
+> map maps every id the snapshot's rows reference to the **same string** the
+> snapshot's own array does. A superset is neither necessary nor sufficient —
+> a map with the same key COUNT but different bytes fails too (the
+> restored/copied/edited-root-array state in `zig/src/dl.zig`): a regex
+> matching the live string **keeps** a row whose snapshot string does not
+> match, and one matching the snapshot string **drops** it. And ids ARE reused:
+> publish wrote only `<snapshot>/symbols.array` while `intern_save` cleared the
+> interner's dirty flag, so `intern -> publish -> add_fact -> publish -> close`
+> left the db-root array 2 lines against the snapshot's 3; a reopen restarted
+> `next_id` below the snapshot's ids. MEASURED on `3dd4ae0`: reading the live
+> map answered 0 rows for the snapshot's own symbol and 1 row for a symbol that
+> did not exist in it. Fixed by reading the snapshot's own array and by making
+> publish persist the db-root `symbols.array`; the 102 + 12 "byte-identical"
+> observations had compared the two sources only on stores where they agree by
+> construction, so they could not see this class.
 
 ## The new primitive
 
@@ -167,10 +186,15 @@ Cross-check every emitted sym_id against `intern_str_of(db->ir, sym_id)` in a te
 1. **Exactly-4-edges payload** — reconstruction must follow exactly 4 edges
    (verified linear by the prototype, even under id suffix sharing); guard with
    the `ntrans != 1` check and `*bad` out-param.
-2. **Snapshot must walk `<sdir>/symbols.dafsa`**, not the live `db->ir` — the
-   live interner may be a superset after post-publish inserts. *(Superseded
-   2026-10-18: the superset is harmless — see the correction under Q4 — and the
-   file is now absent from snapshots published by default.)*
+2. **Snapshot must walk the snapshot's OWN symbol source**, not the live
+   `db->ir` — the live interner may be a superset after post-publish inserts.
+   *(2026-10-18: marked superseded, on the argument that a superset is
+   harmless. **REINSTATED 2026-10-19 (unit `fix-idreuse`): the argument was
+   wrong** — it assumed ids are never reused, but a publish used to leave the
+   db-root `symbols.array` short, so a reopen handed ids the snapshot had
+   already assigned to other strings. See the correction under Q4. The rule is
+   now: walk `<sdir>/symbols.dafsa` when present, else `<sdir>/symbols.array` —
+   never the live map.)*
 3. **Don't forget `magic.c` `atom_copy` `pattern_col`** — a missed copy silently
    drops the column selection in magic-set re-written rules. (Moot: the
    magic-sets transform was deleted 2026-08-11.)

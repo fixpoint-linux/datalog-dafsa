@@ -192,10 +192,23 @@ CLI: `dl similar '<name>' [--k N]` prints `distance<TAB>name`, nearest first.
 
 **Time travel is free:** both mechanisms resolve against the LIVE symbol space
 (the scan reads the interner's symbol table directly; the `~~` walk reads the
-live forward DAFSA). Sym-ids are append-only and never reused, so the live symbol
-set is a superset of any snapshot's; rows still come from the version's relation
-view, so a superset filter can only be applied to rows that exist in that
-version. No version entry point is needed.
+live forward DAFSA). Rows still come from the version's relation view, so the
+filter is only ever applied to rows that exist in that version.
+
+> **Correction (2026-10-19, unit `fix-idreuse`).** The original justification
+> here ("sym-ids are append-only and never reused, so the live symbol set is a
+> superset of any snapshot's") is **MEASURED FALSE across a publish**, and a
+> superset is the wrong predicate anyway: what a version-scoped filter needs is
+> that the live map sends every id the version's rows reference to the SAME
+> string. `dl similar` itself has no `--version` form, so it is unaffected;
+> `dl search --version N` is: its terms are interned LIVE and then looked up in
+> that version's postings, so a db-root `symbols.array` that diverges from the
+> snapshot's selects another term's postings — MEASURED on a truncated root
+> array: `search "blue" --version 1` returned the "red fox" observation (id 2)
+> where the intact store returns id 4. `fix-idreuse` closes the publish path
+> that produced that state (publish now persists the db-root array), so what
+> remains is a legacy-store / restored-or-edited-root exposure — reported, not
+> fixed, and not resolved by the argument above.
 
 ## Verification
 

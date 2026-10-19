@@ -377,8 +377,12 @@ corrected attribution below).
    written at all by default (pure derived cache of `symbols.array`; it cost
    11.7 s rebuild + 17.5 s save ≈ 285 MB on a 1.5 M-symbol store whenever the
    vocabulary changed, which is every content write). The pattern read path
-   falls back to the live in-memory forward map; `DL_PUB_DERIVED=1` restores
-   the old behaviour. Only `terms.bin` is still re-saved ungated.
+   rebuilds the map from the snapshot's own `symbols.array` when the file is
+   absent (NOT from the live interner: sym-ids are reused across a publish, so
+   the live map is not the snapshot's map — corrected 2026-10-19, unit
+   `fix-idreuse`, see CHANGELOG); `DL_PUB_DERIVED=1` / `dl publish
+   --with-derived` restores the old behaviour. Only `terms.bin` is still
+   re-saved ungated.
 2. **VFS / atomic-commit syscall dance** -- per saved file:
    `open(tmp)` -> `writeAll` -> `fsync(fd)` -> `close` -> `renameat` ->
    `fsyncDirOf` (`persist.zig`). This is the price of crash-atomicity and is
