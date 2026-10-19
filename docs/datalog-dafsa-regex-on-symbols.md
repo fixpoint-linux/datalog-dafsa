@@ -24,8 +24,9 @@ fixed-width `u32BE` column ids. The new primitive `symbols_dfa_walk` /
 and the walker emits the **sym_id** (reconstructed from the 4-byte `u32BE`
 payload). The relation filter becomes "keep tuple iff `cols[k] ∈ S`", where `S`
 is the set of sym-ids whose string matched. The generic whole-key
-`regex_dfa_walk` / `regex_dfa_walk_view` primitives **stay** (the raw-DAFSA tests
-keep passing) but are no longer the `~` path.
+`regex_dfa_walk` primitive **stays** (the raw-DAFSA tests keep passing) but is no
+longer the `~` path; its mmap-view sibling `regex_dfa_walk_view` was removed
+2026-10-19 (see the Q4 corrections).
 
 ## Motivation
 
@@ -63,8 +64,10 @@ engine's behavior).
 
 **(Q3) Escape hatch — replace whole-key matching on the `~` surface entirely.**
 Whole-key byte matching is **removed** from the `~` surface. The generic
-`regex_dfa_walk` / `regex_dfa_walk_view` remain only as **tested raw-DAFSA
-primitives** (used by the raw-DAFSA engine tests), not as the `~` path.
+`regex_dfa_walk` remains only as a **tested raw-DAFSA primitive** (used by the
+raw-DAFSA engine tests), not as the `~` path; `regex_dfa_walk_view` and
+`view_pattern` (its only caller) were deleted 2026-10-19 — see the Q4
+corrections.
 
 **(Q4) Both in-memory and snapshot mmap paths.** `symbols_dfa_walk` runs over
 `db->ir->fwd` (live); `symbols_dfa_walk_view` runs over `<sdir>/symbols.dafsa`
@@ -101,6 +104,20 @@ primitives** (used by the raw-DAFSA engine tests), not as the `~` path.
 > publish persist the db-root `symbols.array`; the 102 + 12 "byte-identical"
 > observations had compared the two sources only on stores where they agree by
 > construction, so they could not see this class.
+>
+> **Correction (2026-10-19, unit `deadcode`, commit `3a588a0`): NO walker is on
+> the read path at all — Q4's live-vs-snapshot DAFSA split no longer exists.**
+> `dl_pattern` (both the live and the VERSION route) and the `~` / `~~` rule
+> atoms now match names with `regexwalk.symbolsScanTable`: the compiled DFA run
+> linearly over the interner's own names, no DAFSA materialized (`dl.zig`
+> `snapshotSymSet`, `vm.zig` OP_WALK). MEASURED on the 166k-symbol store:
+> 0.1-0.2 s of scan against a 0.37 s store-open floor, versus `ensureFwd`'s
+> 10-19 s. `symbols_dfa_walk` / `symbols_dfa_walk_view` therefore keep only
+> their raw-DAFSA test consumers (`tests/test_m5.c`), plus `symbols_dfa_walk` as
+> the differential-test arm (`dl.zig`); `regex_dfa_walk_view` and
+> `snapshot.c`'s `view_pattern` (its only caller, itself uncalled) were deleted
+> in that unit. A snapshot's `symbols.dafsa` is never read; `DL_PUB_DERIVED=1`
+> still writes one for an external consumer.
 
 ## The new primitive
 
@@ -218,10 +235,11 @@ Cross-check every emitted sym_id against `intern_str_of(db->ir, sym_id)` in a te
 
 ## References
 
-- `src/regexwalk.c` / `src/regexwalk.h` — `regex_dfa_walk` / `regex_dfa_walk_view`
-  (the generic whole-key primitives, unchanged; the new `symbols_dfa_walk*` live here).
-- `src/intern.c` / `src/intern.h` — `interner` + `intern_str_of`; `db->ir->fwd`
-  is the live symbol DAFSA.
+- `src/regexwalk.h` / `zig/src/regexwalk.zig` — `regex_dfa_walk` (the generic
+  whole-key primitive, unchanged; `regex_dfa_walk_view` removed 2026-10-19) and
+  the `symbols_dfa_walk*` walkers + Zig-only `symbolsScanTable`.
+- `src/intern.h` / `zig/src/intern.zig` — `interner` + `intern_str_of`; the
+  forward symbol DAFSA (`ensureFwd`) is a derived cache no read path materializes.
 - `src/dl.c` `dl_pattern` (~3507), `src/relation.c` `rel_pattern` (~940),
   `src/snapshot.c` `view_pattern` (~426), `src/vrelation.c` `vrel_pattern` (~147).
 - `src/vm.c` `OP_WALK` (~619), `src/compiler.c` OP_WALK emission (~1704/2654/2748)

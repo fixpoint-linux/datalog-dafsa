@@ -56,7 +56,10 @@ long dl_node_observations(dl_db *db, const char *node,
 ### Both paths
 
 - In-memory: operate on `db->ir` interner + live relations.
-- Snapshot: use the mmap view + the published vocabulary (`<sdir>/symbols.dafsa`) — the same live-vs-snapshot split as the regex plan (`docs/datalog-dafsa-regex-on-symbols.md`).
+- Snapshot: use the mmap view + the published vocabulary (`<sdir>/symbols.array`;
+  `<sdir>/symbols.dafsa` is no longer written by default and no read path reads
+  it — `3a588a0`) — the same live-vs-snapshot split as the regex plan
+  (`docs/datalog-dafsa-regex-on-symbols.md`).
 
 ## Files that change
 

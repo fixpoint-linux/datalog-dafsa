@@ -611,47 +611,6 @@ pub export fn snapshot_query_scan(db_dir: [*c]const u8, snap_version: c_uint, vc
     return view_prefix(v, arity, leading, k, cb, user);
 }
 
-// ─── Regex pattern walk (mmap view) ───────────────────────────────────────
-
-const VpatCtx = struct {
-    arity: u8,
-    cb: relation.RelEnumCb,
-    user: ?*anyopaque,
-    count: c_long,
-};
-
-fn vpatCb(key_bytes: [*c]const u8, key_len: usize, user: ?*anyopaque) callconv(.c) c_int {
-    const ctx: *VpatCtx = @ptrCast(@alignCast(user orelse return -1));
-    if (key_len != @as(usize, ctx.arity) * 4 + 1) return 0;
-
-    var cols: [MAX_ARITY]u32 = undefined;
-    readColsBe(&cols, key_bytes, ctx.arity);
-
-    ctx.count += 1;
-    return ctx.cb.?(&cols, ctx.arity, ctx.user);
-}
-
-/// long view_pattern(void *view_handle, uint8_t arity,
-///                   const struct regex_dfa *dfa, dl_tuple_cb cb, void *user)
-pub export fn view_pattern(view_handle: ?*anyopaque, arity: u8, dfa: ?*const regexwalk.regex_dfa, cb: relation.RelEnumCb, user: ?*anyopaque) c_long {
-    const v: [*c]const dc.dafsa_view = @ptrCast(@alignCast(view_handle orelse return -1));
-    if (dfa == null or cb == null) return -1;
-
-    var ctx = VpatCtx{
-        .arity = arity,
-        .cb = cb,
-        .user = user,
-        .count = 0,
-    };
-
-    // v is this module's @cImport of dafsa_internal.h; regexwalk's is a
-    // separate @cImport namespace — cast the identical-layout pointer across
-    // (precedent: relation.zig rel_pattern).
-    const n = regexwalk.regex_dfa_walk_view(@ptrCast(v), dfa, vpatCb, &ctx);
-    if (n < 0) return -1;
-    return ctx.count;
-}
-
 // Filter callback context for view_filter_col
 const VfilterCtx = struct {
     arity: u8,

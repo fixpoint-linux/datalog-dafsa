@@ -7,9 +7,8 @@
  * Regex subset: literals (incl. \\, \xHH, \0), ., [abc]/[a-z]/[^abc],
  * *, +, ?, |, ().  NO backrefs, {n,m}, lookaround.
  *
- * Two walkers:
+ * Walker:
  *   regex_dfa_walk       — in-memory (iterates via trans_arr_c)
- *   regex_dfa_walk_view  — mmap view (iterates via view_edge_next)
  */
 
 #ifndef REGEXWALK_H
@@ -69,7 +68,7 @@ void regex_dfa_free(regex_dfa *dfa);
 /* Compile a Levenshtein automaton for (term, k) into an ordinary regex_dfa:
  * its states are edit-distance DP rows, accepting states are those whose
  * dp[term_len] <= k.  Because the layout IS a regex_dfa, the existing walkers
- * (regex_dfa_walk / symbols_dfa_walk and their _view forms) walk it unchanged.
+ * (regex_dfa_walk / symbols_dfa_walk / symbols_dfa_walk_view) walk it unchanged.
  *
  * Same contract as regex_compile: n_states > 0 with errmsg == NULL on success,
  * n_states == 0 with errmsg != NULL on failure (k > 2, empty/NULL term, term
@@ -99,11 +98,6 @@ typedef int (*regex_walk_cb)(const unsigned char *key_bytes, size_t key_len,
  * Returns the number of matching keys, or -1 on error. */
 long regex_dfa_walk(const dafsa *d, const regex_dfa *dfa,
                     regex_walk_cb cb, void *user);
-
-/* Walk a mmap'd DAFSA view, same semantics as regex_dfa_walk.
- * Returns the number of matching keys, or -1 on error. */
-long regex_dfa_walk_view(const dafsa_view *v, const regex_dfa *dfa,
-                         regex_walk_cb cb, void *user);
 
 /* ─── Symbol DAFSA walkers (M5-symbols: match string content, emit sym_ids) ─── */
 

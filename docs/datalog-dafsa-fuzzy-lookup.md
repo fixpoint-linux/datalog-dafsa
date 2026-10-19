@@ -28,7 +28,8 @@ extern struct (`n_states`, `trans[s*256+b]`, `accept[s]`, `errmsg`), so the
 product DFS that already exists — `symProdDfs` in zig/src/regexwalk.zig, reached
 through `symbols_dfa_walk` — walks it **verbatim**. The only new engine code is
 the constructor. `vm.zig` (`OP_WALK`) needed no change: it filters a relation
-column by the `sym_set` the walker emits, and the automaton *is* a `regex_dfa`.
+column by the `sym_set` the matcher emits — the walk then, the scan
+(`symbolsScanTable`) since `3a588a0` — and the automaton *is* a `regex_dfa`.
 
 **The prune is sound.** A state whose row has `min_j dp[j] > k` can never lead to
 an accepting state, because `min_j dp[i][j]` is non-decreasing in the row index
@@ -191,9 +192,11 @@ uint32_t lev_distance_cap(const uint8_t *a, size_t alen,
 CLI: `dl similar '<name>' [--k N]` prints `distance<TAB>name`, nearest first.
 
 **Time travel is free:** both mechanisms resolve against the LIVE symbol space
-(the scan reads the interner's symbol table directly; the `~~` walk reads the
-live forward DAFSA). Rows still come from the version's relation view, so the
-filter is only ever applied to rows that exist in that version.
+(the scan reads the interner's symbol table directly; the `~~` walk — now the
+differential-test arm only, `dl.zig`, since the `~~` atom itself scans
+`symbolsScanTable` as of `3a588a0` — reads the live forward DAFSA). Rows still
+come from the version's relation view, so the filter is only ever applied to
+rows that exist in that version.
 
 > **Correction (2026-10-19, unit `fix-idreuse`).** The original justification
 > here ("sym-ids are append-only and never reused, so the live symbol set is a

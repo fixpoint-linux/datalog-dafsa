@@ -8,20 +8,22 @@
 //!      open-addressing state map (dsm_*) for dedup.  trans[s*256+byte]
 //!      (UINT32_MAX = DFA_DEAD) + accept[].
 //!   3. Product DFS walkers over a DAFSA × regex DFA, with a FNV-1a visited
-//!      set for cycle detection: regex_dfa_walk (in-memory, trans_arr_c) and
-//!      regex_dfa_walk_view (mmap view, view_edge_next).  symbols_dfa_walk /
-//!      symbols_dfa_walk_view match the string portion of symbol keys
-//!      (utf8 \0 u32BE) and emit sym_ids; the symbol walkers are ITERATIVE
-//!      (explicit heap stack, MAX_WORD_LEN frames) so deep symbol DAFSAs can
-//!      never overflow the C stack.
+//!      set for cycle detection: regex_dfa_walk (in-memory, trans_arr_c).
+//!      symbols_dfa_walk / symbols_dfa_walk_view match the string portion of
+//!      symbol keys (utf8 \0 u32BE) and emit sym_ids; the symbol walkers are
+//!      ITERATIVE (explicit heap stack, MAX_WORD_LEN frames) so deep symbol
+//!      DAFSAs can never overflow the C stack.  The generic whole-key mmap-view
+//!      walker (regex_dfa_walk_view) was removed 2026-10-19 with its only
+//!      caller, snapshot.c's view_pattern — no engine read path walked an
+//!      mmap'd relation view by regex after the `~` re-point.
 //!   4. symbolsScanTable — the symbol matcher the ENGINE READ PATH uses: the
 //!      same DFA, run over each interned NAME linearly (no DAFSA is built for
 //!      a query any more).  It is Zig-only (not part of the C ABI) and is
 //!      checked against symbols_dfa_walk by the tests below.
 //!
 //! Strangler-hybrid ABI: `regex_dfa` and `sym_set` are CONCRETE C structs
-//! (src/regexwalk.h) dereferenced by still-C code (relation.c→relation.zig's
-//! rel_pattern/rel_filter_col, snapshot.c's view_pattern, vm.c's symbol
+//! (src/regexwalk.h) dereferenced by engine code (relation.zig's
+//! rel_pattern/rel_filter_col, dl.zig's pattern/similar paths, vm.zig's symbol
 //! walks, tests/test_m5*) — so they are `extern struct`s with the exact C
 //! field order/types.  The dafsa engine stays C in the hybrid .so
 //! (vendor/dafsa/*.c) and is addressed via @cImport("dafsa_internal.h")
@@ -1771,77 +1773,6 @@ pub export fn regex_dfa_walk(d: [*c]const dc.dafsa, dfa: [*c]const regex_dfa, cb
     defer vsFree(&ctx.visited);
 
     _ = prodDfs(&ctx, d.*.initial, 0, 0);
-    return ctx.count;
-}
-
-// ─── Product DFS: mmap view DAFSA × regex DFA ──────────────────────────────
-
-const ProdViewCtx = struct {
-    v: [*c]const dc.dafsa_view,
-    dfa: [*c]const regex_dfa,
-    cb: RegexWalkCb,
-    user: ?*anyopaque,
-    visited: VisitedSet,
-    buf: [4096]u8,
-    count: c_long,
-};
-
-fn prodViewDfs(ctx: *ProdViewCtx, dstate: u32, rstate: u32, depth: usize) c_int {
-    if (depth >= ctx.buf.len) return 0;
-
-    // Accept check
-    if ((ctx.v.*.final_bits[@intCast(dstate / 8)] & (@as(u8, 1) << @intCast(dstate % 8))) != 0) {
-        if (ctx.dfa.*.accept.?[@intCast(rstate)] != 0) {
-            ctx.count +%= 1;
-            if (ctx.cb.?(ctx.buf[0..depth].ptr, depth, ctx.user) != 0) return 1;
-        }
-    }
-
-    // Cycle detection: if already on recursion stack, stop
-    const vkey: u64 = (@as(u64, dstate) << 32) | @as(u64, rstate);
-    const on_stack = vsTryInsert(&ctx.visited, vkey);
-    if (on_stack < 0) return -1;
-    if (on_stack == 1) return 0; // cycle
-
-    // Iterate edges via view_edge_next
-    var rc: c_int = 0;
-    var cur: [*c]const u8 = ctx.v.*.csr + @as(usize, @intCast(ctx.v.*.state_off[@intCast(dstate)]));
-    var sym: u8 = 0;
-    var tgt: u32 = 0;
-
-    while (dc.view_edge_next(ctx.v, dstate, &cur, &sym, &tgt) == 0) {
-        const next_rs = ctx.dfa.*.trans.?[@as(usize, rstate) * 256 + @as(usize, sym)];
-        if (next_rs == DFA_DEAD) continue;
-
-        ctx.buf[depth] = sym;
-        rc = prodViewDfs(ctx, tgt, next_rs, depth + 1);
-        if (rc != 0) break;
-    }
-
-    // Remove from recursion stack
-    _ = vsRemove(&ctx.visited, vkey);
-    return rc;
-}
-
-/// long regex_dfa_walk_view(const dafsa_view *v, const regex_dfa *dfa, regex_walk_cb cb, void *user)
-pub export fn regex_dfa_walk_view(v: [*c]const dc.dafsa_view, dfa: [*c]const regex_dfa, cb: RegexWalkCb, user: ?*anyopaque) c_long {
-    if (v == null or dfa == null or cb == null) return -1;
-    if (dfa.*.n_states == 0) return 0;
-
-    var ctx = ProdViewCtx{
-        .v = v,
-        .dfa = dfa,
-        .cb = cb,
-        .user = user,
-        .visited = std.mem.zeroes(VisitedSet),
-        .buf = [_]u8{0} ** 4096,
-        .count = 0,
-    };
-
-    if (vsInit(&ctx.visited) != 0) return -1;
-    defer vsFree(&ctx.visited);
-
-    _ = prodViewDfs(&ctx, v.*.initial, 0, 0);
     return ctx.count;
 }
 

@@ -3,7 +3,9 @@
 > **SUPERSEDED (2026-08-11) — do not build. This page is kept as the design
 > record only.** The capability it exists for (typo-tolerant entity-name lookup)
 > is delivered with **no relation, no build step and no incremental
-> maintenance** by the Levenshtein automaton over `symbols.dafsa` — see
+> maintenance** by the Levenshtein automaton over the live interner's symbol
+> table (it scanned `symbols.dafsa` while that file was persisted; since
+> `3a588a0` it scans the names directly) — see
 > [datalog-dafsa-fuzzy-lookup.md](datalog-dafsa-fuzzy-lookup.md) and the
 > `~~` atom operator / `dl similar`. This doc's own TL;DR already named
 > "Levenshtein over a candidate set" as the refinement, and the refinement is
