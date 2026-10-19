@@ -107,15 +107,21 @@ int  dl_search_ranked_top(dl_db *db, const uint32_t *terms, int n_terms, int min
                           uint32_t *obs_ids_out, int *scores_out, int limit);
 ```
 
-- `min_terms == n_terms` **is** the AND path: it delegates to the same
-  intersect/rank/emit body, so the result set, the scores and the emission order
-  are identical to `dl_search`'s on the same fixture, and the AND path keeps its
-  cost.
+- `min_terms == n_distinct` **is** the AND path (`n_distinct` = the number of
+  DISTINCT sym_ids in `terms[]`, i.e. `n_terms` unless the query repeats a
+  term): it delegates to the same intersect/rank/emit body on the deduped
+  query, so the result set, the scores and the emission order are identical to
+  `dl_search`'s on the same distinct terms, and the AND path keeps its cost.
 - `min_terms == 1` is pure OR.
 - Order: score descending, then **obs_id ascending** as an explicit tie-break
-  (never std.mem.sort's stability).
-- `min_terms > n_terms` and `min_terms <= 0` are **rejected** (`-1`), not
-  silently emptied.
+  (never std.mem.sort's stability) — on both paths, including the delegated AND
+  body, whose results all score the same and whose order is therefore decided
+  entirely by that tie-break.
+- `min_terms > n_distinct` and `min_terms <= 0` are **rejected** (`-1`), not
+  silently emptied. Duplicate sym_ids are deduped once at entry: a repeated
+  term cannot raise a score nor help reach a threshold, so the distinct count is
+  the only reachable threshold — and the score stays a property of
+  `(db, doc, query)`, the same at every admissible `min_terms`.
 - Counting reuses the IntSet posting machinery (insertion-ordered array + O(1)
   membership index) and adds no membership scan: one u64 per posting, packed
   `(obs_id << 32) | distinct_term_rank`, sorted — the sort groups each obs_id

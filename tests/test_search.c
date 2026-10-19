@@ -931,6 +931,108 @@ static void t_search_ranked_contract(void)
     dl_close(db);
 }
 
+/* Duplicate sym_ids must never make a threshold SILENTLY EMPTY and must never
+ * change a document's score.  The threshold is range-checked against the number
+ * of DISTINCT query terms — a query cannot match more distinct terms than it
+ * names — so min_terms above that is the documented caller-bug rejection (-1),
+ * not 0 results.  Pre-fix this suite fails on {a,a,a} min_terms=2 (0 results,
+ * exit 0) and on min_terms=3 (documents returned at score 3). */
+static void t_search_ranked_duplicate_syms(void)
+{
+    char dir[512];
+    dl_db *db = fresh_db(dir, sizeof(dir), "t_search_ranked_dup");
+    uint32_t a, b;
+    uint32_t terms[3];
+    uint32_t ids[8];
+    int scores[8];
+    rk_sink sink;
+    int n, mt;
+
+    TEST("dl_search_ranked: duplicate syms rejected above the DISTINCT count");
+    if (aux_index_ensure_postings(db) != 0) { FAIL("ensure postings failed"); dl_close(db); return; }
+
+    a = dl_intern_str(db, "rk_d_a");
+    b = dl_intern_str(db, "rk_d_b");
+    if (a == 0 || b == 0) { FAIL("intern failed"); dl_close(db); return; }
+    aux_index_add_posting(db, a, 602);
+    aux_index_add_posting(db, a, 601);
+    aux_index_add_posting(db, b, 601);
+
+    /* {a,a,a} names ONE distinct term: min_terms=1 is the only reachable
+     * threshold; 2 and 3 are caller bugs, not empty results. */
+    terms[0] = a; terms[1] = a; terms[2] = a;
+    n = dl_search_ranked_top(db, terms, 3, 1, ids, scores, 8);
+    if (n != 2 || ids[0] != 601 || scores[0] != 1 || ids[1] != 602 || scores[1] != 1) {
+        FAIL("{a,a,a} min_terms=1 is not the 2 matching documents at score 1");
+        dl_close(db);
+        return;
+    }
+    if (dl_search_ranked_top(db, terms, 3, 2, ids, scores, 8) != -1) {
+        FAIL("{a,a,a} min_terms=2 was not rejected (silently empty)");
+        dl_close(db);
+        return;
+    }
+    sink.ids = ids; sink.scores = scores; sink.n = 0; sink.cap = 8;
+    if (dl_search_ranked(db, terms, 3, 2, rk_sink_cb, &sink) != -1 || sink.n != 0) {
+        FAIL("{a,a,a} min_terms=2 was not rejected (stream form)");
+        dl_close(db);
+        return;
+    }
+    if (dl_search_ranked_top(db, terms, 3, 3, ids, scores, 8) != -1) {
+        FAIL("{a,a,a} min_terms=3 was not rejected");
+        dl_close(db);
+        return;
+    }
+
+    /* {a,a,b} names two distinct terms: 1..2 are reachable, 3 is rejected — and
+     * document 601 scores 2 at EVERY reachable threshold, i.e. score is a
+     * property of (db, doc, query), not of the caller's min_terms sweep. */
+    terms[0] = a; terms[1] = a; terms[2] = b;
+    for (mt = 1; mt <= 2; mt++) {
+        n = dl_search_ranked_top(db, terms, 3, mt, ids, scores, 8);
+        if (n < 0) { FAIL("{a,a,b}: a reachable threshold was rejected"); dl_close(db); return; }
+        if (ids[0] != 601 || scores[0] != 2) {
+            FAIL("{a,a,b}: document 601's score depends on min_terms");
+            dl_close(db);
+            return;
+        }
+        if (mt == 1 && (n != 2 || ids[1] != 602 || scores[1] != 1)) {
+            FAIL("{a,a,b} min_terms=1 is not (601,2),(602,1)");
+            dl_close(db);
+            return;
+        }
+        if (mt == 2 && n != 1) { FAIL("{a,a,b} min_terms=2 returned extra documents"); dl_close(db); return; }
+    }
+    if (dl_search_ranked_top(db, terms, 3, 3, ids, scores, 8) != -1) {
+        FAIL("{a,a,b} min_terms=3 was not rejected");
+        dl_close(db);
+        return;
+    }
+
+    /* dl_search's AND semantics are untouched: it still scores n_terms verbatim,
+     * duplicate syms included. */
+    n = dl_search_top(db, terms, 3, ids, scores, 8);
+    if (n != 1 || ids[0] != 601 || scores[0] != 3) {
+        FAIL("dl_search AND semantics changed on a duplicate-sym query");
+        dl_close(db);
+        return;
+    }
+
+    /* Tie-break PIN on the delegated AND branch (min_terms == n_distinct).  Not
+     * a pre-fix failure — the all-equal sort happened to come out ascending —
+     * but the order must come from the comparator, not from sort stability. */
+    terms[0] = a;
+    n = dl_search_ranked_top(db, terms, 1, 1, ids, scores, 8);
+    if (n != 2 || ids[0] != 601 || ids[1] != 602 || scores[0] != scores[1]) {
+        FAIL("AND-branch equal scores are not obs_id ascending");
+        dl_close(db);
+        return;
+    }
+
+    PASS();
+    dl_close(db);
+}
+
 /* ─── Integration test ──────────────────────────────────────────────────── */
 
 static void t_integration_observation_indexing(void)
@@ -1287,6 +1389,7 @@ int main(void)
     t_search_ranked_bruteforce_crosscheck();
     t_search_ranked_and_equivalence();
     t_search_ranked_contract();
+    t_search_ranked_duplicate_syms();
     
     /* Integration test */
     t_integration_observation_indexing();

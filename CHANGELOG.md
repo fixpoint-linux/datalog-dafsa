@@ -3,6 +3,43 @@
 All notable changes to this project are documented in this file.
 
 ## [Unreleased]
+- **`dl_search_ranked` duplicate sym_ids: a threshold in `(n_distinct, n_terms]`
+  was SILENTLY EMPTY, and a document's score depended on `min_terms`**
+  (2026-10-19, unit `ranked-fix`, found by the independent review of `f23899f`).
+  - **The defect, MEASURED.** The range check validated `min_terms` against
+    `n_terms` (query POSITIONS) while the partial-match count compared it against
+    the DISTINCT matched count, so a repeated term pushed the threshold out of
+    reach: `dl search 'a a a' --min-terms 2` printed `(no results)` with exit 0,
+    and `--min-terms 3` returned the documents at score 3 via the AND branch. The
+    score was not a property of `(db, doc, query)` either — `{a,a}` scored 1 at
+    `min_terms=1` and 2 at `min_terms=2` for the same document, so a caller
+    sweeping `min_terms` saw one document at two scores. Both contradict the
+    documented "rejected as a caller bug rather than silently emptied" rule.
+  - **Fix, chosen option: dedupe the query at entry.** `terms[]` is deduped once
+    in `dl_search_ranked`, the threshold is checked against the resulting
+    `n_distinct`, the delegating branch is `min_terms == n_distinct`, and the
+    deduped query is what every downstream body sees. Rejected the narrower
+    "keep `min_terms == n_terms` dispatch, just range-check against `n_distinct`"
+    variant because it leaves the score dependent on `min_terms` (the AND branch
+    still returns `n_terms` verbatim for a duplicate query). Consequence, stated
+    rather than hidden: for a duplicate-sym query `min_terms == n_terms` is now
+    REJECTED (it was score-`n_terms` results) and the score is `n_distinct`.
+    Non-duplicate queries are bit-identical — `n_distinct == n_terms` makes the
+    dedupe a no-op.
+  - **`scoredResultLt` now carries the obs_id tie-break too** (score desc, then
+    obs_id asc, both paths). The AND branch's results all score the same, so its
+    emission order was decided entirely by `std.mem.sort` (pdq, NOT stable) over
+    the smallest posting set, while the header/docs promised an explicit
+    tie-break. Observationally inert on today's tree (probed ascending at n=60
+    and n=2000 with postings inserted in descending order) — it removes the
+    latent dependence, and the comment claiming sort stability is gone.
+  - `tests/test_search.c` +1 case (27 total): `{a,a,a}` at `min_terms` 1/2/3
+    (1 is the documents, 2 and 3 are `-1`), `{a,a,b}` scoring 2 at both
+    admissible thresholds, `{a,a,b}` `min_terms=3` rejected, `dl_search` on the
+    same duplicate query still scoring 3, and an AND-branch ascending pin.
+    Asymmetry proven: the case FAILS against the pre-fix `libdatalog.so`
+    (`{a,a,a} min_terms=2 was not rejected (silently empty)`) and passes after.
+
 - **Sym-id reuse across a publish — silent wrong answers in VERSION pattern
   queries (BLOCKER, 2026-10-19, unit `fix-idreuse`).** Found by reviewing
   `3dd4ae0` and reproduced through the public API only.

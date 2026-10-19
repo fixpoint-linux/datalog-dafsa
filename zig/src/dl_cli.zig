@@ -399,16 +399,34 @@ fn runSearch(db: [*c]c.dl_db, terms_str: [:0]const u8, opts: SearchParams) c_int
 
     var n_results: c_int = undefined;
     if (min_terms != 0) {
-        // Partial-match path: reject a threshold above the term count here
-        // with a specific message (the engine also rejects it with -1).
-        if (min_terms > n_tokens) {
-            _ = fprintf(stderr, "dl: --min-terms %lu exceeds the %lu query terms\n", min_terms, n_tokens);
+        // Partial-match path: reject a threshold above the number of DISTINCT
+        // query terms here with a specific message (the engine also rejects it
+        // with -1).  Counting tokens would let a repeated term like 'a a a'
+        // push the threshold past what the query can match.
+        var n_distinct: usize = 0;
+        var k: usize = 0;
+        while (k < n_tokens) : (k += 1) {
+            var dup = false;
+            var j: usize = 0;
+            while (j < n_distinct) : (j += 1) {
+                if (syms[j] == syms[k]) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup) {
+                syms[n_distinct] = syms[k];
+                n_distinct += 1;
+            }
+        }
+        if (min_terms > n_distinct) {
+            _ = fprintf(stderr, "dl: --min-terms %lu exceeds the %lu distinct query terms\n", min_terms, n_distinct);
             free(term_syms);
             free(obs_ids);
             free(scores);
             return 1;
         }
-        n_results = c.dl_search_ranked_top(db, syms, @intCast(n_tokens), @intCast(min_terms), @ptrCast(@alignCast(obs_ids.?)), @ptrCast(@alignCast(scores.?)), @intCast(top_n));
+        n_results = c.dl_search_ranked_top(db, syms, @intCast(n_distinct), @intCast(min_terms), @ptrCast(@alignCast(obs_ids.?)), @ptrCast(@alignCast(scores.?)), @intCast(top_n));
     } else if (version == 0) {
         n_results = c.dl_search_top(db, syms, @intCast(n_tokens), @ptrCast(@alignCast(obs_ids.?)), @ptrCast(@alignCast(scores.?)), @intCast(top_n));
     } else {

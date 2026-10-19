@@ -424,10 +424,13 @@ const ScoredResult = struct {
     score: c_int,
 };
 
-/// Stable sort keeps the input (intersection) order for equal scores —
-/// what glibc qsort's mergesort does for the all-equal AND-search results.
+/// Sort order for the AND path: score descending, then obs_id ASCENDING.
+/// Every AND result scores the same, so the tie-break is what actually decides
+/// the emitted order — it must be explicit, because std.mem.sort is pdq and is
+/// NOT stable, so "keep the input order" is not something it promises.
 fn scoredResultLt(_: void, a: ScoredResult, b: ScoredResult) bool {
-    return a.score > b.score; // descending
+    if (a.score != b.score) return a.score > b.score; // descending
+    return a.obs_id < b.obs_id; // ascending, deterministic
 }
 
 /// Callback context for dl_search_top
@@ -548,10 +551,11 @@ fn rankedResultLt(_: void, a: ScoredResult, b: ScoredResult) bool {
 }
 
 /// Body of dl_search_ranked for min_terms < n_terms: partial / OR retrieval.
-///
-/// A document is a result iff it appears in at least `min_terms` of the query
-/// terms' posting sets; its score is the number of DISTINCT query terms it
-/// matched, i.e. the honest integer 1..n_terms.
+/// `terms[]` is the DEDUPED query (distinct sym_ids only) and `n_terms` is that
+/// distinct count, so a document is a result iff it appears in at least
+/// `min_terms` of those posting sets, and its score is the number of query terms
+/// it matched — the honest integer 1..n_terms, a property of (db, doc, query)
+/// alone.
 ///
 /// Counting: one u64 per posting, packed (obs_id << 32) | distinct_term_rank,
 /// sorted ascending — the sort groups every obs_id with its ranks in ascending
@@ -676,12 +680,13 @@ pub export fn dl_search_top(db: ?*dl.DlDb, terms: ?[*]const u32, n_terms: c_int,
 /// are emitted score-descending with obs_id-ascending as the explicit
 /// tie-break, so the order is fully deterministic.
 ///
-/// `min_terms == n_terms` is exactly dl_search's AND retrieval: it delegates to
-/// the SAME intersect/rank/emit body, so the result set, the scores AND the
-/// emission order are identical to dl_search's on the same fixture — and the
-/// AND path keeps its current cost, because the partial-match counting below
-/// runs only when retrieval actually admits partial matches.  `min_terms == 1`
-/// is pure OR.
+/// `min_terms == n_distinct` (n_distinct = the number of DISTINCT sym_ids in
+/// terms[], i.e. n_terms unless the query repeats a term) is exactly dl_search's
+/// AND retrieval: it delegates to the SAME intersect/rank/emit body, with the
+/// deduped query, so the result set, the scores AND the emission order are
+/// identical to dl_search's on the same DISTINCT terms — and the AND path keeps
+/// its current cost, because the partial-match counting below runs only when
+/// retrieval actually admits partial matches.  `min_terms == 1` is pure OR.
 ///
 /// Score: matched-term count, NOT tf-idf, and deliberately so.  tf is
 /// impossible (the store is SET-semantic, so duplicate postings cannot exist)
@@ -695,14 +700,17 @@ pub export fn dl_search_top(db: ?*dl.DlDb, terms: ?[*]const u32, n_terms: c_int,
 /// posting set.
 ///
 /// Error contract: -1 for NULL db, NULL terms, NULL cb, n_terms <= 0,
-/// min_terms <= 0, min_terms > n_terms (a query cannot match more terms than it
-/// has — rejected as a caller bug rather than silently emptied), or a per-term
-/// read failure.  0 is a valid empty result.
+/// min_terms <= 0, min_terms > n_distinct (a query cannot match more DISTINCT
+/// terms than it names — rejected as a caller bug rather than silently
+/// emptied), or a per-term read failure.  0 is a valid empty result.
 ///
-/// Duplicate sym_ids in terms[] are counted ONCE by the partial-match path (a
-/// repeated term cannot raise a document's score or help it reach min_terms);
-/// the min_terms == n_terms branch keeps dl_search's existing score of n_terms
-/// verbatim.
+/// Duplicate sym_ids in terms[] are deduped ONCE at entry, before anything else
+/// looks at the query.  A repeated term cannot raise a document's score or help
+/// it reach min_terms, so the DISTINCT count is the only reachable threshold —
+/// which is why the range check above is against n_distinct and not against
+/// n_terms.  Deduping up front also keeps score a property of
+/// (db, doc, query) rather than of the caller's min_terms: the same document
+/// gets the same score at every admissible threshold.
 pub export fn dl_search_ranked(
     db: ?*dl.DlDb,
     terms: ?[*]const u32,
@@ -716,10 +724,42 @@ pub export fn dl_search_ranked(
     if (min_terms <= 0 or min_terms > n_terms)
         return -1;
 
-    if (min_terms == n_terms)
-        return searchImpl(db, 0, false, terms, n_terms, cb, user);
+    const n: usize = @intCast(n_terms);
 
-    return searchRankedImpl(db, terms.?, @intCast(n_terms), @intCast(min_terms), cb, user);
+    // Dedupe the query.  `terms` may repeat a sym_id, and the ONE body that
+    // must not see the repeats is the threshold check below: counting positions
+    // there made a repeated term push the threshold out of reach, so a query
+    // like {a,a,a} with min_terms=2 came back SILENTLY EMPTY instead of being
+    // rejected.  n_uniq <= n, so n slots are always enough.
+    const uniq_all = c.malloc(n * @sizeOf(u32)) orelse return -1;
+    const uniq: [*]u32 = @ptrCast(@alignCast(uniq_all));
+    defer c.free(uniq_all);
+
+    var n_uniq: usize = 0;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        var seen = false;
+        var j: usize = 0;
+        while (j < n_uniq) : (j += 1) {
+            if (uniq[j] == terms.?[i]) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) {
+            uniq[n_uniq] = terms.?[i];
+            n_uniq += 1;
+        }
+    }
+
+    const min: usize = @intCast(min_terms);
+    if (min > n_uniq)
+        return -1; // unreachable threshold: a caller bug, not an empty result
+
+    if (min == n_uniq)
+        return searchImpl(db, 0, false, uniq, @intCast(n_uniq), cb, user);
+
+    return searchRankedImpl(db, uniq, n_uniq, min, cb, user);
 }
 
 /// Convenience: dl_search_ranked with a --top N limit.  Collects up to `limit`
