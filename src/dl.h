@@ -399,13 +399,21 @@ int dl_attach_schema(dl_db *db, const dl_schema *schema);
  *     the fact-propagation path evaluate the accumulated rule set, and a query
  *     after the second dl_load_rules sees both batches' rules.
  *   - Stratification and recursion are computed over the ACCUMULATED rule set
- *     (strata are a property of the program, not of a batch), so the answer
- *     does not depend on how the rules were grouped: loading {A,B} as one call
- *     and as two calls give the same result.  A batch that closes an
- *     unstratifiable cycle, or that makes an existing rule a recursive
- *     aggregate / a recursive rule over a variadic head / a range over a
- *     recursive relation, is REFUSED (returns -1) exactly as the single-batch
- *     program of the same rules is.
+ *     (strata are a property of the program, not of a batch), so the ANSWER
+ *     does not depend on how the rules were grouped or ordered: loading {A,B}
+ *     as one call, as two calls in either order, or as one call per rule gives
+ *     the same relation contents.  A batch that closes an unstratifiable
+ *     cycle, or that makes an existing rule a recursive aggregate / a
+ *     recursive rule over a variadic head / a range over a recursive relation,
+ *     is REFUSED (returns -1) with the single-batch program's diagnostic.
+ *     Two limits, both measured and both about cost rather than answers: the
+ *     bytecode is compiled per batch, so a rule promoted to recursive by a
+ *     later batch keeps the op the earlier compile chose (the recursive driver
+ *     feeds every op it can emit — see vm.zig driverFeeds — so the answer is
+ *     unaffected, but the plan, and therefore the cost, may differ from the
+ *     single-batch plan); and because that forced-perm compile-time step is
+ *     not re-run, a split program cannot be refused with "too many permutation
+ *     indices" where the single-batch program would be.
  *   - Previously derived relations are NOT kept: each evaluation resets the
  *     derived views and re-derives them from the EDB, so no tuple derived under
  *     an earlier rule set survives.

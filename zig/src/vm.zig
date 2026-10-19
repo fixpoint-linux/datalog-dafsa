@@ -1859,6 +1859,29 @@ fn rebuildPermShadows(db: *dl.DlDb, nr: c_int, rd: [*]RdT, perm_count: [*]c_int,
     }
 }
 
+/// The body-atom ops the recursive driver can FEED.  For each of these the
+/// driver may substitute its own idb/delta tupleset for the atom (the
+/// `overrides` array), and the handler consults that override (findOv) BEFORE
+/// the relation: the OP_SCAN, OP_LOOKUP, OP_LOOKUP_PERM and OP_HASH_JOIN
+/// handlers each call findOv.  An atom whose op is NOT listed keeps reading the
+/// RELATION for the whole fixpoint, and during a fixpoint the recursive head
+/// relations' views are EMPTY (they are written back only at the end), so such
+/// an atom silently matches nothing — the rule never fires and its head stays
+/// empty, with no error.  OP_WALK (pattern atoms) and OP_MAT_JOIN (bushy plans)
+/// have no findOv and are therefore NOT feedable; that is a pre-existing hole
+/// in the driver, not one a promotion introduces.
+///
+/// This matters because whether an atom is emitted as OP_LOOKUP_PERM or as
+/// OP_HASH_JOIN is a COMPILE-TIME decision (compiler.emit_nonleading_join
+/// forces a perm when the relation is recursive at compile time and otherwise
+/// picks a cost path).  A rule can be compiled non-recursive — hash join
+/// emitted — and then be promoted to recursive by a later batch's union
+/// stratification (dl.zig, is_recursive republish).  The op does not change on
+/// promotion, so the driver must be able to feed the op the rule already has.
+fn driverFeeds(op: u8) bool {
+    return op == OP_SCAN or op == OP_LOOKUP or op == OP_LOOKUP_PERM or op == OP_HASH_JOIN;
+}
+
 fn evalStratumRecursive(db: *dl.DlDb, rules: [*]?*compiler.compiled_rule, n: c_int, ivm: c_int) c_int {
     var i: c_int = 0;
     var ri: c_int = 0;
@@ -1899,7 +1922,7 @@ fn evalStratumRecursive(db: *dl.DlDb, rules: [*]?*compiler.compiled_rule, n: c_i
             var ii: c_int = 0;
             while (ii < cr.n_instrs) : (ii += 1) {
                 const in = &cr.instrs.?[@intCast(ii)];
-                if (in.op != OP_LOOKUP and in.op != OP_SCAN and in.op != OP_LOOKUP_PERM) continue;
+                if (!driverFeeds(in.op)) continue;
                 if (rp_idx[@intCast(in.a)] < 0) continue;
                 n_rec += 1;
                 if (in.op == OP_LOOKUP) n_lookup += 1;
@@ -2205,7 +2228,7 @@ fn evalStratumRecursive(db: *dl.DlDb, rules: [*]?*compiler.compiled_rule, n: c_i
                 var ii: c_int = 0;
                 while (ii < ni_instrs) : (ii += 1) {
                     const in = &prog[@intCast(ii)];
-                    if (in.op != OP_SCAN and in.op != OP_LOOKUP and in.op != OP_LOOKUP_PERM) continue;
+                    if (!driverFeeds(in.op)) continue;
 
                     const br: c_int = @intCast(in.a);
                     const bdi = rp_idx[@intCast(br)];
@@ -2217,7 +2240,7 @@ fn evalStratumRecursive(db: *dl.DlDb, rules: [*]?*compiler.compiled_rule, n: c_i
                     var ji: c_int = 0;
                     while (ji < ni_instrs) : (ji += 1) {
                         const jin = &prog[@intCast(ji)];
-                        if (jin.op != OP_SCAN and jin.op != OP_LOOKUP and jin.op != OP_LOOKUP_PERM) continue;
+                        if (!driverFeeds(jin.op)) continue;
                         const jbr: c_int = @intCast(jin.a);
                         const jbdi = rp_idx[@intCast(jbr)];
                         if (jbdi < 0) continue;
