@@ -3,6 +3,54 @@
 All notable changes to this project are documented in this file.
 
 ## [Unreleased]
+- **`^` / `$` in a pattern silently matched NOTHING — now real anchors, and a
+  loud parse error anywhere they cannot mean anything** (2026-10-19, unit
+  `anchors`).
+  - **The defect, MEASURED through the CLI.** `^` and `$` lexed as ordinary
+    literal bytes, so on a store whose unanchored pattern matches, the anchored
+    forms returned zero rows with exit 0 and no diagnostic:
+    `pattern t 'zzz'` → 1 row; `'^zzz$'`, `'^zzz.*'`, `'zzz$'`, `'.*zzz$'`,
+    `'^zz'` → `(no results)`. A related silent failure: `'doc^1'` (a middle
+    anchor) also matched nothing, exit 0. Zero results is indistinguishable
+    from "no such name", which is the worst possible answer.
+  - **Semantics (unchanged matching, new syntax).** The symbol walkers are
+    ALREADY whole-name anchored — the walk starts at the DAFSA root and never
+    skips a byte (start), and `accept` is consulted only at the name's NUL
+    transition (end) — so `^p$` == `^p` == `p$` == `p`, and every unanchored
+    pattern keeps its exact previous behaviour (differential below). `^` as the
+    pattern's first character and `$` as its last are accepted anchors that
+    constrain nothing; an anchor in ANY other position (`a^b`, `a$b`, `$a`,
+    `a$$`, `a|^b`, `a$|b`, `(^a)`, `(a$)`, `a[b]^c`) is a parse error naming
+    the anchor. `\^` / `\$` remain the literal bytes, and inside `[...]`
+    nothing changed (leading `^` still negates, `$` is still literal).
+    `'^'`, `'$'` and `'^$'` are the empty-name pattern.
+  - **Where.** `zig/src/regexwalk.zig`: `RxToken.quoted` distinguishes an
+    escaped literal from a bare anchor; `rxAtCaret`/`rxAtDollar`/
+    `rxMisplacedAnchor`; `rxRegex` consumes the optional anchors (and builds
+    the ε fragment for a body-less one); `rxSeq` stops before a trailing `$`;
+    `rxAtom` rejects a misplaced anchor — including before a group's `)` so the
+    message names the anchor instead of "unclosed parenthesis".
+  - **Tests (can fail; 7 of them fail on the pre-anchor engine).**
+    `anchor: '^zzz$' …`, `anchor: '^zz.*' …` (a name that CONTAINS `zz` but
+    does not start with it is asserted ABSENT), `anchor: '.*zzz$' …` (a name
+    that starts with `zzz` but does not end with it is ABSENT), `anchor: middle
+    anchors are a loud parse error`, `anchor: escaped '\^' / '\$' stay
+    literal`, `anchor: '^' '$' '^$' are the empty-name pattern`, and
+    `anchor: '^p$' == '^p' == 'p$' == 'p' over the unanchored battery`.
+    Re-linked against `9217ffa`'s `regexwalk.zig`, those 7 fail (98/105) and
+    the unanchored pin test passes; on this tree 105/105 pass. A 20-pattern
+    unanchored battery is pinned to masks MEASURED on the pre-anchor engine, so
+    any drift in unanchored matching fails the suite.
+  - **Goldens.** None of the 95 existing `cli_diff` goldens moved (the
+    unanchored differential at the CLI level). 8 new ones: `c51`-`c55`,
+    `r18`-`r19` — `pattern observation "^doc[12]$"` and `"^doc1$"` now return
+    rows, `pattern observation 1 "^.*barks$"` returns `doc3`, and the middle
+    anchor `"doc^1"` is `dl: bad pattern` / exit 1 on both the in-memory and
+    the snapshot path. **NOTE:** `c56`/`c57`/`r17` (`pattern edge '^[12]$'`)
+    stay `(no results)` and are NOT evidence about anchors — the `edge`
+    relation's columns are raw `u32` ints, not interned strings, so
+    `pattern edge '<anything>'` is empty by construction (`pattern edge 0 '.*'`
+    is also `(no results)`); a comment in `cli_diff.sh` records this.
 - **`search --version N` resolved its query terms in the LIVE interner — silent
   wrong answers across a vocabulary divergence** (2026-10-19, unit `verintern`;
   the defect the `fix-idreuse` review recorded as its "NEW FINDING, SAME DEFECT

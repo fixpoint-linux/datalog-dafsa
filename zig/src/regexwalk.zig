@@ -213,6 +213,10 @@ const RxTokenKind = enum(u8) {
 const RxToken = struct {
     kind: RxTokenKind,
     ch: u8, // for CHAR
+    /// TRUE for a CHAR produced by an escape (\^, \$, \\, \xHH, \0 …).
+    /// Only used to tell a bare '^'/'$' (an ANCHOR, see rxRegex) from the
+    /// escaped literal byte — everywhere else an escaped char is just a byte.
+    quoted: bool = false,
 };
 
 const RxParser = struct {
@@ -272,6 +276,9 @@ fn rxLex(p: *RxParser) void {
             rxError(p, "trailing backslash");
             return;
         }
+        // Every escape yields a literal byte — including \^ and \$, which is
+        // how a pattern asks for an actual '^'/'$' character.
+        p.tok.quoted = true;
         if (s[0] == '\\') {
             p.tok.kind = .char;
             p.tok.ch = '\\';
@@ -319,7 +326,11 @@ fn rxLex(p: *RxParser) void {
         return;
     }
 
-    // Metacharacters
+    // Metacharacters.  A bare '^' / '$' lexes as an ordinary CHAR here and the
+    // PARSER decides whether it is an anchor or an error — see rxAtCaret /
+    // rxAtDollar / rxRegex.  `quoted` is cleared for every unescaped token so a
+    // bare byte is never mistaken for an escaped one (and vice versa).
+    p.tok.quoted = false;
     switch (s[0]) {
         '.' => {
             p.tok.kind = .dot;
@@ -388,6 +399,52 @@ fn rxNext(p: *RxParser) RxToken {
 fn rxMatch(p: *RxParser, k: RxTokenKind) bool {
     if (rxPeek(p).kind == k) {
         _ = rxNext(p);
+        return true;
+    }
+    return false;
+}
+
+// ─── Anchors ───────────────────────────────────────────────────────────────
+//
+// Both walkers are ALREADY anchored at both ends, so '^' and '$' constrain
+// nothing — they are accepted only so that a user's anchor is never silently
+// lexed as a literal byte (which used to match nothing at all):
+//
+//   START — the product walk begins at the DAFSA root and never skips a byte,
+//           so the pattern's first atom is matched against the name's first
+//           byte.
+//   END   — the symbol walkers consult `accept` only on the name's NUL
+//           transition (symProdDfs/symProdViewDfs) and regex_dfa_walk only at
+//           a final DAFSA state, so the pattern must consume the name exactly.
+//
+// MEASURED (pre-anchor engine, names {zzz, prezzz, zzzpost}): 'zzz.*' matched
+// zzz+zzzpost but not prezzz, and '.*zzz' matched zzz+prezzz but not zzzpost.
+//
+// Hence '^p$' == '^p' == 'p$' == 'p', and an anchor anywhere but the pattern's
+// own first/last character is meaningless — it is a loud parse error rather
+// than a pattern that quietly matches nothing.
+
+/// Lookahead is an UNESCAPED '^' (a start anchor).
+fn rxAtCaret(p: *RxParser) bool {
+    const t = rxPeek(p);
+    return t.kind == .char and !t.quoted and t.ch == '^';
+}
+
+/// Lookahead is an UNESCAPED '$' (an end anchor).
+fn rxAtDollar(p: *RxParser) bool {
+    const t = rxPeek(p);
+    return t.kind == .char and !t.quoted and t.ch == '$';
+}
+
+/// Reject a misplaced anchor.  Returns false (having set no error) when the
+/// lookahead is not an anchor at all.
+fn rxMisplacedAnchor(p: *RxParser) bool {
+    if (rxAtCaret(p)) {
+        rxError(p, "anchor '^' only allowed as the pattern's first character");
+        return true;
+    }
+    if (rxAtDollar(p)) {
+        rxError(p, "anchor '$' only allowed as the pattern's last character");
         return true;
     }
     return false;
@@ -561,7 +618,11 @@ fn rxSeq(n: *Nfa, p: *RxParser, out: *NfaFrag) c_int {
     var left: NfaFrag = undefined;
     if (rxPostfix(n, p, &left) != 0) return -1;
 
-    while (rxPeek(p).kind != .eof and rxPeek(p).kind != .pipe and rxPeek(p).kind != .rparen) {
+    // A trailing '$' belongs to rxRegex (the end anchor), not to this
+    // sequence — stop before it so 'a$' parses as 'a' + anchor.
+    while (rxPeek(p).kind != .eof and rxPeek(p).kind != .pipe and
+        rxPeek(p).kind != .rparen and !rxAtDollar(p))
+    {
         var right: NfaFrag = undefined;
         if (rxPostfix(n, p, &right) != 0) return -1;
 
@@ -633,8 +694,13 @@ fn rxPostfix(n: *Nfa, p: *RxParser, out: *NfaFrag) c_int {
 }
 
 fn rxAtom(n: *Nfa, p: *RxParser, out: *NfaFrag) c_int {
+    // A bare '^'/'$' here is an anchor in a position where it cannot mean
+    // anything: only rxRegex may consume one, and only at the pattern's ends.
+    if (rxMisplacedAnchor(p)) return -1;
+
     if (rxMatch(p, .lparen)) {
         if (rxAlt(n, p, out) != 0) return -1;
+        if (rxMisplacedAnchor(p)) return -1;
         if (!rxMatch(p, .rparen)) {
             rxError(p, "unclosed parenthesis");
             return -1;
@@ -680,11 +746,42 @@ fn rxAtom(n: *Nfa, p: *RxParser, out: *NfaFrag) c_int {
     return -1;
 }
 
-/// top-level: alt EOF (implicit ^...$ — just match the full string)
+/// top-level: [^] alt [$] EOF
+///
+/// The walkers already match a whole name (see the Anchors section), so the
+/// optional anchors are accepted and dropped rather than becoming literal
+/// bytes that could only ever match nothing.
 fn rxRegex(n: *Nfa, p: *RxParser, out: *NfaFrag) c_int {
-    if (rxAlt(n, p, out) != 0) return -1;
+    if (rxAtCaret(p)) _ = rxNext(p);
+
+    var end_anchored = false;
+    // A body-less anchored pattern ('^', '$', '^$') is the empty-name pattern
+    // (regex_compile has already rejected a 0-length pattern).
+    if (rxPeek(p).kind == .eof or rxAtDollar(p)) {
+        if (rxAtDollar(p)) {
+            _ = rxNext(p);
+            end_anchored = true;
+        }
+        const s = nfaAddState(n, 0);
+        const a = nfaAddState(n, 1);
+        if (s < 0 or a < 0) return -1;
+        if (nfaAddEdge(n, s, a, symEpsilon()) != 0) return -1;
+        out.start = s;
+        out.accept = a;
+    } else {
+        if (rxAlt(n, p, out) != 0) return -1;
+        if (rxAtDollar(p)) {
+            _ = rxNext(p);
+            end_anchored = true;
+        }
+    }
+
     if (rxPeek(p).kind != .eof) {
-        rxError(p, "unexpected trailing characters");
+        if (end_anchored) {
+            rxError(p, "anchor '$' must be the pattern's last character");
+        } else if (!rxMisplacedAnchor(p)) {
+            rxError(p, "unexpected trailing characters");
+        }
         return -1;
     }
     return 0;
@@ -2325,6 +2422,209 @@ test "symbols_dfa_walk emits matched sym_ids" {
     const n2 = symbols_dfa_walk(d, dfa2, symTestCb, &ctx2);
     try std.testing.expectEqual(@as(c_long, 1), n2);
     try std.testing.expectEqual(@as(u64, 2), ctx2.sum);
+}
+
+// ─── anchor tests ─────────────────────────────────────────────────────────
+//
+// '^' / '$' are ANCHORS: accepted at the pattern's first/last character (where
+// they constrain nothing — the walk is already whole-name) and a loud parse
+// error anywhere else.  See the Anchors section next to rxAtCaret for why the
+// walker is already anchored, and for the pre-anchor measurements.
+
+const IdMask = struct {
+    mask: u64 = 0,
+    n: usize = 0,
+};
+
+fn idMaskCb(sym_id: u32, user: ?*anyopaque) callconv(.c) c_int {
+    const ctx: *IdMask = @ptrCast(@alignCast(user orelse return -1));
+    if (sym_id < 64) ctx.mask |= @as(u64, 1) << @intCast(sym_id);
+    ctx.n += 1;
+    return 0;
+}
+
+/// Compiled the pattern (asserting it parsed) and walked the symbol DAFSA,
+/// returning the matched sym_ids as a bitmask.
+fn maskFor(d: [*c]dc.dafsa, pat: [:0]const u8) !u64 {
+    const dfa = regex_compile(pat.ptr) orelse return error.CompileNull;
+    defer regex_dfa_free(dfa);
+    try std.testing.expect(dfa.*.errmsg == null);
+    var ctx = IdMask{};
+    _ = symbols_dfa_walk(d, dfa, idMaskCb, &ctx);
+    return ctx.mask;
+}
+
+fn idBit(id: u32) u64 {
+    return @as(u64, 1) << @intCast(id);
+}
+
+/// zzz(1) prezzz(2) zzzpost(3) zz(4) — the fixture every anchor case uses.
+fn anchorFixture() ![*c]dc.dafsa {
+    const d = dc.dafsa_create() orelse return error.OutOfMemory;
+    addSymKey(d, "zzz", 1);
+    addSymKey(d, "prezzz", 2); // CONTAINS zzz, does not start with it, ends with it
+    addSymKey(d, "zzzpost", 3); // STARTS with zzz, does not end with it
+    addSymKey(d, "zz", 4);
+    return d;
+}
+
+test "anchor: '^zzz$' matches the whole name (was 0 matches pre-anchor)" {
+    const d = try anchorFixture();
+    defer dc.dafsa_free(d);
+
+    try std.testing.expectEqual(idBit(1), try maskFor(d, "^zzz$"));
+    // The differential: an explicit whole-name anchor is exactly the
+    // unanchored literal, which the walker already matched whole-name.
+    try std.testing.expectEqual(try maskFor(d, "zzz"), try maskFor(d, "^zzz$"));
+    try std.testing.expectEqual(try maskFor(d, "zzz"), try maskFor(d, "^zzz"));
+    try std.testing.expectEqual(try maskFor(d, "zzz"), try maskFor(d, "zzz$"));
+}
+
+test "anchor: '^zz.*' matches names STARTING with zz only" {
+    const d = try anchorFixture();
+    defer dc.dafsa_free(d);
+
+    // prezzz(2) CONTAINS zz but does not start with it — it must be ABSENT,
+    // which is what makes the leading '^' observable at all.  ('zz' itself
+    // matches: '.*' takes zero bytes.)
+    try std.testing.expectEqual(idBit(1) | idBit(3) | idBit(4), try maskFor(d, "^zz.*"));
+    try std.testing.expectEqual(try maskFor(d, "zz.*"), try maskFor(d, "^zz.*"));
+}
+
+test "anchor: '.*zzz$' matches names ENDING with zzz only" {
+    const d = try anchorFixture();
+    defer dc.dafsa_free(d);
+
+    // zzzpost(3) STARTS with zzz but does not end with it — must be ABSENT.
+    try std.testing.expectEqual(idBit(1) | idBit(2), try maskFor(d, ".*zzz$"));
+    try std.testing.expectEqual(try maskFor(d, ".*zzz"), try maskFor(d, ".*zzz$"));
+}
+
+test "anchor: middle anchors are a loud parse error" {
+    const bad = [_][:0]const u8{
+        "a^b",   // '^' mid-pattern
+        "a$b",   // '$' mid-pattern
+        "$a",    // '$' not last
+        "a$$",   // second '$' is not last
+        "^a^",   // second '^' is not first
+        "a|^b",  // '^' inside a later alternative
+        "a$|b",  // '$' followed by another alternative
+        "(^a)",  // '^' inside a group
+        "(a$)",  // '$' inside a group
+        "[a]^b", // '^' after a class
+    };
+    for (bad) |pat| {
+        const dfa = regex_compile(pat.ptr) orelse return error.CompileNull;
+        defer regex_dfa_free(dfa);
+        try std.testing.expect(dfa.*.errmsg != null);
+        try std.testing.expectEqual(@as(u32, 0), dfa.*.n_states);
+        // The message must name the offending anchor, not just "parse error".
+        const msg = std.mem.span(dfa.*.errmsg.?);
+        try std.testing.expect(std.mem.indexOf(u8, msg, "anchor") != null);
+    }
+}
+
+test "anchor: escaped '\\^' / '\\$' stay literal bytes" {
+    const d = dc.dafsa_create() orelse return error.OutOfMemory;
+    defer dc.dafsa_free(d);
+    addSymKey(d, "a^b", 1);
+    addSymKey(d, "a$b", 2);
+    addSymKey(d, "ab", 3);
+    addSymKey(d, "$", 4);
+    addSymKey(d, "^", 5);
+
+    try std.testing.expectEqual(idBit(1), try maskFor(d, "a\\^b"));
+    try std.testing.expectEqual(idBit(2), try maskFor(d, "a\\$b"));
+    try std.testing.expectEqual(idBit(3), try maskFor(d, "ab"));
+    try std.testing.expectEqual(idBit(1) | idBit(2) | idBit(3), try maskFor(d, "a.*b"));
+
+    // Inside a class the pre-anchor meanings are unchanged: '$' is a literal
+    // byte and a LEADING '^' still negates.
+    try std.testing.expectEqual(idBit(4), try maskFor(d, "[$]"));
+    try std.testing.expectEqual(idBit(5), try maskFor(d, "[^$]"));
+
+    // Bare forms of the same text are anchors, so they are errors — that is
+    // the whole point: an anchor is never silently a literal.
+    for ([_][:0]const u8{ "a^b", "a$b" }) |pat| {
+        const dfa = regex_compile(pat.ptr) orelse return error.CompileNull;
+        defer regex_dfa_free(dfa);
+        try std.testing.expect(dfa.*.errmsg != null);
+    }
+}
+
+test "anchor: '^' '$' '^$' are the empty-name pattern" {
+    const d = dc.dafsa_create() orelse return error.OutOfMemory;
+    defer dc.dafsa_free(d);
+    addSymKey(d, "", 1); // an empty interned string is reachable (CSV "")
+    addSymKey(d, "a", 2);
+
+    for ([_][:0]const u8{ "^", "$", "^$" }) |pat| {
+        try std.testing.expectEqual(idBit(1), try maskFor(d, pat));
+    }
+}
+
+// The pre-anchor unanchored battery.  Expected masks were MEASURED on the
+// pre-anchor engine (CLI `dl pattern` over a store holding exactly these ten
+// names) and are pinned here so any change to unanchored matching fails the
+// suite — this is the "unchanged behaviour" differential.
+const UnanchoredCase = struct { pat: [:0]const u8, want: u64 };
+const unanchored_all: u64 = (idBit(1) | idBit(2) | idBit(3) | idBit(4) | idBit(5) |
+    idBit(6) | idBit(7) | idBit(8) | idBit(9) | idBit(10));
+const unanchored_cases = [_]UnanchoredCase{
+    .{ .pat = ".*", .want = unanchored_all },
+    .{ .pat = "zzz", .want = idBit(1) },
+    .{ .pat = "z.z", .want = idBit(1) },
+    .{ .pat = "[^z].*", .want = idBit(3) | idBit(5) | idBit(6) | idBit(7) | idBit(8) | idBit(9) | idBit(10) },
+    .{ .pat = "(zz|pre)zzz", .want = idBit(3) },
+    .{ .pat = "z+", .want = idBit(1) | idBit(2) },
+    .{ .pat = "z*", .want = idBit(1) | idBit(2) },
+    .{ .pat = "zzz.*", .want = idBit(1) | idBit(4) },
+    .{ .pat = ".*zzz", .want = idBit(1) | idBit(3) },
+    .{ .pat = ".*zzz.*", .want = idBit(1) | idBit(3) | idBit(4) },
+    .{ .pat = "a.*b", .want = idBit(6) },
+    .{ .pat = "[a-c].*", .want = idBit(5) | idBit(6) },
+    .{ .pat = ".+", .want = unanchored_all },
+    .{ .pat = "prezzz", .want = idBit(3) },
+    .{ .pat = "(p|z).*", .want = idBit(1) | idBit(2) | idBit(3) | idBit(4) },
+    .{ .pat = "doc[0-9]", .want = idBit(10) },
+    .{ .pat = "a|b", .want = 0 },
+    .{ .pat = "zz?", .want = idBit(2) },
+    .{ .pat = ".*zz*.*", .want = idBit(1) | idBit(2) | idBit(3) | idBit(4) | idBit(7) },
+    .{ .pat = "red fox", .want = idBit(9) },
+};
+
+fn unanchoredFixture() ![*c]dc.dafsa {
+    const d = dc.dafsa_create() orelse return error.OutOfMemory;
+    const names = [_][]const u8{ "zzz", "zz", "prezzz", "zzzpost", "abc", "a_b", "xyz", "hello", "red fox", "doc1" };
+    for (names, 1..) |nm, id| addSymKey(d, nm, @intCast(id));
+    return d;
+}
+
+test "anchor: unanchored patterns are byte-identical to the pre-anchor engine" {
+    const d = try unanchoredFixture();
+    defer dc.dafsa_free(d);
+    for (unanchored_cases) |cse| {
+        try std.testing.expectEqual(cse.want, try maskFor(d, cse.pat));
+    }
+}
+
+// The other half of the differential, and the one that FAILS on the pre-anchor
+// engine (every one of these 20 patterns matched NOTHING there): adding the
+// whole-name anchors a user would naturally write changes nothing.
+test "anchor: '^p$' == '^p' == 'p$' == 'p' over the unanchored battery" {
+    const d = try unanchoredFixture();
+    defer dc.dafsa_free(d);
+    for (unanchored_cases) |cse| {
+        var buf: [64]u8 = undefined;
+        const both = try std.fmt.bufPrintZ(&buf, "^{s}$", .{cse.pat});
+        try std.testing.expectEqual(cse.want, try maskFor(d, both));
+
+        const start_only = try std.fmt.bufPrintZ(&buf, "^{s}", .{cse.pat});
+        try std.testing.expectEqual(cse.want, try maskFor(d, start_only));
+
+        const end_only = try std.fmt.bufPrintZ(&buf, "{s}$", .{cse.pat});
+        try std.testing.expectEqual(cse.want, try maskFor(d, end_only));
+    }
 }
 
 test "symset add/contains roundtrip" {

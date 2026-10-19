@@ -115,6 +115,19 @@ primitives** (used by the raw-DAFSA engine tests), not as the `~` path.
   check `dfa->accept[rstate]`; if accepting, follow **exactly 4 edges** to read
   the payload and emit the id.
 
+### Anchors (`^` / `$`)
+
+Matching is **whole-name** by construction: the walk starts at the DAFSA root
+and never skips a byte, and `accept` is consulted only at the name's NUL
+transition — so every pattern is implicitly `^…$`. `^` as the pattern's first
+character and `$` as its last are therefore **accepted anchors and constrain
+nothing**; they exist so a user's anchor can never be silently lexed as a
+literal byte (which matched nothing). An anchor in any other position (`a^b`,
+`a$b`, `(^a)`, `a|^b`, `$a`) is a **loud parse error** — `dl: bad pattern`,
+exit 1; a `~` pattern atom prints the reason at compile time. `\^` / `\$` are
+the literal bytes, and inside `[...]` the old meanings still hold (leading `^`
+negates, `$` is literal).
+
 Validated `read_sym_id` helper (prototype, verified to reconstruct all ids):
 
 ```c

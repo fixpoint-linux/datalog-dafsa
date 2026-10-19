@@ -231,7 +231,10 @@ in { relations =
   (`dl_colspec_eq`) deliberately ignores them (a `Natural[1..10]` and a plain
   `Natural` are the SAME type). The loaders (`dlp check`/`build`) reject rows
   outside `[min,max]` and Text cells that fail the regex (full-key match,
-  implicit `^...$` — do not write anchors). `Signed` bounds are `Integer`
+  implicit `^...$`; an explicit leading `^` / trailing `$` is accepted and
+  equivalent, and an anchor anywhere else is a compile error — see
+  [datalog-dafsa-regex-on-symbols.md](datalog-dafsa-regex-on-symbols.md)).
+  `Signed` bounds are `Integer`
   literals and require an explicit sign (`Some -10` / `Some +10`); a bare `10`
   is `Natural`.
 - **Extensibility hook**: the union payload is reserved for future type

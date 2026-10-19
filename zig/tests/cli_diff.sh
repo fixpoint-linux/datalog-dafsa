@@ -158,6 +158,16 @@ build_corpus() {
     run_cmd "$out" c48 "$db" bound tc 1
     run_cmd "$out" c49 "$db" bound edge 1
     run_cmd "$out" c50 "$db" bound nosuchrel
+    # Anchors ('^' … '$').  NOTE the edge relation below holds RAW u32 ints,
+    # not interned strings, so `pattern edge '<anything>'` is "(no results)" by
+    # construction (the symbol DAFSA walk can only see interned names) — c56,
+    # c57 and r17 are NOT evidence about anchor handling.  c51-c55 exercise
+    # anchors where they are observable: observation's interned string columns.
+    run_cmd "$out" c51 "$db" pattern observation "^doc[12]$"
+    run_cmd "$out" c52 "$db" pattern observation "doc[12]"
+    run_cmd "$out" c53 "$db" pattern observation 1 "^.*barks$"
+    run_cmd "$out" c54 "$db" pattern observation "^doc1$"
+    run_cmd "$out" c55 "$db" pattern observation "doc^1"
     run_cmd "$out" c56 "$db" pattern edge "^[12]$"
     run_cmd "$out" c57 "$db" pattern edge 1 "^3$"
     run_cmd "$out" c58 "$db" pattern edge "^zzz$"
@@ -206,6 +216,8 @@ read_corpus() {
     run_cmd "$out" r13 "$db" query "tc(X,Y):-edge(X,Y)." tc
     run_cmd "$out" r14 "$db" bound tc 1
     run_cmd "$out" r17 "$db" pattern edge "^[12]$"
+    run_cmd "$out" r18 "$db" pattern observation "^doc[12]$"
+    run_cmd "$out" r19 "$db" pattern observation "doc^1"
     run_cmd "$out" r20 "$db" txn
 }
 
