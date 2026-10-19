@@ -13,9 +13,11 @@
 //! byte-identical extern structs in compiler.zig; `vm_override` is defined
 //! here (the body-atom override the semi-naive cascade builds per join).  `struct dl_db`/
 //! `rel_entry`/`perm_index_entry` and every C function (`rel_*`, `term_*`,
-//! `intern_*`, `dl_iter_*`, `permindex_*`, `symset_*`, `symbols_dfa_walk`,
+//! `intern_*`, `dl_iter_*`, `permindex_*`, `symset_*`,
 //! `db_rel_at_arity_*`, `db_has_*`) are consumed through @cImport
-//! ("dl_internal.h"), NOT redefined.  `tuple_set` is tupleset.zig's extern
+//! ("dl_internal.h"), NOT redefined.  The `~` / `~~` symbol set is matched by
+//! regexwalk.zig's symbolsScanTable (a linear scan of the interner's names),
+//! not by the forward-DAFSA walkers.  `tuple_set` is tupleset.zig's extern
 //! struct (the only type that must cross the opaque<->native boundary).
 //!
 //! Oracle: src/vm.c (never modified).  All allocation goes through libc
@@ -693,7 +695,11 @@ fn execRange(
                     ip = end;
                     break :blk;
                 }
-                const ns = regexwalk.symbols_dfa_walk(@ptrCast(@alignCast(intern.intern_fwd(@ptrCast(@alignCast(db.ir))))), dfa, symsetAddCb, &set);
+                // The symbol set comes from a linear scan of the live
+                // interner's names (regexwalk.symbolsScanTable), the same
+                // matcher dl_pattern uses: no forward DAFSA is materialized
+                // for a `~` / `~~` atom any more.
+                const ns = regexwalk.symbolsScanTable(db.ir, intern.liveSymBound(db.ir), dfa, symsetAddCb, &set);
                 if (ns < 0) {
                     regexwalk.symset_free(&set);
                     ip = end;

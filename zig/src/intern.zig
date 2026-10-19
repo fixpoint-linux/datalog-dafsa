@@ -3,8 +3,24 @@
 //! Forward map: DAFSA keyed  utf8_bytes \0 sym_id_u32BE  — a pure DERIVED
 //! cache of the reverse array (the source of truth); it is never persisted
 //! (intern_save writes only symbols.array) and rebuilt lazily from rev[].
-//! Reverse map: growable array of strdup'd char*, indexed by sym_id-1.
+//! Reverse map: growable array of strdup'd char* (rev[sym_id-1]).
 //! Sym ids are 1-based; 0 = not-found sentinel.
+//!
+//! WHO ACTUALLY WANTS THE FORWARD DAFSA (as of the ensureFwd-cliff unit): no
+//! READ path.  `dl pattern`, the `~` / `~~` rule atoms and version-pattern
+//! queries match names with a linear scan over rev[] driven by the compiled
+//! regex DFA (regexwalk.zig symbolsScanTable), which MEASURED ~20-40 ms at
+//! 166k symbols (including a 166k-name strlen pass) against ensureFwd's
+//! 6-9 µs/symbol.  The remaining callers are
+//!   - intern_fwd (dl.zig publishDerivedDafsa): the DL_PUB_DERIVED=1 opt-in
+//!     serializes the forward DAFSA into a snapshot — a derived artifact
+//!     nothing in the engine reads, kept for an external consumer;
+//!   - intern_fwd_mutable (index.zig): the full-text index rebuild interns
+//!     thousands of tokens and grows the DAFSA IN PLACE instead of paying a
+//!     rev[] scan per token (index.zig:994).
+//! Both are off the read path, so neither can put ensureFwd in front of a
+//! query.  Cutting the index-rebuild one would need a string→id hash index
+//! (the scan it replaces is O(symbols) per interned token).
 //!
 //! Strangler-hybrid ABI: `struct interner` is OPAQUE to C (intern.h only
 //! forward-declares it), so the implementation is a native Zig struct; every

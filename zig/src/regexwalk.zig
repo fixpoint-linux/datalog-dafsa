@@ -14,6 +14,10 @@
 //!      (utf8 \0 u32BE) and emit sym_ids; the symbol walkers are ITERATIVE
 //!      (explicit heap stack, MAX_WORD_LEN frames) so deep symbol DAFSAs can
 //!      never overflow the C stack.
+//!   4. symbolsScanTable — the symbol matcher the ENGINE READ PATH uses: the
+//!      same DFA, run over each interned NAME linearly (no DAFSA is built for
+//!      a query any more).  It is Zig-only (not part of the C ABI) and is
+//!      checked against symbols_dfa_walk by the tests below.
 //!
 //! Strangler-hybrid ABI: `regex_dfa` and `sym_set` are CONCRETE C structs
 //! (src/regexwalk.h) dereferenced by still-C code (relation.c→relation.zig's
@@ -2269,6 +2273,127 @@ pub export fn symbols_dfa_walk_view(v: [*c]const dc.dafsa_view, dfa: [*c]const r
     return ctx.count;
 }
 
+// ─── Linear symbol-table scan (the symbol matcher the READ PATH uses) ──────
+
+/// Zig-internal (NOT a C export — the ABI surface regexwalk.h pins is
+/// unchanged): the interner's id → name map, reached by name so this module
+/// needs no knowledge of `struct interner`'s layout (intern.h leaves it
+/// opaque).  Declared here for the same reason dl.zig declares it.
+extern "c" fn intern_str_of(ir: ?*anyopaque, sym_id: u32) ?[*:0]const u8;
+
+/// Longest name a symbol can hold (intern.zig's MAX_WORD_LEN cap is on the
+/// key `name \0 id_u32BE`, so a name is at most 65536 - 5 bytes).  The DAFSA
+/// walk's depth guard uses the same constant; the scan needs no guard (it
+/// walks whatever the interner holds) but states the bound the two share.
+const SYMBOL_NAME_MAX: usize = MAX_WORD_LEN;
+
+/// long symbolsScanTable(interner *ir, uint32_t bound, const regex_dfa *dfa,
+///                        sym_walk_cb cb, void *user)
+///
+/// The symbol matcher of the READ PATH: run `dfa` over every interned name,
+/// ids 1 .. bound-1, and emit the id of each name that matches.  `bound` is
+/// the interner's live id bound (intern.zig liveSymBound: next_id, i.e. one
+/// past the last id ever handed out).
+///
+/// WHY A SCAN AND NOT A DAFSA WALK.  symbols_dfa_walk is the product DFS over
+/// the forward DAFSA, and MATERIALIZING that DAFSA (intern.zig ensureFwd) is
+/// what the read path paid on its first pattern query in a process.  The
+/// forward DAFSA has exactly one job here, and the scan does it directly over
+/// the interner's reverse array (intern_str_of), which is already in memory.
+///
+/// MEASURED (this host, ReleaseFast, one cold process per query, `dl` CLI):
+///
+///   ensureFwd alone (isolated via the C ABI): 0.79-1.05 s at 166,745
+///   symbols and 4.4 s at 500,000 — 6.3 / 8.8 µs per symbol.
+///   `dl pattern` (VERSION path, whole command incl. open + array parse):
+///     166,746 symbols   0.898 s / 422 MB RSS  ->  0.125 s / 69 MB
+///     166,746 random    1.248 s / 520 MB      ->  0.053 s / 71 MB
+///     500,000 symbols   5.221 s / 1901 MB     ->  0.177 s / 112 MB
+///   live `~` atom (OP_WALK):  0.839 s / 414 MB -> 0.059 s / 61 MB  (166k)
+///                             4.899 s / 1874 MB -> 0.136 s / 85 MB (500k)
+///   `~~` atom (lev automaton): 0.710 s / 365 MB -> 0.036 s / 13 MB  (166k)
+///                              4.226 s / 1826 MB -> 0.088 s / 30 MB (500k)
+///
+/// The scan's own share of that is small and pattern-shaped — every name dies
+/// at its first non-conforming byte, so `handoff-.*` over 500k names costs
+/// ~0.13 s INCLUDING the ~0.06 s process open and the ~0.055 s snapshot-array
+/// parse, while `.*` (which runs every name to its end) costs ~0.20 s.
+///
+/// NOTE ON THE 60 µs/symbol FIGURE carried in this engine's earlier records
+/// (10-19 s at 166k on the agent-memory store): it is ~7-10x the per-symbol
+/// cost that reproduces on this host for the same operation.  The figures
+/// above are this host's measurements, not a re-derivation of that record;
+/// on a machine where the record's constant does hold, the before-numbers
+/// scale up by that factor and the after-numbers do not move (the scan never
+/// builds a DAFSA).
+///
+/// SEMANTICS — identical to symbols_dfa_walk's accept test, which is the
+/// whole contract:
+///   * the DFA starts in state 0 (the walk's `symProdViewDfs(.., rstate 0)`);
+///   * name bytes are fed in order; a byte whose transition is DFA_DEAD ends
+///     that candidate with no match (the walk never descends such an edge,
+///     and DFA_DEAD is absorbing, so the name cannot match later either);
+///   * the accept test is made ONLY at the end of the NAME — the walk's
+///     `sym == 0x00` edge out of the name's node, i.e. the `accept[]` check
+///     happens at end-of-name and nowhere else.  Patterns are therefore
+///     implicitly whole-name anchored exactly as they were: `^` and `$` are
+///     accepted-and-inert (94fd4f7), `zzz.*` matches names STARTING with zzz,
+///     `.*zzz` names ENDING with zzz, and there is no middle anchor.
+///   * a name of length 0 (the interner can hold one) is a candidate like any
+///     other: the loop body runs zero times and accept[0] decides.
+///   * a null name — an id consumed by a failed strdup at intern time — is
+///     SKIPPED, exactly as ensureFwd skips it (such an id is not in the DAFSA
+///     either, so the walk could not report it).
+///   * dfa.n_states == 0 (regex_compile failed / empty pattern) matches
+///     NOTHING: symbols_dfa_walk returns 0 without walking, and answering
+///     "everything matched" would be the opposite of its contract.
+///
+/// THE ONE STATED DIFFERENCE from the walk: a symbols.array that holds the
+/// SAME name twice under two ids (only reachable with a hand-edited array —
+/// intern_str dedupes and ensureFwd's key carries the id) is reported once
+/// per id by the scan, while the walk's readSymId rejects a payload node with
+/// two outgoing edges and reports NEITHER.  Matching rows are unaffected: both
+/// ids name the same string, and the scan is the one that agrees with the
+/// snapshot's own array.
+///
+/// Returns the number of ids emitted (or -1 on NULL ir/dfa/cb or a malformed
+/// dfa).  A callback returning nonzero stops the scan, and the count so far
+/// is returned — the same early-stop contract as the walkers above.
+pub fn symbolsScanTable(
+    ir: ?*anyopaque,
+    bound: u32,
+    dfa: [*c]const regex_dfa,
+    cb: SymWalkCb,
+    user: ?*anyopaque,
+) c_long {
+    if (ir == null or dfa == null or cb == null) return -1;
+    if (dfa.*.n_states == 0) return 0;
+    const trans = dfa.*.trans orelse return -1;
+    const accept = dfa.*.accept orelse return -1;
+
+    var count: c_long = 0;
+    var id: u32 = 1;
+    while (id < bound) : (id += 1) {
+        const name = intern_str_of(ir, id) orelse continue;
+        const len = strlen(@ptrCast(name));
+        if (len > SYMBOL_NAME_MAX) continue; // unreachable: intern caps names
+        var rs: u32 = 0;
+        var alive = true;
+        var i: usize = 0;
+        while (i < len) : (i += 1) {
+            rs = trans[@as(usize, rs) * 256 + @as(usize, name[i])];
+            if (rs == DFA_DEAD) {
+                alive = false;
+                break;
+            }
+        }
+        if (!alive or accept[@intCast(rs)] == 0) continue;
+        count +%= 1;
+        if (cb.?(id, user) != 0) break;
+    }
+    return count;
+}
+
 // ─── Tests ─────────────────────────────────────────────────────────────────
 
 const WalkTestCtx = struct {
@@ -2627,6 +2752,169 @@ test "anchor: '^p$' == '^p' == 'p$' == 'p' over the unanchored battery" {
     }
 }
 
+// ─── symbolsScanTable: the read path's matcher, checked against the walk ───
+
+// Test-only interner bindings (intern.zig exports these; the scan reaches the
+// interner by name — see intern_str_of above — so the module graph is
+// unchanged and regexwalk.zig still knows nothing about struct interner).
+extern "c" fn intern_create() ?*anyopaque;
+extern "c" fn intern_str(ir: ?*anyopaque, str: [*:0]const u8) u32;
+extern "c" fn intern_free(ir: ?*anyopaque) void;
+
+/// The names of unanchoredFixture/unanchored_cases, in id order (id i+1).
+const unanchored_names = [_][*:0]const u8{
+    "zzz", "zz", "prezzz", "zzzpost", "abc", "a_b", "xyz", "hello", "red fox", "doc1",
+};
+
+/// Intern `names` into a fresh interner; returns it with *bound = next id.
+fn internerOf(names: []const [*:0]const u8, bound: *u32) !?*anyopaque {
+    const ir = intern_create() orelse return error.OutOfMemory;
+    for (names) |nm| {
+        if (intern_str(ir, nm) == 0) {
+            intern_free(ir);
+            return error.InternFailed;
+        }
+    }
+    bound.* = @intCast(names.len + 1);
+    return ir;
+}
+
+/// The production scan's answer, in the same id-bitmask form maskFor returns
+/// for the DAFSA walk.
+fn scanMaskFor(ir: ?*anyopaque, bound: u32, pat: [:0]const u8) !u64 {
+    const dfa = regex_compile(pat.ptr) orelse return error.CompileNull;
+    defer regex_dfa_free(dfa);
+    try std.testing.expect(dfa.*.errmsg == null);
+    var ctx = IdMask{};
+    _ = symbolsScanTable(ir, bound, dfa, idMaskCb, &ctx);
+    return ctx.mask;
+}
+
+test "symbolsScanTable: byte-identical to the DAFSA walk over the pinned battery" {
+    // THE DIFFERENTIAL for the read path: every pinned unanchored case must
+    // give the scan the mask the WALK gives it AND the mask MEASURED on the
+    // pre-anchor engine (unanchored_cases' wants).  The walk arm is the
+    // reference semantics; the pinned wants are the historical ones.
+    const d = try unanchoredFixture();
+    defer dc.dafsa_free(d);
+    var bound: u32 = 0;
+    const ir = try internerOf(&unanchored_names, &bound);
+    defer intern_free(ir);
+
+    var patbuf: [64]u8 = undefined;
+    for (unanchored_cases) |cse| {
+        const walk = try maskFor(d, cse.pat);
+        const scan = try scanMaskFor(ir, bound, cse.pat);
+        try std.testing.expectEqual(walk, scan);
+        try std.testing.expectEqual(cse.want, scan);
+    }
+
+    // …and the anchor forms of every case, which is where whole-name anchoring
+    // would break if the scan accepted anywhere but at the end of the name.
+    for (unanchored_cases) |cse| {
+        const both = try std.fmt.bufPrintZ(&patbuf, "^{s}$", .{cse.pat});
+        const start_only = try std.fmt.bufPrintZ(&patbuf, "^{s}", .{cse.pat});
+        const end_only = try std.fmt.bufPrintZ(&patbuf, "{s}$", .{cse.pat});
+        try std.testing.expectEqual(try maskFor(d, both), try scanMaskFor(ir, bound, both));
+        try std.testing.expectEqual(try maskFor(d, start_only), try scanMaskFor(ir, bound, start_only));
+        try std.testing.expectEqual(try maskFor(d, end_only), try scanMaskFor(ir, bound, end_only));
+    }
+}
+
+test "symbolsScanTable: empty name, non-ASCII bytes, escapes, prefixes" {
+    // The names the battery above cannot reach: an EMPTY interned name, bytes
+    // >= 0x80, a name that is a strict prefix of another, an embedded newline
+    // and an embedded backslash (intern_save's escaped forms), a byte that is
+    // not valid UTF-8, and a 400-byte name.  Ids are the order below, so the
+    // pinned masks are tiny and checkable by hand.
+    var longbuf: [401:0]u8 = undefined;
+    @memset(longbuf[0..400], 'q');
+    longbuf[400] = 0;
+    const names = [_][*:0]const u8{
+        "", // 1  — the empty name (a CSV "" interns it)
+        "a", // 2
+        "\u{00fc}n\u{00ef}code", // 3  — ünïcode
+        "caf\u{00e9}-x", // 4
+        "handle", // 5  — a strict prefix of...
+        "handler", // 6  — ...this
+        "line1\nline2", // 7  — embedded newline
+        "back\\slash", // 8  — one backslash byte
+        @ptrCast(&longbuf), // 9  — 400 'q's
+        "\xff-z", // 10 — not valid UTF-8
+        "midfile", // 11
+        "abc-midfile-xyz", // 12
+    };
+
+    const d = dc.dafsa_create() orelse return error.OutOfMemory;
+    defer dc.dafsa_free(d);
+    for (names, 1..) |nm, id| addSymKey(d, std.mem.span(nm), @intCast(id));
+
+    var bound: u32 = 0;
+    const ir = try internerOf(&names, &bound);
+    defer intern_free(ir);
+    try std.testing.expectEqual(@as(u32, names.len + 1), bound);
+
+    // Every pattern: the scan must answer exactly what the walk answers.
+    const pats = [_][:0]const u8{
+        "^$",               "^",                  "$",
+        ".*",               ".",                  "a",
+        "a|b",              "midfile",            ".*midfile",
+        "midfile.*",        ".*midfile.*",        "abc.*xyz",
+        "handle",           "handler",            "handle.*",
+        ".*andle",          "q*",                 "q+",
+        ".*1.*",            "line1.line2",        "back\\\\slash",
+        "\xc3\xbc.*",     "caf\xc3\xa9-x",    "\xff-z",
+        "[\x80-\xff].*",  "^q+$",               ".*zzz.*",
+    };
+    for (pats) |p| {
+        try std.testing.expectEqual(try maskFor(d, p), try scanMaskFor(ir, bound, p));
+    }
+
+    // Pins, so the differential is not the only thing holding the scan down:
+    // the empty name is matched ONLY by the empty-name pattern, 'q*' spans the
+    // empty name and the 400-q name, and whole-name anchoring is visible in
+    // every middle-anchored-free row.
+    try std.testing.expectEqual(idBit(1), try scanMaskFor(ir, bound, "^$"));
+    try std.testing.expectEqual(idBit(1), try scanMaskFor(ir, bound, "^"));
+    try std.testing.expectEqual(idBit(1), try scanMaskFor(ir, bound, "$"));
+    try std.testing.expectEqual(idBit(1) | idBit(9), try scanMaskFor(ir, bound, "q*"));
+    try std.testing.expectEqual(idBit(9), try scanMaskFor(ir, bound, "q+"));
+    try std.testing.expectEqual(idBit(2), try scanMaskFor(ir, bound, "a"));
+    try std.testing.expectEqual(idBit(5), try scanMaskFor(ir, bound, "handle"));
+    try std.testing.expectEqual(idBit(5) | idBit(6), try scanMaskFor(ir, bound, "handle.*"));
+    try std.testing.expectEqual(idBit(11), try scanMaskFor(ir, bound, ".*midfile"));
+    try std.testing.expectEqual(idBit(11) | idBit(12), try scanMaskFor(ir, bound, ".*midfile.*"));
+    try std.testing.expectEqual(idBit(3), try scanMaskFor(ir, bound, "\xc3\xbc.*"));
+    try std.testing.expectEqual(idBit(4), try scanMaskFor(ir, bound, "caf\xc3\xa9-x"));
+    try std.testing.expectEqual(idBit(7), try scanMaskFor(ir, bound, "line1.line2"));
+    try std.testing.expectEqual(idBit(8), try scanMaskFor(ir, bound, "back\\\\slash"));
+    try std.testing.expectEqual(idBit(10), try scanMaskFor(ir, bound, "\xff-z"));
+    try std.testing.expectEqual(
+        idBit(3) | idBit(10),
+        try scanMaskFor(ir, bound, "[\x80-\xff].*"),
+    );
+    var all: u64 = 0;
+    var id: u32 = 1;
+    while (id <= names.len) : (id += 1) all |= idBit(id);
+    try std.testing.expectEqual(all, try scanMaskFor(ir, bound, ".*"));
+
+    // The EMPTY PATTERN is a compile error (regex_compile: "empty pattern"), and
+    // n_states == 0 must mean "matches nothing" on BOTH mechanisms — never
+    // "everything matched".
+    {
+        const dfa = regex_compile("") orelse return error.CompileNull;
+        defer regex_dfa_free(dfa);
+        try std.testing.expect(dfa.*.errmsg != null);
+        try std.testing.expectEqual(@as(u32, 0), dfa.*.n_states);
+        var ctx = IdMask{};
+        try std.testing.expectEqual(@as(c_long, 0), symbolsScanTable(ir, bound, dfa, idMaskCb, &ctx));
+        try std.testing.expectEqual(@as(u64, 0), ctx.mask);
+        var wctx = IdMask{};
+        try std.testing.expectEqual(@as(c_long, 0), symbols_dfa_walk(d, dfa, idMaskCb, &wctx));
+        try std.testing.expectEqual(@as(u64, 0), wctx.mask);
+    }
+}
+
 test "symset add/contains roundtrip" {
     var s: sym_set = undefined;
     try std.testing.expectEqual(@as(c_int, 0), symset_init(&s));
@@ -2642,6 +2930,7 @@ test "symset add/contains roundtrip" {
     try std.testing.expectEqual(@as(c_int, 0), symset_contains(&s, 6));
     try std.testing.expectEqual(@as(c_int, 0), symset_contains(&s, 0));
 }
+
 
 // ─── lev_compile tests ─────────────────────────────────────────────────────
 

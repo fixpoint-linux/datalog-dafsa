@@ -441,7 +441,6 @@ extern "c" fn permindex_free_all(db: ?*DlDb) void;
 
 // regexwalk.zig — symbol walkers take regexwalk.zig's private dafsa types.
 extern "c" fn symbols_dfa_walk(d: ?*const anyopaque, dfa: ?*const regexwalk.regex_dfa, cb: regexwalk.SymWalkCb, user: ?*anyopaque) c_long;
-extern "c" fn symbols_dfa_walk_view(v: ?*const anyopaque, dfa: ?*const regexwalk.regex_dfa, cb: regexwalk.SymWalkCb, user: ?*anyopaque) c_long;
 
 // util.zig.
 extern "c" fn atomic_write_str(path: [*c]const u8, content: [*c]const u8) c_int;
@@ -2983,11 +2982,13 @@ pub export fn dl_intern_str_version(db: ?*DlDb, version: u32, str: [*c]const u8,
     if (str == null or version == 0) return -1;
     const ir = snapshotInterner(d, version) orelse return -1;
     // NON-MUTATING: intern_str_find's lookup never allocates a symbol.  It uses
-    // the forward DAFSA only if this cached interner already has one current
-    // (a VERSION pattern query built it), else the rev[] scan — deliberately
-    // NOT intern_fwd(): materializing the DAFSA for a handful of query terms is
-    // the cost that made dl_fuzzy_lookup drop it (MEASURED 10-19 s at 166k
-    // symbols), while the scan is O(symbols) strcmp per term.
+    // the forward DAFSA only if this cached interner already has one current —
+    // which nothing in the read path materializes any more (a VERSION pattern
+    // query scans the array now, see snapshotSymSet), so in practice this is
+    // always the rev[] scan.  Deliberately NOT intern_fwd(): materializing the
+    // DAFSA for a handful of query terms is the cost that made
+    // dl_fuzzy_lookup drop it (MEASURED 10-19 s at 166k symbols), while the
+    // scan is O(symbols) strcmp per term.
     out.* = intern_str_find(ir, str);
     return 0;
 }
@@ -4540,9 +4541,11 @@ fn consolidateInner(d: *DlDb) c_int {
 // ─── Derived-file publish opt-in ───────────────────────────────────────────
 //
 // DL_PUB_DERIVED=1 makes publish persist <snapshot>/symbols.dafsa again (the
-// pre-2026-08 behaviour), for a snapshot that must answer a pattern query with
-// no live interner of its own.  Zero overhead when unset (one getenv at the
-// first publish); OFF is the default.  Motivated in the 4a block comment of
+// pre-2026-08 behaviour).  Nothing in the ENGINE reads it: the version pattern
+// path scans the snapshot's symbols.array (snapshotSymSet), so the file is
+// produced for an external consumer that wants the key set as a DAFSA and has
+// no interner.  Zero overhead when unset (one getenv at the first publish);
+// OFF is the default.  Motivated in the 4a block comment of
 // materializeSnapshot: the file is a pure derived cache of symbols.array, and
 // re-serializing it on every vocabulary change was the entire cost of a
 // content write.
@@ -4575,9 +4578,9 @@ fn pubDerivedForce(on: bool) void {
 /// makes the byte comparison a tautology — skip reading 44 MB to prove it.
 /// Returns 0 on success, -1 on failure.
 fn publishDerivedDafsa(d: *DlDb, rev: *[4096:0]u8, fwd: *[4096:0]u8, prev_snap_dir: [*c]const u8, rev_inherited: bool) c_int {
-    // Test hook: this file is the one optional publish product, and it is the
-    // reason the read path has two sources, so its failure path needs to be
-    // reachable deterministically (a full filesystem is not).
+    // Test hook: this file is the one optional publish product, and its
+    // failure path needs to be reachable deterministically (a full filesystem
+    // is not).
     if (d.fault_hook) |hook| {
         if (hook(DL_FPOINT_DERIVED_SAVE, d.fault_user) != 0) return -1;
     }
@@ -4666,35 +4669,32 @@ fn materializeSnapshot(d: *DlDb) c_int {
     // The forward DAFSA is a PURE DERIVED CACHE of symbols.array: nothing ever
     // reads <snapshot>/symbols.dafsa as the source of truth (intern_load builds
     // the interner from symbols.array alone and ensureFwd rebuilds the forward
-    // DAFSA from it — intern.zig), and the only consumer of the file is the
-    // mmap'd pattern/regex walk, whose key set the array already determines.
-    // Publishing it therefore buys a read-path convenience (no rebuild) at the
-    // cost of re-serializing every state on any vocabulary change:
+    // DAFSA from it — intern.zig), and NO READ PATH reads the file at all any
+    // more: dl_pattern's version route scans the snapshot's symbols.array
+    // directly (snapshotSymSet), so the file's last consumer is gone.
+    // Publishing it therefore buys nothing and costs a full re-serialization
+    // of every state on any vocabulary change:
     //
     // MEASURED (agent store: 166,745 symbols, 44 MB array): a publish that
-    // interns ONE new symbol pays 11.7 s ensureFwd rebuild + 17.5 s dafsa_save
-    // ≈ 298 MB, which at ~0.3 s of actual query work is the entire cost of a
-    // content write — and every new agent-memory node adds symbols, so every
-    // content write paid it.  The snapshot's own copy was never consulted on a
-    // publishing process (the live in-memory map answers identically; see
-    // snapshotSymSet), so the default is: DO NOT PERSIST IT.
+    // interns ONE new symbol pays a 11.7 s ensureFwd rebuild + 17.5 s
+    // dafsa_save ≈ 298 MB, which at ~0.3 s of actual query work is the entire
+    // cost of a content write — and every new agent-memory node adds symbols,
+    // so every content write paid it.  The snapshot's own copy was never
+    // consulted on a publishing process (the live in-memory map answers
+    // identically; see snapshotSymSet), so the default is: DO NOT PERSIST IT.
     //
-    // What still reads it: the VERSION pattern path of a process that did not
-    // build the snapshot (old snapshots, and any snapshot published with
-    // DL_PUB_DERIVED=1 — see below).  Those snapshots keep working: the file is
-    // untouched where it exists and read exactly as before, and where it is
-    // absent dl_pattern falls back to the live in-memory forward map.
-    //
-    // DL_PUB_DERIVED=1 restores the old behaviour for a deliberate
-    // self-contained read-only snapshot (one that can answer a pattern query
-    // without any live interner).  The old hardlink gate lives there: when the
-    // freshly serialized array is byte-identical to the previous snapshot's,
-    // that snapshot's two files already describe the same key set (a DAFSA of
-    // the same keys is answer-equivalent even if a fresh save would number its
-    // states in another order — dafsa_view surfaces keys, never state ids), so
-    // the pair is hardlinked instead of re-serialized.  Snapshot files are
-    // immutable once renamed into place (only rmRf unlinks them), so the links
-    // are safe exactly as relSaveGated's are.
+    // DL_PUB_DERIVED=1 still produces the file for an EXTERNAL consumer (a
+    // tool that wants the key set as a DAFSA and has no interner of its own —
+    // dl_abi still exports dafsa_view/the walkers; NO engine code path reads
+    // <snapshot>/symbols.dafsa any more).
+    // The old hardlink gate lives there: when the freshly serialized array is
+    // byte-identical to the previous snapshot's, that snapshot's two files
+    // already describe the same key set (a DAFSA of the same keys is
+    // answer-equivalent even if a fresh save would number its states in
+    // another order — dafsa_view surfaces keys, never state ids), so the pair
+    // is hardlinked instead of re-serialized.  Snapshot files are immutable
+    // once renamed into place (only rmRf unlinks them), so the links are safe
+    // exactly as relSaveGated's are.
     {
         var fwd: [4096:0]u8 = undefined;
         var rev: [4096:0]u8 = undefined;
@@ -5350,9 +5350,10 @@ fn symsetAddCb(sym_id: u32, user: ?*anyopaque) callconv(.c) c_int {
 /// process pays the array read once per version it reads.
 ///
 /// TWO READERS SHARE IT, which is why it is one function: the VERSION pattern
-/// path (snapshotSymSet, when that snapshot has no symbols.dafsa) and VERSION
-/// term interning (dl_intern_str_version).  Both need the mapping "id → the
-/// string THIS snapshot means by it", and neither may use the live interner.
+/// path (snapshotSymSet, which scans this table with the compiled regex DFA)
+/// and VERSION term interning (dl_intern_str_version).  Both need the mapping
+/// "id → the string THIS snapshot means by it", and neither may use the live
+/// interner.
 ///
 /// Returns null when the snapshot's array is missing or unreadable; every
 /// caller turns that into an explicit ERROR.  A damaged snapshot is not an
@@ -5388,11 +5389,21 @@ fn snapshotInterner(d: *DlDb, version: u32) ?*anyopaque {
     return ir;
 }
 
-/// Symbol set for a VERSION pattern query: walk the snapshot's own derived
-/// symbols.dafsa when it is present (every snapshot published before the
-/// derived file stopped being written, plus anything published with
-/// DL_PUB_DERIVED=1), otherwise build the map from that SAME snapshot's
-/// symbols.array.
+/// Symbol set for a VERSION pattern query: scan that SNAPSHOT's own
+/// symbols.array (via snapshotInterner) and match each of its names with the
+/// compiled regex DFA.
+///
+/// NO DAFSA, IN EITHER FORM.  This used to prefer <snapshot>/symbols.dafsa
+/// (mmap'd, symbols_dfa_walk_view) when a snapshot carried one, and otherwise
+/// materialize a forward DAFSA from the array (intern_fwd → ensureFwd, the
+/// once-per-process rebuild: MEASURED 6.3 µs/symbol here, 8.8 µs at 500k, and
+/// recorded at ~60 µs/symbol on the agent store).  Both routes are gone: the
+/// array IS the vocabulary, parsing it costs ~19 ms at 166k symbols
+/// (MEASURED) and scanning it costs ~20-40 ms, so materializing a 0.4-3.7 GB
+/// index for one query was never the cheaper half.  A snapshot's
+/// symbols.dafsa is now never read here — DL_PUB_DERIVED=1 still WRITES one,
+/// for a consumer that wants the file (dl_abi still exports the walkers), but
+/// no read path needs it.
 ///
 /// WHAT SOUNDNESS REQUIRES HERE.  dl_pattern filters BY SYM-ID
 /// (view_filter_col): the map decides which ids are in the set, and the rows
@@ -5423,26 +5434,20 @@ fn snapshotInterner(d: *DlDb, version: u32) ?*anyopaque {
 /// discipline holding (an old store, a restored/copied root array, a crashed
 /// process).
 ///
-/// Cost: one symbols.array read + the same ensureFwd rebuild the live path
-/// paid, cached per snapshot version (so repeated queries pay it once).  A
-/// process that publishes AND issues a VERSION pattern query then holds two
-/// forward maps (the live one and this one); sharing the live map is exactly
-/// the assumption that broke, and proving the two maps agree for every id a
-/// snapshot references costs a full array comparison on every query.
+/// Cost: one symbols.array read (MEASURED ~19 ms for 166k symbols, ~55 ms for
+/// 500k) + one linear scan, cached per snapshot version (so repeated queries
+/// pay it once).  A process that publishes AND issues a VERSION pattern query
+/// then holds two symbol tables (the live one and this one); sharing the live
+/// map is exactly the assumption that broke, and proving the two maps agree
+/// for every id a snapshot references costs a full array comparison on every
+/// query.
 fn snapshotSymSet(d: *DlDb, version: u32, dfa: ?*const regexwalk.regex_dfa, set: *regexwalk.sym_set) c_long {
     if (d.dir == null) return -1;
-    var sym_path: [16384:0]u8 = undefined;
-    _ = snprintf(&sym_path, 16384, "%s/snapshots/%u/symbols.dafsa", d.dir.?, version);
-    if (dc.dafsa_view_open(&sym_path)) |v| {
-        defer dc.dafsa_view_close(v);
-        return symbols_dfa_walk_view(@ptrCast(v), dfa, symsetAddCb, set);
-    }
-    // A snapshot without symbols.dafsa normally has symbols.array; a missing
-    // one is a damaged store, not an empty vocabulary — say so instead of
-    // answering "no symbols match" from an empty interner.
+    // A snapshot without symbols.array is a damaged store, not an empty
+    // vocabulary — say so instead of answering "no symbols match" from an
+    // empty interner.
     const sir = snapshotInterner(d, version) orelse return -1;
-    const fwd = intern_fwd(sir) orelse return -1;
-    return symbols_dfa_walk(@ptrCast(fwd), dfa, symsetAddCb, set);
+    return regexwalk.symbolsScanTable(sir, intern_mod.liveSymBound(sir), dfa, symsetAddCb, set);
 }
 
 pub export fn dl_pattern(db: ?*DlDb, rel_name: [*c]const u8, col: u8, dfa: ?*const regexwalk.regex_dfa, cb: DlTupleCb, user: ?*anyopaque) c_long {
@@ -5504,13 +5509,17 @@ pub export fn dl_pattern(db: ?*DlDb, rel_name: [*c]const u8, col: u8, dfa: ?*con
         return n;
     }
 
-    // In-memory path
+    // In-memory path.  The symbol set comes from the SAME linear scan the
+    // VERSION path uses (regexwalk.symbolsScanTable over the live interner):
+    // no forward DAFSA is materialized for a pattern query any more, so the
+    // first pattern query in a process no longer pays ensureFwd's
+    // per-symbol rebuild (see symbolsScanTable's doc).
     const idx = findRel(d, rel_name);
     if (idx < 0) return -1;
 
     var set: regexwalk.sym_set = std.mem.zeroes(regexwalk.sym_set);
     if (regexwalk.symset_init(&set) != 0) return -1;
-    const ns = symbols_dfa_walk(@ptrCast(intern_fwd(d.ir)), dfa, symsetAddCb, &set);
+    const ns = regexwalk.symbolsScanTable(d.ir, intern_mod.liveSymBound(d.ir), dfa, symsetAddCb, &set);
     if (ns < 0) {
         regexwalk.symset_free(&set);
         return -1;
