@@ -1722,7 +1722,41 @@ fn nonrecRuleSettled(cr: *const compiler.compiled_rule, written: u64, variadic: 
     return true;
 }
 
+/// Stable permutation of `rules` into STRATUM order (source order preserved
+/// inside a stratum).  This is what makes stratified negation order-invariant:
+/// a negated body relation always sits in a STRICTLY LOWER stratum than the
+/// negating rule's head (compute_strata forces stratum[head] >=
+/// stratum[body] + 1 across a negative edge, and compile/programStratifies
+/// reject anything it cannot force), so low-to-high stratum order is exactly
+/// the order the semantics require.
+///
+/// Source order does NOT have that property, and that was a SILENT WRONG
+/// ANSWER (MEASURED, this fix's repro): over m = {(1,2),(2,3)} the program
+///   p(X) :- m(X,Y), !q(Y).   q(X) :- m(X,Y).
+/// derived p = {1,2} instead of {2}, because q was still empty when p first
+/// tested it and NEG_CHECK rejections are never revisited (facts are only
+/// ever ADDED, so a tuple derived by mistake stays).  The same program with
+/// its two rules swapped gave the correct {2}.
+///
+/// Insertion sort: n is the rule count of one stratum call (tens), and the
+/// sort must be STABLE — an unstable sort would scramble the source order
+/// inside a stratum, changing aggregate/join emission order for no reason.
+fn ruleStratumOrder(rules: [*]?*compiler.compiled_rule, n: c_int) ?[*]c_int {
+    const idx: [*]c_int = @ptrCast(@alignCast(c.malloc(@as(usize, @intCast(n)) * @sizeOf(c_int)) orelse return null));
+    var i: c_int = 0;
+    while (i < n) : (i += 1) idx[@intCast(i)] = i;
+    const Ctx = struct {
+        rules: [*]?*compiler.compiled_rule,
+        fn lessThan(self: @This(), a: c_int, b: c_int) bool {
+            return self.rules[@intCast(a)].?.stratum < self.rules[@intCast(b)].?.stratum;
+        }
+    };
+    std.sort.insertion(c_int, idx[0..@intCast(n)], Ctx{ .rules = rules }, Ctx.lessThan);
+    return idx;
+}
+
 fn evalNonrecursive(db: *dl.DlDb, rules: [*]?*compiler.compiled_rule, n: c_int) c_int {
+    if (n <= 0) return 0; // also keeps ruleStratumOrder's malloc(0) out of play
     // A non-recursive stratum still iterates because one rule may read
     // another's head (a chain, or an unlucky emission order), and
     // vm_dred_delete re-derives an arbitrary SUBSET of a stratum — in both
@@ -1730,17 +1764,26 @@ fn evalNonrecursive(db: *dl.DlDb, rules: [*]?*compiler.compiled_rule, n: c_int) 
     // against exactly this set.
     const written = nonrecWrittenMask(rules, n);
     const variadic = dl.db_has_variadic(db) != 0;
+
+    // Evaluate stratum by stratum (see ruleStratumOrder).  Callers that pass
+    // one stratum (vmExecuteMode's per-stratum dispatch, vm_dred_delete's
+    // re-derive) get their own order back unchanged; the whole-program
+    // non-recursive fast path in vmExecuteMode is the caller this fixes.
+    const order = ruleStratumOrder(rules, n) orelse return -1;
+    defer c.free(@ptrCast(order));
+
     var pass: c_int = 0;
     while (pass <= n) : (pass += 1) {
         var changed: c_int = 0;
-        var i: c_int = 0;
-        while (i < n) : (i += 1) {
-            if (pass > 0 and nonrecRuleSettled(rules[@intCast(i)].?, written, variadic)) continue;
-            const m = execRule(db, rules[@intCast(i)].?, null, 0, 0, null, null);
+        var oi: c_int = 0;
+        while (oi < n) : (oi += 1) {
+            const cr = rules[@intCast(order[@intCast(oi)])].?;
+            if (pass > 0 and nonrecRuleSettled(cr, written, variadic)) continue;
+            const m = execRule(db, cr, null, 0, 0, null, null);
             if (m < 0) return -1;
             if (m > 0) changed = 1;
             if (m > 0) {
-                permindex.permindex_mark_dirty(db, @intCast(rules[@intCast(i)].?.head_rel_id));
+                permindex.permindex_mark_dirty(db, @intCast(cr.head_rel_id));
                 if (permindex.permindex_build_dirty(db) != 0) return -1;
             }
         }
@@ -3645,4 +3688,241 @@ test "vm counters: propagate/dred/agg runs increment (observable paths taken)" {
 
     try testing.expectEqual(@as(c_int, 0), vm_agg_maintain(db));
     try testing.expectEqual(@as(c_int, 1), vmAggRunsRef().*);
+}
+
+// ─── Order-invariance battery: stratified negation ─────────────────────────
+//
+// The property under test is ORDER-INVARIANCE, not one answer: a stratified
+// program's meaning does not depend on the source order of its rules, nor on
+// the insertion order of its base facts.  So every case runs EVERY
+// permutation of its rules under BOTH fact-insertion orders, and checks the
+// HAND-COMPUTED answer every time.  Both halves are load-bearing: a single
+// ordering proves nothing, and cross-permutation agreement alone would pass a
+// uniformly wrong evaluator (e.g. one that ignored negation entirely).
+//
+// Pre-fix (MEASURED against the libdatalog.so saved before evalNonrecursive
+// was made stratum-ordered; case 1 over m = {(1,2),(2,3),(4,4)}): the
+// negation-first ordering returns p = {1,2,4} and the swapped one {2}.
+// Post-fix every ordering returns {2}.
+
+const OrderFact = struct {
+    rel: [*:0]const u8,
+    arity: u8,
+    cols: []const u32,
+};
+
+/// One evaluation of `src` over a fresh copy of `facts`: run, then check the
+/// exact answer of `goal` — each hand-computed tuple present, and no others
+/// (the cardinality closes the gap between "expected ⊆ answer" and equality).
+fn negOrderRun(
+    dbpath: [*:0]const u8,
+    facts: []const OrderFact,
+    reverse_facts: bool,
+    src: [*:0]const u8,
+    goal: [*:0]const u8,
+    arity: u8,
+    expected_flat: []const u32,
+) !void {
+    const db = testOpenDb(dbpath);
+    defer testCloseDb(db, dbpath);
+
+    for (facts) |f| {
+        try testing.expectEqual(@as(c_int, 0), dl.dl_declare_relation(db, f.rel, f.arity));
+    }
+    for (facts) |f| {
+        const ntup = f.cols.len / f.arity;
+        var k: usize = 0;
+        while (k < ntup) : (k += 1) {
+            const t = if (reverse_facts) ntup - 1 - k else k;
+            try testing.expectEqual(@as(c_int, 1), dl.dl_add_fact(db, f.rel, f.cols.ptr + t * f.arity, f.arity));
+        }
+    }
+
+    var n: c_int = 0;
+    const arr = testCompile(db, src, &n) orelse return error.TestUnexpectedResult;
+    defer testFreeCompiled(arr, n);
+    try testing.expectEqual(@as(c_int, 0), vm_execute(db, arr, n));
+
+    var k: usize = 0;
+    while (k < expected_flat.len) : (k += arity) {
+        try testing.expectEqual(@as(c_int, 1), dl.dl_lookup(db, goal, expected_flat.ptr + k, arity));
+    }
+    try testing.expectEqual(@as(u64, expected_flat.len / arity), dl.dl_count(db, goal));
+}
+
+fn negOrderSource(buf: []u8, rules: []const [*:0]const u8, perm: []const usize) [:0]const u8 {
+    var len: usize = 0;
+    for (perm, 0..) |pi, k| {
+        if (k != 0) {
+            buf[len] = '\n';
+            len += 1;
+        }
+        const s = std.mem.span(rules[pi]);
+        @memcpy(buf[len .. len + s.len], s);
+        len += s.len;
+    }
+    buf[len] = 0;
+    return buf[0..len :0];
+}
+
+/// Lexicographic next permutation; false when the sequence is exhausted.
+fn negOrderNext(p: []usize) bool {
+    if (p.len < 2) return false;
+    var i = p.len - 1;
+    while (i > 0 and p[i - 1] >= p[i]) : (i -= 1) {}
+    if (i == 0) return false;
+    var j = p.len - 1;
+    while (p[j] <= p[i - 1]) : (j -= 1) {}
+    std.mem.swap(usize, &p[i - 1], &p[j]);
+    std.mem.reverse(usize, p[i..]);
+    return true;
+}
+
+fn negOrderBattery(
+    dbpath: [*:0]const u8,
+    facts: []const OrderFact,
+    rules: []const [*:0]const u8,
+    goal: [*:0]const u8,
+    arity: u8,
+    expected_flat: []const u32,
+) !void {
+    var perm: [8]usize = undefined;
+    for (0..rules.len) |k| perm[k] = k;
+    var srcbuf: [2048]u8 = undefined;
+    var runs: usize = 0;
+    while (true) {
+        const src = negOrderSource(&srcbuf, rules, perm[0..rules.len]);
+        for ([_]bool{ false, true }) |rev| {
+            try negOrderRun(dbpath, facts, rev, src, goal, arity, expected_flat);
+            runs += 1;
+        }
+        if (!negOrderNext(perm[0..rules.len])) break;
+    }
+    // 2 orderings x 2 fact orders is the floor; a case that only ever ran one
+    // ordering would be testing nothing.
+    try testing.expect(runs >= 4);
+}
+
+test "vm_execute: stratified negation is ORDER-INVARIANT (rule + fact order)" {
+    // ── Case 1: a negated relation DEFINED AFTER the rule that tests it —
+    // the reported repro.  m = {(1,2),(2,3),(4,4)}, so q = {1,2,4} and
+    // p(X) :- m(X,Y), !q(Y) survives only on Y=3: p = {2}.
+    try negOrderBattery(
+        "/tmp/datalog_zig_vm_neg_order_1",
+        &[_]OrderFact{.{ .rel = "m", .arity = 2, .cols = &[_]u32{ 1, 2, 2, 3, 4, 4 } }},
+        &[_][*:0]const u8{
+            "p(X) :- m(X,Y), !q(Y).",
+            "q(X) :- m(X,Y).",
+        },
+        "p",
+        1,
+        &[_]u32{2},
+    );
+
+    // ── Case 2: chained strata — r1 negates an EDB, r2 negates r1, r3
+    // negates r2 (strata 1, 2, 3).
+    //   node = {1,2,3,4}, m = {(1,2),(2,3),(3,1)}, banned = {3}
+    //   r1 = node \ banned        = {1,2,4}
+    //   r2 = X from m with r1(Y)  = {2}   (Y=2 taken, Y=3 free, Y=1 taken)
+    //   r3 = node \ r2            = {1,3,4}
+    try negOrderBattery(
+        "/tmp/datalog_zig_vm_neg_order_2",
+        &[_]OrderFact{
+            .{ .rel = "node", .arity = 1, .cols = &[_]u32{ 1, 2, 3, 4 } },
+            .{ .rel = "m", .arity = 2, .cols = &[_]u32{ 1, 2, 2, 3, 3, 1 } },
+            .{ .rel = "banned", .arity = 1, .cols = &[_]u32{3} },
+        },
+        &[_][*:0]const u8{
+            "r3(X) :- node(X), !r2(X).",
+            "r2(X) :- m(X,Y), !r1(Y).",
+            "r1(X) :- node(X), !banned(X).",
+        },
+        "r3",
+        1,
+        &[_]u32{ 1, 3, 4 },
+    );
+
+    // ── Case 3: TWO negations in one rule body, against a DERIVED relation,
+    // plus an intra-stratum chain (s reads empty, same stratum, positive).
+    //   m = {(1,2),(2,3),(3,4)}, nb = {2} -> banned = {2}
+    //   empty = {(3,4)}   (the (1,2)/(2,3) pairs hit banned at both ends)
+    try negOrderBattery(
+        "/tmp/datalog_zig_vm_neg_order_3",
+        &[_]OrderFact{
+            .{ .rel = "m", .arity = 2, .cols = &[_]u32{ 1, 2, 2, 3, 3, 4 } },
+            .{ .rel = "nb", .arity = 1, .cols = &[_]u32{2} },
+        },
+        &[_][*:0]const u8{
+            "s(X,Y) :- empty(X,Y).",
+            "empty(X,Y) :- m(X,Y), !banned(X), !banned(Y).",
+            "banned(X) :- nb(X).",
+        },
+        "s",
+        2,
+        &[_]u32{ 3, 4 },
+    );
+
+    // ── Case 4: negation of a RECURSIVE relation (recursion below the
+    // negation, so the recursive stratum runs first).  edge is the chain
+    // 1->2->3->4->5, so reach = {(i,j) : i<j} (10 tuples) and
+    //   nonreach(X,Y) :- node(X), node(Y), !reach(X,Y)
+    // is every remaining pair: 25 - 10 = 15, i.e. exactly a >= b.
+    try negOrderBattery(
+        "/tmp/datalog_zig_vm_neg_order_4",
+        &[_]OrderFact{
+            .{ .rel = "edge", .arity = 2, .cols = &[_]u32{ 1, 2, 2, 3, 3, 4, 4, 5 } },
+            .{ .rel = "node", .arity = 1, .cols = &[_]u32{ 1, 2, 3, 4, 5 } },
+        },
+        &[_][*:0]const u8{
+            "nonreach(X,Y) :- node(X), node(Y), !reach(X,Y).",
+            "reach(X,Y) :- edge(X,Y).",
+            "reach(X,Y) :- reach(X,Z), reach(Z,Y).",
+        },
+        "nonreach",
+        2,
+        &[_]u32{
+            1, 1,
+            2, 1, 2, 2,
+            3, 1, 3, 2, 3, 3,
+            4, 1, 4, 2, 4, 3, 4, 4,
+            5, 1, 5, 2, 5, 3, 5, 4, 5, 5,
+        },
+    );
+
+    // ── Case 5: an AGGREGATE over a negated DERIVED relation (negating an
+    // EDB only looks harmless: its facts are already complete, so it cannot
+    // show the ordering bug — MEASURED, an earlier version of this case used
+    // the EDB directly and was order-invariant even pre-fix).
+    //   m = {(1,2),(1,3),(1,4),(2,2)}, aged = {3} -> old = {3}
+    //   cnt(X,N) :- m(X,Y), !old(Y), N = count()  -> {(1,2),(2,1)}
+    try negOrderBattery(
+        "/tmp/datalog_zig_vm_neg_order_5",
+        &[_]OrderFact{
+            .{ .rel = "m", .arity = 2, .cols = &[_]u32{ 1, 2, 1, 3, 1, 4, 2, 2 } },
+            .{ .rel = "aged", .arity = 1, .cols = &[_]u32{3} },
+        },
+        &[_][*:0]const u8{
+            "cnt(X,N) :- m(X,Y), !old(Y), N = count().",
+            "tot(N) :- m(X,Y), N = count().",
+            "old(X) :- aged(X).",
+        },
+        "cnt",
+        2,
+        &[_]u32{ 1, 2, 2, 1 },
+    );
+
+    // ── Case 6: NO negation — an intra-stratum chain whose rules are written
+    // definition-last.  Stratum sorting must not disturb the pass loop that
+    // converges same-stratum chains: d = c = node = {1,2,3}.
+    try negOrderBattery(
+        "/tmp/datalog_zig_vm_neg_order_6",
+        &[_]OrderFact{.{ .rel = "node", .arity = 1, .cols = &[_]u32{ 1, 2, 3 } }},
+        &[_][*:0]const u8{
+            "d(X) :- c(X).",
+            "c(X) :- node(X).",
+        },
+        "d",
+        1,
+        &[_]u32{ 1, 2, 3 },
+    );
 }
