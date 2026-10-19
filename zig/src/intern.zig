@@ -12,7 +12,7 @@
 //! and return semantics.  The dafsa engine stays C in the hybrid .so
 //! (vendor/dafsa/*.c) and is addressed through raw extern bindings.  All
 //! allocation and file I/O goes through raw libc (calloc/realloc/free/strdup,
-//! FILE*, getline, fputc) so syscall/partial-write/error semantics match the
+//! FILE*, getline, fwrite) so syscall/partial-write/error semantics match the
 //! C oracle byte-for-byte.
 //!
 //! Oracle: src/intern.c (never modified).  NULL ir/str inputs crash in C and
@@ -48,9 +48,9 @@ extern "c" fn dafsa_add_n(d: *dafsa, key: [*]const u8, len: usize) c_int;
 extern "c" fn dafsa_prefix_enum(d: *const dafsa, prefix: [*]const u8, prefix_len: usize, cb: DafsaEnumCb, user: ?*anyopaque) c_long;
 
 // std.c does not re-export these.
+extern "c" fn memchr(s: ?*const anyopaque, ch: c_int, n: usize) ?*const anyopaque;
 extern "c" fn strdup(s: [*:0]const u8) ?[*:0]u8;
 extern "c" fn strcmp(a: [*:0]const u8, b: [*:0]const u8) c_int;
-extern "c" fn fputc(ch: c_int, stream: *c.FILE) c_int;
 extern "c" fn fflush(stream: *c.FILE) c_int;
 extern "c" fn fileno(stream: *c.FILE) c_int;
 extern "c" fn getline(lineptr: *?[*]u8, n: *usize, stream: *c.FILE) isize;
@@ -91,9 +91,9 @@ pub const SymStamp = struct {
 /// is append-only, so earlier bytes never change) and symStamp catches up the
 /// rest in one sequential pass.  A read-only process therefore never hashes,
 /// and a publishing one hashes the pending prefix at most once, OUTSIDE its
-/// write path — MEASURED: hashing interleaved with intern_save's fputc loop
-/// costs ~37 ms on a 44 MB array vs ~25 ms for the sequential catch-up, so the
-/// write path deliberately does not fuse it.
+/// write path — MEASURED: hashing interleaved with intern_save's per-byte write
+/// loop cost ~37 ms on a 44 MB array vs ~25 ms for the sequential catch-up, so
+/// the write path deliberately does not fuse it.
 const SymHash = struct {
     a: std.hash.Wyhash,
     b: std.hash.Wyhash,
@@ -411,7 +411,7 @@ pub fn liveSymBound(ir: ?*const anyopaque) u32 {
 /// pay a second pass over a 44 MB array it may never publish from), so the
 /// first call here feeds every slot loaded since — O(one pass over the array,
 /// once per process) — and later calls are O(1) until the next append.  A
-/// publish therefore pays ~20 ms of hashing instead of ~150 ms of fputc
+/// publish therefore pays ~20 ms of hashing instead of ~150 ms of per-byte
 /// rewriting, and nothing else pays anything.  Wyhash.final() shallow-copies
 /// its state, so stamping is idempotent.
 pub fn symStamp(ir: ?*anyopaque) SymStamp {
@@ -448,6 +448,87 @@ pub export fn intern_fwd_mutable(ir: ?*Interner) ?*const dafsa {
 
 // ─── Persistence ─────────────────────────────────────────────────────────
 
+/// Bytes accumulated before one fwrite.  MEASURED: the previous loop called
+/// fputc once per byte (~44 M calls on the 44 MB array) and was ~126-150 ms of
+/// a ~260 ms vocabulary-changing publish; the same stream in 1 MiB chunks is
+/// ~44 fwrite calls.
+const SAVE_CHUNK: usize = 1 << 20;
+
+/// Buffered sink for symbols.array's canonical byte stream.  Emits the exact
+/// bytes the per-byte fputc loop emitted — escaping is decided by the caller —
+/// and reports failure the way fputc==-1 did: any chunk that does not transfer
+/// whole (ENOSPC, EIO) fails, and intern_save then fcloses + unlinks the tmp
+/// file and returns -1.
+const SaveSink = struct {
+    f: *c.FILE,
+    buf: [*]u8,
+    len: usize = 0,
+
+    fn flush(self: *SaveSink) bool {
+        if (self.len == 0) return true;
+        const n = c.fwrite(self.buf, 1, self.len, self.f);
+        const ok = n == self.len;
+        self.len = 0;
+        return ok;
+    }
+
+    /// Append bytes, flushing whenever the chunk fills.  A run longer than the
+    /// chunk (a symbol may be up to MAX_WORD_LEN bytes) is written across
+    /// several chunks rather than needing a buffer that fits all of it.
+    fn put(self: *SaveSink, bytes: []const u8) bool {
+        var rest = bytes;
+        while (rest.len != 0) {
+            if (self.len == SAVE_CHUNK and !self.flush()) return false;
+            const k = @min(SAVE_CHUNK - self.len, rest.len);
+            @memcpy(self.buf[self.len .. self.len + k], rest[0..k]);
+            self.len += k;
+            rest = rest[k..];
+        }
+        return true;
+    }
+};
+
+/// Write the whole reverse array in canonical symbols.array form: each symbol
+/// with '\\' -> "\\\\" and '\n' -> "\\n" (so an embedded newline round-trips as
+/// one physical line, see intern_load), then one '\n' per symbol.  A null slot
+/// (an id consumed by a strdup failure) is its bare '\n'.  Returns 0, or -1 on
+/// a failed write.
+fn writeSymbols(s: *Interner, f: *c.FILE, buf: [*]u8) c_int {
+    var sink = SaveSink{ .f = f, .buf = buf };
+    var i: u32 = 1;
+    while (i < s.next_id) : (i += 1) {
+        if (s.rev.?[i - 1]) |str| {
+            // Run scan with libc memchr (vectorized) instead of a
+            // byte-at-a-time loop: the scalar scan was MEASURED at ~10 ms of
+            // the 44 MB array's write (51 -> 41 ms for the whole save).
+            const slen = cstrLen(str);
+            var off: usize = 0;
+            while (off < slen) {
+                var at = slen; // next byte that needs an escape
+                var ch: u8 = 0;
+                if (memchr(str + off, '\\', slen - off)) |p| {
+                    at = @intFromPtr(p) - @intFromPtr(str);
+                    ch = '\\';
+                }
+                if (memchr(str + off, '\n', slen - off)) |p| {
+                    const k = @intFromPtr(p) - @intFromPtr(str);
+                    if (k < at) {
+                        at = k;
+                        ch = '\n';
+                    }
+                }
+                if (at > off and !sink.put(str[off..at])) return -1;
+                if (at == slen) break;
+                const esc = [2]u8{ '\\', if (ch == '\\') '\\' else 'n' };
+                if (!sink.put(&esc)) return -1;
+                off = at + 1;
+            }
+        }
+        if (!sink.put("\n")) return -1;
+    }
+    return if (sink.flush()) 0 else -1;
+}
+
 /// int intern_save(interner *ir, const char *fwd_path, const char *rev_path)
 /// Atomic save of symbols.array ONLY: streaming tmp+fsync+rename+dir-fsync.
 /// The forward DAFSA is a pure derived cache and is NOT persisted; fwd_path
@@ -461,35 +542,17 @@ pub export fn intern_save(ir: ?*Interner, fwd_path: ?[*:0]const u8, rev_path: ?[
     tmpNameOf(&tmp, rev_path_p);
     const f = c.fopen(&tmp, "w") orelse return -1;
 
-    var i: u32 = 1;
-    while (i < s.next_id) : (i += 1) {
-        // Escape '\\' and '\n' so embedded newlines round-trip as one
-        // physical line (see intern_load).  '\n' becomes the two chars
-        // '\\' 'n' (0x5C 0x6E).
-        if (s.rev.?[i - 1]) |str| {
-            var j: usize = 0;
-            while (str[j] != 0) : (j += 1) {
-                var ch: c_int = str[j];
-                if (ch == '\\' or ch == '\n') {
-                    if (fputc('\\', f) == -1) { // EOF
-                        _ = c.fclose(f);
-                        _ = c.unlink(&tmp);
-                        return -1;
-                    }
-                    ch = if (ch == '\\') '\\' else 'n';
-                }
-                if (fputc(ch, f) == -1) {
-                    _ = c.fclose(f);
-                    _ = c.unlink(&tmp);
-                    return -1;
-                }
-            }
-        }
-        if (fputc('\n', f) == -1) {
-            _ = c.fclose(f);
-            _ = c.unlink(&tmp);
-            return -1;
-        }
+    const bufp = c.malloc(SAVE_CHUNK) orelse {
+        _ = c.fclose(f);
+        _ = c.unlink(&tmp);
+        return -1;
+    };
+    const wrote = writeSymbols(s, f, @ptrCast(bufp));
+    c.free(bufp);
+    if (wrote != 0) {
+        _ = c.fclose(f);
+        _ = c.unlink(&tmp);
+        return -1;
     }
 
     if (fflush(f) != 0) {
