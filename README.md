@@ -162,6 +162,9 @@ Total: 313 test cases across 18 test binaries + a CLI smoke test.
 - [`docs/datalog-dafsa-cas.md`](docs/datalog-dafsa-cas.md) — CAS / optimistic-concurrency
   transactions for the write path (`rev()`, `dl_cas_revision`, the `dl_txn_*` API, txn-WAL
   crash recovery).
+- [`docs/language-reference.md`](docs/language-reference.md) — the complete rule-language
+  reference: facts, rules, recursion, negation, aggregates, string builtins, lists, range,
+  regex patterns, variadic relations and the compile-error semantics.
 
 ## Building from Source
 
