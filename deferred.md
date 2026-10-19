@@ -6,6 +6,21 @@ was parked. Ties to the search-stack thesis (`docs/datalog-dafsa-search-stack.md
 
 ---
 
+## `dl scan <rel> --col N <val>` — considered, NOT built (2026-08-11)
+
+A schema-neutral convenience for "enumerate a relation filtering a non-leading
+column" (the gap that made a `dl nodes --type/--name` lister tempting for the
+agent store). **Decision: do not build it.** The engine already answers that
+query two ways, both generically: Datalog (`q(X) :- entity(X,"review").` — 0.33 s
+on a 1 M-symbol store after `81f5581`), or the consumer enumerating via
+`dl_prefix`/`dl_iter` and filtering itself (0.5 s, open-dominated). `dl` stays a
+Datalog executor plus generic read primitives; adding a column-filter flag is the
+first step toward teaching it one client's schema, and the relation is small
+enough (7 k rows) that no index is justified either. Revisit only if a caller
+appears that cannot issue Datalog.
+
+---
+
 ## Full-text search tier (`dl_search` / `aux_index`) — shipped `27bbee7`
 
 Deferred from the initial implementation. See `docs/datalog-dafsa-fulltext.md`.
