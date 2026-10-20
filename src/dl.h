@@ -39,6 +39,21 @@ void    dl_close(dl_db *db);
 #define DL_E_LOCKED   1   /* database is locked by another writer */
 #define DL_E_CONFLICT 2   /* CAS: expected revision != current revision */
 
+/* Distinct code the rule-evaluation family surfaces when a rule body needs
+ * more simultaneous join frames than the interpreter provides (8: one frame
+ * per enumerating body atom — SCAN/LOOKUP/LOOKUP_PERM/HASH_JOIN/WALK/
+ * MAT_JOIN/LIST_MEMBER/RANGE).  Wherever a contract below says "-1 on
+ * error", the frame-limit overflow returns DL_E_FRAMES INSTEAD, with a
+ * diagnostic naming the rule and the atom on stderr — so a caller can tell
+ * it apart from every other failure.  Data-dependent by nature (a frame is
+ * only live while its atom's loop sits on the backtracking stack), so the
+ * compile step cannot reject it; the same program may still answer
+ * correctly on data too small to reach the limit.  The incremental
+ * maintenance ladder (dl_consolidate's aggregate/delete/delta branches)
+ * masks it as -1 on that call: those branches retry as a full re-eval, and
+ * the retry surfaces DL_E_FRAMES. */
+#define DL_E_FRAMES   (-2)
+
 /* Open with explicit error reporting.  On success, *err_out=0 and handle
  * is returned.  On failure, *err_out is set and NULL is returned.
  * err_out may be NULL (behaviour identical to dl_open). */
@@ -444,11 +459,12 @@ int dl_load_rules(dl_db *db, const char *dl_source);
 
 /* Compile all previously loaded rules into bytecode and run them against
  * the database, materializing derived relations in-place.
- * Returns 0 on success, -1 on error. */
+ * Returns 0 on success, -1 on error (or DL_E_FRAMES — see the block above). */
 int dl_compile(dl_db *db);
 
 /* Evaluate all compiled rules and stream the goal relation's tuples via cb.
- * Returns the number of tuples emitted, or -1 on error.
+ * Returns the number of tuples emitted, or -1 on error (or DL_E_FRAMES —
+ * see the block above).
  * If a snapshot has been published, reads from mmap'd snapshot (bypasses VM). */
 long dl_query(dl_db *db, const char *goal_rel, dl_tuple_cb cb, void *user);
 
@@ -474,7 +490,8 @@ long dl_query(dl_db *db, const char *goal_rel, dl_tuple_cb cb, void *user);
  *
  * Returns the tuple count streamed, or -1 on error (NULL args, parse/compile
  * failure, goal_rel not found in the clone after evaluation, OOM).  Errors are
- * printed to stderr in the engine's fx style. */
+ * printed to stderr in the engine's fx style; a rule body that exceeds the
+ * interpreter's frame limit returns DL_E_FRAMES — see the block above. */
 long dl_query_rules_ro(dl_db *db, const char *dl_source,
                        const char *goal_rel, dl_tuple_cb cb, void *user);
 
@@ -568,7 +585,9 @@ long dl_fuzzy_lookup(dl_db *db, const char *needle, uint32_t k,
 /* ─── Snapshot publish (M4) ────────────────────────────────────────────── */
 
 /* Atomic publish: saves interner + all relations to a versioned snapshot
- * directory, flips the CURRENT pointer.  Returns 0 on success, -1 on error.
+ * directory, flips the CURRENT pointer.  Returns 0 on success, -1 on error
+ * (or DL_E_FRAMES when the fixpoint hits the frame limit — see the block
+ * above; the incremental ladder may mask it as -1, see there).
  * After publish, dl_query reads from mmap instead of the VM. */
 int dl_publish_snapshot(dl_db *db);
 
@@ -594,7 +613,8 @@ int dl_publish_snapshot(dl_db *db);
  * or dl_publish_snapshot to force a fresh snapshot now.
  *
  * Returns 0 on success, -1 on error (NULL db, read-only handle, open txn,
- * or a consolidation/materialization failure). */
+ * or a consolidation/materialization failure; the fixpoint's frame-limit
+ * overflow surfaces as DL_E_FRAMES — see the block above). */
 int dl_consolidate(dl_db *db);
 
 /* Set the WAL-append byte budget that triggers a snapshot materialization

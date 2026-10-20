@@ -22,6 +22,12 @@ const ch = @cImport({
     @cInclude("dl_internal.h");
 });
 
+// dl.zig hand-declares the dl.h error surface (no cImport), so pin its
+// DL_E_FRAMES literal copy to the header here.
+comptime {
+    if (ch.DL_E_FRAMES != -2) @compileError("src/dl.h DL_E_FRAMES must stay -2 (dl.zig's literal copy)");
+}
+
 /// Structural type comparison via @typeInfo.  `.@"struct"`/`.@"opaque"`/
 /// `.@"union"`/`.@"enum"` are compared by KIND only (their layouts are
 /// verified separately by the @sizeOf/@offsetOf checks at the top level), so

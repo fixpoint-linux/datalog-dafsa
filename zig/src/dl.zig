@@ -495,6 +495,13 @@ fn dlErr(comptime fmt: []const u8, args: anytype) void {
     _ = c.write(2, msg.ptr, msg.len);
 }
 
+/// DL_E_FRAMES (src/dl.h): the vm_ layer's frame-limit overflow code, which
+/// the rule-evaluation family here surfaces VERBATIM where the contract says
+/// "-1 on error" (dl_compile, dl_query, dl_query_rules_ro, dl_publish_snapshot,
+/// dl_consolidate).  A literal copy because dl.zig hand-declares the dl.h
+/// surface (no cImport); abi_witness.zig pins it to the header at test time.
+const DL_E_FRAMES: c_int = -2;
+
 // ─── Internal helpers ──────────────────────────────────────────────────────
 
 fn findRel(db: *const DlDb, name: [*c]const u8) c_int {
@@ -3824,8 +3831,10 @@ pub export fn dl_compile(db: ?*DlDb) c_int {
     if (d.read_only != 0) return -1;
     if (d.n_crules == 0) return 0;
 
-    if (vm_execute(d, d.crules, d.n_crules) != 0)
-        return -1;
+    {
+        const m = vm_execute(d, d.crules, d.n_crules);
+        if (m != 0) return m; // DL_E_FRAMES (-2) propagates (dl.h)
+    }
 
     d.fixpoint_dirty = 0;
     d.full_reeval_pending = 0;
@@ -3844,8 +3853,8 @@ pub export fn dl_query(db: ?*DlDb, goal_rel: [*c]const u8, cb: DlTupleCb, user: 
 
     // Legacy M3 path: compile and run rules, then stream in-memory.
     if (d.n_crules > 0) {
-        if (vm_execute(d, d.crules, d.n_crules) != 0)
-            return -1;
+        const m = vm_execute(d, d.crules, d.n_crules);
+        if (m != 0) return @intCast(m); // DL_E_FRAMES (-2) propagates (dl.h)
     }
 
     if (goal_rel != null and cb != null) {
@@ -4005,16 +4014,19 @@ pub export fn dl_query_rules_ro(db: ?*DlDb, dl_source: [*c]const u8, goal_rel: [
         return -1;
     }
 
-    if (vm_execute(&edb, crules, n_crules) != 0) {
-        dlErr("dl_query_rules_ro: evaluation failed\n", .{});
-        {
-            var i: c_int = 0;
-            while (i < n_crules) : (i += 1) compiler.compiled_rule_free(crules.?[@intCast(i)]);
-            if (crules) |x| c.free(@ptrCast(x));
+    {
+        const m = vm_execute(&edb, crules, n_crules);
+        if (m != 0) {
+            if (m != DL_E_FRAMES) dlErr("dl_query_rules_ro: evaluation failed\n", .{});
+            {
+                var i: c_int = 0;
+                while (i < n_crules) : (i += 1) compiler.compiled_rule_free(crules.?[@intCast(i)]);
+                if (crules) |x| c.free(@ptrCast(x));
+            }
+            evalDbFreeOwned(&edb, n_aliased, &owned);
+            freeRulesAndParser(rules, n_rules, p);
+            return m; // DL_E_FRAMES (-2) propagates (dl.h)
         }
-        evalDbFreeOwned(&edb, n_aliased, &owned);
-        freeRulesAndParser(rules, n_rules, p);
-        return -1;
     }
 
     {
@@ -4639,8 +4651,10 @@ fn consolidateInner(d: *DlDb) c_int {
             }
         }
         if (d.full_reeval_pending != 0) {
-            if (vm_execute(d, d.crules, d.n_crules) != 0)
-                return -1;
+            {
+                const m = vm_execute(d, d.crules, d.n_crules);
+                if (m != 0) return m; // DL_E_FRAMES (-2) propagates (dl.h)
+            }
             vm_clear_deltas(d);
             vm_clear_deletes(d);
         } else if (has_agg != 0) {
@@ -4650,19 +4664,25 @@ fn consolidateInner(d: *DlDb) c_int {
                     return -1;
                 }
             } else {
-                    if (vm_execute(d, d.crules, d.n_crules) != 0)
-                    return -1;
+                    {
+                        const m = vm_execute(d, d.crules, d.n_crules);
+                        if (m != 0) return m; // DL_E_FRAMES (-2) propagates (dl.h)
+                    }
                 vm_clear_deltas(d);
                 vm_clear_deletes(d);
             }
         } else if (has_del != 0 and vm_dred_eligible(d) == 0) {
-            if (vm_execute(d, d.crules, d.n_crules) != 0)
-                return -1;
+            {
+                const m = vm_execute(d, d.crules, d.n_crules);
+                if (m != 0) return m; // DL_E_FRAMES (-2) propagates (dl.h)
+            }
             vm_clear_deltas(d);
             vm_clear_deletes(d);
         } else if (has_ins != 0 and vm_ivm_eligible(d) == 0 and vm_dred_eligible(d) == 0) {
-            if (vm_execute(d, d.crules, d.n_crules) != 0)
-                return -1;
+            {
+                const m = vm_execute(d, d.crules, d.n_crules);
+                if (m != 0) return m; // DL_E_FRAMES (-2) propagates (dl.h)
+            }
             vm_clear_deltas(d);
             vm_clear_deletes(d);
         } else if (has_del != 0 or (has_ins != 0 and vm_ivm_eligible(d) == 0)) {
@@ -4671,8 +4691,10 @@ fn consolidateInner(d: *DlDb) c_int {
                 return -1;
             }
         } else if (vm_ivm_eligible(d) == 0) {
-            if (vm_execute(d, d.crules, d.n_crules) != 0)
-                return -1;
+            {
+                const m = vm_execute(d, d.crules, d.n_crules);
+                if (m != 0) return m; // DL_E_FRAMES (-2) propagates (dl.h)
+            }
             vm_clear_deltas(d);
             vm_clear_deletes(d);
         } else if (vm_has_recursive(d) != 0) {
@@ -5114,7 +5136,10 @@ pub export fn dl_publish_snapshot(db: ?*DlDb) c_int {
     const t_start = nowNs();
 
     const t_cons = nowNs();
-    if (consolidate(d) != 0) return -1;
+    {
+        const m = consolidate(d);
+        if (m != 0) return m; // DL_E_FRAMES (-2) propagates (dl.h)
+    }
     const t_mat = nowNs();
     if (materializeSnapshot(d) != 0) return -1;
     if (pub_timers_on) {
@@ -5151,7 +5176,10 @@ pub export fn dl_consolidate(db: ?*DlDb) c_int {
     if (d.read_only != 0) return -1;
     if (d.txn != null) return -1;
 
-    if (consolidate(d) != 0) return -1;
+    {
+        const m = consolidate(d);
+        if (m != 0) return m; // DL_E_FRAMES (-2) propagates (dl.h)
+    }
 
     if (d.snapshot_budget_bytes > 0) {
         const pending = sumRelWalAppended(d) -| d.wal_appended_at_snapshot;
@@ -8746,4 +8774,36 @@ test "dl_load_rules: split plan keeps the INCREMENTAL-MAINTENANCE class" {
     try testing.expectEqual(@as(u64, 2), bq_split);
     try testing.expectEqual(@as(u64, 1), ad_split);
     try testing.expectEqual(@as(u64, 1), bd_split);
+}
+
+// Frame-limit overflow (MAX_FRAMES): the caller-visible contract.  The same
+// 9-atom body that the CLI surfaces as "publish failed" must return the
+// distinct DL_E_FRAMES code (dl.h) to the C caller — not the bare -1 — with
+// the loud diagnostic on stderr; the 8-atom control publishes cleanly.
+test "publish surfaces DL_E_FRAMES when a rule body exhausts the frame limit" {
+    const dir = "/tmp/datalog_zig_u11_frames";
+    rmrfTestDir(dir);
+    defer rmrfTestDir(dir);
+
+    const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+    defer dl_close(db);
+
+    try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "edge", 2));
+    // 12-node chain: 11 edges, so the 9th enumerating atom is reached.
+    var v: u32 = 1;
+    while (v < 12) : (v += 1) {
+        const e = [2]u32{ v, v + 1 };
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "edge", &e, 2));
+    }
+
+    // Control: ONE atom under the limit — publishes 0.
+    try testing.expectEqual(@as(c_int, 0), dl_load_rules(db,
+        "h(X,Y):-edge(X,A),edge(A,B),edge(B,C),edge(C,D),edge(D,E),edge(E,F),edge(F,G),edge(G,Y)."));
+    try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db));
+
+    // Overflow: DL_E_FRAMES (-2), per dl.h.
+    try testing.expectEqual(@as(c_int, 0), dl_load_rules(db,
+        "h2(X,Y):-edge(X,A),edge(A,B),edge(B,C),edge(C,D),edge(D,E),edge(E,F),edge(F,G),edge(G,H),edge(H,Y)."));
+    try testing.expectEqual(@as(c_int, -2), dl_publish_snapshot(db));
+    try testing.expectEqual(@as(c_int, -2), dl_compile(db));
 }

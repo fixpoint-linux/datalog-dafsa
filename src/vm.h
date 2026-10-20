@@ -23,7 +23,9 @@
 #include "dl.h"
 
 /* Evaluate all compiled rules against the database, materializing derived
- * relations in-place.  Returns 0 on success, -1 on error. */
+ * relations in-place.  Returns 0 on success, -1 on error (DL_E_FRAMES, dl.h,
+ * when a rule body exceeds the interpreter's 8-frame limit — the diagnostic
+ * names the rule and the atom on stderr). */
 int vm_execute(dl_db *db, compiled_rule **rules, int n_rules);
 
 /* Evaluate rules and stream tuples of the goal relation via a callback.

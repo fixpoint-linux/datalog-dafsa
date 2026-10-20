@@ -58,6 +58,12 @@ const MAX_VARS = 64;
 const MAX_ARITY = 8;
 const MAX_RELS = 64;
 const MAX_FRAMES = 8;
+
+/// execRange/execRule return this when a body atom would need a
+/// (MAX_FRAMES+1)-th simultaneous join frame.  Distinct from the generic -1
+/// so a caller can tell a frame-limit overflow from any other failure; the
+/// dl_ rule-evaluation family surfaces it as DL_E_FRAMES (dl.h).
+const FRAME_LIMIT_ERR: c_long = -2;
 const FIXPOINT_ERROR_BOUND = 10000000;
 const UNBOUND: u32 = 0xFFFFFFFF;
 
@@ -565,6 +571,31 @@ fn symsetAddCb(sym_id: u32, user: ?*anyopaque) callconv(.c) c_int {
 
 // ─── Bytecode interpreter ──────────────────────────────────────────────────
 
+/// The 8 frame-slot guards below were bare `return -1` (MEASURED on 87f01d7:
+/// a 9-atom body over a long edge chain failed with the CLI's generic
+/// "publish failed" and no engine message).  A frame overflow is
+/// DATA-DEPENDENT — frames only stay live while their atom's loop is on the
+/// backtracking stack — so no compile-time check can reject exactly the
+/// failing programs without also rejecting 9-atom bodies that fail early
+/// and answer correctly; the failure stays a runtime one, but LOUD: name the
+/// rule, the atom and the limit, and return FRAME_LIMIT_ERR instead of -1.
+fn frameOverflow(cr: *const compiler.compiled_rule, op: u8, body_idx: u8) c_long {
+    const hp: [*c]const u8 = if (cr.head_pred) |h| @as([*c]const u8, h) else "?";
+    // Every frame-pushing opcode carries its body atom's index except
+    // OP_MAT_JOIN (the bushy materialized join spans several atoms, so the
+    // compiler tags no single one — i_emit zeroes body_idx).
+    const where = if (op == OP_MAT_JOIN)
+        std.fmt.allocPrint(std.heap.c_allocator, "at the materialized (bushy) join", .{}) catch return FRAME_LIMIT_ERR
+    else
+        std.fmt.allocPrint(std.heap.c_allocator, "at body atom {d} (0-based index {d})", .{ @as(c_int, body_idx) + 1, @as(c_int, body_idx) }) catch return FRAME_LIMIT_ERR;
+    defer std.heap.c_allocator.free(where);
+    std.debug.print(
+        "vm: rule '{s}' body exceeds the {d}-frame limit {s} — split the rule body\n",
+        .{ hp, @as(c_int, MAX_FRAMES), where },
+    );
+    return FRAME_LIMIT_ERR;
+}
+
 fn execRange(
     db: *dl.DlDb,
     cr: *const compiler.compiled_rule,
@@ -625,7 +656,7 @@ fn execRange(
 
         switch (in.op) {
             OP_SCAN => blk: {
-                if (sp >= MAX_FRAMES) return -1;
+                if (sp >= MAX_FRAMES) return frameOverflow(cr, in.op, in.body_idx);
                 const f = &frames[@intCast(sp)];
                 f.ip = ip;
                 f.op = OP_SCAN;
@@ -669,7 +700,7 @@ fn execRange(
             },
 
             OP_WALK => blk: {
-                if (sp >= MAX_FRAMES) return -1;
+                if (sp >= MAX_FRAMES) return frameOverflow(cr, in.op, in.body_idx);
                 const f = &frames[@intCast(sp)];
                 f.ip = ip;
                 f.op = OP_SCAN;
@@ -751,7 +782,7 @@ fn execRange(
             },
 
             OP_LOOKUP => blk: {
-                if (sp >= MAX_FRAMES) return -1;
+                if (sp >= MAX_FRAMES) return frameOverflow(cr, in.op, in.body_idx);
                 const f = &frames[@intCast(sp)];
                 f.ip = ip;
                 f.op = OP_LOOKUP;
@@ -805,7 +836,7 @@ fn execRange(
             },
 
             OP_LOOKUP_PERM => blk: {
-                if (sp >= MAX_FRAMES) return -1;
+                if (sp >= MAX_FRAMES) return frameOverflow(cr, in.op, in.body_idx);
 
                 const perm_id: c_int = @intCast(in.imm);
                 const rel_id: c_int = @intCast(in.a);
@@ -876,7 +907,7 @@ fn execRange(
             },
 
             OP_HASH_JOIN => blk: {
-                if (sp >= MAX_FRAMES) return -1;
+                if (sp >= MAX_FRAMES) return frameOverflow(cr, in.op, in.body_idx);
 
                 const rel_id: c_int = @intCast(in.a);
                 const k: c_int = @intCast(in.b);
@@ -1006,7 +1037,7 @@ fn execRange(
                     if (tupleset.ts_init(ts, @intCast(ar)) != 0) return -1;
                 }
                 const sub = execRange(db, cr, ip + 1, end_ip, ov, n_ov, dry, cb, user, matCaptureCb, ts, pool, n_pool);
-                if (sub < 0) return -1;
+                if (sub < 0) return sub; // propagate (incl. FRAME_LIMIT_ERR)
                 ip = end_ip;
             },
 
@@ -1032,7 +1063,7 @@ fn execRange(
                     break :blk;
                 }
 
-                if (sp >= MAX_FRAMES) return -1;
+                if (sp >= MAX_FRAMES) return frameOverflow(cr, in.op, in.body_idx);
                 const f = &frames[@intCast(sp)];
                 f.ip = ip;
                 f.op = OP_MAT_JOIN;
@@ -1377,7 +1408,7 @@ fn execRange(
                     ip += 1;
                     break :blk;
                 }
-                if (sp >= MAX_FRAMES) return -1;
+                if (sp >= MAX_FRAMES) return frameOverflow(cr, in.op, in.body_idx);
                 {
                     const f = &frames[@intCast(sp)];
                     var cur = lv;
@@ -1441,7 +1472,7 @@ fn execRange(
                     ip += 1;
                     break :blk;
                 }
-                if (sp >= MAX_FRAMES) return -1;
+                if (sp >= MAX_FRAMES) return frameOverflow(cr, in.op, in.body_idx);
                 {
                     const f = &frames[@intCast(sp)];
                     f.ip = ip;
@@ -1812,7 +1843,7 @@ fn evalNonrecursive(db: *dl.DlDb, rules: [*]?*compiler.compiled_rule, n: c_int) 
             const cr = rules[@intCast(order[@intCast(oi)])].?;
             if (pass > 0 and nonrecRuleSettled(cr, written, variadic)) continue;
             const m = execRule(db, cr, null, 0, 0, null, null);
-            if (m < 0) return -1;
+            if (m < 0) return @intCast(m); // propagate (incl. FRAME_LIMIT_ERR)
             if (m > 0) changed = 1;
             if (m > 0) {
                 permindex.permindex_mark_dirty(db, @intCast(cr.head_rel_id));
@@ -2109,7 +2140,7 @@ fn evalStratumRecursive(db: *dl.DlDb, rules: [*]?*compiler.compiled_rule, n: c_i
                     permFreeAll(nr, perm_count, perm_ids, perm_cap, idb_perm_shadows);
                     rdFreeTs(rd, nr);
                     c.free(@ptrCast(rd));
-                    return -1;
+                    return @intCast(m); // propagate (incl. FRAME_LIMIT_ERR)
                 }
                 if (m > 0) {
                     changed_nr = 1;
@@ -2135,7 +2166,7 @@ fn evalStratumRecursive(db: *dl.DlDb, rules: [*]?*compiler.compiled_rule, n: c_i
                 permFreeAll(nr, perm_count, perm_ids, perm_cap, idb_perm_shadows);
                 rdFreeTs(rd, nr);
                 c.free(@ptrCast(rd));
-                return -1;
+                return @intCast(m); // propagate (incl. FRAME_LIMIT_ERR)
             }
             permindex.permindex_mark_dirty(db, @intCast(cr.head_rel_id));
             if (permindex.permindex_build_dirty(db) != 0) {
@@ -2164,7 +2195,7 @@ fn evalStratumRecursive(db: *dl.DlDb, rules: [*]?*compiler.compiled_rule, n: c_i
                 permFreeAll(nr, perm_count, perm_ids, perm_cap, idb_perm_shadows);
                 rdFreeTs(rd, nr);
                 c.free(@ptrCast(rd));
-                return -1;
+                return @intCast(m);
             }
 
             var ci: c_long = 0;
@@ -2209,7 +2240,7 @@ fn evalStratumRecursive(db: *dl.DlDb, rules: [*]?*compiler.compiled_rule, n: c_i
                     permFreeAll(nr, perm_count, perm_ids, perm_cap, idb_perm_shadows);
                     rdFreeTs(rd, nr);
                     c.free(@ptrCast(rd));
-                    return -1;
+                    return @intCast(n_out);
                 }
 
                 var ci: c_long = 0;
@@ -2345,7 +2376,7 @@ fn evalStratumRecursive(db: *dl.DlDb, rules: [*]?*compiler.compiled_rule, n: c_i
                         permFreeAll(nr, perm_count, perm_ids, perm_cap, idb_perm_shadows);
                         rdFreeTs(rd, nr);
                         c.free(@ptrCast(rd));
-                        return -1;
+                        return @intCast(n_out);
                     }
 
                     var ci: c_long = 0;
@@ -2522,15 +2553,19 @@ fn vmExecuteMode(db: *dl.DlDb, rules: [*]?*compiler.compiled_rule, n_rules: c_in
             i = 0;
             while (i < sc) : (i += 1)
                 strat_rules[@intCast(i)] = rules[@intCast(sr[@intCast(i)])];
-            if (evalNonrecursive(db, strat_rules[0..].ptr, sc) != 0)
-                return -1;
+            {
+                const m = evalNonrecursive(db, strat_rules[0..].ptr, sc);
+                if (m != 0) return m; // propagate (incl. FRAME_LIMIT_ERR)
+            }
         } else {
             var strat_rules: [256]?*compiler.compiled_rule = undefined;
             i = 0;
             while (i < sc) : (i += 1)
                 strat_rules[@intCast(i)] = rules[@intCast(sr[@intCast(i)])];
-            if (evalStratumRecursive(db, strat_rules[0..].ptr, sc, ivm) != 0)
-                return -1;
+            {
+                const m = evalStratumRecursive(db, strat_rules[0..].ptr, sc, ivm);
+                if (m != 0) return m; // propagate (incl. FRAME_LIMIT_ERR)
+            }
         }
     }
 
@@ -2570,7 +2605,10 @@ pub export fn vm_query(
 ) c_long {
     const d = db orelse return -1;
     const r = rules orelse return -1;
-    if (vmExecuteMode(d, r, n_rules, 0) != 0) return -1;
+    {
+        const m = vmExecuteMode(d, r, n_rules, 0);
+        if (m != 0) return @intCast(m); // propagate (incl. FRAME_LIMIT_ERR)
+    }
 
     const gri = dbFind(d, goal_rel);
     if (gri >= 0 and cb != null) {
@@ -4011,4 +4049,95 @@ test "vm_execute: stratified negation is ORDER-INVARIANT (rule + fact order)" {
         1,
         &[_]u32{ 1, 2, 3 },
     );
+}
+
+// ─── Frame-limit overflow (MAX_FRAMES) ─────────────────────────────────────
+
+extern "c" fn open(path: [*:0]const u8, flags: c_int, ...) c_int;
+
+// Linux O_WRONLY|O_CREAT|O_TRUNC = 0o1101, mode 0o600.
+const O_CAPTURE: c_int = 0o1101;
+
+// A 12-node chain gives the 9-atom body plenty of full-length paths, so the
+// 9th enumerating atom is REACHED while 8 frames are live — the overflow is
+// data-dependent, and this is the data that reaches it.
+//
+// The stderr capture is raw libc fds: std.debug.print writes through the
+// fd-2 handle, so the redirection must happen beneath it.  This test fails
+// on the PRE-fix tree (87f01d7): rc was the bare -1 (indistinguishable from
+// any other failure) and stderr was SILENT.
+test "vm_execute: frame-limit overflow fails LOUDLY with FRAME_LIMIT_ERR" {
+    const path = "/tmp/datalog_zig_u9_vm_frames_overflow";
+    const err_path = "/tmp/datalog_zig_u9_vm_frames_overflow.err";
+    const db = testOpenDb(path);
+    defer testCloseDb(db, path);
+
+    try testing.expectEqual(@as(c_int, 0), dl.dl_declare_relation(db, "edge", 2));
+    testAddFacts(db, "edge", &[_]u32{
+        1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12,
+    }, 2, 11);
+
+    var n: c_int = 0;
+    const arr = testCompile(db, "h(X,Y):-edge(X,A),edge(A,B),edge(B,C),edge(C,D),edge(D,E),edge(E,F),edge(F,G),edge(G,H),edge(H,Y).\n", &n) orelse return error.TestUnexpectedResult;
+    defer testFreeCompiled(arr, n);
+    try testing.expectEqual(@as(c_int, 1), n);
+
+    const saved = c.dup(2);
+    try testing.expect(saved >= 0);
+    const cap = open(err_path, O_CAPTURE, @as(c_uint, 0o600));
+    try testing.expect(cap >= 0);
+    const duprc = c.dup2(cap, 2);
+    try testing.expectEqual(@as(c_int, 2), duprc); // dup2 returns the new fd
+    const rc = vm_execute(db, arr, n);
+    try testing.expectEqual(@as(c_int, 2), c.dup2(saved, 2));
+    _ = c.close(saved);
+    _ = c.close(cap);
+
+    // (b) the distinct, documented error code — not the bare -1.
+    try testing.expectEqual(@as(c_int, -2), @as(c_int, @intCast(rc)));
+
+    // (a) the loud diagnostic: rule head, atom index, and the limit.
+    const rf = c.fopen(err_path, "r");
+    try testing.expect(rf != null);
+    var buf: [4096]u8 = undefined;
+    const got = c.fread(&buf, 1, buf.len, rf.?);
+    _ = c.fclose(rf.?);
+    const text = buf[0..@intCast(got)];
+    try testing.expect(std.mem.indexOf(u8, text, "vm: rule 'h' body exceeds the 8-frame limit") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "body atom 9 (0-based index 8)") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "split the rule body") != null);
+}
+
+// Control: ONE atom under the limit, over data that keeps every frame live —
+// the same program shape the overflow test uses, evaluated correctly.  This
+// is also the regression guard against an over-eager compile-time frame
+// check: a body just under the limit must still load AND answer.
+test "vm_execute: an 8-atom body just under the frame limit still evaluates" {
+    const path = "/tmp/datalog_zig_u9_vm_frames_under";
+    const db = testOpenDb(path);
+    defer testCloseDb(db, path);
+
+    try testing.expectEqual(@as(c_int, 0), dl.dl_declare_relation(db, "edge", 2));
+    testAddFacts(db, "edge", &[_]u32{
+        1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12,
+    }, 2, 11);
+
+    var n: c_int = 0;
+    const arr = testCompile(db, "h(X,Y):-edge(X,A),edge(A,B),edge(B,C),edge(C,D),edge(D,E),edge(E,F),edge(F,G),edge(G,Y).\n", &n) orelse return error.TestUnexpectedResult;
+    defer testFreeCompiled(arr, n);
+    try testing.expectEqual(@as(c_int, 1), n);
+
+    try testing.expectEqual(@as(c_int, 0), vm_execute(db, arr, n));
+
+    // Every 8-edge chain suffix answers: 1..9, 2..10, 3..11, 4..12.
+    const t1 = [2]u32{ 1, 9 };
+    const t2 = [2]u32{ 2, 10 };
+    const t3 = [2]u32{ 3, 11 };
+    const t4 = [2]u32{ 4, 12 };
+    try testing.expectEqual(@as(c_int, 1), dl.dl_lookup(db, "h", &t1, 2));
+    try testing.expectEqual(@as(c_int, 1), dl.dl_lookup(db, "h", &t2, 2));
+    try testing.expectEqual(@as(c_int, 1), dl.dl_lookup(db, "h", &t3, 2));
+    try testing.expectEqual(@as(c_int, 1), dl.dl_lookup(db, "h", &t4, 2));
+    const absent = [2]u32{ 1, 12 }; // 11 edges — beyond any 8-atom evaluation
+    try testing.expectEqual(@as(c_int, 0), dl.dl_lookup(db, "h", &absent, 2));
 }
