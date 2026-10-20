@@ -3958,18 +3958,54 @@ pub export fn compile_rules(db: ?*dl.DlDb, rules: ?[*]?*parser.rule, n_rules: c_
 
     if (compute_strata(d, rules.?, n_rules, rel_strata, recursive, @intCast(nrels), true) != 0) return -1;
 
-    // The out-params are published ONLY on success (n>0 <=> rules!=null):
-    // every failure path below frees the partial array itself, so callers
-    // must see *out_rules == null and *out_n == 0 when we return -1.
+    return compileList(d, rules.?, n_rules, rel_strata, recursive, @intCast(nrels), out_rules.?, out_n.?);
+}
+
+/// int compileUnionRules(dl_db*, rule**, int, const int *strata,
+///                       const int *recursive, compiled_rule***, int*)
+///
+/// Compile a WHOLE programme — every retained rule of every dl_load_rules
+/// batch — against the UNION's stratification, which is what dl_load_rules
+/// needs once a later batch changes a relation's recursion status: the
+/// perm-vs-hash-join choice for a non-leading body atom and the "too many
+/// permutation indices" refusal are made from `recursive` AT COMPILE TIME
+/// (emit_nonleading_join), so a rule compiled under its own batch's recursive
+/// set cannot be corrected by republishing the flag.
+///
+/// `n_rels` bounds `rel_strata`/`recursive`: the caller's arrays cover the
+/// relations that existed when it computed them, and this routine must never
+/// index past them.  (compile_one declares a head relation only when it is
+/// MISSING — and every head here is already declared — so a longer
+/// db_rel_count would be an out-of-range read, not a relations-grown case.)
+///
+/// No stratification and no kind check runs here (the caller has done both over
+/// the union: compute_strata/checkUnionRecursion and checkAllRuleConstKinds).
+/// Everything else — the per-rule rejects and the two-phase error/ownership
+/// discipline — is the same code as compile_rules, so the two cannot drift.
+pub fn compileUnionRules(db: ?*dl.DlDb, rules: ?[*]?*parser.rule, n_rules: c_int, rel_strata: [*]const c_int, recursive: [*]const c_int, n_rels: c_int, out_rules: ?*?[*]?*compiled_rule, out_n: ?*c_int) c_int {
+    if (db == null or rules == null or n_rules <= 0 or out_rules == null or out_n == null) return -1;
+    return compileList(db.?, rules.?, n_rules, rel_strata, recursive, n_rels, out_rules.?, out_n.?);
+}
+
+/// The emission core shared by compile_rules and compileUnionRules: compile
+/// every rule against the given strata/recursion vectors, publish is_recursive,
+/// and apply the two per-rule rejects.
+///
+/// The out-params are published ONLY on success (n>0 <=> rules!=null):
+/// every failure path frees the partial array itself, so callers must see
+/// *out_rules == null and *out_n == 0 when this returns -1.
+fn compileList(db: *dl.DlDb, rules: [*]?*parser.rule, n_rules: c_int, rel_strata: [*]const c_int, recursive: [*]const c_int, n_rels: c_int, out_rules: ?*?[*]?*compiled_rule, out_n: ?*c_int) c_int {
+    const d = db;
+    const nrels: usize = @intCast(n_rels);
     const arr: [*]?*compiled_rule = @ptrCast(@alignCast(c.calloc(@as(usize, @intCast(n_rules)), @sizeOf(?*compiled_rule)) orelse return -1));
     out_rules.?.* = null;
     out_n.?.* = 0;
 
     var n_done: c_int = 0;
     var failed = false;
-    i = 0;
+    var i: c_int = 0;
     while (i < n_rules) : (i += 1) {
-        const r = rules.?[@intCast(i)] orelse {
+        const r = rules[@intCast(i)] orelse {
             failed = true;
             break;
         };

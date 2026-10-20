@@ -3585,6 +3585,102 @@ pub export fn dl_load_rules(db: ?*DlDb, dl_source: [*c]const u8) c_int {
         }
     }
 
+    // ── Union recompile: the PLAN is a property of the PROGRAMME, too ──────
+    //
+    // What a non-leading, partially-bound body atom becomes — OP_LOOKUP_PERM or
+    // OP_HASH_JOIN — is decided by compiler.zig emit_nonleading_join from the
+    // recursive set AT COMPILE TIME, and (for a recursive relation) it DECLARES
+    // a perm index, which can fail with "too many permutation indices".
+    // Publishing is_recursive onto a retained rule cannot reach either
+    // decision, so a rule from an earlier batch kept the plan its own batch
+    // chose.  MEASURED PRE-FIX on 75846fb (the tests below carry the full
+    // readings): r(X) :- edge(X,Y), reach(W,Y). with the reach rules in a LATER
+    // batch installed SCAN,HASH_JOIN,PROJECT,HALT and 0 perms where the single
+    // batch installs SCAN,LOOKUP_PERM,PROJECT,HALT and 1 perm — and 70
+    // non-leading joins over one arity-8 relation were REFUSED as one batch and
+    // accepted as two.
+    //
+    // compile_rules stratifies and compiles ONE batch, so the fix is to compile
+    // the UNION — every retained rule plus this batch — against the union's
+    // vectors whenever the union's recursion vector DIFFERS from the one the
+    // resident rules were compiled under.  That vector needs no storage: the
+    // republish below writes it onto every retained rule, so "relation k is
+    // recursive" is readable as "some retained rule with head k says so" — and
+    // the batch compile has already used the same vector, because
+    // compute_strata SEEDS out_recursive from the resident rules.  When the two
+    // agree nothing about recursion changed, emit_nonleading_join would take
+    // the cost path it already took, and only the card-dependent decisions
+    // could move — which a single-batch compile freezes at ITS own load too, so
+    // re-planning them would be churn, not parity.  The first load (union IS
+    // this batch, n_ast_rules == 0) needs nothing either.
+    //
+    // INVARIANT this trigger maintains: after every accepted load, every
+    // retained rule was planned under the union vector published at that load.
+    // If the vectors agree, the residents already were (that is what the
+    // published flag means) and this batch's own compile used V_prev too — its
+    // vector is SCC(batch) | V_prev, and V_new == V_prev forces
+    // SCC(union) ⊆ V_prev.  If they differ, the recompile below re-plans
+    // everything under V_new.
+    //
+    // Direction note: compute_strata already SEEDS out_recursive from resident
+    // compiled rules ("carry recursion across dl_load_rules batches"), so the
+    // forward batching (recursion loaded first) was already planned correctly
+    // pre-fix — MEASURED, see the plan test.  The carry cannot flow backwards,
+    // which is the case this block closes.
+    //
+    // The recompile reads the retained AST clones, which are deep copies
+    // (astRuleClone: strings, tokens, exprs) and outlive the parser of the call
+    // that loaded them, so a resident rule recompiles byte-for-byte from its
+    // own AST.  Only the source OFFSET is lost (0 in the clone), which is the
+    // same convention checkUnionRecursion uses for its diagnostics.
+    var union_crules: ?[*]?*compiler.compiled_rule = null;
+    var union_n: c_int = 0;
+    defer if (union_crules) |ur| freeNewCompiled(ur, union_n);
+    if (uni_recursive != null and d.n_ast_rules > 0) {
+        // The vector the resident rules were compiled under, read off their
+        // published flags (every retained rule's is_recursive was rewritten by
+        // the republish at the end of the load that installed it).
+        var prev_rec: [MAX_RELS]c_int = [_]c_int{0} ** MAX_RELS;
+        var q: c_int = 0;
+        while (q < d.n_crules) : (q += 1) {
+            const cr = d.crules.?[@intCast(q)] orelse continue;
+            const hid: usize = @intCast(cr.head_rel_id);
+            if (hid < MAX_RELS and cr.is_recursive != 0) prev_rec[hid] = 1;
+        }
+        var changed = false;
+        var k: c_int = 0;
+        while (k < uni_nrels and !changed) : (k += 1) {
+            if (prev_rec[@intCast(k)] != uni_recursive.?[@intCast(k)]) changed = true;
+        }
+        if (changed) {
+            const nres: usize = @intCast(d.n_ast_rules);
+            const total: usize = nres + @as(usize, @intCast(n_rules));
+            const mem = c.malloc(total * @sizeOf(?*parser.rule)) orelse {
+                freeNewCompiled(new_crules, n_compiled);
+                freeRulesAndParser(rules, n_rules, p);
+                return -1;
+            };
+            const merged: [*]?*parser.rule = @ptrCast(@alignCast(mem));
+            @memcpy(merged[0..nres], d.ast_rules.?[0..nres]);
+            @memcpy(merged[nres..total], rules.?[0..@intCast(n_rules)]);
+            const perms_before: c_int = d.n_perms;
+            const rc = compiler.compileUnionRules(d, merged, @intCast(total), uni_strata.?, uni_recursive.?, uni_nrels, &union_crules, &union_n);
+            c.free(mem);
+            if (rc != 0) {
+                // Refused (e.g. "too many permutation indices"): the same
+                // programme compiled as ONE batch is refused, so this load
+                // loads nothing and the resident programme is untouched.  The
+                // perm indices the refused compile declared are released again
+                // — nothing references them (their rules are already freed) and
+                // the table is a finite resource a caller may retry against.
+                d.n_perms = perms_before;
+                freeNewCompiled(new_crules, n_compiled);
+                freeRulesAndParser(rules, n_rules, p);
+                return -1;
+            }
+        }
+    }
+
     // Retain a DEEP copy of the rule AST: dl_add_fact's constant-kind
     // recheck (compiler.checkAllRuleConstKinds) consults the resident rules.
     {
@@ -3628,8 +3724,21 @@ pub export fn dl_load_rules(db: ?*DlDb, dl_source: [*c]const u8) c_int {
         }
     }
 
-    // Append compiled rules to db's list.
-    {
+    // Install the compiled programme.  When the union compile ran it IS the
+    // whole programme (resident rules included), so it REPLACES the list; the
+    // batch compile's output is dropped with the batch strata it was compiled
+    // under.  Otherwise this batch appends, exactly as before.
+    if (union_crules) |ur| {
+        freeNewCompiled(new_crules, n_compiled);
+        var i: c_int = 0;
+        while (i < d.n_crules) : (i += 1) {
+            if (d.crules.?[@intCast(i)]) |cr| compiler.compiled_rule_free(cr);
+        }
+        c.free(@ptrCast(d.crules));
+        d.crules = ur;
+        d.n_crules = union_n;
+        union_crules = null;
+    } else {
         const new_total = d.n_crules + n_compiled;
         const merged = c.realloc(@ptrCast(d.crules), @as(usize, @intCast(new_total)) * @sizeOf(?*compiler.compiled_rule)) orelse {
             var i: c_int = 0;
@@ -8122,4 +8231,519 @@ test "dl_load_rules: SPLIT == SINGLE for every batching, order and grouping" {
             try testing.expectEqualStrings(ref, got);
         }
     }
+}
+
+// ─── Plan parity for a split programme ────────────────────────────────────
+//
+// Whether a non-leading, partially-bound body atom is emitted as
+// OP_LOOKUP_PERM or OP_HASH_JOIN is a COMPILE-TIME decision
+// (compiler.zig emit_nonleading_join): a relation that is recursive AT COMPILE
+// TIME forces a perm index, otherwise a cost path picks the op.  A batch is
+// compiled against its OWN recursive set, so a rule from an earlier batch keeps
+// the op its own batch compile chose even after a later batch's union
+// stratification makes the relation recursive.  That is the residual 8ba09a0
+// left open twice over: the answers agree (the recursive driver feeds both ops,
+// vm.driverFeeds), the PLAN does not — and a plan that needs too many perm
+// indices is a refusal the single-batch compile makes and the split one cannot.
+// Both halves are measured below, on the ops the engine will actually run.
+
+test "dl_load_rules: a union-recompiled perm over a POPULATED idb answers" {
+    // The recompile happens at a LOAD, which can be long after the relation it
+    // now needs a perm on was derived and filled.  A perm index declared then is
+    // built from the relation's CURRENT tuples by the existing dirty-gating
+    // (vm.zig permindex_build_dirty), not from the empty relation the earlier
+    // compiles saw.  The recursion has to arrive at the LAST load or the batch
+    // compile's own recursion carry already plans it (MEASURED: the reverse
+    // order of the plan test recompiles, the forward order does not need to).
+    //
+    //   a(Y)     :- c(Y), bq(X,Y).    batch 1
+    //   bq(X,Y)  :- e(X), d(Y).       batch 2  -> bq is POPULATED by a compile
+    //   bq(X,Y)  :- e(X), a(Y).       batch 3  -> closes the SCC {a,bq}, the
+    //                                              only recursion, so THIS load
+    //                                              recompiles a's rule
+    // c={1,2} e={1} d={1,2,3} -> bq={(1,1),(1,2),(1,3)} (3 rows), a={1,2}.
+    // bq's 3 rows outnumber c's 2, so the re-planned body keeps c first and the
+    // bq atom is the non-leading, non-prefix-bound join: the perm carve-out,
+    // over a relation that already holds tuples.
+    const dir = "/tmp/datalog_zig_xbatch_pop";
+    rmrfTestDir(dir);
+    defer rmrfTestDir(dir);
+
+    const b1 = "a(Y) :- c(Y), bq(X,Y).";
+    const b2 = "bq(X,Y) :- e(X), d(Y).";
+    const b3 = "bq(X,Y) :- e(X), a(Y).";
+
+    var ops: [32]u8 = undefined;
+    var n_ops: usize = 0;
+    var perm_rel: c_int = -1;
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "c", 1));
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "d", 1));
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "e", 1));
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "a", 1));
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "bq", 2));
+
+        try testing.expectEqual(@as(c_int, 0), dl_load_rules(db, b1));
+        try testing.expectEqual(@as(c_int, 0), dl_load_rules(db, b2));
+        const c1 = [_]u32{ 1, 2 };
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "c", &c1[0], 1));
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "c", &c1[1], 1));
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "e", &[_]u32{1}, 1));
+        for ([_]u32{ 1, 2, 3 }) |v|
+            try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "d", &v, 1));
+        // Evaluate: bq is now populated (3 rows) and a is derived.
+        try testing.expectEqual(@as(c_int, 0), dl_compile(db));
+        try testing.expectEqual(@as(u64, 3), dl_count(db, "bq"));
+        try testing.expectEqual(@as(u64, 2), dl_count(db, "a"));
+
+        // Batch 3 closes the recursion -> the union recompile runs with bq
+        // holding its 3 rows.
+        try testing.expectEqual(@as(c_int, 0), dl_load_rules(db, b3));
+        const ops_seq = xRuleOps(db, "a", &ops);
+        n_ops = ops_seq.len;
+        const ri = findRel(db, "bq");
+        try testing.expect(ri >= 0);
+        var i: c_int = 0;
+        while (i < db.n_crules) : (i += 1) {
+            const cr = db.crules.?[@intCast(i)] orelse continue;
+            if (!std.mem.eql(u8, std.mem.span(cr.head_pred.?), "a")) continue;
+            var w: c_int = 0;
+            while (w < cr.n_instrs) : (w += 1) {
+                const in = &cr.instrs.?[@intCast(w)];
+                if (in.op == 11) perm_rel = @intCast(in.a);
+            }
+        }
+        // The perm atom must be over `bq` — the POPULATED idb — or this case
+        // would be testing a perm over an empty relation instead.
+        try testing.expect(n_ops > 0);
+        try testing.expectEqual(ri, perm_rel);
+        var nb: [256]u8 = undefined;
+        std.debug.print("  populated-idb recompile: a ops [{s}], perm atom over bq({d}), bq held 3 rows\n", .{ xOpNames(ops[0..n_ops], &nb), ri });
+
+        try testing.expectEqual(@as(c_int, 0), dl_compile(db));
+        try testing.expectEqual(@as(u64, 2), dl_count(db, "a"));
+        try testing.expectEqual(@as(u64, 3), dl_count(db, "bq"));
+        try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "a", &[_]u32{2}, 1));
+        try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "bq", &[_]u32{ 1, 3 }, 2));
+    }
+
+    // The single-batch twin answers the same, whatever plan the different card
+    // estimates give it.  (A fresh directory: the first block's facts are
+    // durable, and a re-add would be a duplicate.)
+    rmrfTestDir(dir);
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "c", 1));
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "d", 1));
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "e", 1));
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "a", 1));
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "bq", 2));
+        const c1 = [_]u32{ 1, 2 };
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "c", &c1[0], 1));
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "c", &c1[1], 1));
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "e", &[_]u32{1}, 1));
+        for ([_]u32{ 1, 2, 3 }) |v|
+            try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "d", &v, 1));
+        var j1: [256]u8 = undefined;
+        var j2: [256]u8 = undefined;
+        const p12 = xJoinInto(&j1, &[_][*:0]const u8{ b1, b2 }, &[_]usize{ 0, 1 });
+        const one = xJoinInto(&j2, &[_][*:0]const u8{ p12, b3 }, &[_]usize{ 0, 1 });
+        try testing.expectEqual(@as(c_int, 0), dl_load_rules(db, one.ptr));
+        try testing.expectEqual(@as(c_int, 0), dl_compile(db));
+        try testing.expectEqual(@as(u64, 2), dl_count(db, "a"));
+        try testing.expectEqual(@as(u64, 3), dl_count(db, "bq"));
+        try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "a", &[_]u32{2}, 1));
+        try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "bq", &[_]u32{ 1, 3 }, 2));
+    }
+}
+
+fn xOpName(op: u8) []const u8 {
+    return switch (op) {
+        0 => "HALT",
+        1 => "SCAN",
+        2 => "LOOKUP",
+        3 => "EQ",
+        4 => "EQ_CONST",
+        5 => "PROJECT",
+        7 => "NEG_CHECK",
+        8 => "AGG_ACC",
+        9 => "AGG_EMIT",
+        10 => "WALK",
+        11 => "LOOKUP_PERM",
+        12 => "HASH_JOIN",
+        18 => "MAT_BEGIN",
+        19 => "MAT_JOIN",
+        else => "?",
+    };
+}
+
+fn xOpNames(ops: []const u8, buf: []u8) []const u8 {
+    var n: usize = 0;
+    for (ops, 0..) |op, k| {
+        if (k != 0) {
+            buf[n] = ',';
+            n += 1;
+        }
+        const s = xOpName(op);
+        @memcpy(buf[n..][0..s.len], s);
+        n += s.len;
+    }
+    return buf[0..n];
+}
+
+/// The op sequence of the installed compiled rule whose head is `pred` — the
+/// program the engine will actually run, not a description of it.
+fn xRuleOps(db: *DlDb, pred: [*:0]const u8, buf: []u8) []const u8 {
+    var i: c_int = 0;
+    while (i < db.n_crules) : (i += 1) {
+        const cr = db.crules.?[@intCast(i)] orelse continue;
+        if (!std.mem.eql(u8, std.mem.span(cr.head_pred.?), std.mem.span(pred))) continue;
+        const n: usize = @intCast(cr.n_instrs);
+        for (cr.instrs.?[0..n], 0..) |ins, k| buf[k] = ins.op;
+        return buf[0..n];
+    }
+    return buf[0..0];
+}
+
+const XPlan = struct {
+    ops: [32]u8 = undefined,
+    n_ops: usize = 0,
+    perms: c_int = 0,
+    count: u64 = 0,
+};
+
+/// Load `batches` into a fresh db, read the installed op sequence of the rule
+/// headed `goal`, then add the facts and compile.  Rules are loaded BEFORE any
+/// fact so every arrangement compiles against the same (empty) relations — the
+/// plan is chosen from the compile-time card estimates.
+fn xPlanRun(dbpath: [*:0]const u8, batches: []const [:0]const u8, goal: [*:0]const u8) !XPlan {
+    rmrfTestDir(dbpath);
+    const db = dl_open(dbpath) orelse return error.TestUnexpectedResult;
+    defer dl_close(db);
+
+    try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "edge", 2));
+    try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "reach", 2));
+    for (batches) |src| try testing.expectEqual(@as(c_int, 0), dl_load_rules(db, src.ptr));
+
+    var out = XPlan{};
+    const ops = xRuleOps(db, goal, &out.ops);
+    out.n_ops = ops.len;
+    out.perms = dl_db_perm_count(db);
+
+    // edge = the chain 1->2->3->4->5
+    const f = [_]u32{ 1, 2, 2, 3, 3, 4, 4, 5 };
+    var k: usize = 0;
+    while (k < 4) : (k += 1)
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "edge", &f[k * 2], 2));
+
+    try testing.expectEqual(@as(c_int, 0), dl_compile(db));
+    out.count = dl_count(db, goal);
+    return out;
+}
+
+test "dl_load_rules: split PLAN == single-batch PLAN (perm vs hash join)" {
+    //   reach(X,Y) :- edge(X,Y).
+    //   reach(X,Y) :- edge(X,Z), reach(Z,Y).
+    //   r(X)       :- edge(X,Y), reach(W,Y).      <- r's second atom is the
+    //                                               non-leading join over reach
+    // As ONE batch, reach is recursive when r is compiled, so the carve-out in
+    // emit_nonleading_join forces a perm index.  Split {reach rules} | {r}, r's
+    // batch sees no rule for reach at all: reach is non-recursive, the cost
+    // path finds no perm and the card estimate is 0 < g_perm_card_threshold,
+    // so r was emitted as OP_HASH_JOIN.
+    //
+    // MEASURED PRE-FIX on 75846fb, ops read out of d.crules:
+    //   single batch        -> SCAN,LOOKUP_PERM,PROJECT,HALT   1 perm declared
+    //   split fwd  (reach|r) -> SCAN,HASH_JOIN,PROJECT,HALT     0 perms
+    //   split rev  (r|reach) -> SCAN,HASH_JOIN,PROJECT,HALT     0 perms
+    // with r = {1,2,3,4} in all three (the driver feeds both ops).
+    const one = "reach(X,Y) :- edge(X,Y).\nreach(X,Y) :- edge(X,Z), reach(Z,Y).";
+    const rd = "r(X) :- edge(X,Y), reach(W,Y).";
+    var jbuf: [512]u8 = undefined;
+    const single = xJoinInto(&jbuf, &[_][*:0]const u8{ one, rd }, &[_]usize{ 0, 1 });
+
+    const p_single = try xPlanRun("/tmp/datalog_zig_xbatch_plan", &[_][:0]const u8{single}, "r");
+    const p_fwd = try xPlanRun("/tmp/datalog_zig_xbatch_plan", &[_][:0]const u8{ one, rd }, "r");
+    const p_rev = try xPlanRun("/tmp/datalog_zig_xbatch_plan", &[_][:0]const u8{ rd, one }, "r");
+
+    var nb1: [256]u8 = undefined;
+    var nb2: [256]u8 = undefined;
+    var nb3: [256]u8 = undefined;
+    std.debug.print("  plan: single [{s}] {d} perm(s) / split-fwd [{s}] {d} / split-rev [{s}] {d}\n", .{
+        xOpNames(p_single.ops[0..p_single.n_ops], &nb1), p_single.perms,
+        xOpNames(p_fwd.ops[0..p_fwd.n_ops], &nb2), p_fwd.perms,
+        xOpNames(p_rev.ops[0..p_rev.n_ops], &nb3), p_rev.perms,
+    });
+
+    // The fixture must actually exercise the perm carve-out, or the parity
+    // assertion below would be vacuous.
+    try testing.expect(std.mem.indexOfScalar(u8, p_single.ops[0..p_single.n_ops], 11) != null);
+    try testing.expectEqualSlices(u8, p_single.ops[0..p_single.n_ops], p_fwd.ops[0..p_fwd.n_ops]);
+    try testing.expectEqualSlices(u8, p_single.ops[0..p_single.n_ops], p_rev.ops[0..p_rev.n_ops]);
+    try testing.expectEqual(p_single.perms, p_fwd.perms);
+    try testing.expectEqual(p_single.perms, p_rev.perms);
+
+    // r ⊆ edge's first column = {1,2,3,4}, so count 4 pins the answer exactly:
+    // every one of 1..4 has an outgoing edge into reach's second column.
+    try testing.expectEqual(@as(u64, 4), p_single.count);
+    try testing.expectEqual(@as(u64, 4), p_fwd.count);
+    try testing.expectEqual(@as(u64, 4), p_rev.count);
+}
+
+/// `q(X0) :- b(X0,...,X7), t(<arg0>,...,<arg7>).` where the JOIN columns of the
+/// t-atom are exactly the bits set in `mask` and every other column holds a
+/// rule-unique variable.  One perm per mask: the perm of a non-leading join
+/// atom is its join columns in column order followed by the rest in column
+/// order, so the join-column SET is the whole of the choice.
+///
+/// `mask` must have bit 0 CLEAR: an atom whose bound columns form a leading
+/// prefix (k > 0) takes emit_pos_atom's OP_LOOKUP path and needs no perm at all,
+/// so a mask with bit 0 set would not exercise the carve-out.
+fn xSubsetRule(buf: []u8, idx: usize, mask: u32) []const u8 {
+    var n: usize = 0;
+    const head = "q(X0) :- b(X0,X1,X2,X3,X4,X5,X6,X7), t(";
+    @memcpy(buf[0..head.len], head);
+    n = head.len;
+    var j: usize = 0;
+    while (j < 8) : (j += 1) {
+        if (j != 0) {
+            buf[n] = ',';
+            n += 1;
+        }
+        var tmp: [16]u8 = undefined;
+        const s = if (mask & (@as(u32, 1) << @intCast(j)) != 0)
+            std.fmt.bufPrint(&tmp, "X{d}", .{j}) catch unreachable
+        else
+            std.fmt.bufPrint(&tmp, "z{d}_{d}", .{ idx, j }) catch unreachable;
+        @memcpy(buf[n..][0..s.len], s);
+        n += s.len;
+    }
+    buf[n] = ')';
+    buf[n + 1] = '.';
+    n += 2;
+    return buf[0..n];
+}
+
+/// Load `batches` in order, assert every PREFIX is accepted (so the refusal is
+/// at the load that closes the recursion, not an earlier one) and the LAST one
+/// is REFUSED with `want` in its diagnostic — and that the refusal loaded
+/// nothing: the accepted prefix still compiles, and the perm table is exactly
+/// where it was (the refused programme's perm declarations are its own).
+fn xRefused(dbpath: [*:0]const u8, rels: []const XRel, batches: []const [:0]const u8, want: []const u8, union_refusal: bool) !void {
+    rmrfTestDir(dbpath);
+    const db = dl_open(dbpath) orelse return error.TestUnexpectedResult;
+    defer dl_close(db);
+    for (rels) |r| try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, r.rel, r.arity));
+
+    const last = batches.len - 1;
+    for (batches[0..last]) |src| try testing.expectEqual(@as(c_int, 0), dl_load_rules(db, src.ptr));
+
+    const perms_before = dl_db_perm_count(db);
+    try testing.expectEqual(@as(c_int, -1), dl_load_rules(db, batches[last].ptr));
+    const msg = compiler.compile_last_error(null) orelse return error.TestUnexpectedResult;
+    const s = std.mem.span(msg);
+    std.debug.print("  refusal at load {d}: {s}\n", .{ last + 1, s });
+    try testing.expect(std.mem.indexOf(u8, s, want) != null);
+    // When the UNION recompile is what refuses, it gives its perm indices back:
+    // nothing references them once the programme it compiled is freed, and the
+    // resident programme's own indices are untouched.  When instead the BATCH
+    // compile refuses (which it can, for the orders where the recursion is
+    // already resident — compute_strata seeds recursion from the resident
+    // rules), the indices it declared before failing are kept, exactly as
+    // compile_rules has always behaved.
+    if (union_refusal) try testing.expectEqual(perms_before, dl_db_perm_count(db));
+
+    // The refused load added no rule: the accepted prefix is still the whole
+    // programme and still compiles.
+    try testing.expectEqual(@as(c_int, 0), dl_compile(db));
+}
+
+test "dl_load_rules: a split load is REFUSED where the single batch is (perm cap)" {
+    // 70 rules whose non-leading join atom is over ONE arity-8 recursive
+    // relation, one per DISTINCT join-column subset with column 0 unbound (a
+    // bound leading prefix is an OP_LOOKUP, not a perm): 70 distinct
+    // (rel, arity, perm) triples against the engine's 64-slot perm table.  As
+    // one batch, `t` is recursive when all 70 rules are compiled, the carve-out
+    // forces every perm, and the 65th is refused with "too many permutation
+    // indices".
+    //
+    // MEASURED PRE-FIX on 75846fb: loading the same rules as {t rules} | {70
+    // rules} was ACCEPTED — the second batch compiled against its own recursive
+    // set, `t` was not recursive there, the cost path declared no perm at all
+    // (card 0 < 4), so a programme that CANNOT be compiled as one batch ran
+    // happily as two.
+    const rec = "t(X0,X1,X2,X3,X4,X5,X6,X7) :- b(X0,X1,X2,X3,X4,X5,X6,X7).\n" ++
+        "t(A0,A1,A2,A3,A4,A5,A6,A7) :- t(A0,A1,A2,A3,A4,A5,A6,A7).";
+    const rels = [_]XRel{
+        .{ .rel = "b", .arity = 8 },
+        .{ .rel = "t", .arity = 8 },
+        .{ .rel = "q", .arity = 1 },
+    };
+
+    var sub: [70][160]u8 = undefined;
+    var h1: [8192]u8 = undefined;
+    var h2: [8192]u8 = undefined;
+    var all: [16384]u8 = undefined;
+    var n1: usize = 0;
+    var n2: usize = 0;
+    var na: usize = 0;
+    var k: usize = 0;
+    while (k < 70) : (k += 1) {
+        const s = xSubsetRule(&sub[k], k, @intCast((k + 1) * 2));
+        const dst = if (k < 35) &h1 else &h2;
+        const at = if (k < 35) &n1 else &n2;
+        std.mem.copyForwards(u8, dst[at.*..][0..s.len], s);
+        dst[at.* + s.len] = '\n';
+        at.* += s.len + 1;
+    }
+    std.mem.copyForwards(u8, all[0..n1], h1[0..n1]);
+    na = n1;
+    std.mem.copyForwards(u8, all[na..][0..n2], h2[0..n2]);
+    na += n2;
+    h1[n1] = 0;
+    h2[n2] = 0;
+    all[na] = 0;
+    const first: [:0]const u8 = h1[0..n1 :0];
+    const second: [:0]const u8 = h2[0..n2 :0];
+    const both: [:0]const u8 = all[0..na :0];
+
+    var jrec: [512]u8 = undefined;
+    var jone: [16384]u8 = undefined;
+    const recz = xJoinInto(&jrec, &[_][*:0]const u8{rec}, &[_]usize{0});
+    const onez = xJoinInto(&jone, &[_][*:0]const u8{recz, both}, &[_]usize{ 0, 1 });
+
+    // Reference: the single batch is refused.
+    try xRefused("/tmp/datalog_zig_xbatch_cap", &rels, &[_][:0]const u8{onez}, "too many permutation indices", false);
+
+    // 2 batches, both orders: refused at the load that closes the recursion.
+    // The reverse order is the one the per-batch compile cannot see — the 70
+    // perm-needing rules are loaded while `t` has no rule at all, so nothing but
+    // the union recompile can refuse them — MEASURED PRE-FIX: accepted.
+    try xRefused("/tmp/datalog_zig_xbatch_cap", &rels, &[_][:0]const u8{ recz, both }, "too many permutation indices", false);
+    try xRefused("/tmp/datalog_zig_xbatch_cap", &rels, &[_][:0]const u8{ both, recz }, "too many permutation indices", true);
+
+    // 3 batches: every prefix under the cap, the last one over it.
+    try xRefused("/tmp/datalog_zig_xbatch_cap", &rels, &[_][:0]const u8{ recz, first, second }, "too many permutation indices", false);
+    try xRefused("/tmp/datalog_zig_xbatch_cap", &rels, &[_][:0]const u8{ first, recz, second }, "too many permutation indices", false);
+}
+
+test "dl_load_rules: split plan keeps the INCREMENTAL-MAINTENANCE class" {
+    // The maintenance class the cascade picks at consolidation is read off the
+    // ops (vm.zig vm_ivm_eligible): one OP_HASH_JOIN atom makes a programme
+    // IVM-ineligible and it falls back to a full re-evaluate, while an
+    // OP_LOOKUP_PERM atom over a recursive head in the SAME stratum is what the
+    // fixpoint's perm shadow exists for and stays incremental.  So a plan
+    // difference is a maintenance-class difference too, and the split
+    // programme must land in the class its single-batch twin lands in.
+    //
+    //   a(Y)     :- c(Y), bq(X,Y).    <- bq is only partially bound and NOT
+    //                                   prefix-bound (col 1 is the join), so it
+    //                                   needs a perm; the SCC is {a,bq}
+    //   bq(X,Y)  :- e(X), a(Y).
+    //   bq(X,Y)  :- e(X), d(Y).
+    // c={1,2} d={1} e={1}  ->  a={1}, bq={(1,1)}; then d(2) -> a={1,2},
+    // bq={(1,1),(1,2)}.
+    const one = "a(Y) :- c(Y), bq(X,Y).\nbq(X,Y) :- e(X), a(Y).\nbq(X,Y) :- e(X), d(Y).";
+    const ba = "a(Y) :- c(Y), bq(X,Y).";
+    const bb = "bq(X,Y) :- e(X), a(Y).\nbq(X,Y) :- e(X), d(Y).";
+
+    const T = struct {
+        fn run(dbpath: [*:0]const u8, batches: []const [:0]const u8, eligible: *c_int, a_count: *u64, bq_count: *u64, a_del: *u64, bq_del: *u64, ops_out: []u8, n_ops: *usize) !void {
+            rmrfTestDir(dbpath);
+            const db = dl_open(dbpath) orelse return error.TestUnexpectedResult;
+            defer dl_close(db);
+            try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "c", 1));
+            try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "d", 1));
+            try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "e", 1));
+            try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "a", 1));
+            try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "bq", 2));
+            // Rules BEFORE the facts: the plan (and so the maintenance class)
+            // is chosen at compile time from the card estimates, and every
+            // batching must be compared against the same empty relations.
+            for (batches) |src| try testing.expectEqual(@as(c_int, 0), dl_load_rules(db, src.ptr));
+
+            const ops = xRuleOps(db, "a", ops_out);
+            n_ops.* = ops.len;
+
+            const f1 = [_]u32{ 1, 2 };
+            const f2 = [_]u32{1};
+            try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "c", &f1[0], 1));
+            try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "c", &f1[1], 1));
+            try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "d", &f2[0], 1));
+            try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "e", &f2[0], 1));
+
+            try testing.expectEqual(@as(c_int, 0), dl_compile(db));
+            try testing.expectEqual(@as(u64, 1), dl_count(db, "a"));
+            try testing.expectEqual(@as(u64, 1), dl_count(db, "bq"));
+            eligible.* = vm_ivm_eligible(db);
+
+            // A new d fact: bq grows, then a = c ∩ proj(bq) grows, so both end
+            // up with two rows.  dl_consolidate runs the maintenance cascade
+            // (where the class decides the path) and the counts below are read
+            // WITHOUT re-evaluating.
+            const d2 = [_]u32{2};
+            try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "d", &d2[0], 1));
+            try testing.expectEqual(@as(c_int, 0), dl_consolidate(db));
+            a_count.* = dl_count(db, "a");
+            bq_count.* = dl_count(db, "bq");
+            try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "a", &[_]u32{2}, 1));
+            try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "bq", &[_]u32{ 1, 2 }, 2));
+
+            // ... and back out again: the DELETE half of the same question
+            // (del_pending + the DRed class, which a recursive programme never
+            // takes — it falls back to the full re-evaluate).  Everything must
+            // return to the pre-insert state.
+            try testing.expectEqual(@as(c_int, 1), dl_delete_fact(db, "d", &d2[0], 1));
+            try testing.expectEqual(@as(c_int, 0), dl_consolidate(db));
+            a_del.* = dl_count(db, "a");
+            bq_del.* = dl_count(db, "bq");
+            try testing.expectEqual(@as(c_int, 0), dl_lookup(db, "a", &[_]u32{2}, 1));
+            try testing.expectEqual(@as(c_int, 0), dl_lookup(db, "bq", &[_]u32{ 1, 2 }, 2));
+        }
+    };
+
+    var e_single: c_int = -1;
+    var e_split: c_int = -1;
+    var a_single: u64 = 0;
+    var a_split: u64 = 0;
+    var bq_single: u64 = 0;
+    var bq_split: u64 = 0;
+    var ad_single: u64 = 0;
+    var ad_split: u64 = 0;
+    var bd_single: u64 = 0;
+    var bd_split: u64 = 0;
+    var ops_single: [32]u8 = undefined;
+    var ops_split: [32]u8 = undefined;
+    var n_single: usize = 0;
+    var n_split: usize = 0;
+    try T.run("/tmp/datalog_zig_xbatch_ivm", &[_][:0]const u8{one}, &e_single, &a_single, &bq_single, &ad_single, &bd_single, &ops_single, &n_single);
+    try T.run("/tmp/datalog_zig_xbatch_ivm", &[_][:0]const u8{ ba, bb }, &e_split, &a_split, &bq_split, &ad_split, &bd_split, &ops_split, &n_split);
+
+    var nb1: [256]u8 = undefined;
+    var nb2: [256]u8 = undefined;
+    std.debug.print("  a-rule ops: single [{s}] / split [{s}]; ivm eligible single {d} split {d}; after insert+consolidate a {d}/{d} bq {d}/{d}\n", .{
+        xOpNames(ops_single[0..n_single], &nb1),
+        xOpNames(ops_split[0..n_split], &nb2),
+        e_single,
+        e_split,
+        a_single,
+        a_split,
+        bq_single,
+        bq_split,
+    });
+    try testing.expectEqualSlices(u8, ops_single[0..n_single], ops_split[0..n_split]);
+    try testing.expectEqual(e_single, e_split);
+    try testing.expectEqual(a_single, a_split);
+    try testing.expectEqual(bq_single, bq_split);
+    try testing.expectEqual(ad_single, ad_split);
+    try testing.expectEqual(bd_single, bd_split);
+    // The incremental cascade really ran on the split db: both relations grew,
+    // and the delete put them back.
+    try testing.expectEqual(@as(u64, 2), a_split);
+    try testing.expectEqual(@as(u64, 2), bq_split);
+    try testing.expectEqual(@as(u64, 1), ad_split);
+    try testing.expectEqual(@as(u64, 1), bd_split);
 }

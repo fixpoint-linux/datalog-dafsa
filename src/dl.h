@@ -406,15 +406,33 @@ int dl_attach_schema(dl_db *db, const dl_schema *schema);
  *     cycle, or that makes an existing rule a recursive aggregate / a
  *     recursive rule over a variadic head / a range over a recursive relation,
  *     is REFUSED (returns -1) with the single-batch program's diagnostic.
- *     Two limits, both measured and both about cost rather than answers: the
- *     bytecode is compiled per batch, so a rule promoted to recursive by a
- *     later batch keeps the op the earlier compile chose (the recursive driver
- *     feeds every BODY-ATOM op the compiler can emit — SCAN, LOOKUP,
- *     LOOKUP_PERM, HASH_JOIN and the pattern WALK — see vm.zig driverFeeds, so
- *     the answer is unaffected, but the plan, and therefore the cost, may
- *     differ from the single-batch plan); and because that forced-perm
- *     compile-time step is not re-run, a split program cannot be refused with
- *     "too many permutation indices" where the single-batch program would be.
+ *   - The COMPILED PROGRAM is the one a single-batch load of the same rules
+ *     produces, not just the answers.  Whether a non-leading, partially-bound
+ *     body atom becomes OP_LOOKUP_PERM or OP_HASH_JOIN — and whether it forces
+ *     a permutation index, which is how a large program is refused with "too
+ *     many permutation indices" — is a COMPILE-TIME decision taken from the
+ *     recursive set (compiler.zig emit_nonleading_join).  Republishing
+ *     is_recursive onto a retained rule cannot reach it, so when a load makes
+ *     ANY relation newly recursive — the union's recursion vector differs from
+ *     the one the retained rules were compiled under — every retained rule and
+ *     the incoming batch are RECOMPILED against the union's strata and
+ *     recursion.  A split load therefore plans (and is refused) as its
+ *     single-batch twin does.  A load that changes no relation's recursion
+ *     status recompiles nothing: the per-batch compile already saw the same
+ *     vector (compute_strata carries recursion across loads), so the only
+ *     decision that could move is a card-dependent one, and those a
+ *     single-batch compile freezes at its own load too.
+ *     Boundary, measured: when recursion does change, that recompile also
+ *     re-plans card-dependent atoms from the card estimates AT THAT LOAD, so a
+ *     program split around fact insertion plans as a single-batch load
+ *     performed at the last load's moment would — not as one performed before
+ *     the facts existed.  And a rule promoted to recursive makes the program
+ *     IVM-eligible where the stale op made it IVM-ineligible: that is the
+ *     single-batch maintenance class, because the fixpoint shadows perm indices
+ *     on recursive heads (vm.zig vm_ivm_eligible) and the incremental path is
+ *     gated on it.  The answers are unaffected either way: the recursive driver
+ *     feeds every BODY-ATOM op the compiler can emit (SCAN, LOOKUP,
+ *     LOOKUP_PERM, HASH_JOIN and the pattern WALK — vm.zig driverFeeds).
  *   - Previously derived relations are NOT kept: each evaluation resets the
  *     derived views and re-derives them from the EDB, so no tuple derived under
  *     an earlier rule set survives.
