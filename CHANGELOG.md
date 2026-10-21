@@ -3,6 +3,42 @@
 All notable changes to this project are documented in this file.
 
 ## [Unreleased]
+- **Interner: the durable save is now an APPEND, not a 45MB rewrite — 50ms per
+  new-string fact -> 0.06ms** (2026-10-26, unit `interninc`).
+  `intern_save` (`zig/src/intern.zig`) rewrote the whole `symbols.array`
+  (tmp+fsync+rename) on EVERY write that interned a new string, and
+  `dl_add_fact` saves the interner before it appends the WAL record — so the
+  cost an agent paid on essentially every content write was O(vocabulary).
+  MEASURED on a copy of the agent store (174,257 symbols / 45.0MB array):
+  49.5/49.0/47.0 ms per new-string fact -> 0.11/0.04/0.03 ms (three in a row
+  145.5 -> 0.19 ms); `dl_open` unchanged (28.6 -> 25.3 ms).  `symbols.array` is
+  append-only (ids are assigned in order and never rewritten), so the save now
+  writes only the canonical lines for the ids added since, with one write+fsync
+  (O(k)), when — and only when — the destination is provably still the file
+  this interner last made durable: a per-path record of (dev, inode, size,
+  mtime, ctime), re-verified under the file lock with `statx(fd,
+  AT_EMPTY_PATH)`.  Everything else (first save of a path, a file replaced by
+  a tmp+rename, a same-size in-place rewrite, a file that does not end at a
+  line boundary) falls through to the unchanged whole-file path, which is also
+  what repairs a torn file.  M7 is unchanged: the append fsyncs before
+  `intern_save` returns 0.  A crash mid-append leaves a truncated final line,
+  which `intern_load` accepts (getline behaviour) as an id no WAL record
+  references, and the next save canonicalizes it.  Readers take a shared
+  `flock` on the array for the length of their read (an in-place append is not
+  a rename), and the append holds it exclusively.
+  The content stamp's lazy catch-up now runs the SAME canonical encoder the
+  save writes with (`writeSymbolsTo`) through a 64KiB staging sink instead of
+  ~700k per-symbol hash updates: the first publish of a process went 45.9 ->
+  28.5 ms; the rest is one bandwidth-bound pass over the array, and a
+  read-only process still pays nothing.  Tests: the append keeps one inode and
+  grows by exactly k lines, the appended file's stamp equals the
+  whole-written one's, an `_exit` without close leaves the appended ids
+  durable and readable by a fresh process, a torn tail is rewritten not
+  appended to, a same-size diverged file is rewritten not appended to, and the
+  publish gate's diverged-root detection still fires (mutation: a count-only
+  gate makes that test fail).  `zig build test`, the release build,
+  `test_binding.py` (37), `cli_diff.sh` (byte-green incl. the db-tree
+  manifest) and the 38 re-linked C suites all green.
 - **Snapshot view cache: keyed on the relation NAME alone — a second VERSION of
   the same relation silently answered with the first version's tuples**
   (2026-10-19, unit `vcache`).  `view_open_cached` (`zig/src/snapshot.zig`) is

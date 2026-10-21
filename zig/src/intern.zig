@@ -44,9 +44,18 @@
 //! rewrites or frees an existing entry except intern_free (whole-interner
 //! destroy).  So the serialized array is a function of (count, content) only,
 //! which is what SymHash below tracks incrementally.
+//!
+//! THE SAVE IS INCREMENTAL for the same reason: a save whose destination file
+//! is still the one this interner last made durable only has to APPEND the
+//! canonical lines for the ids added since (one write + one fsync, O(k)) —
+//! see appendSymbols.  MEASURED on a copy of the agent store (174k symbols /
+//! 45 MB array): a new-string fact went 50.0/52.1/49.5 ms -> 0.14/0.06/0.07 ms
+//! (three in a row: 151.5 ms -> 0.27 ms).  Everything that cannot be proven
+//! appendable falls back to the whole-file tmp+fsync+rename.
 
 const std = @import("std");
 const c = std.c;
+const linux = std.os.linux;
 const util = @import("util.zig");
 
 /// dafsa_internal.h: MAX_WORD_LEN guard (intern-side, on str \0 id_u32BE).
@@ -71,6 +80,32 @@ extern "c" fn strdup(s: [*:0]const u8) ?[*:0]u8;
 extern "c" fn strcmp(a: [*:0]const u8, b: [*:0]const u8) c_int;
 extern "c" fn fflush(stream: *c.FILE) c_int;
 extern "c" fn fileno(stream: *c.FILE) c_int;
+extern "c" fn fork() c_int;
+
+/// Longest path the incremental-save bookkeeping keys on; a longer one simply
+/// takes the whole-file path (every path buffer in the engine is 4096).
+const MAX_SAVED_PATH: usize = 4096;
+
+/// One "this file is the durable symbols.array for ids [1, next_id)" record.
+///
+/// The identity is the FILE's (device, inode, size, mtime, ctime), keyed by
+/// the path it was written to.  Size alone would accept a same-length
+/// divergence (the hazard the publish stamp exists for: a restored/copied/
+/// tampered root array) and append onto bytes this interner never wrote;
+/// mtime/ctime catch an in-place rewrite even at an unchanged size, and the
+/// path key keeps a recycled inode from being mistaken for our file.
+const SavedPrefix = struct {
+    path: [MAX_SAVED_PATH]u8, // NUL-terminated; path[0] == 0 -> empty slot
+    next_id: u32, // ids [1, next_id) are durable in the file
+    bytes: u64, // file size at that point
+    dev: u64, // major << 32 | minor
+    ino: u64,
+    mtim_sec: i64,
+    mtim_nsec: i64,
+    ctim_sec: i64,
+    ctim_nsec: i64,
+    used: u64, // LRU stamp
+};
 
 /// struct interner — private (opaque in intern.h).
 const Interner = struct {
@@ -91,6 +126,11 @@ const Interner = struct {
     // per-slot free the strdup'd slots get.
     load_buf: ?[*]u8,
     buf_owned_n: u32,
+    // Durable-prefix records for the incremental save (two slots: the db-root
+    // array and the last snapshot-staging array are both live in a publishing
+    // process, and each must keep its own append state).
+    saved: [2]SavedPrefix,
+    saved_seq: u64,
 };
 
 /// The content stamp a publish compares to decide whether a snapshot's
@@ -118,6 +158,10 @@ pub const SymStamp = struct {
 /// write path — MEASURED: hashing interleaved with intern_save's per-byte write
 /// loop cost ~37 ms on a 44 MB array vs ~25 ms for the sequential catch-up, so
 /// the write path deliberately does not fuse it.
+///
+/// WHAT IS FED is literally writeSymbolsTo's output (the same function the
+/// save writes with), through one of the sinks below — so the stamp cannot
+/// drift from the bytes a save produces.
 const SymHash = struct {
     a: std.hash.Wyhash,
     b: std.hash.Wyhash,
@@ -132,26 +176,51 @@ const SymHash = struct {
         self.a.update(bytes);
         self.b.update(bytes);
     }
+};
 
-    /// Feed one rev[] slot in canonical encoding.  A null slot (an id consumed
-    /// by a strdup failure) encodes exactly as intern_save writes it: a bare
-    /// newline.
-    fn addSlot(self: *SymHash, s: ?[*:0]const u8) void {
-        const p = s orelse {
-            self.feed("\n");
-            return;
-        };
-        var start: usize = 0;
-        var i: usize = 0;
-        while (p[i] != 0) : (i += 1) {
-            if (p[i] == '\\' or p[i] == '\n') {
-                if (i > start) self.feed(p[start..i]);
-                self.feed(if (p[i] == '\\') "\\\\" else "\\n");
-                start = i + 1;
-            }
+/// Hash sink for the CATCH-UP pass: stages the canonical bytes in one buffer
+/// and feeds the hash a whole chunk at a time.  MEASURED on the agent store's
+/// 45 MB array: one update per symbol/escape/newline (~700k calls) made the
+/// first publish of every process cost ~48 ms; 64 KiB batches make the same
+/// content hash ~29 ms (the rest is the escape scan and the staging copy, both
+/// memory-bandwidth-bound).
+const HashSink = struct {
+    h: *SymHash,
+    buf: [64 * 1024]u8 = undefined,
+    len: usize = 0,
+
+    fn flush(self: *HashSink) bool {
+        if (self.len != 0) self.h.feed(self.buf[0..self.len]);
+        self.len = 0;
+        return true;
+    }
+
+    fn put(self: *HashSink, bytes: []const u8) bool {
+        var rest = bytes;
+        while (rest.len != 0) {
+            if (self.len == self.buf.len and !self.flush()) return false;
+            const k = @min(self.buf.len - self.len, rest.len);
+            @memcpy(self.buf[self.len .. self.len + k], rest[0..k]);
+            self.len += k;
+            rest = rest[k..];
         }
-        if (i > start) self.feed(p[start..i]);
-        self.feed("\n");
+        return true;
+    }
+};
+
+/// Hash sink for ONE slot (the intern_str append path): feeds directly, since
+/// a single symbol is far smaller than a staging buffer.
+const DirectSink = struct {
+    h: *SymHash,
+
+    fn flush(self: *DirectSink) bool {
+        _ = self;
+        return true;
+    }
+
+    fn put(self: *DirectSink, bytes: []const u8) bool {
+        self.h.feed(bytes);
+        return true;
     }
 };
 
@@ -220,6 +289,8 @@ pub export fn intern_create() ?*Interner {
         .sym_hashed = 0,
         .load_buf = null,
         .buf_owned_n = 0,
+        .saved = .{ std.mem.zeroes(SavedPrefix), std.mem.zeroes(SavedPrefix) },
+        .saved_seq = 0,
     };
 
     ir.fwd = dafsa_create() orelse {
@@ -370,9 +441,11 @@ pub export fn intern_str(ir: ?*Interner, str: ?[*:0]const u8) u32 {
     // Feed the content stamp the slot just appended — but ONLY when the hash is
     // caught up to this slot; otherwise the pending slots (unhashed since a
     // load) are fed in order by symStamp's catch-up, this one included.  A
-    // failed strdup leaves a HOLE that serializes as a bare newline (addSlot).
+    // failed strdup leaves a HOLE that serializes as a bare newline, which is
+    // exactly what writeSymbolsTo emits for a null slot.
     if (s.sym_hashed == id - 1) {
-        s.sym_hash.addSlot(if (dup == null) null else p);
+        var ds = DirectSink{ .h = &s.sym_hash };
+        _ = writeSymbolsTo(s, &ds, id, id + 1);
         s.sym_hashed = id;
     }
     if (dup == null) return 0;
@@ -437,23 +510,26 @@ pub fn liveSymBound(ir: ?*const anyopaque) u32 {
 /// unconditional 44 MB write + read-back.
 ///
 /// The hash is LAZY: intern_load hashes nothing (a read-only process must not
-/// pay a second pass over a 44 MB array it may never publish from), so the
-/// first call here feeds every slot loaded since — O(one pass over the array,
-/// once per process) — and later calls are O(1) until the next append.  A
-/// publish therefore pays ~20 ms of hashing instead of ~150 ms of per-byte
-/// rewriting, and nothing else pays anything.  Wyhash.final() shallow-copies
-/// its state, so stamping is idempotent.
+/// pay a second pass over a 44 MB array it may never publish from — MEASURED:
+/// fusing it into the load costs every open ~5 ms, and it has to be thrown
+/// away and redone whenever a line needs escaping), so the first call here
+/// feeds every slot loaded since — O(one pass over the array, once per
+/// process) — and later calls are O(1) until the next append, which intern_str
+/// feeds inline.  A publish therefore pays ~29 ms of hashing instead of ~150 ms
+/// of per-byte rewriting, and nothing else pays anything.  Wyhash.final()
+/// shallow-copies its state, so stamping is idempotent.
 pub fn symStamp(ir: ?*anyopaque) SymStamp {
     if (ir == null) return .{ .count = 0, .h0 = 0, .h1 = 0 };
     const s: *Interner = @ptrCast(@alignCast(ir.?));
     // Catch up over slots appended since the last stamp (in load ORDER: the
-    // canonical byte stream is a concatenation, so order is not optional).
-    var i = s.sym_hashed;
-    while (i + 1 < s.next_id) : (i += 1) {
-        const slot: ?[*:0]const u8 = if (i < s.rev_cap) s.rev.?[i] else null;
-        s.sym_hash.addSlot(slot);
+    // canonical byte stream is a concatenation, so order is not optional),
+    // through the SAME writer a save uses and in whole-buffer batches.
+    if (s.sym_hashed + 1 < s.next_id) {
+        var hs = HashSink{ .h = &s.sym_hash };
+        _ = writeSymbolsTo(s, &hs, s.sym_hashed + 1, s.next_id);
+        _ = hs.flush();
+        s.sym_hashed = s.next_id - 1;
     }
-    s.sym_hashed = i;
     var a = s.sym_hash.a;
     var b = s.sym_hash.b;
     return .{ .count = s.next_id -% 1, .h0 = a.final(), .h1 = b.final() };
@@ -517,15 +593,49 @@ const SaveSink = struct {
     }
 };
 
-/// Write the whole reverse array in canonical symbols.array form: each symbol
-/// with '\\' -> "\\\\" and '\n' -> "\\n" (so an embedded newline round-trips as
-/// one physical line, see intern_load), then one '\n' per symbol.  A null slot
-/// (an id consumed by a strdup failure) is its bare '\n'.  Returns 0, or -1 on
-/// a failed write.
-fn writeSymbols(s: *Interner, f: *c.FILE, buf: [*]u8) c_int {
-    var sink = SaveSink{ .f = f, .buf = buf };
-    var i: u32 = 1;
-    while (i < s.next_id) : (i += 1) {
+/// Growable in-memory sink for the incremental append's canonical bytes.  The
+/// chunk is O(k) — the ids added since the last save — so it is built whole
+/// and written with ONE write(2) after the file is locked and re-verified.
+const MemSink = struct {
+    buf: ?*anyopaque = null,
+    cap: usize = 0,
+    len: usize = 0,
+
+    fn deinit(self: *MemSink) void {
+        if (self.buf) |b| c.free(b);
+        self.buf = null;
+        self.cap = 0;
+        self.len = 0;
+    }
+
+    fn flush(self: *MemSink) bool {
+        _ = self;
+        return true; // nothing is buffered behind the buffer
+    }
+
+    fn put(self: *MemSink, bytes: []const u8) bool {
+        if (self.len + bytes.len > self.cap) {
+            var ncap: usize = if (self.cap == 0) 4096 else self.cap;
+            while (ncap < self.len + bytes.len) ncap *= 2;
+            const nm = c.realloc(self.buf, ncap) orelse return false;
+            self.buf = nm;
+            self.cap = ncap;
+        }
+        const out: [*]u8 = @ptrCast(self.buf.?);
+        @memcpy(out[self.len .. self.len + bytes.len], bytes);
+        self.len += bytes.len;
+        return true;
+    }
+};
+
+/// Write rev[] slots [from, to) (1-based ids) in canonical symbols.array form
+/// to `sink`: each symbol with '\\' -> "\\\\" and '\n' -> "\\n" (so an embedded
+/// newline round-trips as one physical line, see intern_load), then one '\n'
+/// per symbol.  A null slot (an id consumed by a strdup failure) is its bare
+/// '\n'.  Returns false on a failed write.
+fn writeSymbolsTo(s: *Interner, sink: anytype, from: u32, to: u32) bool {
+    var i: u32 = from;
+    while (i < to) : (i += 1) {
         if (s.rev.?[i - 1]) |str| {
             // Run scan with libc memchr (vectorized) instead of a
             // byte-at-a-time loop: the scalar scan was MEASURED at ~10 ms of
@@ -546,26 +656,195 @@ fn writeSymbols(s: *Interner, f: *c.FILE, buf: [*]u8) c_int {
                         ch = '\n';
                     }
                 }
-                if (at > off and !sink.put(str[off..at])) return -1;
+                if (at > off and !sink.put(str[off..at])) return false;
                 if (at == slen) break;
                 const esc = [2]u8{ '\\', if (ch == '\\') '\\' else 'n' };
-                if (!sink.put(&esc)) return -1;
+                if (!sink.put(&esc)) return false;
                 off = at + 1;
             }
         }
-        if (!sink.put("\n")) return -1;
+        if (!sink.put("\n")) return false;
     }
-    return if (sink.flush()) 0 else -1;
+    return sink.flush();
+}
+
+// ─── Incremental save: the durable-prefix records ────────────────────────
+//
+// A save is O(k) when the destination file is still the exact file this
+// interner last made durable: symbols.array is append-only, so the only bytes
+// that are missing are the canonical lines for ids [saved.next_id, next_id).
+// The identity check is what makes that sound — see SavedPrefix — and it is
+// O(1) (one statx).
+
+fn statxOfPath(path: [*:0]const u8, out: *linux.Statx) bool {
+    return c.statx(c.AT.FDCWD, path, 0, linux.STATX.BASIC_STATS, out) == 0;
+}
+
+fn statxOfFd(fd: c_int, out: *linux.Statx) bool {
+    return c.statx(fd, "", c.AT.EMPTY_PATH, linux.STATX.BASIC_STATS, out) == 0;
+}
+
+fn devOf(stx: *const linux.Statx) u64 {
+    return (@as(u64, stx.dev_major) << 32) | @as(u64, stx.dev_minor);
+}
+
+/// Is `stx` the file `slot` recorded — same device, inode, size and both
+/// timestamps?  Anything that rewrote the file (a tmp+rename from another
+/// engine, a restore, an in-place edit) moves at least one of them.
+fn isRecordedFile(slot: *const SavedPrefix, stx: *const linux.Statx) bool {
+    return stx.ino == slot.ino and devOf(stx) == slot.dev and
+        stx.size == slot.bytes and
+        stx.mtime.sec == slot.mtim_sec and @as(i64, stx.mtime.nsec) == slot.mtim_nsec and
+        stx.ctime.sec == slot.ctim_sec and @as(i64, stx.ctime.nsec) == slot.ctim_nsec;
+}
+
+fn savedSlot(s: *Interner, path: [*:0]const u8) ?*SavedPrefix {
+    const plen = cstrLen(path);
+    if (plen >= MAX_SAVED_PATH) return null;
+    for (&s.saved) |*slot| {
+        if (slot.path[0] == 0) continue;
+        if (std.mem.eql(u8, std.mem.sliceTo(&slot.path, 0), path[0..plen])) return slot;
+    }
+    return null;
+}
+
+/// Record that `path` now holds the canonical bytes for ids [1, next_id).
+/// `expect_bytes`, when given, is the size this interner itself just wrote or
+/// read: a file of any other size is not ours to append to, so nothing is
+/// recorded (and the next save rewrites in full).
+fn rememberSavedAt(s: *Interner, path: [*:0]const u8, expect_bytes: ?u64) void {
+    const plen = cstrLen(path);
+    if (plen >= MAX_SAVED_PATH) return;
+    var stx: linux.Statx = undefined;
+    if (!statxOfPath(path, &stx)) return;
+    if (expect_bytes) |want| {
+        if (stx.size != want) return;
+    }
+    // Reuse this path's slot, else a free one, else the least recently used:
+    // the db-root array and the current snapshot-staging array are both live.
+    var target: ?*SavedPrefix = null;
+    var lru: *SavedPrefix = &s.saved[0];
+    for (&s.saved) |*cand| {
+        if (cand.path[0] == 0) {
+            if (target == null) target = cand; // a free slot beats evicting one
+            continue;
+        }
+        if (std.mem.eql(u8, std.mem.sliceTo(&cand.path, 0), path[0..plen])) {
+            target = cand;
+            break;
+        }
+        if (cand.used < lru.used) lru = cand;
+    }
+    const slot = target orelse lru;
+    @memset(&slot.path, 0);
+    @memcpy(slot.path[0..plen], path[0..plen]);
+    slot.next_id = s.next_id;
+    slot.bytes = stx.size;
+    slot.dev = devOf(&stx);
+    slot.ino = stx.ino;
+    slot.mtim_sec = stx.mtime.sec;
+    slot.mtim_nsec = @intCast(stx.mtime.nsec);
+    slot.ctim_sec = stx.ctime.sec;
+    slot.ctim_nsec = @intCast(stx.ctime.nsec);
+    s.saved_seq +%= 1;
+    slot.used = s.saved_seq;
+}
+
+/// Append the ids added since the last save of `path`, in place, and fsync
+/// them.  Returns true when the file is durable and complete up to next_id;
+/// false means "not provably appendable — write it whole" (the caller then
+/// does exactly that, which is also what repairs a torn file).
+///
+/// DURABILITY (M7): the fsync happens before this returns 0, so the interner
+/// is durable before the WAL record that references the new ids is appended —
+/// the same ordering the whole-file save provided.
+///
+/// ATOMICITY: the whole-file path commits by rename, so a crash leaves either
+/// the old file or the new one.  An append cannot be atomic that way, and it
+/// does not need to be: a crash mid-append leaves a TRUNCATED FINAL LINE, which
+/// intern_load accepts (it takes the last line without a trailing '\n' as a
+/// symbol — the getline behaviour it replaced).  The id it lands on was
+/// allocated but never referenced by any WAL record (the WAL append follows a
+/// successful save), so the residue is an unreferenced symbol: readable,
+/// monotone in the ids that matter, and CANONICALIZED by the next save, which
+/// refuses to append to a file that does not end at a line boundary.  A reader
+/// never sees the torn state at all: intern_load takes a shared flock on the
+/// array for the length of its read and the append holds it exclusively.
+fn appendSymbols(s: *Interner, path: [*:0]const u8) bool {
+    const slot = savedSlot(s, path) orelse return false;
+    if (slot.next_id > s.next_id) { // cannot happen (append-only); distrust it
+        slot.path[0] = 0;
+        return false;
+    }
+    var stx: linux.Statx = undefined;
+    if (!statxOfPath(path, &stx) or !isRecordedFile(slot, &stx)) {
+        slot.path[0] = 0;
+        return false;
+    }
+    if (slot.next_id == s.next_id) return true; // nothing new to make durable
+
+    var sink = MemSink{};
+    defer sink.deinit();
+    if (!writeSymbolsTo(s, &sink, slot.next_id, s.next_id)) return false;
+
+    // O_APPEND and NO O_CREAT: the file must be the one we just verified.
+    const fd = c.open(path, .{ .ACCMODE = .WRONLY, .APPEND = true });
+    if (fd < 0) {
+        slot.path[0] = 0;
+        return false;
+    }
+    if (c.flock(fd, c.LOCK.EX) != 0) {
+        _ = c.close(fd);
+        slot.path[0] = 0;
+        return false;
+    }
+    // Re-verify under the lock: the stat above raced with the open.
+    if (!statxOfFd(fd, &stx) or !isRecordedFile(slot, &stx)) {
+        _ = c.close(fd);
+        slot.path[0] = 0;
+        return false;
+    }
+    const out: [*]const u8 = @ptrCast(sink.buf.?);
+    var off: usize = 0;
+    while (off < sink.len) {
+        const n = c.write(fd, out + off, sink.len - off);
+        if (n <= 0) break;
+        off += @intCast(n);
+    }
+    const ok = off == sink.len and c.fsync(fd) == 0;
+    if (!ok) {
+        // Roll the file back to the last complete line so the torn tail does
+        // not outlive this call; the caller's full rewrite repairs it anyway.
+        _ = c.ftruncate(fd, @intCast(slot.bytes));
+        _ = c.fsync(fd);
+        slot.path[0] = 0;
+    }
+    _ = c.close(fd); // the fsync above is the durability point
+    if (!ok) return false;
+    rememberSavedAt(s, path, null);
+    return true;
 }
 
 /// int intern_save(interner *ir, const char *fwd_path, const char *rev_path)
-/// Atomic save of symbols.array ONLY: streaming tmp+fsync+rename+dir-fsync.
+/// Save of symbols.array ONLY.  Two shapes:
+///   - INCREMENTAL (appendSymbols): append the canonical lines of the ids
+///     added since the last save of this exact file — one write + one fsync,
+///     O(k).  This is the shape every per-fact write takes (dl_add_fact and
+///     friends save the interner before appending the WAL record).
+///   - WHOLE FILE: streaming tmp+fsync+rename+dir-fsync, as before.  Taken on
+///     the first save of a path, after any rewrite of the file by something
+///     else, and for a file that does not end at a line boundary.
 /// The forward DAFSA is a pure derived cache and is NOT persisted; fwd_path
 /// is kept in the signature for caller compatibility but ignored.
 pub export fn intern_save(ir: ?*Interner, fwd_path: ?[*:0]const u8, rev_path: ?[*:0]const u8) c_int {
     const s = ir orelse return -1;
     if (fwd_path == null or rev_path == null) return -1;
     const rev_path_p = rev_path.?;
+
+    if (appendSymbols(s, rev_path_p)) {
+        s.dirty = 0;
+        return 0;
+    }
 
     var tmp: [8192:0]u8 = undefined;
     tmpNameOf(&tmp, rev_path_p);
@@ -576,9 +855,10 @@ pub export fn intern_save(ir: ?*Interner, fwd_path: ?[*:0]const u8, rev_path: ?[
         _ = c.unlink(&tmp);
         return -1;
     };
-    const wrote = writeSymbols(s, f, @ptrCast(bufp));
+    var sink = SaveSink{ .f = f, .buf = @ptrCast(bufp) };
+    const wrote = writeSymbolsTo(s, &sink, 1, s.next_id);
     c.free(bufp);
-    if (wrote != 0) {
+    if (!wrote) {
         _ = c.fclose(f);
         _ = c.unlink(&tmp);
         return -1;
@@ -605,6 +885,9 @@ pub export fn intern_save(ir: ?*Interner, fwd_path: ?[*:0]const u8, rev_path: ?[
     }
     if (util.fsync_dir_of_path(rev_path_p) != 0) return -1;
 
+    // The renamed file is now the durable prefix for every live id, so the
+    // next save of this path can append instead of rewriting.
+    rememberSavedAt(s, rev_path_p, null);
     s.dirty = 0;
     return 0;
 }
@@ -630,6 +913,8 @@ pub export fn intern_load(fwd_path: ?[*:0]const u8, rev_path: ?[*:0]const u8) ?*
         .sym_hashed = 0,
         .load_buf = null,
         .buf_owned_n = 0,
+        .saved = .{ std.mem.zeroes(SavedPrefix), std.mem.zeroes(SavedPrefix) },
+        .saved_seq = 0,
     };
 
     if (fwd_path) |fp| {
@@ -648,6 +933,12 @@ pub export fn intern_load(fwd_path: ?[*:0]const u8, rev_path: ?[*:0]const u8) ?*
     ir.rev = @ptrCast(@alignCast(rm));
 
     const f = c.fopen(rev_path.?, "r") orelse return ir; // no file: start empty
+
+    // SHARED lock for the length of the read: a save that APPENDS to this file
+    // holds it exclusively, so a reader can never observe a half-appended
+    // array (the whole-file path commits by rename and needs no lock).  The
+    // close below releases it.
+    _ = c.flock(fileno(f), c.LOCK.SH);
 
     // Bulk read the whole array into one buffer (fread on large requests
     // bypasses stdio's buffer for direct read()s), then split/decode in
@@ -679,14 +970,23 @@ pub export fn intern_load(fwd_path: ?[*:0]const u8, rev_path: ?[*:0]const u8) ?*
         };
         buf = @ptrCast(bufm.?);
     }
+    // Does the file end at a LINE BOUNDARY?  Read before the decode below
+    // overwrites the final '\n' with a NUL terminator.  A file that does not
+    // (a torn append — the one crash shape this module can leave behind) is
+    // still parsed (the last line is a symbol, as getline accepted it) but is
+    // NOT recorded as an appendable prefix: the next save rewrites it whole,
+    // which both canonicalizes it and prevents appending onto a partial line.
+    const ends_nl = len > 0 and buf[len - 1] == '\n';
     _ = c.fclose(f);
 
     if (len == 0) {
         // Empty file (or an unopenable/unreadable one): empty interner, no
-        // buffer retained.
+        // buffer retained.  A 0-byte file IS a valid appendable prefix.
         c.free(bufm);
+        rememberSavedAt(ir, rev_path.?, 0);
         return ir;
     }
+
     ir.load_buf = buf;
 
     // Split on '\n' and decode in place, one rev[] slot per physical line —
@@ -759,6 +1059,12 @@ pub export fn intern_load(fwd_path: ?[*:0]const u8, rev_path: ?[*:0]const u8) ?*
         ir.next_id += 1;
         pos = end + 1;
     }
+
+    // The file holds exactly the ids just parsed, so a later save can append
+    // to it — unless it does not end at a line boundary, in which case the
+    // parse consumed a PARTIAL line and appending would join the next symbol
+    // onto it.
+    if (ends_nl) rememberSavedAt(ir, rev_path.?, len);
 
     return ir;
 }
@@ -1063,5 +1369,239 @@ test "content stamp: append-only hash survives a save/load round trip" {
         try std.testing.expectEqual(st_a.count, st_b.count);
         try std.testing.expectEqual(st_a.h0, st_b.h0);
         try std.testing.expectEqual(st_a.h1, st_b.h1);
+    }
+}
+
+// ─── Incremental save: the append path ───────────────────────────────────
+
+const Timespec = extern struct { sec: isize, nsec: isize };
+const CLOCK_MONOTONIC: c_int = 1;
+extern "c" fn clock_gettime(clk_id: c_int, tp: *Timespec) c_int;
+
+fn testNowNs() u64 {
+    var ts: Timespec = undefined;
+    _ = clock_gettime(CLOCK_MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
+/// (device, inode) of `path`, or null when it cannot be stat'd.
+fn testIno(path: [*:0]const u8) ?u64 {
+    var stx: linux.Statx = undefined;
+    if (!statxOfPath(path, &stx)) return null;
+    return stx.ino;
+}
+
+fn testSize(path: [*:0]const u8) ?u64 {
+    var stx: linux.Statx = undefined;
+    if (!statxOfPath(path, &stx)) return null;
+    return stx.size;
+}
+
+/// Read a whole file into `out`; returns the byte count read.
+fn testRead(path: [*:0]const u8, out: []u8) usize {
+    const f = c.fopen(path, "r") orelse return 0;
+    defer _ = c.fclose(f);
+    return c.fread(out.ptr, 1, out.len, f);
+}
+
+/// Write `bytes` to `path`, replacing it.
+fn testWrite(path: [*:0]const u8, bytes: []const u8) bool {
+    const f = c.fopen(path, "w") orelse return false;
+    const n = c.fwrite(bytes.ptr, 1, bytes.len, f);
+    return c.fclose(f) == 0 and n == bytes.len;
+}
+
+test "incremental save: k new symbols cost an append, not a whole-file rewrite" {
+    const path = "/tmp/datalog_zig_u3_incr_append.array";
+    const full = "/tmp/datalog_zig_u3_incr_append_full.array";
+    defer _ = c.unlink(path);
+    defer _ = c.unlink(full);
+    defer _ = c.unlink(full ++ ".tmp");
+
+    // A vocabulary big enough for the difference to be visible, written
+    // directly: interning 60k symbols one at a time is a linear rev[] scan
+    // each (O(n^2)).
+    {
+        const f = c.fopen(path, "w") orelse return error.TestUnexpectedResult;
+        var namebuf: [64]u8 = undefined;
+        var i: u32 = 0;
+        while (i < 60000) : (i += 1) {
+            const line = std.fmt.bufPrint(&namebuf, "seed_symbol_{d}_padding_padding_padding\n", .{i}) catch unreachable;
+            try std.testing.expectEqual(line.len, c.fwrite(line.ptr, 1, line.len, f));
+        }
+        try std.testing.expectEqual(@as(c_int, 0), c.fclose(f));
+    }
+    const size0 = testSize(path).?;
+    try std.testing.expect(size0 > 2_000_000);
+
+    const ir = intern_load(null, path) orelse return error.OutOfMemory;
+    defer intern_free(ir);
+    try std.testing.expectEqual(@as(u32, 60000), liveSymBound(ir) - 1);
+
+    // Reference cost: the WHOLE file, written to a different path (a full save
+    // of the same vocabulary — what every new-string add used to pay).
+    var t_full = testNowNs();
+    try std.testing.expectEqual(@as(c_int, 0), intern_save(ir, "/tmp/ignored.dafsa", full));
+    t_full = testNowNs() - t_full;
+    try std.testing.expectEqual(size0, testSize(full).?); // same bytes
+
+    // Three new symbols, each saved on its own (the dl_add_fact shape).
+    const ino0 = testIno(path).?;
+    var t_app: u64 = 0;
+    var k: u32 = 0;
+    while (k < 3) : (k += 1) {
+        var nbuf: [64]u8 = undefined;
+        const s = std.fmt.bufPrintZ(&nbuf, "appended_symbol_{d}", .{k}) catch unreachable;
+        try std.testing.expectEqual(@as(u32, 60001 + k), intern_str(ir, s.ptr));
+        const t0 = testNowNs();
+        try std.testing.expectEqual(@as(c_int, 0), intern_save(ir, "/tmp/ignored.dafsa", path));
+        t_app += testNowNs() - t0;
+        // An APPEND keeps the inode; a whole-file save renames a new one in.
+        try std.testing.expectEqual(ino0, testIno(path).?);
+    }
+    // The file grew by exactly the three new lines, and no more.
+    const grown = "appended_symbol_0\nappended_symbol_1\nappended_symbol_2\n";
+    try std.testing.expectEqual(size0 + grown.len, testSize(path).?);
+    // THE CLAIM: three saves together cost less than ONE whole-file save (they
+    // used to cost three of them).  Deliberately a loose bound — the point is
+    // the O(k)/O(n) shape, and the inode assertion above is the exact proof.
+    try std.testing.expect(t_app < t_full);
+
+    // What was appended is what a reload sees, in order, after the seed.
+    const ir2 = intern_load(null, path) orelse return error.OutOfMemory;
+    defer intern_free(ir2);
+    try std.testing.expectEqual(@as(u32, 60003), liveSymBound(ir2) - 1);
+    try std.testing.expectEqualStrings("seed_symbol_0_padding_padding_padding", std.mem.span(intern_str_of(ir2, 1).?));
+    try std.testing.expectEqualStrings("seed_symbol_59999_padding_padding_padding", std.mem.span(intern_str_of(ir2, 60000).?));
+    try std.testing.expectEqualStrings("appended_symbol_2", std.mem.span(intern_str_of(ir2, 60003).?));
+    try std.testing.expectEqual(@as(u32, 60002), intern_str_find(ir2, "appended_symbol_1"));
+    // The stamp of the appended file equals the stamp of the same content
+    // written whole: the append writes exactly the canonical bytes.
+    const s_app = symStamp(ir);
+    const s_full = symStamp(ir2);
+    try std.testing.expectEqual(s_app.count, s_full.count);
+    try std.testing.expectEqual(s_app.h0, s_full.h0);
+    try std.testing.expectEqual(s_app.h1, s_full.h1);
+}
+
+test "incremental save: appended ids are durable across an _exit without close" {
+    const path = "/tmp/datalog_zig_u3_incr_crash.array";
+    defer _ = c.unlink(path);
+
+    {
+        const ir = intern_load(null, path) orelse return error.OutOfMemory;
+        _ = intern_str(ir, "before_a");
+        _ = intern_str(ir, "before_b");
+        try std.testing.expectEqual(@as(c_int, 0), intern_save(ir, "/tmp/ignored.dafsa", path));
+        intern_free(ir);
+    }
+    try std.testing.expectEqualStrings("before_a\nbefore_b\n", blk: {
+        var b: [64]u8 = undefined;
+        const n = testRead(path, &b);
+        break :blk b[0..n];
+    });
+    const ino0 = testIno(path).?;
+
+    const pid = fork();
+    try std.testing.expect(pid >= 0);
+    if (pid == 0) {
+        // CHILD: load, intern two more, save (APPEND), then _exit with no
+        // close and no intern_free — the crash-equivalent of a process that
+        // dies right after a save.
+        const ir = intern_load(null, path) orelse c._exit(11);
+        _ = intern_str(ir, "crash_c");
+        _ = intern_str(ir, "crash_d");
+        if (intern_save(ir, "/tmp/ignored.dafsa", path) != 0) c._exit(12);
+        c._exit(0);
+    }
+    var status: c_int = -1;
+    try std.testing.expectEqual(pid, c.waitpid(pid, &status, 0));
+    try std.testing.expectEqual(@as(c_int, 0), status);
+    try std.testing.expectEqual(ino0, testIno(path).?); // it was an APPEND
+
+    // A fresh process (this one) reads the appended strings: the save's fsync
+    // is the durability point, not the close.
+    const ir2 = intern_load(null, path) orelse return error.OutOfMemory;
+    defer intern_free(ir2);
+    try std.testing.expectEqual(@as(u32, 4), liveSymBound(ir2) - 1);
+    try std.testing.expectEqual(@as(u32, 3), intern_str_find(ir2, "crash_c"));
+    try std.testing.expectEqual(@as(u32, 4), intern_str_find(ir2, "crash_d"));
+    try std.testing.expectEqualStrings("crash_d", std.mem.span(intern_str_of(ir2, 4).?));
+}
+
+test "incremental save: a torn tail is not appended to — the next save rewrites it" {
+    const path = "/tmp/datalog_zig_u3_incr_torn.array";
+    defer _ = c.unlink(path);
+    defer _ = c.unlink(path ++ ".tmp");
+
+    // A file whose final line was cut mid-append: no trailing '\n'.
+    try std.testing.expect(testWrite(path, "alpha\nbeta"));
+    const ino0 = testIno(path).?;
+
+    const ir = intern_load(null, path) orelse return error.OutOfMemory;
+    defer intern_free(ir);
+    // The parser ACCEPTS the truncated final line (the getline behaviour it
+    // replaced), so the file is readable — that is the recovery guarantee.
+    try std.testing.expectEqualStrings("alpha", std.mem.span(intern_str_of(ir, 1).?));
+    try std.testing.expectEqualStrings("beta", std.mem.span(intern_str_of(ir, 2).?));
+
+    // But it is NOT an appendable prefix: appending would join "gamma" onto
+    // "beta".  The save rewrites the file whole (a NEW inode) and canonicalizes
+    // it.
+    _ = intern_str(ir, "gamma");
+    try std.testing.expectEqual(@as(c_int, 0), intern_save(ir, "/tmp/ignored.dafsa", path));
+    try std.testing.expect(testIno(path).? != ino0);
+    {
+        var b: [64]u8 = undefined;
+        const n = testRead(path, &b);
+        try std.testing.expectEqualStrings("alpha\nbeta\ngamma\n", b[0..n]);
+    }
+
+    // ... and THAT file is appendable, so the next save is O(k) again.
+    const ino1 = testIno(path).?;
+    _ = intern_str(ir, "delta");
+    try std.testing.expectEqual(@as(c_int, 0), intern_save(ir, "/tmp/ignored.dafsa", path));
+    try std.testing.expectEqual(ino1, testIno(path).?);
+    {
+        var b: [64]u8 = undefined;
+        const n = testRead(path, &b);
+        try std.testing.expectEqualStrings("alpha\nbeta\ngamma\ndelta\n", b[0..n]);
+    }
+}
+
+test "incremental save: a rewritten or diverged file is never appended to" {
+    const path = "/tmp/datalog_zig_u3_incr_diverge.array";
+    defer _ = c.unlink(path);
+    defer _ = c.unlink(path ++ ".tmp");
+
+    try std.testing.expect(testWrite(path, "red\nblue\n"));
+    const ir = intern_load(null, path) orelse return error.OutOfMemory;
+    defer intern_free(ir);
+
+    // Same SIZE, different bytes, rewritten under the live interner — the
+    // divergence shape the publish stamp exists for.  Appending would leave a
+    // file whose prefix disagrees with rev[], so the save must rewrite.
+    try std.testing.expect(testWrite(path, "blue\nred\n"));
+    const ino0 = testIno(path).?;
+    _ = intern_str(ir, "green");
+    try std.testing.expectEqual(@as(c_int, 0), intern_save(ir, "/tmp/ignored.dafsa", path));
+    try std.testing.expect(testIno(path).? != ino0);
+    {
+        var b: [64]u8 = undefined;
+        const n = testRead(path, &b);
+        try std.testing.expectEqualStrings("red\nblue\ngreen\n", b[0..n]);
+    }
+    // An engine-rewritten (tmp+rename) file is a NEW inode, so the append state
+    // is dropped with it: the next save rewrites rather than appending to an
+    // inode this interner never wrote.
+    try std.testing.expect(savedSlot(ir, path) != null); // the rewrite re-armed it
+    _ = intern_str(ir, "yellow");
+    const ino1 = testIno(path).?;
+    try std.testing.expectEqual(@as(c_int, 0), intern_save(ir, "/tmp/ignored.dafsa", path));
+    try std.testing.expectEqual(ino1, testIno(path).?); // appended onto OUR file
+    {
+        var b: [64]u8 = undefined;
+        const n = testRead(path, &b);
+        try std.testing.expectEqualStrings("red\nblue\ngreen\nyellow\n", b[0..n]);
     }
 }

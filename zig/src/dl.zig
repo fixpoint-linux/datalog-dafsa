@@ -7438,6 +7438,120 @@ test "publish gate: a steady publish inherits again right after a full write" {
     }
 }
 
+test "incremental interner save: new-string facts append and resolve after a reopen" {
+    // The shape an agent store actually has: every content write interns new
+    // strings, and every such write used to pay a whole-file symbols.array
+    // rewrite (MEASURED 51 ms per fact on the 45 MB agent store).  The interner
+    // save now APPENDS the ids added since the last save — same fsync, O(k).
+    const dir = "/tmp/datalog_zig_u3_internappend";
+    rmrfTestDir(dir);
+    defer rmrfTestDir(dir);
+    try testing.expectEqual(@as(c_int, 0), mkdir(dir, @as(posix.mode_t, 0o755)));
+
+    // A vocabulary large enough for a whole-file save to be visible, written
+    // straight to the db root (interning 40k symbols one at a time would be a
+    // linear rev[] scan each).
+    {
+        var rootbuf: [512:0]u8 = undefined;
+        const root = std.fmt.bufPrintZ(&rootbuf, "{s}/symbols.array", .{dir}) catch unreachable;
+        const f = c.fopen(root, "w") orelse return error.TestUnexpectedResult;
+        var linebuf: [96]u8 = undefined;
+        var i: u32 = 0;
+        while (i < 40000) : (i += 1) {
+            const line = std.fmt.bufPrint(&linebuf, "seed_{d}_padding_padding_padding_padding\n", .{i}) catch unreachable;
+            try testing.expectEqual(line.len, c.fwrite(line.ptr, 1, line.len, f));
+        }
+        try testing.expectEqual(@as(c_int, 0), c.fclose(f));
+    }
+
+    var rootbuf: [512:0]u8 = undefined;
+    const root = std.fmt.bufPrintZ(&rootbuf, "{s}/symbols.array", .{dir}) catch unreachable;
+    var st0: Stat = undefined;
+    try testing.expectEqual(@as(c_int, 0), stat(root, &st0));
+    const size0: u64 = @intCast(st0.st_size);
+
+    var names: [3][32]u8 = undefined;
+    var ids: [3]u32 = undefined;
+    var added_bytes: u64 = 0;
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "e", 2));
+        var k: u32 = 0;
+        while (k < 3) : (k += 1) {
+            const s1 = std.fmt.bufPrintZ(&names[k], "newstr_{d}_alpha", .{k}) catch unreachable;
+            var idbuf: [32]u8 = undefined;
+            const s2 = std.fmt.bufPrintZ(&idbuf, "newstr_{d}_beta", .{k}) catch unreachable;
+            const row = [2]u32{ intern_str(db.ir, s1.ptr), intern_str(db.ir, s2.ptr) };
+            try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "e", &row, 2));
+            ids[k] = row[0];
+            added_bytes += s1.len + 1 + s2.len + 1; // canonical: content + '\n'
+        }
+        dl_close(db);
+    }
+
+    // The three per-fact saves APPENDED: the root array is the same inode it
+    // was, grown by exactly the six new lines.  (A whole-file save renames a
+    // new inode in — that is what this asserts did NOT happen.)
+    var st1: Stat = undefined;
+    try testing.expectEqual(@as(c_int, 0), stat(root, &st1));
+    try testing.expectEqual(st0.st_ino, st1.st_ino);
+    try testing.expectEqual(st0.st_dev, st1.st_dev);
+    try testing.expectEqual(size0 + added_bytes, @as(u64, @intCast(st1.st_size)));
+
+    // A REOPEN resolves every id to the string it was assigned: the appended
+    // lines are what a fresh process parses.
+    {
+        const db2 = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db2);
+        var k: u32 = 0;
+        while (k < 3) : (k += 1) {
+            const got = dl_intern_str_of(db2, ids[k]) orelse return error.TestUnexpectedResult;
+            try testing.expectEqualStrings(std.mem.span(@as([*:0]const u8, @ptrCast(&names[k]))), std.mem.span(got));
+            // and the beta string of the same row is right after it
+            const beta = dl_intern_str_of(db2, ids[k] + 1) orelse return error.TestUnexpectedResult;
+            try testing.expect(std.mem.startsWith(u8, std.mem.span(beta), "newstr_"));
+            try testing.expect(std.mem.endsWith(u8, std.mem.span(beta), "_beta"));
+        }
+        // The live stamp still describes the whole array: an unchanged publish
+    }
+}
+
+test "publish: the interner save stays incremental across publishes" {
+    // A publishing process touches TWO symbols.array paths — the staged
+    // snapshot's and the db root's — so the append bookkeeping keeps one
+    // durable-prefix record per path.  A publish must not disarm the root's
+    // record, or every fact after a publish would fall back to a 44 MB rewrite.
+    const dir = "/tmp/datalog_zig_u3_internappend_pub";
+    rmrfTestDir(dir);
+    defer rmrfTestDir(dir);
+
+    var rootbuf: [512:0]u8 = undefined;
+    const root = std.fmt.bufPrintZ(&rootbuf, "{s}/symbols.array", .{dir}) catch unreachable;
+    var inos: [4]u64 = @splat(0);
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "e", 2));
+        var k: u32 = 0;
+        while (k < 4) : (k += 1) {
+            var nbuf: [32]u8 = undefined;
+            const s = std.fmt.bufPrintZ(&nbuf, "pubstr_{d}", .{k}) catch unreachable;
+            const row = [2]u32{ intern_str(db.ir, s.ptr), intern_str(db.ir, "constant") };
+            try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "e", &row, 2));
+            var st: Stat = undefined;
+            try testing.expectEqual(@as(c_int, 0), stat(root, &st));
+            inos[k] = st.st_ino;
+            // A vocabulary-changing publish (full snapshot write) in between.
+            try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db));
+        }
+    }
+    // Every add appended onto the SAME root inode, including the ones that
+    // followed a publish — the staged snapshot write did not steal the record.
+    try testing.expect(inos[1] == inos[0]);
+    try testing.expect(inos[2] == inos[0]);
+    try testing.expect(inos[3] == inos[0]);
+}
+
 test "dl_snapshot_relations enumerates a published manifest" {
     const dir = "/tmp/datalog_zig_u11_snaprels";
     rmrfTestDir(dir);
