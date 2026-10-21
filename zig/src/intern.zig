@@ -3,7 +3,9 @@
 //! Forward map: DAFSA keyed  utf8_bytes \0 sym_id_u32BE  — a pure DERIVED
 //! cache of the reverse array (the source of truth); it is never persisted
 //! (intern_save writes only symbols.array) and rebuilt lazily from rev[].
-//! Reverse map: growable array of strdup'd char* (rev[sym_id-1]).
+//! Reverse map: growable array of char* (rev[sym_id-1]) — intern_load points
+//! the slots straight into one whole-file buffer (zero per-symbol
+//! allocation), intern_str appends strdup'd ones past that.
 //! Sym ids are 1-based; 0 = not-found sentinel.
 //!
 //! WHO ACTUALLY WANTS THE FORWARD DAFSA (as of the ensureFwd-cliff unit): no
@@ -28,7 +30,7 @@
 //! and return semantics.  The dafsa engine stays C in the hybrid .so
 //! (vendor/dafsa/*.c) and is addressed through raw extern bindings.  All
 //! allocation and file I/O goes through raw libc (calloc/realloc/free/strdup,
-//! FILE*, getline, fwrite) so syscall/partial-write/error semantics match the
+//! FILE*, fread/fwrite) so syscall/partial-write/error semantics match the
 //! C oracle byte-for-byte.
 //!
 //! Oracle: src/intern.c (never modified).  NULL ir/str inputs crash in C and
@@ -69,7 +71,6 @@ extern "c" fn strdup(s: [*:0]const u8) ?[*:0]u8;
 extern "c" fn strcmp(a: [*:0]const u8, b: [*:0]const u8) c_int;
 extern "c" fn fflush(stream: *c.FILE) c_int;
 extern "c" fn fileno(stream: *c.FILE) c_int;
-extern "c" fn getline(lineptr: *?[*]u8, n: *usize, stream: *c.FILE) isize;
 
 /// struct interner — private (opaque in intern.h).
 const Interner = struct {
@@ -83,6 +84,13 @@ const Interner = struct {
     fwd_gen: u32, // next_id the in-memory fwd was built from
     sym_hash: SymHash, // running hash of symbols.array's canonical bytes
     sym_hashed: u32, // rev[] slots already fed to sym_hash (lazy catch-up)
+    // Whole-file buffer intern_load read symbols.array into; rev[0..
+    // buf_owned_n) point into it (zero per-symbol allocation), the slots
+    // past buf_owned_n are individually strdup'd/freed (the intern_str
+    // append path).  intern_free frees the buffer ONCE instead of the
+    // per-slot free the strdup'd slots get.
+    load_buf: ?[*]u8,
+    buf_owned_n: u32,
 };
 
 /// The content stamp a publish compares to decide whether a snapshot's
@@ -210,6 +218,8 @@ pub export fn intern_create() ?*Interner {
         .fwd_gen = 0,
         .sym_hash = SymHash.init(),
         .sym_hashed = 0,
+        .load_buf = null,
+        .buf_owned_n = 0,
     };
 
     ir.fwd = dafsa_create() orelse {
@@ -231,8 +241,11 @@ pub export fn intern_free(ir: ?*Interner) void {
     const s = ir orelse return;
     dafsa_free(s.fwd);
     if (s.fwd_path) |p| c.free(@ptrCast(p));
+    // The load buffer backs rev[0..buf_owned_n) — free it once, and free the
+    // remaining slots (strdup'd by intern_str) individually, as before.
+    if (s.load_buf) |b| c.free(@ptrCast(b));
     if (s.rev) |rev| {
-        var i: u32 = 0;
+        var i: u32 = s.buf_owned_n;
         const n = s.next_id -% 1;
         while (i < n and i < s.rev_cap) : (i += 1) {
             if (rev[i]) |str| c.free(@ptrCast(str));
@@ -599,6 +612,8 @@ pub export fn intern_save(ir: ?*Interner, fwd_path: ?[*:0]const u8, rev_path: ?[
 /// interner *intern_load(const char *fwd_path, const char *rev_path)
 /// Lazy forward DAFSA: ir->fwd stays NULL; only the reverse array is parsed.
 /// Returns an empty interner if the rev file doesn't exist; NULL on OOM.
+/// Bulk read: one fread'd buffer split/decoded in place, rev[] pointing into
+/// it (see the body comment for the measurement that retired getline).
 pub export fn intern_load(fwd_path: ?[*:0]const u8, rev_path: ?[*:0]const u8) ?*Interner {
     const mem = c.calloc(1, @sizeOf(Interner)) orelse return null;
     const ir: *Interner = @ptrCast(@alignCast(mem));
@@ -613,6 +628,8 @@ pub export fn intern_load(fwd_path: ?[*:0]const u8, rev_path: ?[*:0]const u8) ?*
         .fwd_gen = 0,
         .sym_hash = SymHash.init(),
         .sym_hashed = 0,
+        .load_buf = null,
+        .buf_owned_n = 0,
     };
 
     if (fwd_path) |fp| {
@@ -632,59 +649,101 @@ pub export fn intern_load(fwd_path: ?[*:0]const u8, rev_path: ?[*:0]const u8) ?*
 
     const f = c.fopen(rev_path.?, "r") orelse return ir; // no file: start empty
 
-    var line: ?[*]u8 = null;
-    var linecap: usize = 0;
-    while (true) {
-        const ll = getline(&line, &linecap, f);
-        if (ll <= 0) break;
-        var len: usize = @intCast(ll);
+    // Bulk read the whole array into one buffer (fread on large requests
+    // bypasses stdio's buffer for direct read()s), then split/decode in
+    // place.  MEASURED on a 171,933-symbol / 44 MB array: the old loop —
+    // one getline per symbol, a byte-at-a-time escape decode and one
+    // strdup per symbol — cost ~100 ms of a CLI invocation's open; this
+    // shape answers the same ids/bytes from ~two vectorized memchr scans.
+    // The +1 is the sentinel byte a final unterminated line's NUL
+    // terminator lands in.
+    var cap: usize = 1 << 16;
+    var len: usize = 0;
+    var bufm: ?*anyopaque = c.malloc(cap + 1) orelse {
+        _ = c.fclose(f);
+        intern_free(ir);
+        return null;
+    };
+    var buf: [*]u8 = @ptrCast(bufm.?);
+    read: while (true) {
+        const want = cap - len;
+        const n = c.fread(buf + len, 1, want, f);
+        len += n;
+        if (n < want) break :read; // EOF (a read error stops the load the way getline's did)
+        cap *= 2;
+        bufm = c.realloc(bufm, cap + 1) orelse {
+            c.free(bufm);
+            _ = c.fclose(f);
+            intern_free(ir);
+            return null;
+        };
+        buf = @ptrCast(bufm.?);
+    }
+    _ = c.fclose(f);
 
-        // strip trailing newline
-        if (len > 0 and line.?[len - 1] == '\n') {
-            len -= 1;
-            line.?[len] = 0;
-        }
-        if (len > 0 and line.?[len - 1] == '\r') {
-            len -= 1;
-            line.?[len] = 0;
-        }
+    if (len == 0) {
+        // Empty file (or an unopenable/unreadable one): empty interner, no
+        // buffer retained.
+        c.free(bufm);
+        return ir;
+    }
+    ir.load_buf = buf;
 
-        // Decode escapes in place: '\\' '\\' -> 0x5C, '\\' 'n' -> 0x0A,
-        // else verbatim (lone trailing backslash stays a backslash).
-        const buf = line.?;
-        var in_i: usize = 0;
-        var out_i: usize = 0;
-        while (buf[in_i] != 0) {
-            if (buf[in_i] == '\\') {
-                in_i += 1;
-                if (buf[in_i] == 'n') {
-                    buf[out_i] = '\n';
-                    out_i += 1;
+    // Split on '\n' and decode in place, one rev[] slot per physical line —
+    // exactly the symbols getline+strdup produced, in the same order.
+    var pos: usize = 0;
+    while (pos < len) {
+        const base = @intFromPtr(buf);
+        const end = if (memchr(buf + pos, '\n', len - pos)) |p|
+            @intFromPtr(p) - base // exclusive: the '\n' itself
+        else
+            len; // final line without a trailing '\n' (accepted, as getline did)
+
+        var seg_len = end - pos;
+        // One trailing '\r' (the CRLF the old strip-after-getline removed).
+        if (seg_len > 0 and buf[end - 1] == '\r') seg_len -= 1;
+
+        // Decode escapes in place, the old loop's exact state machine:
+        // '\\' '\\' -> 0x5C, '\\' 'n' -> 0x0A, else verbatim (a lone trailing
+        // backslash stays a backslash), stopping at an embedded NUL exactly
+        // where the old strdup did.  A line with no '\\' (the overwhelming
+        // case — memchr, vectorized) needs no copy at all: the bytes are
+        // already the answer, just terminate.
+        if (memchr(buf + pos, '\\', seg_len) == null) {
+            buf[pos + seg_len] = 0;
+        } else {
+            var in_i: usize = 0;
+            var out_i: usize = 0;
+            while (in_i < seg_len and buf[pos + in_i] != 0) {
+                if (buf[pos + in_i] == '\\') {
                     in_i += 1;
-                } else if (buf[in_i] == '\\') {
-                    buf[out_i] = '\\';
-                    out_i += 1;
-                    in_i += 1;
+                    if (in_i < seg_len and buf[pos + in_i] == 'n') {
+                        buf[pos + out_i] = '\n';
+                        out_i += 1;
+                        in_i += 1;
+                    } else if (in_i < seg_len and buf[pos + in_i] == '\\') {
+                        buf[pos + out_i] = '\\';
+                        out_i += 1;
+                        in_i += 1;
+                    } else {
+                        // lone trailing backslash, or unknown escape
+                        buf[pos + out_i] = '\\';
+                        out_i += 1;
+                    }
                 } else {
-                    // lone trailing backslash, or unknown escape
-                    buf[out_i] = '\\';
+                    buf[pos + out_i] = buf[pos + in_i];
                     out_i += 1;
+                    in_i += 1;
                 }
-            } else {
-                buf[out_i] = buf[in_i];
-                out_i += 1;
-                in_i += 1;
             }
+            buf[pos + out_i] = 0;
         }
-        buf[out_i] = 0;
 
         // Grow rev array if needed.
         if (ir.next_id > ir.rev_cap) {
             var new_cap = ir.rev_cap *% 2;
             if (new_cap < ir.next_id) new_cap = ir.next_id *% 2;
             const nm = c.realloc(@ptrCast(ir.rev.?), @as(usize, new_cap) * @sizeOf(?[*:0]u8)) orelse {
-                c.free(@ptrCast(line));
-                _ = c.fclose(f);
                 intern_free(ir);
                 return null;
             };
@@ -694,18 +753,12 @@ pub export fn intern_load(fwd_path: ?[*:0]const u8, rev_path: ?[*:0]const u8) ?*
             ir.rev_cap = new_cap;
         }
 
-        const dup = strdup(@ptrCast(buf));
-        ir.rev.?[ir.next_id - 1] = dup;
-        if (dup == null) {
-            c.free(@ptrCast(line));
-            _ = c.fclose(f);
-            intern_free(ir);
-            return null;
-        }
+        // Zero-copy: the slot points at the NUL-terminated line in load_buf.
+        ir.rev.?[ir.next_id - 1] = @ptrCast(buf + pos);
+        ir.buf_owned_n = ir.next_id;
         ir.next_id += 1;
+        pos = end + 1;
     }
-    c.free(@ptrCast(line));
-    _ = c.fclose(f);
 
     return ir;
 }
@@ -839,6 +892,70 @@ test "MAX_WORD_LEN reject (key = str \\0 id_u32BE > 65536)" {
     const id = intern_str(ir, ok_long);
     try std.testing.expectEqual(@as(u32, 1), id);
     try std.testing.expectEqual(@as(u32, 1), intern_str_find(ir, ok_long));
+}
+
+test "bulk load: CRLF, embedded NUL, truncated final line, empty file" {
+    const path = "/tmp/datalog_zig_u3_bulk.array";
+    defer _ = c.unlink(path);
+    {
+        const wf = c.fopen(path, "w") orelse return error.TestUnexpectedResult;
+        defer _ = c.fclose(wf);
+        // CRLF: exactly one trailing '\r' stripped, as the old strip-after-getline did.
+        try std.testing.expectEqual(@as(usize, 6), c.fwrite("crlf\r\n", 1, 6, wf));
+        // Embedded NUL: the decode (and every reader) stops where strdup did.
+        try std.testing.expectEqual(@as(usize, 4), c.fwrite("a\x00b\n", 1, 4, wf));
+        // Escaped newline + unknown escape (\z keeps the backslash verbatim).
+        try std.testing.expectEqual(@as(usize, 7), c.fwrite("x\\ny\\z\n", 1, 7, wf));
+        // Final line WITHOUT a trailing '\n' — accepted, as getline accepted it.
+        try std.testing.expectEqual(@as(usize, 5), c.fwrite("tail.", 1, 5, wf));
+    }
+    const ir = intern_load(null, path) orelse return error.OutOfMemory;
+    defer intern_free(ir);
+    try std.testing.expectEqualStrings("crlf", std.mem.span(intern_str_of(ir, 1).?));
+    try std.testing.expectEqualStrings("a", std.mem.span(intern_str_of(ir, 2).?));
+    try std.testing.expectEqualStrings("x\ny\\z", std.mem.span(intern_str_of(ir, 3).?));
+    try std.testing.expectEqualStrings("tail.", std.mem.span(intern_str_of(ir, 4).?));
+    try std.testing.expect(intern_str_of(ir, 5) == null); // 4 symbols exactly
+    try std.testing.expectEqual(@as(u32, 3), intern_str_find(ir, "x\ny\\z"));
+
+    // A 0-byte file answers the same empty interner a missing one does.
+    const empty = "/tmp/datalog_zig_u3_empty.array";
+    defer _ = c.unlink(empty);
+    {
+        const wf = c.fopen(empty, "w") orelse return error.TestUnexpectedResult;
+        _ = c.fclose(wf);
+    }
+    const eir = intern_load(null, empty) orelse return error.OutOfMemory;
+    defer intern_free(eir);
+    try std.testing.expectEqual(@as(u32, 0), intern_str_find(eir, "anything"));
+    try std.testing.expect(intern_str_of(eir, 1) == null);
+}
+
+test "bulk load grows rev[] past initial capacity (zero-copy slots + append)" {
+    const path = "/tmp/datalog_zig_u3_bulkgrow.array";
+    defer _ = c.unlink(path);
+    {
+        const wf = c.fopen(path, "w") orelse return error.TestUnexpectedResult;
+        defer _ = c.fclose(wf);
+        var namebuf: [32]u8 = undefined;
+        var i: u32 = 1;
+        while (i <= 600) : (i += 1) { // crosses the 256 initial rev_cap ON LOAD
+            const name = std.fmt.bufPrint(&namebuf, "s{d}\n", .{i}) catch unreachable;
+            try std.testing.expectEqual(name.len, c.fwrite(name.ptr, 1, name.len, wf));
+        }
+    }
+    const ir = intern_load(null, path) orelse return error.OutOfMemory;
+    // intern_free must free the load-backed slots via the buffer (a wrong
+    // buf_owned_n would free an interior pointer — a loud allocator abort,
+    // not a silent leak), so exercise it both WITHOUT and WITH an append.
+    try std.testing.expectEqualStrings("s1", std.mem.span(intern_str_of(ir, 1).?));
+    try std.testing.expectEqualStrings("s256", std.mem.span(intern_str_of(ir, 256).?));
+    try std.testing.expectEqualStrings("s600", std.mem.span(intern_str_of(ir, 600).?));
+    try std.testing.expect(intern_str_of(ir, 601) == null);
+    try std.testing.expectEqual(@as(u32, 300), intern_str_find(ir, "s300"));
+    try std.testing.expectEqual(@as(u32, 601), intern_str(ir, "late"));
+    try std.testing.expectEqual(@as(u32, 600), intern_str_find(ir, "s600"));
+    intern_free(ir);
 }
 
 test "rev array grows past initial capacity (doubling)" {
