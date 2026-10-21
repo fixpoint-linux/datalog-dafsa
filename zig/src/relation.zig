@@ -137,8 +137,8 @@ pub const ReadState = enum(u8) {
 
 /// Bump the content revision (every mutation site that sets dirty=1 calls
 /// this too, with ONE exception: open-time WAL replay sets dirty WITHOUT
-/// touching rev — a fresh process starts at rev 0 and its first publish
-/// must serialize everything).
+/// touching rev — that content is NOT on disk, so the relation opens .owned
+/// and the publish gate must serialize it rather than link a file).
 pub export fn rel_touch(rel: ?*Relation) void {
     const r = rel orelse return;
     r.rev +%= 1;
@@ -517,6 +517,33 @@ pub export fn rel_read_state(rel: ?*const Relation) u8 {
 pub export fn rel_rev(rel: ?*const Relation) u64 {
     const r = rel orelse return 0;
     return r.rev;
+}
+
+/// The on-disk file whose BYTES ARE this relation's content (the live
+/// <db>/<rel>.dafsa), or NULL when the content exists only in memory.
+///
+/// Non-NULL exactly while the relation has never been mutated in this
+/// process, because every mutation goes through relEnsureOwned (which promotes
+/// to .owned and frees the path), and open-time WAL replay — the one mutation
+/// that does NOT bump rev — opens the relation .owned in the first place.  So
+/// a non-NULL answer carries two guarantees the publish gate needs:
+///
+///   1. the file's content is the relation's content (a .deferred/.view
+///      relation reads nothing else), and
+///   2. no WAL record is pending (a relation with committed WAL records is
+///      never .deferred/.view — see Relation.state).
+///
+/// Hence rel_save(rel, dst) on such a relation writes the same CONTENT, and
+/// for a current-format file — what dafsa_save itself writes — the same BYTES:
+/// dafsa_save renumbers states in a canonical BFS order, so load-then-save
+/// reproduces the file (MEASURED byte-identical on all 26 relation files of
+/// the agent store).  A pre-v4 legacy file is the one divergence: it loads
+/// fine but dafsa_save would re-emit it with the v4 CRC trailer, so linking
+/// keeps it v3 — answer-identical, and dafsa_view_open accepts both.
+pub export fn rel_content_file(rel: ?*const Relation) [*c]const u8 {
+    const r = rel orelse return null;
+    if (r.state == .owned) return null;
+    return r.on_disk_dafsa;
 }
 
 /// Monotonic WAL-append byte count since open (snapshot-budget signal).

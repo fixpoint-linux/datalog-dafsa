@@ -330,10 +330,11 @@ pub const DlDb = extern struct {
     // saved_rev[i] is the relation.revs content revision already serialized
     // into the last published snapshot.  SAVED_REV_NONE (max u64) means
     // "no snapshot from this process has serialized it yet" — forces a full
-    // save on the first publish after open.  Relations opened fresh load
-    // with rev==0, and any post-open mutation bumps rev, so gate == (rev ==
-    // saved_rev) is exactly "byte-identical content to what the previous
-    // snapshot holds".
+    // save on the first publish after open.  It is a PER-PROCESS watermark
+    // (re-armed on every open), so it only covers relations whose content
+    // lives in memory; the cross-process half of the gate is
+    // relation.rel_content_file (an unmutated relation is .deferred/.view and
+    // is hardlinked from its live file — see relSaveGated).
     saved_rev: [MAX_RELS]u64 = @splat(SAVED_REV_NONE),
     saved_rev_var: [MAX_RELS][MAX_VAR_ARITY + 1]u64 = @splat(@splat(SAVED_REV_NONE)),
     saved_rev_perm: [MAX_PERMS]u64 = @splat(SAVED_REV_NONE),
@@ -910,8 +911,12 @@ fn dlOpenCommon(dir: ?[*:0]const u8, err_out: ?*c_int, ro: c_int) ?*DlDb {
     // "never auto-snapshot" — the default keeps dl_consolidate periodic.
     db.snapshot_budget_bytes = snapshotBudgetBytes();
     // Publish gate: mem.zeroes above clears the default-field sentinels;
-    // re-arm them so the first publish of this process serializes
-    // everything (open-time WAL replay does not bump rev).
+    // re-arm them so an OWNED relation (mutated, or WAL-replayed at open —
+    // which does not bump rev) is serialized on the first publish of the
+    // process rather than hardlinked from a previous snapshot.  UNMUTATED
+    // relations do not need this: they are .deferred/.view and the gate links
+    // their live file (see relSaveGated), so a fresh process no longer
+    // re-serializes the whole store.
     @memset(&db.saved_rev, SAVED_REV_NONE);
     for (&db.saved_rev_var) |*row| @memset(row, SAVED_REV_NONE);
     @memset(&db.saved_rev_perm, SAVED_REV_NONE);
@@ -5352,19 +5357,26 @@ fn dlPublishFail(tmp_dir: [*c]const u8, new_dir: [*c]const u8, renamed: c_int) c
     return -1;
 }
 
-/// Publish-side save gate (selfreg-relsave-fix): a relation whose content
-/// revision equals the revision already serialized into the previous
-/// snapshot is byte-identical to that snapshot's file, so re-serializing it
-/// (BFS renumbering + three O(nstates) allocations + full buffer build, per
-/// relation per publish) is pure waste — the dominant cost of a delta
-/// publish at a large store.  Instead, hardlink the previous snapshot's
-/// file into the new snapshot directory.  Snapshot files are immutable once
-/// renamed into place (only rmRf unlinks them, and unlinking one hardlink
-/// never disturbs the other), so the link is exactly the bytes rel_save
-/// would have produced for the same content.  Falls back to a full
-/// rel_save whenever the gate does not apply: first publish of the process
-/// (watermark sentinel), any content change since (rev moved), or hardlink
-/// failure (previous snapshot pruned, cross-device, pathological FS).
+/// Publish-side save gate (selfreg-relsave-fix): re-serializing a relation
+/// whose content already exists on disk (BFS renumbering + three O(nstates)
+/// allocations + full buffer build, per relation per publish) is pure waste —
+/// the dominant cost of a delta publish at a large store.  Two gates decide,
+/// in this order:
+///
+///   1. UNMUTATED (cross-process): the relation is .deferred/.view, so its
+///      content IS its live <db>/<rel>.dafsa file — hardlink that file.
+///      This is the only gate a fresh process can apply, and the one that
+///      makes a no-op publish O(#relations) instead of O(store).
+///   2. UNCHANGED IN THIS PROCESS: the content revision equals the revision
+///      already serialized into the previous snapshot — hardlink the previous
+///      snapshot's file.
+///
+/// Snapshot files are immutable once renamed into place (only rmRf unlinks
+/// them, and unlinking one hardlink never disturbs the other), so a link is
+/// exactly the bytes rel_save would have produced for the same content.
+/// Falls back to a full rel_save whenever neither gate applies (a mutated
+/// relation, WAL-replayed content, a fresh vocabulary) or a hardlink fails
+/// (previous snapshot pruned, no live file yet, cross-device, EMLINK).
 /// `saved_rev` points at the caller's STAGED slot (pre-seeded from the live
 /// watermark): the decision reads the last durable value, the write is
 /// committed into d.saved_rev* only if the publish succeeds (see
@@ -5377,6 +5389,32 @@ fn relSaveGated(
     saved_rev: *u64,
     prev_snap_dir: [*c]const u8,
 ) c_int {
+    // CROSS-PROCESS gate: an UNMUTATED relation's content IS its live
+    // <db>/<rel>.dafsa file (rel_content_file's contract: .deferred/.view
+    // means never mutated, no WAL records pending, nothing read from anywhere
+    // else), so the file can be hardlinked into the snapshot — O(1), zero
+    // bytes read.  This is the only gate that survives a fresh process: rev /
+    // saved_rev is a PER-PROCESS counter re-armed to the sentinel on every
+    // open (dl_open), so on its own it re-serialized EVERY relation of the
+    // agent store on the first publish of every invocation (MEASURED: 26
+    // relations, 61,878,035 bytes, 1.44 s of rel_save per fresh process).
+    //
+    // Content equivalence with the rel_save it replaces: rel_save on a
+    // non-owned relation promotes (relEnsureOwned) — which loads the SAME live
+    // path — and then serializes; dafsa_save's BFS renumbering is canonical,
+    // so load-then-save reproduces the file byte for byte (MEASURED on the
+    // agent store: 26/26 live relation files identical to their snapshot's
+    // re-serialization).
+    //
+    // Safety of the link: dafsa_save commits via tmp + rename (never an
+    // in-place write), so a later save of this relation replaces the live
+    // PATH, leaving this inode — and every snapshot that links it — untouched.
+    if (relation.rel_content_file(rel)) |live| {
+        if (posix.link(live, dst) == 0) return 0;
+        // No live file (relation created in this process) or a link failure
+        // (cross-device, EMLINK, ENOENT): serialize as before.
+    }
+
     const rev = relation.rel_rev(rel);
 
     if (rev != saved_rev.* or d.snap_version == 0) {
@@ -6554,10 +6592,10 @@ test "zerocopy: publishing with a VIEW-BACKED relation keeps the snapshot correc
     //   2. a SECOND publish with no writes between them re-uses the previous
     //      snapshot's file by hardlink (the save gate) — the promoted-vs-view
     //      distinction must not disturb it.
-    // NOTE: the FIRST publish of a process serializes every relation by
-    // design (saved_rev starts at SAVED_REV_NONE, the process cannot know what
-    // the previous snapshot holds), so it parses the view-backed ones too —
-    // that is pre-existing publish behaviour, not a view regression.
+    // NOTE: the FIRST publish of a process re-serializes only relations it
+    // MUTATED (owned); an unmutated one is .view/.deferred and is hardlinked
+    // from its live file, so the view-backed alpha below is linked, not parsed
+    // (see relSaveGated's cross-process gate).
     const dir = "/tmp/datalog_zig_zerocopy_publish";
     rmrfTestDir(dir);
     defer rmrfTestDir(dir);
@@ -6665,6 +6703,224 @@ test "zerocopy: a write after a view read promotes and works end to end" {
         try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "alpha", &[2]u32{ 1, 2 }, 2));
         try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "alpha", &[2]u32{ 9, 9 }, 2));
         try testing.expectEqual(@as(c_int, 0), dl_lookup(db, "alpha", &[2]u32{ 9, 8 }, 2));
+    }
+}
+
+// ─── publish gate: the cross-process (unmutated ⇒ live file) half ───────────
+
+/// stat <dir>/<name>.dafsa and <dir>/snapshots/<version>/<name>.dafsa and
+/// require the SAME inode — i.e. the publish hardlinked the live file into the
+/// snapshot instead of re-serializing it.
+fn expectSnapshotLinksLive(dir: [*:0]const u8, version: u32, name: [*:0]const u8) !void {
+    var live: [4096:0]u8 = undefined;
+    var snap: [4096:0]u8 = undefined;
+    _ = snprintf(&live, 4096, "%s/%s.dafsa", dir, name);
+    _ = snprintf(&snap, 4096, "%s/snapshots/%u/%s.dafsa", dir, version, name);
+    var sl: Stat = undefined;
+    var ss: Stat = undefined;
+    try testing.expectEqual(@as(c_int, 0), stat(&live, &sl));
+    try testing.expectEqual(@as(c_int, 0), stat(&snap, &ss));
+    try testing.expectEqual(sl.st_dev, ss.st_dev);
+    try testing.expectEqual(sl.st_ino, ss.st_ino);
+}
+
+/// stat the two paths and require DIFFERENT inodes (the publish wrote new
+/// bytes instead of linking an existing file).
+fn expectDifferentInode(a: [*:0]const u8, b: [*:0]const u8) !void {
+    var sa: Stat = undefined;
+    var sb: Stat = undefined;
+    try testing.expectEqual(@as(c_int, 0), stat(a, &sa));
+    try testing.expectEqual(@as(c_int, 0), stat(b, &sb));
+    try testing.expect(sa.st_ino != sb.st_ino or sa.st_dev != sb.st_dev);
+}
+
+test "publish gate: a FRESH process links unmutated relations from their live files" {
+    // The dominant publish cost at a large store: every invocation is a fresh
+    // process, and saved_rev — a PER-PROCESS counter re-armed to the sentinel
+    // at open — made the first publish of every process re-serialize the whole
+    // store (MEASURED on the agent store: 26 relations, 61,878,035 bytes,
+    // 1.44 s of rel_save) even when nothing had been written.  An unmutated
+    // relation is .deferred/.view, so its content IS its live
+    // <db>/<rel>.dafsa file: the publish must hardlink it, writing zero bytes.
+    //
+    // FAILS on the pre-gate tree: there the snapshot's file is a fresh
+    // serialization — a different inode — for every relation.
+    const dir = "/tmp/datalog_zig_pubgate_fresh";
+    rmrfTestDir(dir);
+    defer rmrfTestDir(dir);
+
+    // Session 1: build the store.  dl_close writes the live relation files.
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "alpha", 2));
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "beta", 2));
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "alpha", &[2]u32{ 1, 2 }, 2));
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "beta", &[2]u32{ 4, 5 }, 2));
+    }
+
+    // Session 2: publish with nothing read and nothing written.
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        try testing.expectEqual(@as(u8, @intFromEnum(relation.ReadState.deferred)), relation.rel_read_state(db.rels[@intCast(findRel(db, "alpha"))].rel));
+        try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db));
+        const v1 = db.snap_version;
+        try testing.expect(v1 > 0);
+        try expectSnapshotLinksLive(dir, v1, "alpha");
+        try expectSnapshotLinksLive(dir, v1, "beta");
+        // The snapshot's bytes ARE the live file's bytes (a hardlink, not a
+        // copy): a fresh serialization would be answer-equivalent, so this
+        // pins the stronger property the gate claims.
+        var live: [4096:0]u8 = undefined;
+        var snap: [4096:0]u8 = undefined;
+        _ = snprintf(&live, 4096, "%s/alpha.dafsa", @as([*:0]const u8, dir));
+        _ = snprintf(&snap, 4096, "%s/snapshots/%u/alpha.dafsa", @as([*:0]const u8, dir), v1);
+        const lb = readFileAlloc(&live);
+        defer c.free(@ptrCast(lb.ptr));
+        const sb = readFileAlloc(&snap);
+        defer c.free(@ptrCast(sb.ptr));
+        try testing.expect(lb.len > 0);
+        try testing.expectEqualSlices(u8, lb, sb);
+    }
+
+    // The linked snapshot answers the store's facts.
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "alpha", &[2]u32{ 1, 2 }, 2));
+        try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "beta", &[2]u32{ 4, 5 }, 2));
+        try testing.expectEqual(@as(c_int, 0), dl_lookup(db, "alpha", &[2]u32{ 1, 3 }, 2));
+    }
+}
+
+test "publish gate: a MUTATED relation is re-serialized and the old snapshot keeps its bytes" {
+    // The failure mode of the gate is a STALE SNAPSHOT: a hardlinked file that
+    // should have been rewritten.  So: publish a relation while it is linked,
+    // snapshot the published bytes, mutate the relation (which promotes it out
+    // of .view — the gate must stop applying), publish again, and require
+    //   * the new snapshot's file is a DIFFERENT inode,
+    //   * it holds the new fact, and
+    //   * the OLD snapshot's file still holds exactly the old bytes — the
+    //     mutation must not have followed the hardlink into it.
+    const dir = "/tmp/datalog_zig_pubgate_mutate";
+    rmrfTestDir(dir);
+    defer rmrfTestDir(dir);
+
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "alpha", 2));
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "alpha", &[2]u32{ 1, 2 }, 2));
+    }
+
+    var v1: u32 = 0;
+    var v2: u32 = 0;
+    var v1_alpha: [4096:0]u8 = undefined;
+    var v2_alpha: [4096:0]u8 = undefined;
+    var live_alpha: [4096:0]u8 = undefined;
+    _ = snprintf(&live_alpha, 4096, "%s/alpha.dafsa", @as([*:0]const u8, dir));
+
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db));
+        v1 = db.snap_version;
+        _ = snprintf(&v1_alpha, 4096, "%s/snapshots/%u/alpha.dafsa", @as([*:0]const u8, dir), v1);
+        try expectSnapshotLinksLive(dir, v1, "alpha");
+
+        // Keep the published bytes to prove they are never touched again.
+        const before = readFileAlloc(&v1_alpha);
+        defer c.free(@ptrCast(before.ptr));
+        try testing.expect(before.len > 0);
+
+        // READ it first (a view), then mutate: the write must promote the
+        // relation to .owned, which is exactly what disables the link gate.
+        const ia = findRel(db, "alpha");
+        try testing.expect(ia >= 0);
+        const rel = db.rels[@intCast(ia)].rel;
+        try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "alpha", &[2]u32{ 1, 2 }, 2));
+        try testing.expectEqual(@as(u8, @intFromEnum(relation.ReadState.view)), relation.rel_read_state(rel));
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "alpha", &[2]u32{ 9, 9 }, 2));
+        try testing.expectEqual(@as(u8, @intFromEnum(relation.ReadState.owned)), relation.rel_read_state(rel));
+
+        try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db));
+        v2 = db.snap_version;
+        try testing.expect(v2 != v1);
+        _ = snprintf(&v2_alpha, 4096, "%s/snapshots/%u/alpha.dafsa", @as([*:0]const u8, dir), v2);
+        try expectDifferentInode(&v1_alpha, &v2_alpha);
+        try expectDifferentInode(&live_alpha, &v2_alpha);
+
+        // The old snapshot is immutable: the mutation did not follow the link.
+        const after = readFileAlloc(&v1_alpha);
+        defer c.free(@ptrCast(after.ptr));
+        try testing.expectEqualSlices(u8, before, after);
+    }
+
+    // Both snapshots answer what they were published with; the live store has
+    // both facts.
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        var got1 = CollectCbCtx{};
+        try testing.expectEqual(@as(c_long, 1), snapshot_query_scan(dir, v1, &db.vcache, "alpha", null, 0, collectCb, &got1));
+        try testing.expectEqualSlices(u32, &[2]u32{ 1, 2 }, got1.rows[0][0..2]);
+        // view_open_cached keys its slots on the relation NAME only, not on the
+        // snapshot dir (PRE-EXISTING, out of this unit's scope — reported), so
+        // two DIFFERENT versions of one relation in one process would otherwise
+        // hand back the first version's view.
+        vcache_invalidate(&db.vcache);
+        var got2 = CollectCbCtx{};
+        try testing.expectEqual(@as(c_long, 2), snapshot_query_scan(dir, v2, &db.vcache, "alpha", null, 0, collectCb, &got2));
+        try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "alpha", &[2]u32{ 9, 9 }, 2));
+    }
+}
+
+test "publish gate: WAL-recovered content is SERIALIZED, never linked from the live file" {
+    // The one case where an unmutated-looking relation's content is NOT its
+    // live file: records committed to the per-relation WAL but never
+    // consolidated.  Such a relation opens .owned (replay), and linking the
+    // stale live file would publish a snapshot that silently LOSES those
+    // facts.  The gate must serialize.
+    const dir = "/tmp/datalog_zig_pubgate_wal";
+    rmrfTestDir(dir);
+    defer rmrfTestDir(dir);
+
+    // Session 1: a fact, consolidated by the close sweep.
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "alpha", 2));
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "alpha", &[2]u32{ 1, 2 }, 2));
+    }
+
+    // Session 2: a second fact, then ABANDON the handle (the crash shape): it
+    // is durable ONLY in the WAL, so the live file still holds {1,2} alone.
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "alpha", &[2]u32{ 7, 8 }, 2));
+        // NO dl_close.
+    }
+
+    var live_alpha: [4096:0]u8 = undefined;
+    _ = snprintf(&live_alpha, 4096, "%s/alpha.dafsa", @as([*:0]const u8, dir));
+
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        const ia = findRel(db, "alpha");
+        try testing.expect(ia >= 0);
+        // Recovered EAGERLY: owned, so the gate's live-file branch cannot fire.
+        try testing.expectEqual(@as(c_int, 1), relation.rel_is_loaded(db.rels[@intCast(ia)].rel));
+        try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "alpha", &[2]u32{ 7, 8 }, 2));
+        try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db));
+        const v1 = db.snap_version;
+        var snap_alpha: [4096:0]u8 = undefined;
+        _ = snprintf(&snap_alpha, 4096, "%s/snapshots/%u/alpha.dafsa", @as([*:0]const u8, dir), v1);
+        try expectDifferentInode(&live_alpha, &snap_alpha);
+        // The replayed fact IS in the snapshot (a stale link would drop it).
+        var got = CollectCbCtx{};
+        try testing.expectEqual(@as(c_long, 2), snapshot_query_scan(dir, v1, &db.vcache, "alpha", null, 0, collectCb, &got));
     }
 }
 
