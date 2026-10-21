@@ -1474,22 +1474,61 @@ pub export fn rel_add_tupleset(rel: ?*Relation, ts: ?*const tupleset.tuple_set) 
     // batch then behaves like an incremental Daciuk construction while each
     // individual add still merges through the live equivalence registry
     // (minimality is preserved exactly as for arbitrary-order adds).
-    var copy: tupleset.tuple_set = undefined;
-    if (tupleset.ts_init(&copy, t.arity) != 0) return -1;
-    var i: c_long = 0;
-    while (i < t.count) : (i += 1) {
-        if (tupleset.ts_add(&copy, t.data.? + @as(usize, @intCast(i)) * @as(usize, t.arity)) < 0) {
-            tupleset.ts_free(&copy);
+    //
+    // A caller whose batch is ALREADY sorted (the fixpoint's per-rule commit
+    // sorts its candidate set before handing it over) skips the defensive
+    // copy: a tuple_set is unique by construction (ts_add rejects a tuple it
+    // already holds), so sorted+unique is exactly what the loops below need.
+    var scratch: tupleset.tuple_set = undefined;
+    var src: *const tupleset.tuple_set = t;
+    if (!tsSorted(t)) {
+        if (tupleset.ts_init(&scratch, t.arity) != 0) return -1;
+        var j: c_long = 0;
+        while (j < t.count) : (j += 1) {
+            if (tupleset.ts_add(&scratch, t.data.? + @as(usize, @intCast(j)) * @as(usize, t.arity)) < 0) {
+                tupleset.ts_free(&scratch);
+                return -1;
+            }
+        }
+        tupleset.ts_sort(&scratch);
+        src = &scratch;
+    }
+
+    // EMPTY VIEW: one bulk build instead of N incremental adds.  The result is
+    // the same set — a minimal DAFSA is canonical, and dafsa_save's contract
+    // is that the bytes are identical to adding the same keys one by one
+    // (dafsa.h:27-29) — but dafsa_build_sorted is ~3x cheaper per key than N
+    // dafsa_add_n, which pays the register/confluence maintenance per word
+    // (MEASURED on a 200-word 1-column relation: 124ns vs 408ns per key).
+    //
+    // This is the fixpoint's hot term: a head view that the driver resets for
+    // a from-scratch re-derivation is empty, so the round's whole batch lands
+    // here (MEASURED, win/move chain n=400: 34.3ms of the 62ms query is
+    // per-tuple dafsa_add_n, and 400 of the 400 rounds reset the view).
+    if (viewOverlayClean(r) and relViewDafsaEmpty(r)) {
+        const new_d = dafsaBuildFromTs(src, r.arity);
+        if (new_d == null) {
+            if (src == &scratch) tupleset.ts_free(&scratch);
             return -1;
         }
+        const aliased = (r.base == r.d);
+        dc.dafsa_free(r.d);
+        r.d = new_d;
+        if (aliased) r.base = r.d; // EDB-only: base aliases the view
+        r.dirty = 1;
+        // One bump per fact, as the per-tuple loop below does — rev is a
+        // monotonic change gate (publish), and an empty view means every
+        // tuple of the batch is new.
+        r.rev +%= @intCast(src.count);
+        if (src == &scratch) tupleset.ts_free(&scratch);
+        return 0;
     }
-    tupleset.ts_sort(&copy);
 
-    i = 0;
-    while (i < copy.count) : (i += 1) {
-        const rc = relAddD(r, r.d, copy.data.? + @as(usize, @intCast(i)) * @as(usize, copy.arity));
+    var i: c_long = 0;
+    while (i < src.count) : (i += 1) {
+        const rc = relAddD(r, r.d, src.data.? + @as(usize, @intCast(i)) * @as(usize, src.arity));
         if (rc < 0) {
-            tupleset.ts_free(&copy);
+            if (src == &scratch) tupleset.ts_free(&scratch);
             return -1;
         }
         if (rc > 0) {
@@ -1497,8 +1536,38 @@ pub export fn rel_add_tupleset(rel: ?*Relation, ts: ?*const tupleset.tuple_set) 
             r.rev +%= 1;
         }
     }
-    tupleset.ts_free(&copy);
+    if (src == &scratch) tupleset.ts_free(&scratch);
     return 0;
+}
+
+/// Is the tuple_set's array in lexicographic order?  O(n) over the strided
+/// rows — cheaper than the copy+ts_sort it lets rel_add_tupleset skip.
+fn tsSorted(ts: *const tupleset.tuple_set) bool {
+    const ar: usize = ts.arity;
+    var i: c_long = 1;
+    while (i < ts.count) : (i += 1) {
+        const prev = ts.data.? + @as(usize, @intCast(i - 1)) * ar;
+        const cur = ts.data.? + @as(usize, @intCast(i)) * ar;
+        var k: usize = 0;
+        while (k < ar and prev[k] == cur[k]) k += 1;
+        if (k < ar and cur[k] < prev[k]) return false;
+    }
+    return true;
+}
+
+/// Early-stopping sink: one tuple answers "does this DAFSA hold any word".
+fn firstTupleProbe(cols: ?[*]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_int {
+    _ = cols;
+    _ = arity;
+    _ = user;
+    return 1;
+}
+
+/// Is the relation's VIEW DAFSA word-empty?  One DFS descent to the first
+/// final state — O(depth), NOT an O(states) stats walk: rel_add_tupleset asks
+/// this per bulk commit, and the view it asks about can be large.
+fn relViewDafsaEmpty(r: *const Relation) bool {
+    return relPrefixD(r, r.d, null, 0, firstTupleProbe, null) == 0;
 }
 
 /// int rel_build_base_from_tupleset(relation *rel, const struct tuple_set *ts)
@@ -2349,6 +2418,51 @@ test "rel_reset_view split + build_from_tupleset" {
     try std.testing.expectEqual(@as(c_int, 0), rel_reset_view(r));
     try std.testing.expectEqual(@as(c_int, 0), rel_exact(r, &.{ 9, 9 }));
     try std.testing.expectEqual(@as(c_int, 1), rel_is_idb(r));
+}
+
+test "rel_add_tupleset bulk-builds an empty view, folds into a populated one" {
+    const r = rel_create(1) orelse return error.OutOfMemory;
+    defer rel_free(r);
+    // IDB shape: base and view both empty (what the fixpoint's per-round
+    // rel_reset_view leaves behind — the batch then hits the bulk build).
+    try std.testing.expectEqual(@as(c_int, 0), rel_reset_view(r));
+
+    // SORTED batch (the fixpoint's commit sorts it): takes the no-copy path.
+    // Duplicates inside the batch collapse — a rule deriving the same head
+    // tuple from two body bindings must insert it once.
+    var ts: tupleset.tuple_set = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), tupleset.ts_init(&ts, 1));
+    defer tupleset.ts_free(&ts);
+    const rows = [_]u32{ 3, 1, 2 };
+    for (rows) |v| try std.testing.expectEqual(@as(c_int, 1), tupleset.ts_add(&ts, &.{v}));
+    try std.testing.expectEqual(@as(c_int, 0), tupleset.ts_add(&ts, &.{2})); // duplicate
+    tupleset.ts_sort(&ts);
+
+    const rev0 = rel_rev(r);
+    try std.testing.expectEqual(@as(c_int, 0), rel_add_tupleset(r, &ts));
+    // NOTE: rel_count is the final-STATE count (final states merge), not the
+    // word count — count words through rel_prefix.
+    var nw: c_long = 0;
+    try std.testing.expectEqual(@as(c_long, 3), rel_prefix(r, null, 0, countCb, &nw));
+    try std.testing.expectEqual(@as(c_long, 3), nw);
+    // One rev bump per inserted fact, exactly as the per-tuple loop does.
+    try std.testing.expectEqual(@as(u64, 3), rel_rev(r) - rev0);
+    for (rows) |v| try std.testing.expectEqual(@as(c_int, 1), rel_exact(r, &.{v}));
+
+    // Populated view + UNSORTED batch: the defensive copy path.  One tuple is
+    // already present (a no-op insert), one is new.
+    var ts2: tupleset.tuple_set = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), tupleset.ts_init(&ts2, 1));
+    defer tupleset.ts_free(&ts2);
+    try std.testing.expectEqual(@as(c_int, 1), tupleset.ts_add(&ts2, &.{5}));
+    try std.testing.expectEqual(@as(c_int, 1), tupleset.ts_add(&ts2, &.{2}));
+
+    const rev1 = rel_rev(r);
+    try std.testing.expectEqual(@as(c_int, 0), rel_add_tupleset(r, &ts2));
+    nw = 0;
+    try std.testing.expectEqual(@as(c_long, 4), rel_prefix(r, null, 0, countCb, &nw));
+    try std.testing.expectEqual(@as(u64, 1), rel_rev(r) - rev1); // only {5} was new
+    try std.testing.expectEqual(@as(c_int, 1), rel_exact(r, &.{5}));
 }
 
 test "rel_build_from_tupleset bulk build" {

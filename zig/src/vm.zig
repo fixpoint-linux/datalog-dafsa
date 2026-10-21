@@ -569,6 +569,79 @@ fn symsetAddCb(sym_id: u32, user: ?*anyopaque) callconv(.c) c_int {
     return regexwalk.symset_add(set, sym_id);
 }
 
+// ─── opt-in VM cost split (DL_VM_STATS) ────────────────────────────────────
+//
+// One VMSTAT line per vm_execute, so a driver that calls vm_execute once per
+// round (the WFS alternating fixpoint) can be summed over the rounds.  The
+// buckets are the ones the fixpoint's hot term was identified and re-measured
+// with: `exec` = rule evaluation (scans, lookups, backtracking) plus the
+// tuple_set the batched commit accumulates into, `add` = the per-tuple
+// relation.rel_add path, `commit` = the batched rel_add_tupleset, `reset` =
+// the per-round head-view reset, `perm` = the permutation-index rebuild, and
+// `other` = the remainder of vm_execute.  Zero overhead when unset: one cached
+// getenv at the first vm_execute and a branch per rule / per projected tuple.
+const Timespec2 = extern struct { sec: isize, nsec: isize };
+extern fn clock_gettime(clk_id: c_int, tp: *Timespec2) c_int;
+
+fn pfNow() u64 {
+    var ts: Timespec2 = undefined;
+    _ = clock_gettime(1, &ts); // CLOCK_MONOTONIC
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
+var pf_checked: bool = false;
+var pf_on: bool = false;
+var pf_exec_ns: u64 = 0;
+var pf_exec_calls: u64 = 0;
+var pf_add_ns: u64 = 0;
+var pf_add_calls: u64 = 0;
+var pf_add_dup: u64 = 0;
+var pf_commit_ns: u64 = 0;
+var pf_commit_calls: u64 = 0;
+var pf_vm_ns: u64 = 0;
+var pf_reset_ns: u64 = 0;
+var pf_perm_ns: u64 = 0;
+var pf_rounds: u64 = 0;
+
+fn pfCheck() void {
+    if (pf_checked) return;
+    pf_checked = true;
+    const v = std.c.getenv("DL_VM_STATS");
+    pf_on = (v != null and v.?[0] != 0);
+}
+
+fn pfDump() void {
+    if (!pf_on) return;
+    // clock_gettime is a vDSO call: the split's own overhead is the two pairs
+    // per rel_add plus one pair per rule, reported so the numbers are read
+    // against it.
+    std.debug.print("VMSTAT rounds={d} exec_calls={d} exec_us={d} add_calls={d} add_dup={d} add_us={d} commit_calls={d} commit_us={d} reset_us={d} perm_us={d} other_us={d} vm_us={d}\n", .{
+        pf_rounds,
+        pf_exec_calls,
+        pf_exec_ns / 1_000,
+        pf_add_calls,
+        pf_add_dup,
+        pf_add_ns / 1_000,
+        pf_commit_calls,
+        pf_commit_ns / 1_000,
+        pf_reset_ns / 1_000,
+        pf_perm_ns / 1_000,
+        (pf_vm_ns -| pf_exec_ns -| pf_commit_ns -| pf_reset_ns -| pf_perm_ns) / 1_000,
+        pf_vm_ns / 1_000,
+    });
+    pf_rounds = 0;
+    pf_exec_ns = 0;
+    pf_exec_calls = 0;
+    pf_add_ns = 0;
+    pf_add_calls = 0;
+    pf_add_dup = 0;
+    pf_commit_ns = 0;
+    pf_commit_calls = 0;
+    pf_vm_ns = 0;
+    pf_reset_ns = 0;
+    pf_perm_ns = 0;
+}
+
 // ─── Bytecode interpreter ──────────────────────────────────────────────────
 
 /// The 8 frame-slot guards below were bare `return -1` (MEASURED on 87f01d7:
@@ -1536,7 +1609,13 @@ fn execRange(
                         break :blk;
                     }
                 } else {
+                    const t_a0 = if (pf_on) pfNow() else 0;
                     const rr = relation.rel_add(r, cols[0..].ptr);
+                    if (pf_on) {
+                        pf_add_ns += pfNow() - t_a0;
+                        pf_add_calls += 1;
+                        if (rr == 0) pf_add_dup += 1;
+                    }
                     if (rr < 0) {
                         ip = end;
                         break :blk;
@@ -1692,7 +1771,12 @@ fn execRule(
         pool = @ptrCast(@alignCast(mem));
     }
 
+    const t_e0 = if (pf_on) pfNow() else 0;
     const rc = execRange(db, cr, 0, n_instrs, ov, n_ov, dry, cb, user, null, null, pool, n_mat);
+    if (pf_on) {
+        pf_exec_ns += pfNow() - t_e0;
+        pf_exec_calls += 1;
+    }
 
     if (pool) |pl| {
         k = 0;
@@ -1725,12 +1809,21 @@ pub export fn vm_exec_rule(
 
 const CandCtx = struct {
     ts: *tupleset.tuple_set,
+    /// Set when the batch could not grow.  execRange treats a non-zero
+    /// callback return as "stop this scan", not as an error, so a caller that
+    /// must not silently lose candidates (execRuleBatched) reads this instead
+    /// of trusting the returned count.
+    err: c_int = 0,
 };
 
 fn candCb(cols: [*c]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_int {
     _ = arity;
     const ctx: *CandCtx = @ptrCast(@alignCast(user orelse return -1));
-    return if (tupleset.ts_add(ctx.ts, cols) < 0) -1 else 0;
+    if (tupleset.ts_add(ctx.ts, cols) < 0) {
+        ctx.err = -1;
+        return -1;
+    }
+    return 0;
 }
 
 // ─── Non-recursive evaluation (M1 path) ────────────────────────────────────
@@ -1818,6 +1911,70 @@ fn ruleStratumOrder(rules: [*]?*compiler.compiled_rule, n: c_int) ?[*]c_int {
     return idx;
 }
 
+/// Evaluate one rule and commit its head writes as ONE bulk insert.
+///
+/// The per-tuple write path (OP_PROJECT -> relation.rel_add) pays one
+/// dafsa_add_n per derived tuple, and on a head view the fixpoint resets for a
+/// from-scratch re-derivation it rebuilds the minimal DAFSA one word at a time
+/// — MEASURED as the fixpoint's largest single term (win/move chain n=400:
+/// 34.3ms of a 62ms query).  This runs the rule in the DRY mode the semi-naive
+/// delta pass already uses (dry=1 + candCb in evalStratumRecursive), collecting head
+/// tuples into a tuple_set, then commits them with one rel_add_tupleset, which
+/// bulk-builds an empty view (see relation.zig:rel_add_tupleset).
+///
+/// Equivalent to the per-tuple path, not merely similar:
+///   - the target is a SET: inserts commute, and the tuple_set collapses
+///     duplicates within the batch, so a rule whose body derives the same head
+///     tuple twice still inserts it once;
+///   - a rule classified non-recursive cannot read the relation it writes
+///     (compileList publishes is_recursive from the SCC vector, so a body atom
+///     over its own head would have made it recursive), hence nothing in the
+///     rule's own body can observe the deferred write.  Other rules in the
+///     stratum see it because the commit happens before this returns.
+///
+/// Returns >0 when the relation gained at least one fact, 0 when nothing
+/// changed, <0 on error.  Callers test only the sign (the per-tuple path's
+/// count of NEW facts is not needed anywhere on this path); a variadic head
+/// keeps the per-tuple path, since its variant relation is created per arity.
+fn execRuleBatched(db: *dl.DlDb, cr: *const compiler.compiled_rule) c_long {
+    const hid: c_int = @intCast(cr.head_rel_id);
+    const hrel: ?*relation.Relation = if (hid >= 0 and @as(usize, @intCast(hid)) < db.nrels and
+        db.rels[@intCast(hid)].kind != dl.RELK_VARIADIC)
+        dbRel(db, hid)
+    else
+        null;
+    const rel = hrel orelse return execRule(db, cr, null, 0, 0, null, null);
+
+    var cand: tupleset.tuple_set = undefined;
+    if (tupleset.ts_init(&cand, relation.rel_arity(rel)) != 0) return -1;
+    var ctx = CandCtx{ .ts = &cand };
+
+    const m = execRule(db, cr, null, 0, 1, candCb, &ctx);
+    if (m < 0 or ctx.err != 0) {
+        tupleset.ts_free(&cand);
+        return if (m < 0) m else -1; // propagate (incl. FRAME_LIMIT_ERR)
+    }
+    if (cand.count == 0) {
+        tupleset.ts_free(&cand);
+        return 0;
+    }
+    // Sort here (not in rel_add_tupleset) so the commit can build the DAFSA
+    // straight from this batch without its defensive copy.
+    tupleset.ts_sort(&cand);
+
+    const rev0 = relation.rel_rev(rel);
+    const t_c0 = if (pf_on) pfNow() else 0;
+    const rc = relation.rel_add_tupleset(rel, &cand);
+    if (pf_on) {
+        pf_commit_ns += pfNow() - t_c0;
+        pf_commit_calls += 1;
+    }
+    const grew = relation.rel_rev(rel) != rev0;
+    tupleset.ts_free(&cand);
+    if (rc != 0) return -1;
+    return if (grew) 1 else 0;
+}
+
 fn evalNonrecursive(db: *dl.DlDb, rules: [*]?*compiler.compiled_rule, n: c_int) c_int {
     if (n <= 0) return 0; // also keeps ruleStratumOrder's malloc(0) out of play
     // A non-recursive stratum still iterates because one rule may read
@@ -1842,7 +1999,7 @@ fn evalNonrecursive(db: *dl.DlDb, rules: [*]?*compiler.compiled_rule, n: c_int) 
         while (oi < n) : (oi += 1) {
             const cr = rules[@intCast(order[@intCast(oi)])].?;
             if (pass > 0 and nonrecRuleSettled(cr, written, variadic)) continue;
-            const m = execRule(db, cr, null, 0, 0, null, null);
+            const m = execRuleBatched(db, cr);
             if (m < 0) return @intCast(m); // propagate (incl. FRAME_LIMIT_ERR)
             if (m > 0) changed = 1;
             if (m > 0) {
@@ -2135,7 +2292,7 @@ fn evalStratumRecursive(db: *dl.DlDb, rules: [*]?*compiler.compiled_rule, n: c_i
             while (i < n) : (i += 1) {
                 const cr = rules[@intCast(i)].?;
                 if (cr.is_recursive != 0) continue;
-                const m = execRule(db, cr, null, 0, 0, null, null);
+                const m = execRuleBatched(db, cr);
                 if (m < 0) {
                     permFreeAll(nr, perm_count, perm_ids, perm_cap, idb_perm_shadows);
                     rdFreeTs(rd, nr);
@@ -2161,7 +2318,7 @@ fn evalStratumRecursive(db: *dl.DlDb, rules: [*]?*compiler.compiled_rule, n: c_i
     while (i < n) : (i += 1) {
         const cr = rules[@intCast(i)].?;
         if (cr.is_recursive == 0) {
-            const m = execRule(db, cr, null, 0, 0, null, null);
+            const m = execRuleBatched(db, cr);
             if (m < 0) {
                 permFreeAll(nr, perm_count, perm_ids, perm_cap, idb_perm_shadows);
                 rdFreeTs(rd, nr);
@@ -2509,12 +2666,20 @@ fn vmExecuteMode(db: *dl.DlDb, rules: [*]?*compiler.compiled_rule, n_rules: c_in
             }
             const r = dbRel(db, hid);
             if (r == null) return -1;
-            if (relation.rel_reset_view(r) != 0) return -1;
+            const t_r0 = if (pf_on) pfNow() else 0;
+            const rrc = relation.rel_reset_view(r);
+            if (pf_on) pf_reset_ns += pfNow() - t_r0;
+            if (rrc != 0) return -1;
             permindex.permindex_mark_dirty(db, hid);
         }
     }
 
-    if (permindex.permindex_build_dirty(db) != 0) return -1;
+    {
+        const t_p0 = if (pf_on) pfNow() else 0;
+        const prc = permindex.permindex_build_dirty(db);
+        if (pf_on) pf_perm_ns += pfNow() - t_p0;
+        if (prc != 0) return -1;
+    }
 
     max_stratum = 0;
     {
@@ -2576,7 +2741,13 @@ fn vmExecuteMode(db: *dl.DlDb, rules: [*]?*compiler.compiled_rule, n_rules: c_in
 pub export fn vm_execute(db: ?*dl.DlDb, rules: ?[*]?*compiler.compiled_rule, n_rules: c_int) c_int {
     const d = db orelse return -1;
     const r = rules orelse return -1;
-    return vmExecuteMode(d, r, n_rules, 0);
+    pfCheck();
+    pf_rounds += 1;
+    defer pfDump();
+    const t_v0 = if (pf_on) pfNow() else 0;
+    const m = vmExecuteMode(d, r, n_rules, 0);
+    if (pf_on) pf_vm_ns += pfNow() - t_v0;
+    return m;
 }
 
 /// int vm_execute_ivm(dl_db*)
