@@ -206,6 +206,23 @@ pub export fn vcache_invalidate(vcache: [*c]dl.ViewCacheSlot) void {
         }
         slot.*.rel_name[0] = 0;
         slot.*.used = 0;
+        slot.*.version = 0;
+    }
+}
+
+/// void vcache_drop_version(view_cache_slot *vcache, uint32_t version)
+/// Close and clear every slot opened at `version` — the views map files of a
+/// snapshot that may no longer exist (retention prune).
+pub export fn vcache_drop_version(vcache: [*c]dl.ViewCacheSlot, version: u32) void {
+    var i: usize = 0;
+    while (i < dl.DL_VIEW_CACHE_SZ) : (i += 1) {
+        const slot = &vcache[i];
+        if (slot.*.view == null or slot.*.version != version) continue;
+        dc.dafsa_view_close(@ptrCast(@alignCast(slot.*.view.?)));
+        slot.*.view = null;
+        slot.*.rel_name[0] = 0;
+        slot.*.used = 0;
+        slot.*.version = 0;
     }
 }
 
@@ -218,8 +235,11 @@ fn strncpyZeroPad(dst: [*]u8, src: [*c]const u8) void {
 }
 
 /// void *view_open_cached(view_cache_slot *vcache, const char *rel_name,
-///                        const char *sdir) — open or find a cached view.
-pub export fn view_open_cached(vcache: [*c]dl.ViewCacheSlot, rel_name: [*c]const u8, sdir: [*c]const u8) ?*anyopaque {
+///                        uint32_t version, const char *sdir)
+/// Open or find a cached view.  The slot is keyed on (relation, VERSION): a
+/// view maps one snapshot's bytes, so a slot opened at v1 must never answer a
+/// v2 read.
+pub export fn view_open_cached(vcache: [*c]dl.ViewCacheSlot, rel_name: [*c]const u8, version: u32, sdir: [*c]const u8) ?*anyopaque {
     var lru_idx: usize = 0;
     var empty_idx: isize = -1;
     var lru_used_val: c_int = 0x7FFFFFFF;
@@ -227,7 +247,7 @@ pub export fn view_open_cached(vcache: [*c]dl.ViewCacheSlot, rel_name: [*c]const
     var i: usize = 0;
     while (i < dl.DL_VIEW_CACHE_SZ) : (i += 1) {
         const slot = &vcache[i];
-        if (slot.*.view != null and strEq(@ptrCast(&slot.*.rel_name), rel_name)) {
+        if (slot.*.view != null and slot.*.version == version and strEq(@ptrCast(&slot.*.rel_name), rel_name)) {
             slot.*.used += 1;
             return slot.*.view;
         }
@@ -255,6 +275,7 @@ pub export fn view_open_cached(vcache: [*c]dl.ViewCacheSlot, rel_name: [*c]const
 
     vcache[slot_idx].view = @ptrCast(v);
     vcache[slot_idx].used = 1;
+    vcache[slot_idx].version = version;
     strncpyZeroPad(@ptrCast(&vcache[slot_idx].rel_name), rel_name);
     return @ptrCast(v);
 }
@@ -594,7 +615,7 @@ pub export fn snapshot_query_scan(db_dir: [*c]const u8, snap_version: c_uint, vc
             var vname: [384:0]u8 = undefined;
             if (snprintf(&vname, 384, "%s.%d", goal_rel, @as(c_int, a)) >= 384)
                 return -1;
-            const v = view_open_cached(vcache, &vname, &sdir) orelse return -1;
+            const v = view_open_cached(vcache, &vname, snap_version, &sdir) orelse return -1;
             const n = view_prefix(v, a, leading, k, cb, user);
             if (n < 0) return -1;
             total += n;
@@ -606,7 +627,7 @@ pub export fn snapshot_query_scan(db_dir: [*c]const u8, snap_version: c_uint, vc
     if (k > 0 and leading == null) return -1;
 
     // Open view (from cache if warm)
-    const v = view_open_cached(vcache, goal_rel, &sdir) orelse return -1;
+    const v = view_open_cached(vcache, goal_rel, snap_version, &sdir) orelse return -1;
 
     return view_prefix(v, arity, leading, k, cb, user);
 }
@@ -995,7 +1016,7 @@ test "view_prefix/rank/select/range_count/count over a saved view" {
 }
 const t12 = [2]u32{ 1, 2 };
 
-test "view_open_cached LRU + vcache_invalidate" {
+test "view_open_cached LRU + version key + invalidate/drop" {
     // the .dafsa must live INSIDE the snapshot dir the cache opens from
     const dir = "/tmp/datalog_zig_u7_lrudir";
     _ = std.c.mkdir(dir, 0o755); // EEXIST on rerun is fine
@@ -1008,11 +1029,28 @@ test "view_open_cached LRU + vcache_invalidate" {
     var vcache: [dl.DL_VIEW_CACHE_SZ]dl.ViewCacheSlot = std.mem.zeroes([dl.DL_VIEW_CACHE_SZ]dl.ViewCacheSlot);
 
     const name = "t";
-    const v1 = view_open_cached(&vcache, name, dir) orelse return error.TestUnexpectedResult;
-    const v1b = view_open_cached(&vcache, name, dir) orelse return error.TestUnexpectedResult;
+    const v1 = view_open_cached(&vcache, name, 1, dir) orelse return error.TestUnexpectedResult;
+    const v1b = view_open_cached(&vcache, name, 1, dir) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(v1, v1b); // cached hit (used incremented)
     try testing.expectEqual(@as(c_int, 2), vcache[0].used);
     try testing.expectEqual(@as(c_int, 0), vcache[1].used);
+    try testing.expectEqual(@as(u32, 1), vcache[0].version);
+
+    // The SAME name at a DIFFERENT version is a MISS: a view maps one
+    // version's bytes, so the v1 slot must not answer a v2 read.
+    _ = view_open_cached(&vcache, name, 2, dir) orelse return error.TestUnexpectedResult;
+    try testing.expect(vcache[1].view != null);
+    try testing.expectEqual(@as(u32, 2), vcache[1].version);
+    try testing.expectEqual(@as(u32, 1), vcache[0].version); // v1 slot untouched
+
+    // vcache_drop_version closes exactly the named version's slots (a pruned
+    // snapshot's views must never be served again).
+    vcache_drop_version(&vcache, 1);
+    try testing.expect(vcache[0].view == null);
+    try testing.expectEqual(@as(u32, 0), vcache[0].version);
+    try testing.expectEqual(@as(u8, 0), vcache[0].rel_name[0]);
+    try testing.expect(vcache[1].view != null);
+    try testing.expectEqual(@as(u32, 2), vcache[1].version);
 
     // invalidate closes + zeroes
     vcache_invalidate(&vcache);
@@ -1026,10 +1064,11 @@ test "view_open_cached LRU + vcache_invalidate" {
     // reopen after invalidate: cache bookkeeping restarted (LRU counters).
     // NOTE: not asserting v2 != v1 — closing + reopening the same file
     // typically mmaps the same address back, deterministically.
-    const v2 = view_open_cached(&vcache, name, dir) orelse return error.TestUnexpectedResult;
+    const v2 = view_open_cached(&vcache, name, 7, dir) orelse return error.TestUnexpectedResult;
     _ = v2;
     try testing.expect(vcache[0].view != null);
     try testing.expectEqual(@as(c_int, 1), vcache[0].used);
+    try testing.expectEqual(@as(u32, 7), vcache[0].version);
     vcache_invalidate(&vcache);
 }
 

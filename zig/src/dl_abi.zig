@@ -79,6 +79,7 @@ pub const view_cache_slot = extern struct {
     rel_name: [64]u8,
     view: ?*anyopaque,
     used: c_int,
+    version: u32,
 };
 
 /// permindex.h: perm_index_entry

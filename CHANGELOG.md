@@ -3,6 +3,20 @@
 All notable changes to this project are documented in this file.
 
 ## [Unreleased]
+- **Snapshot view cache: keyed on the relation NAME alone — a second VERSION of
+  the same relation silently answered with the first version's tuples**
+  (2026-10-19, unit `vcache`).  `view_open_cached` (`zig/src/snapshot.zig`) is
+  the 8-slot LRU that backs every mmap snapshot read; a slot held
+  `rel_name`/`view`/`used` but not the version the view was opened from, so a
+  v2 read that found a v1 slot returned v1's mapped bytes.  MEASURED pre-fix
+  (one process, one handle, one cache: publish v1 {1,2}, add {9,9}, publish v2,
+  `snapshot_query_scan(dir, v1, &db.vcache, …)` then `…, v2, …`):
+  `expected 2, found 1` — the v2 read returned exactly v1's tuple set.
+  `view_cache_slot` now carries `uint32_t version`, the lookup compares it, and
+  `vcache_drop_version` closes the slots of a version that retention prunes.
+  Tests: two- and three-version reads in one process, pruned-version read is a
+  loud `-1` (never a cached tuple set), and the publish-gate test's
+  `vcache_invalidate` workaround is REMOVED — it now exercises the real cache.
 - **Version reads: damaged/diverged vocabularies were silently wrong in BOTH
   directions — closed, and each half pinned by a test that fails when reverted**
   (2026-10-19, unit `revfixes`; the findings of the `verintern` (4727cb2) and

@@ -16,6 +16,7 @@ typedef struct {
     char         rel_name[64];
     void        *view;      /* dafsa_view* */
     int           used;     /* access marker for LRU eviction */
+    uint32_t     version;   /* snapshot version the view was opened from */
 } view_cache_slot;
 
 /* ─── Fault-injection hooks (test-only, NULL in production) ──────────── */
@@ -29,6 +30,9 @@ uint32_t snapshot_read_current(const char *db_dir);
 
 /* Invalidate the view cache (close all views, zero array). */
 void vcache_invalidate(view_cache_slot *vcache);
+
+/* Close + clear the slots opened at `version` (retention prune). */
+void vcache_drop_version(view_cache_slot *vcache, uint32_t version);
 
 /* Query a published snapshot via mmap.
  * Returns tuple count or -1 on error. */
@@ -44,9 +48,13 @@ long view_prefix(void *view_handle, uint8_t arity,
                  const uint32_t *leading, uint8_t k,
                  dl_tuple_cb cb, void *user);
 
-/* Open or find a cached view.  Returns dafsa_view* or NULL. */
+/* Open or find a cached view for (rel_name, version).  Returns dafsa_view*
+ * or NULL.  A view maps ONE snapshot version's bytes: the slot carries the
+ * version it was opened at and the lookup compares it, so two versions of one
+ * relation in one process never share a slot. */
 void *view_open_cached(view_cache_slot *vcache,
-                       const char *rel_name, const char *sdir);
+                       const char *rel_name, uint32_t version,
+                       const char *sdir);
 
 /* ─── Regex pattern walk ──────────────────────────────────────────────── */
 

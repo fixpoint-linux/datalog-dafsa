@@ -279,11 +279,15 @@ pub const Txn = extern struct {
     meta_dirty_at_begin: c_int = 0,
 };
 
-/// view_cache_slot (snapshot.h) — rel_name[64] + view* + used.
+/// view_cache_slot (snapshot.h) — rel_name[64] + view* + used + version.
 pub const ViewCacheSlot = extern struct {
     rel_name: [64]u8,
     view: ?*anyopaque, // dafsa_view*
     used: c_int,
+    // The snapshot version the view was opened from.  A view maps ONE
+    // version's bytes, so a slot is only reusable for the same
+    // (rel_name, version) — keying on the name alone hands a v2 read v1's data.
+    version: u32,
 };
 
 /// perm_index_entry (permindex.h).
@@ -423,7 +427,8 @@ extern "c" fn vm_agg_maintain(db: ?*DlDb) c_int;
 // snapshot.zig.
 extern "c" fn snapshot_read_current(db_dir: [*c]const u8) u32;
 extern "c" fn vcache_invalidate(vcache: [*c]ViewCacheSlot) void;
-extern "c" fn view_open_cached(vcache: [*c]ViewCacheSlot, rel_name: [*c]const u8, sdir: [*c]const u8) ?*anyopaque;
+extern "c" fn view_open_cached(vcache: [*c]ViewCacheSlot, rel_name: [*c]const u8, version: u32, sdir: [*c]const u8) ?*anyopaque;
+extern "c" fn vcache_drop_version(vcache: [*c]ViewCacheSlot, version: u32) void;
 extern "c" fn manifest_find_rel_ex(sdir: [*c]const u8, rel_name: [*c]const u8, arity_out: [*c]u8, variadic_out: [*c]c_int) c_int;
 extern "c" fn manifest_find_variants(sdir: [*c]const u8, rel_name: [*c]const u8, present: [*]u8) void;
 extern "c" fn manifest_enumerate_rels(sdir: [*c]const u8, cb: DlRelationCb, user: ?*anyopaque) c_long;
@@ -3264,7 +3269,7 @@ fn snapshotViewOpenRel(db: ?*const DlDb, rel_name: [*c]const u8, arity_out: *u8,
     _ = snprintf(&sdir, 8192, "%s/snapshots/%u", d.dir.?, d.snap_version);
     if (manifest_find_rel_ex(&sdir, rel_name, arity_out, variadic_out) == 0)
         return null;
-    return view_open_cached(@constCast(&d.vcache), rel_name, &sdir);
+    return view_open_cached(@constCast(&d.vcache), rel_name, d.snap_version, &sdir);
 }
 
 pub export fn dl_rank(db: ?*const DlDb, rel_name: [*c]const u8, cols: [*c]const u32, arity: u8) u64 {
@@ -4549,6 +4554,9 @@ fn pruneSnapshots(db: *DlDb) void {
         var vdir: [4096:0]u8 = undefined;
         _ = snprintf(&vdir, 4096, "%s/snapshots/%u", db.dir.?, vers.?[i]);
         rmRf(&vdir);
+        // A view of the pruned version maps a file that no longer exists —
+        // close those slots rather than keep serving them.
+        vcache_drop_version(&db.vcache, vers.?[i]);
     }
     if (vers) |x| c.free(@ptrCast(x));
 }
@@ -5876,7 +5884,7 @@ pub export fn dl_pattern(db: ?*DlDb, rel_name: [*c]const u8, col: u8, dfa: ?*con
                     regexwalk.symset_free(&set);
                     return -1;
                 }
-                const vv = view_open_cached(@constCast(&d.vcache), @ptrCast(&vname), &sdir) orelse {
+                const vv = view_open_cached(@constCast(&d.vcache), @ptrCast(&vname), d.snap_version, &sdir) orelse {
                     regexwalk.symset_free(&set);
                     return -1;
                 };
@@ -5891,7 +5899,7 @@ pub export fn dl_pattern(db: ?*DlDb, rel_name: [*c]const u8, col: u8, dfa: ?*con
             return total;
         }
 
-        const vv = view_open_cached(@constCast(&d.vcache), rel_name, &sdir) orelse {
+        const vv = view_open_cached(@constCast(&d.vcache), rel_name, d.snap_version, &sdir) orelse {
             regexwalk.symset_free(&set);
             return -1;
         };
@@ -6865,14 +6873,170 @@ test "publish gate: a MUTATED relation is re-serialized and the old snapshot kee
         var got1 = CollectCbCtx{};
         try testing.expectEqual(@as(c_long, 1), snapshot_query_scan(dir, v1, &db.vcache, "alpha", null, 0, collectCb, &got1));
         try testing.expectEqualSlices(u32, &[2]u32{ 1, 2 }, got1.rows[0][0..2]);
-        // view_open_cached keys its slots on the relation NAME only, not on the
-        // snapshot dir (PRE-EXISTING, out of this unit's scope — reported), so
-        // two DIFFERENT versions of one relation in one process would otherwise
-        // hand back the first version's view.
-        vcache_invalidate(&db.vcache);
+        // Same cache, other version: the slot carries the version it was
+        // opened at, so this is a MISS and re-opens from v2's dir.
         var got2 = CollectCbCtx{};
         try testing.expectEqual(@as(c_long, 2), snapshot_query_scan(dir, v2, &db.vcache, "alpha", null, 0, collectCb, &got2));
         try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "alpha", &[2]u32{ 9, 9 }, 2));
+    }
+}
+
+test "snapshot vcache: one relation at TWO versions in one process" {
+    // A view maps ONE version's bytes, so a cache slot is only reusable for the
+    // (relation, version) it was opened at.  Keyed on the name alone, the v2
+    // read below is served v1's view — the second version's answer is silently
+    // the first version's data.
+    const dir = "/tmp/datalog_zig_vcache_version";
+    rmrfTestDir(dir);
+    defer rmrfTestDir(dir);
+
+    var v1: u32 = 0;
+    var v2: u32 = 0;
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "alpha", 2));
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "alpha", &[2]u32{ 1, 2 }, 2));
+        try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db));
+        v1 = db.snap_version;
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "alpha", &[2]u32{ 9, 9 }, 2));
+        try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db));
+        v2 = db.snap_version;
+        try testing.expect(v2 != v1);
+    }
+
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+
+        var got1 = CollectCbCtx{};
+        try testing.expectEqual(@as(c_long, 1), snapshot_query_scan(dir, v1, &db.vcache, "alpha", null, 0, collectCb, &got1));
+        try testing.expectEqualSlices(u32, &[2]u32{ 1, 2 }, got1.rows[0][0..2]);
+
+        // The SAME cache, a different version — no invalidation in between.
+        var got2 = CollectCbCtx{};
+        try testing.expectEqual(@as(c_long, 2), snapshot_query_scan(dir, v2, &db.vcache, "alpha", null, 0, collectCb, &got2));
+        try testing.expectEqualSlices(u32, &[2]u32{ 1, 2 }, got2.rows[0][0..2]);
+        try testing.expectEqualSlices(u32, &[2]u32{ 9, 9 }, got2.rows[1][0..2]);
+    }
+}
+
+test "snapshot vcache: one relation at THREE versions in one process" {
+    // Three versions live in the cache at once (8 slots), each opened at its
+    // own version: every read must answer from ITS version, in any order.
+    const dir = "/tmp/datalog_zig_vcache_three";
+    rmrfTestDir(dir);
+    defer rmrfTestDir(dir);
+
+    var v1: u32 = 0;
+    var v2: u32 = 0;
+    var v3: u32 = 0;
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "alpha", 2));
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "alpha", &[2]u32{ 1, 2 }, 2));
+        try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db));
+        v1 = db.snap_version;
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "alpha", &[2]u32{ 9, 9 }, 2));
+        try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db));
+        v2 = db.snap_version;
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "alpha", &[2]u32{ 5, 6 }, 2));
+        try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db));
+        v3 = db.snap_version;
+    }
+
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+
+        var g1 = CollectCbCtx{};
+        try testing.expectEqual(@as(c_long, 1), snapshot_query_scan(dir, v1, &db.vcache, "alpha", null, 0, collectCb, &g1));
+        var g2 = CollectCbCtx{};
+        try testing.expectEqual(@as(c_long, 2), snapshot_query_scan(dir, v2, &db.vcache, "alpha", null, 0, collectCb, &g2));
+        var g3 = CollectCbCtx{};
+        try testing.expectEqual(@as(c_long, 3), snapshot_query_scan(dir, v3, &db.vcache, "alpha", null, 0, collectCb, &g3));
+        try testing.expectEqualSlices(u32, &[2]u32{ 1, 2 }, g3.rows[0][0..2]);
+        try testing.expectEqualSlices(u32, &[2]u32{ 5, 6 }, g3.rows[1][0..2]);
+        try testing.expectEqualSlices(u32, &[2]u32{ 9, 9 }, g3.rows[2][0..2]);
+
+        // Back to the OLDEST version with all three slots warm: still v1's
+        // single tuple (no eviction happened — 3 of 8 slots are used).
+        var g1b = CollectCbCtx{};
+        try testing.expectEqual(@as(c_long, 1), snapshot_query_scan(dir, v1, &db.vcache, "alpha", null, 0, collectCb, &g1b));
+        try testing.expectEqualSlices(u32, &[2]u32{ 1, 2 }, g1b.rows[0][0..2]);
+        var g2b = CollectCbCtx{};
+        try testing.expectEqual(@as(c_long, 2), snapshot_query_scan(dir, v2, &db.vcache, "alpha", null, 0, collectCb, &g2b));
+        try testing.expectEqualSlices(u32, &[2]u32{ 9, 9 }, g2b.rows[1][0..2]);
+
+        // The cache really did hold one slot PER version.
+        var seen: [3]u32 = .{ 0, 0, 0 };
+        for (db.vcache) |slot| {
+            if (slot.view == null) continue;
+            if (slot.version == v1) seen[0] += 1;
+            if (slot.version == v2) seen[1] += 1;
+            if (slot.version == v3) seen[2] += 1;
+        }
+        try testing.expectEqual(@as(u32, 1), seen[0]);
+        try testing.expectEqual(@as(u32, 1), seen[1]);
+        try testing.expectEqual(@as(u32, 1), seen[2]);
+    }
+}
+
+test "snapshot vcache: a PRUNED version is never served from a warm slot" {
+    // Retention deletes old snapshot dirs.  A slot that maps a pruned version's
+    // file must be closed, not served: the answer for a version that no longer
+    // exists is the loud -1, never a cached tuple set.  (Publish's own
+    // vcache_invalidate runs before the prune, so this pins the requirement
+    // from the outside; vcache_drop_version covers a future prune caller.)
+    const dir = "/tmp/datalog_zig_vcache_prune";
+    rmrfTestDir(dir);
+    defer rmrfTestDir(dir);
+
+    var v1: u32 = 0;
+    var v2: u32 = 0;
+    var v3: u32 = 0;
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "alpha", 2));
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "alpha", &[2]u32{ 1, 2 }, 2));
+        try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db));
+        v1 = db.snap_version;
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "alpha", &[2]u32{ 9, 9 }, 2));
+        try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db));
+        v2 = db.snap_version;
+
+        // Warm the cache for BOTH existing versions, then prune down to one.
+        var warm1 = CollectCbCtx{};
+        try testing.expectEqual(@as(c_long, 1), snapshot_query_scan(dir, v1, &db.vcache, "alpha", null, 0, collectCb, &warm1));
+        var warm2 = CollectCbCtx{};
+        try testing.expectEqual(@as(c_long, 2), snapshot_query_scan(dir, v2, &db.vcache, "alpha", null, 0, collectCb, &warm2));
+
+        try testing.expectEqual(@as(c_int, 0), dl_set_snapshot_retain(db, 1));
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "alpha", &[2]u32{ 5, 6 }, 2));
+        try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db)); // v3 → prune v1, v2
+        v3 = db.snap_version;
+
+        // Pruned versions: loud failure, not a cached answer.
+        var p1 = CollectCbCtx{};
+        try testing.expectEqual(@as(c_long, -1), snapshot_query_scan(dir, v1, &db.vcache, "alpha", null, 0, collectCb, &p1));
+        try testing.expectEqual(@as(usize, 0), p1.n);
+        var p2 = CollectCbCtx{};
+        try testing.expectEqual(@as(c_long, -1), snapshot_query_scan(dir, v2, &db.vcache, "alpha", null, 0, collectCb, &p2));
+        try testing.expectEqual(@as(usize, 0), p2.n);
+
+        // No slot may still claim a pruned version.
+        for (db.vcache) |slot| {
+            if (slot.view == null) continue;
+            try testing.expect(slot.version != v1);
+            try testing.expect(slot.version != v2);
+        }
+
+        // The surviving version still answers.
+        var g3 = CollectCbCtx{};
+        try testing.expectEqual(@as(c_long, 3), snapshot_query_scan(dir, v3, &db.vcache, "alpha", null, 0, collectCb, &g3));
+        try testing.expectEqualSlices(u32, &[2]u32{ 5, 6 }, g3.rows[1][0..2]);
     }
 }
 
