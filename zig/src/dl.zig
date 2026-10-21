@@ -6145,6 +6145,184 @@ test "dl_open + declare + add_fact + lookup roundtrip" {
     try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "edge", &b, 2));
 }
 
+// ─── lazyrel (lazy on-disk relation load) ──────────────────────────────────
+
+/// mtime of `path` (stat(2)); -1 when unstat-able.  Used by the spurious-save
+/// probe below: a close that rewrites an UNTOUCHED relation's .dafsa must
+/// show up as a bumped mtime.
+fn testStatMtime(path: [*:0]const u8) i64 {
+    var st: Stat = undefined;
+    if (stat(path, &st) != 0) return -1;
+    return st.st_mtim.tv_sec;
+}
+
+test "lazyrel: open defers the DAFSA read; a touch loads ONLY the touched relation" {
+    const dir = "/tmp/datalog_zig_lazyrel_touch";
+    rmrfTestDir(dir);
+    defer rmrfTestDir(dir);
+
+    // Seed a store with two relations, each with its own fact.
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "alpha", 2));
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "beta", 3));
+        const a1 = [2]u32{ 1, 2 };
+        const b1 = [3]u32{ 5, 6, 7 };
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "alpha", &a1, 2));
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "beta", &b1, 3));
+    }
+
+    // Reopen: BOTH relations must still be deferred — open reads no relation
+    // DAFSA (this is the assertion that fails on the eager tree).
+    const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+    defer dl_close(db);
+    const ia = findRel(db, "alpha");
+    const ib = findRel(db, "beta");
+    try testing.expect(ia >= 0 and ib >= 0);
+    try testing.expectEqual(@as(c_int, 0), relation.rel_is_loaded(db.rels[@intCast(ia)].rel));
+    try testing.expectEqual(@as(c_int, 0), relation.rel_is_loaded(db.rels[@intCast(ib)].rel));
+
+    // A read of alpha loads alpha ONLY — beta stays deferred.
+    const a1 = [2]u32{ 1, 2 };
+    try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "alpha", &a1, 2));
+    try testing.expectEqual(@as(c_int, 1), relation.rel_is_loaded(db.rels[@intCast(ia)].rel));
+    try testing.expectEqual(@as(c_int, 0), relation.rel_is_loaded(db.rels[@intCast(ib)].rel));
+
+    // The deferred relation still answers from disk once touched.
+    const b1 = [3]u32{ 5, 6, 7 };
+    try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "beta", &b1, 3));
+    try testing.expectEqual(@as(c_int, 1), relation.rel_is_loaded(db.rels[@intCast(ib)].rel));
+    try testing.expectEqual(@as(c_int, 0), dl_lookup(db, "beta", &[3]u32{ 5, 6, 8 }, 3));
+}
+
+test "lazyrel: writing a never-read relation persists it; untouched relations are not rewritten" {
+    const dir = "/tmp/datalog_zig_lazyrel_write";
+    rmrfTestDir(dir);
+    defer rmrfTestDir(dir);
+
+    // Seed: alpha only.
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "alpha", 2));
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "beta", 2));
+        const a1 = [2]u32{ 1, 2 };
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "alpha", &a1, 2));
+    }
+
+    var alpha_path: [4096:0]u8 = undefined;
+    _ = snprintf(&alpha_path, 4096, "%s/alpha.dafsa", @as([*:0]const u8, dir));
+    const mt_before = testStatMtime(&alpha_path);
+
+    // Write to beta WITHOUT ever reading it: the lazy load happens at the
+    // write, the fact must survive the close/save, and alpha (untouched,
+    // never read this session) must NOT be written back spuriously.
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        const ib = findRel(db, "beta");
+        try testing.expect(ib >= 0);
+        try testing.expectEqual(@as(c_int, 0), relation.rel_is_loaded(db.rels[@intCast(ib)].rel));
+        const b1 = [2]u32{ 10, 20 };
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "beta", &b1, 2));
+        // The write loaded beta (duplicate check against the DAFSA view).
+        try testing.expectEqual(@as(c_int, 1), relation.rel_is_loaded(db.rels[@intCast(ib)].rel));
+    }
+
+    // alpha.dafsa is byte-for-byte untouched: same size, same mtime.
+    var st: Stat = undefined;
+    try testing.expect(stat(&alpha_path, &st) == 0);
+    try testing.expect(st.st_size > 0);
+    try testing.expectEqual(mt_before, testStatMtime(&alpha_path));
+
+    // Reopen: BOTH the old alpha fact and the never-read beta fact persist.
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "alpha", &[2]u32{ 1, 2 }, 2));
+        try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "beta", &[2]u32{ 10, 20 }, 2));
+        try testing.expectEqual(@as(c_int, 0), dl_lookup(db, "beta", &[2]u32{ 11, 20 }, 2));
+    }
+}
+
+test "lazyrel: order statistics on a NEVER-loaded relation answer EMPTY, not error" {
+    // Regression guard for the lazyrel gate ORDER: the pre-lazy accessors
+    // checked `r.d == NULL` as an OOM guard BEFORE loading; on a deferred
+    // relation that check fires first and rank/select/range return their
+    // ERROR values (UINT64_MAX / -1) instead of the empty answers.  Caught by
+    // the C oracle (test_m10_rank T6/T10), not by the CLI corpus.
+    const dir = "/tmp/datalog_zig_lazyrel_ordstats";
+    rmrfTestDir(dir);
+    defer rmrfTestDir(dir);
+
+    // Seed a store with one fact in alpha; declare r but never write it.
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "alpha", 2));
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "r", 2));
+        const a1 = [2]u32{ 1, 2 };
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "alpha", &a1, 2));
+    }
+
+    const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+    defer dl_close(db);
+    const ir = findRel(db, "r");
+    try testing.expect(ir >= 0);
+    // r is deferred and stays deferred: nothing below loads it.
+    try testing.expectEqual(@as(c_int, 0), relation.rel_is_loaded(db.rels[@intCast(ir)].rel));
+
+    // Empty-relation contract (oracle test_m10_rank T6): select == -1,
+    // rank == 0, count == 0, range_count == 0 — WITHOUT an error value.
+    var out: [2]u32 = undefined;
+    const k3 = [2]u32{ 3, 3 };
+    const k_lo = [2]u32{ 0, 0 };
+    const k_hi = [2]u32{ 9, 9 };
+    const a1b = [2]u32{ 1, 2 };
+    const a9 = [2]u32{ 9, 9 };
+    try testing.expectEqual(@as(c_int, -1), dl_select(db, "r", 0, &out, 2));
+    try testing.expectEqual(@as(c_int, -1), dl_select(db, "r", 5, &out, 2));
+    try testing.expectEqual(@as(u64, 0), dl_rank(db, "r", &k3, 2));
+    try testing.expectEqual(@as(u64, 0), dl_count(db, "r"));
+    try testing.expectEqual(@as(u64, 0), dl_range_count(db, "r", &k_lo, &k_hi, 2));
+    // prefix-bound stats over the empty bound: rank_bound 0, select_bound -1.
+    try testing.expectEqual(@as(u64, 0), dl_rank_bound(db, "r", &.{3}, 1, &k3, 2));
+    try testing.expectEqual(@as(c_int, -1), dl_select_bound(db, "r", &.{3}, 1, 0, &out, 2));
+    // And a LOADED relation still answers exactly.
+    try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "alpha", &a1b, 2));
+    try testing.expectEqual(@as(u64, 0), dl_rank(db, "alpha", &a1b, 2));
+    try testing.expectEqual(@as(u64, 1), dl_rank(db, "alpha", &a9, 2));
+}
+
+test "lazyrel: WAL records at open are recovered EAGERLY (never deferred)" {
+    const dir = "/tmp/datalog_zig_lazyrel_wal";
+    rmrfTestDir(dir);
+    defer rmrfTestDir(dir);
+
+    // Session 1: add a fact and ABANDON the handle without dl_close — the
+    // crash shape: the fact is durable ONLY through the WAL (never
+    // consolidated into the DAFSA by a close/publish).
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "alpha", 2));
+        const a1 = [2]u32{ 7, 8 };
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "alpha", &a1, 2));
+        // NO dl_close: the WAL record stays unconsolidated.
+    }
+
+    // Session 2: the reopen must see the committed WAL records, load the
+    // DAFSA EAGERLY (not lazily), replay, and compact.
+    const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+    defer dl_close(db);
+    const ia = findRel(db, "alpha");
+    try testing.expect(ia >= 0);
+    try testing.expectEqual(@as(c_int, 1), relation.rel_is_loaded(db.rels[@intCast(ia)].rel));
+    try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "alpha", &[2]u32{ 7, 8 }, 2));
+    // The WAL was compacted back to the 16-byte header at open.
+    try testing.expectEqual(@as(u64, 16), relation.rel_wal_size(db.rels[@intCast(ia)].rel));
+}
+
 test "dl query: rule load + compile + query" {
     const dir = "/tmp/datalog_zig_u11_query";
     rmrfTestDir(dir);

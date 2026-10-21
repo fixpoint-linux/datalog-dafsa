@@ -89,6 +89,18 @@ pub const Relation = struct {
     // along into the clones that check them; a dl_db-tail field would be
     // invisible to wfs.zig's dl.DlDb clone.
     col_kind: [MAX_ARITY]u8 = @splat(0),
+    // ─── lazy on-disk load (lazyrel) ─────────────────────────────────────────
+    // rel_open_* defers the on-disk DAFSA read to the FIRST access that needs
+    // d/base (lookup/prefix/enum/count/rank/select, a write, WAL replay,
+    // perm-index build, or the fixpoint).  `lazy` is 1 from open until that
+    // first touch; d/base are NULL while it is set.  A relation whose WAL
+    // holds committed records is NEVER lazy — recovery at open needs the
+    // DAFSA in memory, so those load eagerly (unchanged).  lazy_base is
+    // non-NULL iff the relation is IDB (split base), which keeps rel_is_idb
+    // exact without loading.
+    lazy: c_int = 0,
+    lazy_dafsa: [*c]u8 = null, // owned: path of the view DAFSA to load lazily
+    lazy_base: [*c]u8 = null, // owned: path of the base DAFSA (IDB only)
 };
 
 /// Bump the content revision (every mutation site that sets dirty=1 calls
@@ -97,6 +109,60 @@ pub const Relation = struct {
 pub export fn rel_touch(rel: ?*Relation) void {
     const r = rel orelse return;
     r.rev +%= 1;
+}
+
+// ─── Lazy on-disk load (lazyrel) ─────────────────────────────────────────────
+//
+// The engine's per-invocation cost profile (MEASURED on the agent store):
+// dl_open eagerly dafsa_load'd EVERY relation's on-disk DAFSA, so a command
+// touching ONE relation paid for all of them — store B (one 20 MiB
+// __postings__.dafsa) opened in 0.350 s where the same command on store A
+// (everything but postings) took 0.031 s.  The load is now deferred to the
+// first access (relEnsureLoaded, gated into every d/base consumer below);
+// a relation is still loaded EAGERLY when its WAL holds committed records,
+// because recovery at open must replay into the in-memory DAFSA.
+
+/// Load a lazily-opened relation's on-disk DAFSA(s) on first touch.
+/// No-op (true) when already loaded; false only on load/OOM failure (the
+/// caller's existing error convention then applies).  A missing or corrupt
+/// file falls back to a fresh empty DAFSA — the same contract the eager
+/// rel_open_* path always had.
+fn relEnsureLoaded(r: *Relation) bool {
+    if (r.lazy == 0) return true;
+
+    r.d = dc.dafsa_load(r.lazy_dafsa);
+    if (r.d == null) {
+        r.d = dc.dafsa_create();
+        if (r.d == null) return false;
+    }
+    if (r.lazy_base != null) {
+        r.base = dc.dafsa_load(r.lazy_base);
+        if (r.base == null) {
+            r.base = dc.dafsa_create();
+            if (r.base == null) {
+                dc.dafsa_free(r.d);
+                r.d = null;
+                return false;
+            }
+        }
+    } else {
+        r.base = r.d; // EDB-only: base aliases view
+    }
+
+    r.lazy = 0;
+    if (r.lazy_dafsa) |p| c.free(@ptrCast(p));
+    r.lazy_dafsa = null;
+    if (r.lazy_base) |p| c.free(@ptrCast(p));
+    r.lazy_base = null;
+    return true;
+}
+
+/// int rel_is_loaded(const relation *rel)
+/// 1 if the relation's on-disk DAFSA is resident (or the relation is
+/// in-memory-only), 0 if still deferred.  The lazyrel test surface.
+pub export fn rel_is_loaded(rel: ?*const Relation) c_int {
+    const r = rel orelse return 0;
+    return if (r.lazy == 0) 1 else 0;
 }
 
 /// Current content revision (publish-gate read side).
@@ -230,6 +296,8 @@ pub export fn rel_create(arity: u8) ?*Relation {
 }
 
 /// relation *rel_open(const char *path, uint8_t arity)
+/// No WAL — nothing to recover — so the on-disk DAFSA is ALWAYS lazy here:
+/// the read is deferred to the first touch (relEnsureLoaded).
 pub export fn rel_open(path: [*c]const u8, arity: u8) ?*Relation {
     if (arity == 0 or arity > MAX_ARITY) return null;
 
@@ -237,17 +305,13 @@ pub export fn rel_open(path: [*c]const u8, arity: u8) ?*Relation {
     const rel: *Relation = @ptrCast(@alignCast(mem));
     rel.* = std.mem.zeroes(Relation);
 
-    rel.d = dc.dafsa_load(path);
-    if (rel.d == null) {
-        // File doesn't exist or is corrupt — start fresh
-        rel.d = dc.dafsa_create();
-        if (rel.d == null) {
-            c.free(mem);
-            return null;
-        }
+    rel.lazy = 1;
+    rel.lazy_dafsa = strdup(path);
+    if (rel.lazy_dafsa == null) {
+        c.free(mem);
+        return null;
     }
 
-    rel.base = rel.d; // EDB-only: base aliases view
     rel.arity = arity;
     return rel;
 }
@@ -277,6 +341,9 @@ fn ovEnsure(rel: *Relation) ?*tupleset.tuple_set {
 pub export fn rel_overlay_add(rel: ?*Relation, cols: [*c]const u32) c_int {
     const r = rel orelse return -1;
     if (cols == null) return -1;
+    // Load before the duplicate check: the overlay's dedup is against the
+    // DAFSA view, so an unloaded relation must be read first (lazyrel).
+    if (!relEnsureLoaded(r)) return -1;
 
     // duplicate against the DAFSA view: overlay adds nothing
     if (relExactD(r, r.d, cols) != 0) return 0;
@@ -333,6 +400,8 @@ pub export fn rel_overlay_flush(rel: ?*Relation) c_int {
         tupleset.ts_reset(ov);
         return 0;
     }
+    // Folding reads AND writes the DAFSA view/base: load first (lazyrel).
+    if (!relEnsureLoaded(r)) return -1;
 
     var i: c_long = 0;
     var rc: c_int = 0;
@@ -391,6 +460,7 @@ fn ovFree(rel: *Relation) void {
 pub export fn rel_save(rel: ?*const Relation, path: [*c]const u8) c_int {
     const r = rel orelse return -1;
     if (path == null) return -1;
+    if (!relEnsureLoaded(@constCast(r))) return -1;
     return dc.dafsa_save(r.d, path);
 }
 
@@ -398,6 +468,7 @@ pub export fn rel_save(rel: ?*const Relation, path: [*c]const u8) c_int {
 pub export fn rel_save_base(rel: ?*const Relation, path: [*c]const u8) c_int {
     const r = rel orelse return -1;
     if (path == null) return -1;
+    if (!relEnsureLoaded(@constCast(r))) return -1;
     return dc.dafsa_save(r.base, path);
 }
 
@@ -405,8 +476,12 @@ pub export fn rel_save_base(rel: ?*const Relation, path: [*c]const u8) c_int {
 pub export fn rel_free(rel: ?*Relation) void {
     const r = rel orelse return;
     ovFree(r);
-    if (r.base != r.d) dc.dafsa_free(r.base);
-    dc.dafsa_free(r.d);
+    if (r.lazy == 0) {
+        if (r.base != r.d) dc.dafsa_free(r.base);
+        dc.dafsa_free(r.d);
+    }
+    if (r.lazy_dafsa != null) c.free(@ptrCast(r.lazy_dafsa));
+    if (r.lazy_base != null) c.free(@ptrCast(r.lazy_base));
     if (r.wal != null) dc.dafsa_wal_close(r.wal);
     if (r.wal_path != null) c.free(r.wal_path);
     c.free(@ptrCast(r));
@@ -423,6 +498,7 @@ pub export fn rel_arity(rel: ?*const Relation) u8 {
 /// rel_overlay_add rejects DAFSA duplicates).
 pub export fn rel_count(rel: ?*const Relation) u64 {
     const r = rel orelse return 0;
+    if (!relEnsureLoaded(@constCast(r))) return 0;
     var n: u64 = 0;
     if (r.d != null) {
         var st: dc.dafsa_stats_out = std.mem.zeroes(dc.dafsa_stats_out);
@@ -439,6 +515,7 @@ pub export fn rel_count(rel: ?*const Relation) u64 {
 /// the overlay must be folded in before the pointer escapes.
 pub export fn rel_dafsa(rel: ?*const Relation) [*c]const dc.dafsa {
     const r = rel orelse return null;
+    if (!relEnsureLoaded(@constCast(r))) return null;
     ovConsolidateForRead(r);
     return r.d;
 }
@@ -448,7 +525,9 @@ pub export fn rel_dafsa(rel: ?*const Relation) [*c]const dc.dafsa {
 /// uint64_t rel_rank(const relation *rel, const uint32_t *cols)
 pub export fn rel_rank(rel: ?*const Relation, cols: ?[*]const u32) u64 {
     const r = rel orelse return std.math.maxInt(u64);
-    if (r.d == null or cols == null) return std.math.maxInt(u64);
+    if (cols == null) return std.math.maxInt(u64);
+    if (!relEnsureLoaded(@constCast(r))) return std.math.maxInt(u64);
+    if (r.d == null) return std.math.maxInt(u64); // OOM during the lazy load
     ovConsolidateForRead(r);
     var key: [MAX_KEY_LEN]u8 = undefined;
     const key_len = encodeKey(&key, cols.?, r.arity);
@@ -458,7 +537,9 @@ pub export fn rel_rank(rel: ?*const Relation, cols: ?[*]const u32) u64 {
 /// int rel_select(const relation *rel, uint64_t k, uint32_t *cols_out)
 pub export fn rel_select(rel: ?*const Relation, k: u64, cols_out: ?[*]u32) c_int {
     const r = rel orelse return -1;
-    if (r.d == null or cols_out == null) return -1;
+    if (cols_out == null) return -1;
+    if (!relEnsureLoaded(@constCast(r))) return -1;
+    if (r.d == null) return -1; // OOM during the lazy load
     ovConsolidateForRead(r);
     var key: [MAX_KEY_LEN]u8 = undefined;
     const key_len = dc.dafsa_select_n(r.d, k, &key, MAX_KEY_LEN);
@@ -471,7 +552,9 @@ pub export fn rel_select(rel: ?*const Relation, k: u64, cols_out: ?[*]u32) c_int
 ///                          const uint32_t *hi)
 pub export fn rel_range_count(rel: ?*const Relation, lo: ?[*]const u32, hi: ?[*]const u32) u64 {
     const r = rel orelse return std.math.maxInt(u64);
-    if (r.d == null or lo == null or hi == null) return std.math.maxInt(u64);
+    if (lo == null or hi == null) return std.math.maxInt(u64);
+    if (!relEnsureLoaded(@constCast(r))) return std.math.maxInt(u64);
+    if (r.d == null) return std.math.maxInt(u64); // OOM during the lazy load
     ovConsolidateForRead(r);
     var lo_key: [MAX_KEY_LEN]u8 = undefined;
     var hi_key: [MAX_KEY_LEN]u8 = undefined;
@@ -484,6 +567,7 @@ pub export fn rel_range_count(rel: ?*const Relation, lo: ?[*]const u32, hi: ?[*]
 /// Word count via subtree counts + overlay occupancy (C19 union).
 pub export fn rel_count_subtree(rel: ?*const Relation) u64 {
     const r = rel orelse return 0;
+    if (!relEnsureLoaded(@constCast(r))) return 0;
     var n: u64 = 0;
     if (r.d != null) {
         n = dc.dafsa_ensure_subtree(r.d);
@@ -502,8 +586,9 @@ pub export fn rel_count_subtree(rel: ?*const Relation) u64 {
 /// index, or -1 if the prefix is not a prefix of any key.
 pub export fn rel_prefix_state(rel: ?*const Relation, leading: ?[*]const u32, k: u8) c_int {
     const r = rel orelse return -1;
-    if (r.d == null) return -1;
     if (r.arity == 0) return -1;
+    if (!relEnsureLoaded(@constCast(r))) return -1;
+    if (r.d == null) return -1; // OOM during the lazy load
     ovConsolidateForRead(r);
     var current: c_uint = r.d.*.initial;
     var i: u8 = 0;
@@ -528,7 +613,9 @@ pub export fn rel_prefix_state(rel: ?*const Relation, leading: ?[*]const u32, k:
 ///                         uint8_t k, const uint32_t *cols)
 pub export fn rel_rank_bound(rel: ?*const Relation, leading: ?[*]const u32, k: u8, cols: ?[*]const u32) u64 {
     const r = rel orelse return std.math.maxInt(u64);
-    if (r.d == null or cols == null) return std.math.maxInt(u64);
+    if (cols == null) return std.math.maxInt(u64);
+    if (!relEnsureLoaded(@constCast(r))) return std.math.maxInt(u64);
+    if (r.d == null) return std.math.maxInt(u64); // OOM during the lazy load
     if (k > r.arity) return std.math.maxInt(u64);
     if (k > 0 and leading == null) return std.math.maxInt(u64);
     const s = rel_prefix_state(r, leading, k);
@@ -542,7 +629,9 @@ pub export fn rel_rank_bound(rel: ?*const Relation, leading: ?[*]const u32, k: u
 ///                      uint8_t k, uint64_t idx, uint32_t *cols_out)
 pub export fn rel_select_bound(rel: ?*const Relation, leading: ?[*]const u32, k: u8, idx: u64, cols_out: ?[*]u32) c_int {
     const r = rel orelse return -1;
-    if (r.d == null or cols_out == null) return -1;
+    if (cols_out == null) return -1;
+    if (!relEnsureLoaded(@constCast(r))) return -1;
+    if (r.d == null) return -1; // OOM during the lazy load
     if (k > r.arity) return -1;
     if (k > 0 and leading == null) return -1;
     const s = rel_prefix_state(r, leading, k);
@@ -562,7 +651,9 @@ pub export fn rel_select_bound(rel: ?*const Relation, leading: ?[*]const u32, k:
 ///                                const uint32_t *hi)
 pub export fn rel_range_count_bound(rel: ?*const Relation, leading: ?[*]const u32, k: u8, lo: ?[*]const u32, hi: ?[*]const u32) u64 {
     const r = rel orelse return std.math.maxInt(u64);
-    if (r.d == null or lo == null or hi == null) return std.math.maxInt(u64);
+    if (lo == null or hi == null) return std.math.maxInt(u64);
+    if (!relEnsureLoaded(@constCast(r))) return std.math.maxInt(u64);
+    if (r.d == null) return std.math.maxInt(u64); // OOM during the lazy load
     if (k > r.arity) return std.math.maxInt(u64);
     if (k > 0 and leading == null) return std.math.maxInt(u64);
     const s = rel_prefix_state(r, leading, k);
@@ -586,6 +677,7 @@ fn relAddD(rel: *Relation, d: [*c]dc.dafsa, cols: ?[*]const u32) c_int {
 /// int rel_add(relation *rel, const uint32_t *cols)
 pub export fn rel_add(rel: ?*Relation, cols: ?[*]const u32) c_int {
     const r = rel orelse return -1;
+    if (!relEnsureLoaded(r)) return -1;
     const rc = relAddD(r, r.d, cols);
     if (rc > 0) {
         r.dirty = 1;
@@ -597,6 +689,7 @@ pub export fn rel_add(rel: ?*Relation, cols: ?[*]const u32) c_int {
 /// int rel_add_base(relation *rel, const uint32_t *cols)
 pub export fn rel_add_base(rel: ?*Relation, cols: ?[*]const u32) c_int {
     const r = rel orelse return -1;
+    if (!relEnsureLoaded(r)) return -1;
     const rc = relAddD(r, r.base, cols);
     if (rc > 0) {
         r.dirty = 1;
@@ -616,6 +709,7 @@ fn relExactD(rel: *const Relation, d: [*c]const dc.dafsa, cols: ?[*]const u32) c
 /// VIEW = DAFSA ∪ overlay (C19: append-only set union).
 pub export fn rel_exact(rel: ?*const Relation, cols: ?[*]const u32) c_int {
     const r = rel orelse return 0;
+    if (!relEnsureLoaded(@constCast(r))) return 0;
     if (relExactD(r, r.d, cols) != 0) return 1;
     if (r.ov) |ov| {
         if (ov.count > 0 and tupleset.ts_contains(ov, cols) != 0) return 1;
@@ -626,6 +720,7 @@ pub export fn rel_exact(rel: ?*const Relation, cols: ?[*]const u32) c_int {
 /// int rel_exact_base(const relation *rel, const uint32_t *cols)
 pub export fn rel_exact_base(rel: ?*const Relation, cols: ?[*]const u32) c_int {
     const r = rel orelse return 0;
+    if (!relEnsureLoaded(@constCast(r))) return 0;
     return relExactD(r, r.base, cols);
 }
 
@@ -639,6 +734,7 @@ fn relDeleteD(rel: *Relation, d: [*c]dc.dafsa, cols: ?[*]const u32) c_int {
 /// int rel_delete(relation *rel, const uint32_t *cols)
 pub export fn rel_delete(rel: ?*Relation, cols: ?[*]const u32) c_int {
     const r = rel orelse return -1;
+    if (!relEnsureLoaded(r)) return -1;
     const rc = relDeleteD(r, r.d, cols);
     if (rc > 0) {
         r.dirty = 1;
@@ -650,6 +746,7 @@ pub export fn rel_delete(rel: ?*Relation, cols: ?[*]const u32) c_int {
 /// int rel_delete_base(relation *rel, const uint32_t *cols)
 pub export fn rel_delete_base(rel: ?*Relation, cols: ?[*]const u32) c_int {
     const r = rel orelse return -1;
+    if (!relEnsureLoaded(r)) return -1;
     const rc = relDeleteD(r, r.base, cols);
     if (rc > 0) {
         r.dirty = 1;
@@ -795,6 +892,7 @@ fn ovPrefixScan(r: *const Relation, ov: *tupleset.tuple_set, leading: ?[*]const 
 /// then overlay (insertion order); consumers needing global sort must sort.
 pub export fn rel_prefix(rel: ?*const Relation, leading: ?[*]const u32, k: u8, cb: RelEnumCb, user: ?*anyopaque) c_long {
     const r = rel orelse return -1;
+    if (!relEnsureLoaded(@constCast(r))) return -1;
     ovConsolidateForRead(r);
     const n = relPrefixD(r, r.d, leading, k, cb, user);
     if (n < 0) return -1;
@@ -811,6 +909,7 @@ pub export fn rel_prefix(rel: ?*const Relation, leading: ?[*]const u32, k: u8, c
 ///                      rel_enum_cb cb, void *user)
 pub export fn rel_prefix_base(rel: ?*const Relation, leading: ?[*]const u32, k: u8, cb: RelEnumCb, user: ?*anyopaque) c_long {
     const r = rel orelse return -1;
+    if (!relEnsureLoaded(@constCast(r))) return -1;
     return relPrefixD(r, r.base, leading, k, cb, user);
 }
 
@@ -826,7 +925,9 @@ pub export fn rel_has_col0(rel: ?*const Relation, x: u32) c_int {
 ///                     rel_enum_cb cb, void *user)
 pub export fn rel_range_each(rel: ?*const Relation, lo: u32, hi: u32, cb: RelEnumCb, user: ?*anyopaque) c_long {
     const r = rel orelse return -1;
-    if (r.d == null or cb == null) return -1;
+    if (cb == null) return -1;
+    if (!relEnsureLoaded(@constCast(r))) return -1;
+    if (r.d == null) return -1; // OOM during the lazy load
     if (hi <= lo) return 0;
 
     var lo_key: [MAX_ARITY]u32 = std.mem.zeroes([MAX_ARITY]u32);
@@ -907,6 +1008,10 @@ pub export fn rel_build_from_tupleset(rel: ?*Relation, ts: ?*const tupleset.tupl
     const r = rel orelse return -1;
     const t = ts orelse return -1;
     if (t.arity != r.arity) return -1;
+    // The view is REPLACED wholesale: the old view's on-disk content must be
+    // resident for the caller's recompute-and-merge contract to hold (and the
+    // old DAFSA must be freed) — load first (lazyrel).
+    if (!relEnsureLoaded(r)) return -1;
 
     const new_d = dafsaBuildFromTs(t, r.arity);
     if (new_d == null) return -1;
@@ -933,6 +1038,7 @@ pub export fn rel_add_tupleset(rel: ?*Relation, ts: ?*const tupleset.tuple_set) 
     const t = ts orelse return -1;
     if (t.arity != r.arity) return -1;
     if (t.count == 0) return 0;
+    if (!relEnsureLoaded(r)) return -1;
 
     // Insert in SORTED order: the cost of a single dafsa_add_n is dominated
     // by re-registering the divergent suffix path, so adding in lex order
@@ -973,6 +1079,9 @@ pub export fn rel_build_base_from_tupleset(rel: ?*Relation, ts: ?*const tupleset
     const r = rel orelse return -1;
     const t = ts orelse return -1;
     if (t.arity != r.arity) return -1;
+    // The BASE is replaced wholesale (same contract as the view rebuild
+    // above): the old base must be resident and freed, so load first.
+    if (!relEnsureLoaded(r)) return -1;
 
     const new_b = dafsaBuildFromTs(t, r.arity);
     if (new_b == null) return -1;
@@ -1007,6 +1116,9 @@ fn dafsaCopyFrom(rel: *const Relation, src: [*c]const dc.dafsa) [*c]dc.dafsa {
 /// int rel_is_idb(const relation *rel)
 pub export fn rel_is_idb(rel: ?*const Relation) c_int {
     const r = rel orelse return 0;
+    // Lazy (unloaded) relation: base==d==NULL would read as EDB.  The split
+    // is recorded in lazy_base (non-NULL iff IDB), so answer WITHOUT loading.
+    if (r.lazy != 0) return if (r.lazy_base != null) 1 else 0;
     return if (r.base != r.d) 1 else 0;
 }
 
@@ -1019,6 +1131,7 @@ pub export fn rel_is_dirty(rel: ?*const Relation) c_int {
 /// int rel_reset_view(relation *rel)
 pub export fn rel_reset_view(rel: ?*Relation) c_int {
     const r = rel orelse return -1;
+    if (!relEnsureLoaded(r)) return -1;
 
     if (r.base == r.d) {
         // First evaluation as a derived relation: SPLIT base from view.
@@ -1069,6 +1182,8 @@ fn walReplayCb(op: u8, key: [*c]const u8, key_len: u32, user: ?*anyopaque) callc
 pub export fn rel_wal_replay_into(rel: ?*Relation) c_int {
     const r = rel orelse return -1;
     if (r.wal == null) return -1;
+    // Replay writes into BASE: it must be resident — load first (lazyrel).
+    if (!relEnsureLoaded(r)) return -1;
 
     var ctx = WalReplayCtx{ .rel = r, .ok = 0 };
 
@@ -1170,6 +1285,10 @@ fn fsyncParentDir(path: [*c]const u8) c_int {
 pub export fn rel_compact(rel: ?*Relation, dafsa_path: [*c]const u8) c_int {
     const r = rel orelse return -1;
     if (r.wal == null or dafsa_path == null) return -1;
+    // Compaction saves BASE: it must be resident — load first (lazyrel).
+    // (Every dirty path loads first, so this is normally a no-op; it keeps
+    // compaction correct even for a caller that dirtied nothing.)
+    if (!relEnsureLoaded(r)) return -1;
 
     // Fold the hot-write overlay into the DAFSA BEFORE truncating the WAL:
     // un-flushed overlay facts are durable only through the WAL, so a
@@ -1201,7 +1320,11 @@ pub export fn rel_wal_size(rel: ?*const Relation) u64 {
 /// uint64_t rel_dafsa_size(const relation *rel)
 pub export fn rel_dafsa_size(rel: ?*const Relation) u64 {
     const r = rel orelse return 0;
-    if (r.base == null) return 0;
+    // Size estimate walks BASE's states: it must be resident — load first
+    // (lazyrel).  (Callers reach this only for relations they wrote to, which
+    // already loaded; the gate keeps the answer exact for any other caller.)
+    if (!relEnsureLoaded(@constCast(r))) return 0;
+    if (r.base == null) return 0; // OOM during the lazy load
     var st: dc.dafsa_stats_out = std.mem.zeroes(dc.dafsa_stats_out);
     dc.dafsa_stats(r.base, &st);
     // Rough byte estimate based on state/transition counts (25% compaction
@@ -1214,29 +1337,20 @@ pub export fn rel_dafsa_size(rel: ?*const Relation) u64 {
 
 /// relation *rel_open_writable(const char *dafsa_path, const char *wal_path,
 ///                             uint8_t arity)
+/// WAL opens EAGERLY (its tail repair is part of open), but the DAFSA read
+/// is deferred unless the WAL holds committed records — recovery must
+/// replay into the in-memory DAFSA and compact, which needs it loaded.
 pub export fn rel_open_writable(dafsa_path: [*c]const u8, wal_path: [*c]const u8, arity: u8) ?*Relation {
     if (arity == 0 or arity > MAX_ARITY) return null;
 
     const mem = c.calloc(1, @sizeOf(Relation)) orelse return null;
     const rel: *Relation = @ptrCast(@alignCast(mem));
     rel.* = std.mem.zeroes(Relation);
-
-    // Load base DAFSA
-    rel.d = dc.dafsa_load(dafsa_path);
-    if (rel.d == null) {
-        rel.d = dc.dafsa_create();
-        if (rel.d == null) {
-            c.free(mem);
-            return null;
-        }
-    }
-    rel.base = rel.d; // EDB-only: base aliases view
     rel.arity = arity;
 
     // Open WAL (rw) — auto-repairs torn tail
     rel.wal = dc.dafsa_wal_open_rw(wal_path);
     if (rel.wal == null) {
-        dc.dafsa_free(rel.d);
         c.free(mem);
         return null;
     }
@@ -1244,15 +1358,21 @@ pub export fn rel_open_writable(dafsa_path: [*c]const u8, wal_path: [*c]const u8
     rel.wal_path = strdup(wal_path);
     if (rel.wal_path == null) {
         dc.dafsa_wal_close(rel.wal);
-        dc.dafsa_free(rel.d);
         c.free(mem);
         return null;
     }
 
-    // If WAL had records > header, replay them into in-memory DAFSA
-    // A WAL with committed records (> 16-B header) needs replay into the
-    // in-memory DAFSA; dafsa_wal_open_rw already truncated any torn tail.
     if (rel.wal.*.size > 16) {
+        // Committed records: recover NOW (replay + compact), loading the
+        // DAFSA eagerly — the lazyrel deferral never delays recovery.
+        rel.d = dc.dafsa_load(dafsa_path);
+        if (rel.d == null) rel.d = dc.dafsa_create();
+        if (rel.d == null) {
+            rel_free(rel);
+            return null;
+        }
+        rel.base = rel.d; // EDB-only: base aliases view
+
         if (rel_wal_replay_into(rel) != 0) {
             rel_free(rel);
             return null;
@@ -1262,47 +1382,34 @@ pub export fn rel_open_writable(dafsa_path: [*c]const u8, wal_path: [*c]const u8
             rel_free(rel);
             return null;
         }
+        return rel;
     }
 
+    // Header-only WAL: defer the DAFSA read to the first touch (lazyrel).
+    rel.lazy = 1;
+    rel.lazy_dafsa = strdup(dafsa_path);
+    if (rel.lazy_dafsa == null) {
+        rel_free(rel);
+        return null;
+    }
     return rel;
 }
 
 /// relation *rel_open_writable_idb(const char *base_path, const char *dafsa_path,
 ///                                 const char *wal_path, uint8_t arity)
+/// Same lazyrel contract as rel_open_writable, for a SPLIT (IDB) relation:
+/// eager only when the WAL holds committed records, lazy otherwise.
 pub export fn rel_open_writable_idb(base_path: [*c]const u8, dafsa_path: [*c]const u8, wal_path: [*c]const u8, arity: u8) ?*Relation {
     if (arity == 0 or arity > MAX_ARITY) return null;
 
     const mem = c.calloc(1, @sizeOf(Relation)) orelse return null;
     const rel: *Relation = @ptrCast(@alignCast(mem));
     rel.* = std.mem.zeroes(Relation);
-
-    // Load base DAFSA
-    rel.base = dc.dafsa_load(base_path);
-    if (rel.base == null) {
-        rel.base = dc.dafsa_create();
-        if (rel.base == null) {
-            c.free(mem);
-            return null;
-        }
-    }
-
-    // Load view DAFSA (base ∪ derived, as last materialized)
-    rel.d = dc.dafsa_load(dafsa_path);
-    if (rel.d == null) {
-        rel.d = dc.dafsa_create();
-        if (rel.d == null) {
-            dc.dafsa_free(rel.base);
-            c.free(mem);
-            return null;
-        }
-    }
     rel.arity = arity;
 
     // Open WAL (rw) — auto-repairs torn tail
     rel.wal = dc.dafsa_wal_open_rw(wal_path);
     if (rel.wal == null) {
-        dc.dafsa_free(rel.d);
-        dc.dafsa_free(rel.base);
         c.free(mem);
         return null;
     }
@@ -1310,16 +1417,30 @@ pub export fn rel_open_writable_idb(base_path: [*c]const u8, dafsa_path: [*c]con
     rel.wal_path = strdup(wal_path);
     if (rel.wal_path == null) {
         dc.dafsa_wal_close(rel.wal);
-        dc.dafsa_free(rel.d);
-        dc.dafsa_free(rel.base);
         c.free(mem);
         return null;
     }
 
-    // Replay WAL into BASE and compact immediately.
-    // A WAL with committed records (> 16-B header) needs replay into the
-    // in-memory DAFSA; dafsa_wal_open_rw already truncated any torn tail.
     if (rel.wal.*.size > 16) {
+        // Committed records: recover NOW (replay + compact), loading base
+        // and view DAFSAs eagerly — the lazyrel deferral never delays
+        // recovery.
+        rel.base = dc.dafsa_load(base_path);
+        if (rel.base == null) rel.base = dc.dafsa_create();
+        if (rel.base == null) {
+            rel_free(rel);
+            return null;
+        }
+        rel.d = dc.dafsa_load(dafsa_path);
+        if (rel.d == null) rel.d = dc.dafsa_create();
+        if (rel.d == null) {
+            dc.dafsa_free(rel.base);
+            rel.base = null;
+            rel_free(rel);
+            return null;
+        }
+
+        // Replay WAL into BASE and compact immediately.
         if (rel_wal_replay_into(rel) != 0) {
             rel_free(rel);
             return null;
@@ -1328,40 +1449,60 @@ pub export fn rel_open_writable_idb(base_path: [*c]const u8, dafsa_path: [*c]con
             rel_free(rel);
             return null;
         }
+        return rel;
     }
 
+    // Header-only WAL: defer both DAFSA reads to the first touch (lazyrel).
+    // lazy_base != NULL marks the relation IDB for rel_is_idb unloaded.
+    rel.lazy = 1;
+    rel.lazy_dafsa = strdup(dafsa_path);
+    rel.lazy_base = strdup(base_path);
+    if (rel.lazy_dafsa == null or rel.lazy_base == null) {
+        rel_free(rel);
+        return null;
+    }
     return rel;
 }
 
 /// relation *rel_open_readonly(const char *dafsa_path, const char *wal_path,
 ///                             uint8_t arity)
+/// Same lazyrel contract as rel_open_writable; RO never compacts, so the
+/// eager branch only replays (no dafsa_save / WAL truncate).
 pub export fn rel_open_readonly(dafsa_path: [*c]const u8, wal_path: [*c]const u8, arity: u8) ?*Relation {
     if (arity == 0 or arity > MAX_ARITY) return null;
 
     const mem = c.calloc(1, @sizeOf(Relation)) orelse return null;
     const rel: *Relation = @ptrCast(@alignCast(mem));
     rel.* = std.mem.zeroes(Relation);
-
-    rel.d = dc.dafsa_load(dafsa_path);
-    if (rel.d == null) {
-        rel.d = dc.dafsa_create();
-        if (rel.d == null) {
-            c.free(mem);
-            return null;
-        }
-    }
-    rel.base = rel.d; // EDB-only: base aliases view
     rel.arity = arity;
 
     if (wal_path != null) {
         rel.wal = dc.dafsa_wal_open_ro(wal_path);
-        if (rel.wal != null and rel_wal_replay_into(rel) != 0) {
-            rel_free(rel);
-            return null;
+        if (rel.wal != null and rel.wal.*.size > 16) {
+            // Committed records: recover NOW, loading the DAFSA eagerly.
+            rel.d = dc.dafsa_load(dafsa_path);
+            if (rel.d == null) rel.d = dc.dafsa_create();
+            if (rel.d == null) {
+                rel_free(rel);
+                return null;
+            }
+            rel.base = rel.d; // EDB-only: base aliases view
+            if (rel_wal_replay_into(rel) != 0) {
+                rel_free(rel);
+                return null;
+            }
+            return rel;
         }
         // wal_path stays NULL: only rel_compact reads it and RO never compacts.
     }
 
+    // No WAL records to recover: defer the DAFSA read to the first touch.
+    rel.lazy = 1;
+    rel.lazy_dafsa = strdup(dafsa_path);
+    if (rel.lazy_dafsa == null) {
+        rel_free(rel);
+        return null;
+    }
     return rel;
 }
 
@@ -1373,35 +1514,43 @@ pub export fn rel_open_readonly_idb(base_path: [*c]const u8, dafsa_path: [*c]con
     const mem = c.calloc(1, @sizeOf(Relation)) orelse return null;
     const rel: *Relation = @ptrCast(@alignCast(mem));
     rel.* = std.mem.zeroes(Relation);
-
-    rel.base = dc.dafsa_load(base_path);
-    if (rel.base == null) {
-        rel.base = dc.dafsa_create();
-        if (rel.base == null) {
-            c.free(mem);
-            return null;
-        }
-    }
-
-    rel.d = dc.dafsa_load(dafsa_path);
-    if (rel.d == null) {
-        rel.d = dc.dafsa_create();
-        if (rel.d == null) {
-            dc.dafsa_free(rel.base);
-            c.free(mem);
-            return null;
-        }
-    }
     rel.arity = arity;
 
     if (wal_path != null) {
         rel.wal = dc.dafsa_wal_open_ro(wal_path);
-        if (rel.wal != null and rel_wal_replay_into(rel) != 0) {
-            rel_free(rel);
-            return null;
+        if (rel.wal != null and rel.wal.*.size > 16) {
+            // Committed records: recover NOW, loading base and view eagerly.
+            rel.base = dc.dafsa_load(base_path);
+            if (rel.base == null) rel.base = dc.dafsa_create();
+            if (rel.base == null) {
+                rel_free(rel);
+                return null;
+            }
+            rel.d = dc.dafsa_load(dafsa_path);
+            if (rel.d == null) rel.d = dc.dafsa_create();
+            if (rel.d == null) {
+                dc.dafsa_free(rel.base);
+                rel.base = null;
+                rel_free(rel);
+                return null;
+            }
+            if (rel_wal_replay_into(rel) != 0) {
+                rel_free(rel);
+                return null;
+            }
+            return rel;
         }
     }
 
+    // No WAL records to recover: defer both DAFSA reads to the first touch.
+    // lazy_base != NULL marks the relation IDB for rel_is_idb unloaded.
+    rel.lazy = 1;
+    rel.lazy_dafsa = strdup(dafsa_path);
+    rel.lazy_base = strdup(base_path);
+    if (rel.lazy_dafsa == null or rel.lazy_base == null) {
+        rel_free(rel);
+        return null;
+    }
     return rel;
 }
 
@@ -1438,6 +1587,7 @@ fn patCb(key_bytes: [*c]const u8, key_len: usize, user: ?*anyopaque) callconv(.c
 pub export fn rel_pattern(rel: ?*const Relation, dfa: [*c]const regexwalk.regex_dfa, cb: RelEnumCb, user: ?*anyopaque) c_long {
     const r = rel orelse return -1;
     if (dfa == null or cb == null) return -1;
+    if (!relEnsureLoaded(@constCast(r))) return -1;
 
     ovConsolidateForRead(r);
     var ctx = PatCtx{
