@@ -6183,16 +6183,19 @@ test "lazyrel: open defers the DAFSA read; a touch loads ONLY the touched relati
     try testing.expectEqual(@as(c_int, 0), relation.rel_is_loaded(db.rels[@intCast(ia)].rel));
     try testing.expectEqual(@as(c_int, 0), relation.rel_is_loaded(db.rels[@intCast(ib)].rel));
 
-    // A read of alpha loads alpha ONLY — beta stays deferred.
+    // A read of alpha touches alpha ONLY — beta stays deferred.  Since
+    // zerocopy-view the touch is a VIEW, not a parse: the relation is readable
+    // but still NOT loaded (owned), which is the whole point.
     const a1 = [2]u32{ 1, 2 };
     try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "alpha", &a1, 2));
-    try testing.expectEqual(@as(c_int, 1), relation.rel_is_loaded(db.rels[@intCast(ia)].rel));
-    try testing.expectEqual(@as(c_int, 0), relation.rel_is_loaded(db.rels[@intCast(ib)].rel));
+    try testing.expectEqual(@as(u8, @intFromEnum(relation.ReadState.view)), relation.rel_read_state(db.rels[@intCast(ia)].rel));
+    try testing.expectEqual(@as(c_int, 0), relation.rel_is_loaded(db.rels[@intCast(ia)].rel));
+    try testing.expectEqual(@as(u8, @intFromEnum(relation.ReadState.deferred)), relation.rel_read_state(db.rels[@intCast(ib)].rel));
 
     // The deferred relation still answers from disk once touched.
     const b1 = [3]u32{ 5, 6, 7 };
     try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "beta", &b1, 3));
-    try testing.expectEqual(@as(c_int, 1), relation.rel_is_loaded(db.rels[@intCast(ib)].rel));
+    try testing.expectEqual(@as(u8, @intFromEnum(relation.ReadState.view)), relation.rel_read_state(db.rels[@intCast(ib)].rel));
     try testing.expectEqual(@as(c_int, 0), dl_lookup(db, "beta", &[3]u32{ 5, 6, 8 }, 3));
 }
 
@@ -6226,8 +6229,10 @@ test "lazyrel: writing a never-read relation persists it; untouched relations ar
         try testing.expectEqual(@as(c_int, 0), relation.rel_is_loaded(db.rels[@intCast(ib)].rel));
         const b1 = [2]u32{ 10, 20 };
         try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "beta", &b1, 2));
-        // The write loaded beta (duplicate check against the DAFSA view).
+        // The write PROMOTED beta to owned (the duplicate check and the
+        // insert both need a mutable DAFSA).
         try testing.expectEqual(@as(c_int, 1), relation.rel_is_loaded(db.rels[@intCast(ib)].rel));
+        try testing.expectEqual(@as(u8, @intFromEnum(relation.ReadState.owned)), relation.rel_read_state(db.rels[@intCast(ib)].rel));
     }
 
     // alpha.dafsa is byte-for-byte untouched: same size, same mtime.
@@ -6289,8 +6294,9 @@ test "lazyrel: order statistics on a NEVER-loaded relation answer EMPTY, not err
     // prefix-bound stats over the empty bound: rank_bound 0, select_bound -1.
     try testing.expectEqual(@as(u64, 0), dl_rank_bound(db, "r", &.{3}, 1, &k3, 2));
     try testing.expectEqual(@as(c_int, -1), dl_select_bound(db, "r", &.{3}, 1, 0, &out, 2));
-    // And a LOADED relation still answers exactly.
+    // And a VIEW-BACKED relation still answers exactly.
     try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "alpha", &a1b, 2));
+    try testing.expectEqual(@as(u8, @intFromEnum(relation.ReadState.view)), relation.rel_read_state(db.rels[@intCast(findRel(db, "alpha"))].rel));
     try testing.expectEqual(@as(u64, 0), dl_rank(db, "alpha", &a1b, 2));
     try testing.expectEqual(@as(u64, 1), dl_rank(db, "alpha", &a9, 2));
 }
@@ -6321,6 +6327,214 @@ test "lazyrel: WAL records at open are recovered EAGERLY (never deferred)" {
     try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "alpha", &[2]u32{ 7, 8 }, 2));
     // The WAL was compacted back to the 16-byte header at open.
     try testing.expectEqual(@as(u64, 16), relation.rel_wal_size(db.rels[@intCast(ia)].rel));
+}
+
+test "zerocopy: a READ-ONLY opener parses no relation (reads go through views)" {
+    // The zerocopy contract at the stack level: a read-only handle reads every
+    // relation through a zero-copy mmap view and NEVER parses one, so a
+    // process that only reads pays the view open (~CRC + state_off walk), not
+    // the states[]/trans[]/register rebuild.  FAILS on the pre-view tree: the
+    // read there ends in .owned (rel_is_loaded == 1).
+    const dir = "/tmp/datalog_zig_zerocopy_ro";
+    rmrfTestDir(dir);
+    defer rmrfTestDir(dir);
+
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "alpha", 2));
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "beta", 2));
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "alpha", &[2]u32{ 1, 2 }, 2));
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "alpha", &[2]u32{ 1, 3 }, 2));
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "beta", &[2]u32{ 4, 5 }, 2));
+    }
+
+    var err: c_int = 0;
+    const db = dl_open_ro(dir, &err) orelse return error.TestUnexpectedResult;
+    defer dl_close(db);
+    const ia = findRel(db, "alpha");
+    const ib = findRel(db, "beta");
+    try testing.expect(ia >= 0 and ib >= 0);
+
+    // Nothing parsed at open.
+    try testing.expectEqual(@as(u8, @intFromEnum(relation.ReadState.deferred)), relation.rel_read_state(db.rels[@intCast(ia)].rel));
+
+    // Lookup + prefix + order statistics all answer from the view.
+    try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "alpha", &[2]u32{ 1, 3 }, 2));
+    try testing.expectEqual(@as(c_int, 0), dl_lookup(db, "alpha", &[2]u32{ 1, 4 }, 2));
+    var got = CollectCbCtx{};
+    try testing.expectEqual(@as(c_long, 2), dl_prefix(db, "alpha", &[1]u32{1}, 1, collectCb, &got));
+    try testing.expectEqual(@as(usize, 2), got.n);
+    try testing.expectEqual(@as(u64, 0), dl_rank(db, "alpha", &[2]u32{ 1, 2 }, 2));
+    try testing.expectEqual(@as(u64, 2), dl_rank(db, "alpha", &[2]u32{ 9, 9 }, 2));
+    var sel: [2]u32 = undefined;
+    try testing.expectEqual(@as(c_int, 0), dl_select(db, "alpha", 1, &sel, 2));
+    try testing.expectEqualSlices(u32, &[2]u32{ 1, 3 }, sel[0..2]);
+    try testing.expectEqual(@as(u64, 2), dl_count(db, "alpha")); // words (subtree count)
+    // rel_count is the FINAL-STATE count (minimal-DAFSA merging: both words
+    // end in the same empty-right-language state), the same value dafsa_stats
+    // reports for an owned relation.
+    try testing.expectEqual(@as(u64, 1), relation.rel_count(db.rels[@intCast(ia)].rel));
+    try testing.expectEqual(@as(u64, 2), dl_range_count(db, "alpha", &[2]u32{ 1, 0 }, &[2]u32{ 2, 0 }, 2));
+
+    // ... and alpha is STILL not parsed, and beta (untouched) is still deferred.
+    try testing.expectEqual(@as(c_int, 0), relation.rel_is_loaded(db.rels[@intCast(ia)].rel));
+    try testing.expectEqual(@as(u8, @intFromEnum(relation.ReadState.view)), relation.rel_read_state(db.rels[@intCast(ia)].rel));
+    try testing.expectEqual(@as(u8, @intFromEnum(relation.ReadState.deferred)), relation.rel_read_state(db.rels[@intCast(ib)].rel));
+}
+
+test "zerocopy: publishing with a VIEW-BACKED relation keeps the snapshot correct" {
+    // The snapshot path must keep working when a relation was only read
+    // (view-backed, non-dirty) and another was written (promoted).  Two
+    // invariants:
+    //   1. the published snapshot holds BOTH relations, and the live store
+    //      still answers after the snapshot flip;
+    //   2. a SECOND publish with no writes between them re-uses the previous
+    //      snapshot's file by hardlink (the save gate) — the promoted-vs-view
+    //      distinction must not disturb it.
+    // NOTE: the FIRST publish of a process serializes every relation by
+    // design (saved_rev starts at SAVED_REV_NONE, the process cannot know what
+    // the previous snapshot holds), so it parses the view-backed ones too —
+    // that is pre-existing publish behaviour, not a view regression.
+    const dir = "/tmp/datalog_zig_zerocopy_publish";
+    rmrfTestDir(dir);
+    defer rmrfTestDir(dir);
+
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "alpha", 2));
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "beta", 2));
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "alpha", &[2]u32{ 1, 2 }, 2));
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "beta", &[2]u32{ 4, 5 }, 2));
+    }
+
+    var v1_alpha: [4096:0]u8 = undefined;
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        // alpha is only READ (view), beta is WRITTEN (promoted).
+        try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "alpha", &[2]u32{ 1, 2 }, 2));
+        const ia = findRel(db, "alpha");
+        const ib = findRel(db, "beta");
+        try testing.expectEqual(@as(u8, @intFromEnum(relation.ReadState.view)), relation.rel_read_state(db.rels[@intCast(ia)].rel));
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "beta", &[2]u32{ 6, 7 }, 2));
+        try testing.expectEqual(@as(u8, @intFromEnum(relation.ReadState.owned)), relation.rel_read_state(db.rels[@intCast(ib)].rel));
+
+        try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db)); // v1
+        const v1 = db.snap_version;
+        _ = snprintf(&v1_alpha, 4096, "%s/snapshots/%u/alpha.dafsa", @as([*:0]const u8, dir), v1);
+
+        // No writes since: publish again — every relation must take the
+        // hardlink path (same inode), i.e. the save gate still works.
+        try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db)); // v2
+        const v2 = db.snap_version;
+        try testing.expect(v2 != v1);
+        var v2_alpha: [4096:0]u8 = undefined;
+        _ = snprintf(&v2_alpha, 4096, "%s/snapshots/%u/alpha.dafsa", @as([*:0]const u8, dir), v2);
+        var s1: Stat = undefined;
+        var s2: Stat = undefined;
+        try testing.expectEqual(@as(c_int, 0), stat(&v1_alpha, &s1));
+        try testing.expectEqual(@as(c_int, 0), stat(&v2_alpha, &s2));
+        try testing.expectEqual(s1.st_ino, s2.st_ino); // hardlinked, not re-serialized
+    }
+
+    // The snapshot holds both relations; the live store answers after the flip.
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "alpha", &[2]u32{ 1, 2 }, 2));
+        try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "beta", &[2]u32{ 4, 5 }, 2));
+        try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "beta", &[2]u32{ 6, 7 }, 2));
+        try testing.expectEqual(@as(c_int, 0), dl_lookup(db, "beta", &[2]u32{ 6, 8 }, 2));
+        // The snapshot's alpha view answers the same as the live one.
+        var v_arity: u8 = 0;
+        var variadic: c_int = 0;
+        const sv = snapshotViewOpenRel(db, "alpha", &v_arity, &variadic);
+        try testing.expect(sv != null and variadic == 0);
+        const lead = [1]u32{1};
+        var got = CollectCbCtx{};
+        try testing.expect(db.snap_version > 0);
+        try testing.expectEqual(@as(c_long, 1), snapshot_query_scan(dir, db.snap_version, &db.vcache, "alpha", &lead, 1, collectCb, &got));
+        try testing.expectEqual(@as(usize, 1), got.n);
+    }
+}
+
+test "zerocopy: a write after a view read promotes and works end to end" {
+    // The promotion contract: read (view) then write must materialize the
+    // relation, apply the write as before, and persist it — the view must not
+    // be a read-only dead end.
+    const dir = "/tmp/datalog_zig_zerocopy_promote";
+    rmrfTestDir(dir);
+    defer rmrfTestDir(dir);
+
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "alpha", 2));
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "alpha", &[2]u32{ 1, 2 }, 2));
+    }
+
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        const ia = findRel(db, "alpha");
+        try testing.expect(ia >= 0);
+        const rel = db.rels[@intCast(ia)].rel;
+
+        // Read first: a view, not a parse.
+        try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "alpha", &[2]u32{ 1, 2 }, 2));
+        try testing.expectEqual(@as(u8, @intFromEnum(relation.ReadState.view)), relation.rel_read_state(rel));
+
+        // Write: promotes, and the pre-existing fact survives the promotion.
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "alpha", &[2]u32{ 9, 9 }, 2));
+        try testing.expectEqual(@as(u8, @intFromEnum(relation.ReadState.owned)), relation.rel_read_state(rel));
+        try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "alpha", &[2]u32{ 1, 2 }, 2));
+        try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "alpha", &[2]u32{ 9, 9 }, 2));
+
+        // A duplicate write through the promoted relation still reports 0.
+        try testing.expectEqual(@as(c_int, 0), dl_add_fact(db, "alpha", &[2]u32{ 1, 2 }, 2));
+    }
+
+    // The promoted relation was saved normally: both facts persist.
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "alpha", &[2]u32{ 1, 2 }, 2));
+        try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "alpha", &[2]u32{ 9, 9 }, 2));
+        try testing.expectEqual(@as(c_int, 0), dl_lookup(db, "alpha", &[2]u32{ 9, 8 }, 2));
+    }
+}
+
+test "zerocopy: an UNCHANGED view-backed relation is not rewritten at close" {
+    // The view must not turn a read-only session into a write: a relation read
+    // through a view stays non-dirty, so dl_close neither compacts nor saves
+    // it (mtime unchanged) — the same no-spurious-write property lazyrel has.
+    const dir = "/tmp/datalog_zig_zerocopy_nosave";
+    rmrfTestDir(dir);
+    defer rmrfTestDir(dir);
+
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "alpha", 2));
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "alpha", &[2]u32{ 1, 2 }, 2));
+    }
+
+    var alpha_path: [4096:0]u8 = undefined;
+    _ = snprintf(&alpha_path, 4096, "%s/alpha.dafsa", @as([*:0]const u8, dir));
+    const mt_before = testStatMtime(&alpha_path);
+
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "alpha", &[2]u32{ 1, 2 }, 2));
+        const ia = findRel(db, "alpha");
+        try testing.expectEqual(@as(u8, @intFromEnum(relation.ReadState.view)), relation.rel_read_state(db.rels[@intCast(ia)].rel));
+        try testing.expectEqual(@as(c_int, 0), relation.rel_is_dirty(db.rels[@intCast(ia)].rel));
+    }
+
+    try testing.expectEqual(mt_before, testStatMtime(&alpha_path));
 }
 
 test "dl query: rule load + compile + query" {
