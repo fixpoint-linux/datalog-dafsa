@@ -94,29 +94,39 @@ here was deleted 2026-08-11 and never closed the gap). The agent's control
 loop must treat recursive queries as amortized
 work, not per-step reads.
 
-## 4. Concurrency envelope (MEASURED, contradicts the naive reading)
+## 4. Concurrency envelope (MEASURED)
 
-- **Cross-process:** `dl_open_ro` from ANOTHER process returns `DL_E_LOCKED`
-  while a writer holds the handle, and a second writer is likewise locked
-  out. **Readers and the writer never coexist across processes** — the LOCK
-  fcntl excludes in both directions. "Reader sees a consistent snapshot
-  across a concurrent writer commit" is therefore **structurally vacuous**:
-  the consistency point is open time (WAL replayed at open). The dl.h
-  sentence "use dl_open_ro from other processes alongside one writer"
-  describes the RO-open failure mode, not coexistence.
+- **Cross-process, READERS COEXIST WITH THE WRITER** (since the two-scope
+  lock: `<dir>/LOCK` byte 0 = writer exclusivity, byte 1 = the mutation
+  window). A reader in ANOTHER process opens while a writer holds the handle
+  and reads the writer's committed state as of its own open (WAL replayed at
+  open). Measured: `dl_open_ro` succeeds under a live writer, `dl lookup`
+  through the CLI succeeds too (read-only commands open with `dl_open_ro`),
+  and the reader blocks only for the duration of one mutation window
+  (WAL-truncating compaction, snapshot publish, close sweep).
+  **A second WRITER is still refused** with `DL_E_LOCKED` — exactly one
+  writer per directory. Pre-fix the whole-file `F_WRLCK` blocked readers as
+  well (exclusive-vs-shared is both directions), which made the old dl.h
+  sentence "use dl_open_ro from other processes alongside one writer" false;
+  it is now true, and stated as the supported model in dl.h.
+- **Visibility boundary:** a reader sees everything up to its own open, never
+  a torn record (the WAL is self-framing with a CRC; a torn tail stops the
+  replay, and replaced files commit by atomic rename). Cross-process
+  read-your-own-writes needs a re-open.
 - **Same process:** a second `dl_open` of the same directory SUCCEEDS at the
   C level (fcntl locks never conflict within one process — measured). The
   binding enforces the single-writer invariant itself: a per-process
   registry refuses a second handle for the same directory (raises
-  `DlLockedError` in ~22 µs). This also implements the dl.h same-process
-  caveat (never RO+RW together in one process).
+  `DlLockedError` in ~22 µs). One handle per directory per process remains
+  the supported rule (independent in-memory views, no internal mutex).
 - **After writer close / crash:** an RO open sees everything the WAL
   contains — a child that `add_fact`s and `_exit(0)`s without close is fully
   visible to the next reader (verified: fact present, count correct).
-- **DL_E_LOCKED surfacing:** cross-process `dl_open_ro` under a live writer
-  raises `DlLockedError`; `dl_open2` under another writer raises
-  `DlLockedError`; CAS/txn conflicts raise `DlConflictError` with nothing
-  applied (verified by test).
+- **DL_E_LOCKED surfacing:** `dl_open2` under another writer raises
+  `DlLockedError` (and the binding's registry raises it for a second handle
+  in the same process); a cross-process `dl_open_ro` under a live writer now
+  SUCCEEDS (it is not an error path any more); CAS/txn conflicts raise
+  `DlConflictError` with nothing applied (verified by test).
 
 ## 5. Thread safety (one handle, many Python threads)
 
@@ -231,9 +241,9 @@ canonical build; 6.7 MB, exports all 86 `dl_*` symbols used).
   2026-08-11, so this is history, not a constraint any more.
 - `dl_open_ro` on the production store costs ~650 ms — every handle
   acquisition, not just the first, after a writer cycle.
-- No coexistence of reader and writer, cross-process (single big lock) —
-  the "many readers alongside one writer" pattern is NOT available with
-  this engine; readers must wait for writer close.
+- Readers no longer exclude the writer and the writer no longer excludes
+  readers (two-scope byte-range lock), but readers still cannot WRITE: a
+  read-modify-write across processes needs the writer handle.
 - Same-process double-open is NOT prevented by the C library (binding
   registry does it).
 - Thread safety of raw concurrent reads is undocumented in the engine;

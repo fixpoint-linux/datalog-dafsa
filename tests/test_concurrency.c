@@ -163,11 +163,14 @@ static long file_size(const char *path)
     return (long)st.st_size;
 }
 
-/* ─── T1: writer held -> DL_E_LOCKED for both dl_open and dl_open_ro ───── */
-/* POSIX: F_RDLCK conflicts with F_WRLCK, so a shared-lock RO open is
- * rejected while a writer is active (and a writer is rejected while any
- * reader is active).  Once the writer releases, dl_open_ro succeeds and
- * sees the writer's fsync'd WAL fact. */
+/* ─── T1: writer held -> a SECOND WRITER is refused, READERS are not ────── */
+/* The two-scope lock (<dir>/LOCK): byte 0 is the writer-exclusivity range
+ * (F_WRLCK for the writer's handle lifetime), byte 1 is the mutation window
+ * (shared by a reader only across its own open, exclusive for the writer's
+ * state-replacing operations).  A live writer therefore excludes WRITERS and
+ * NOT readers: dl_open_ro succeeds and sees the writer's WAL'd fact while the
+ * writer's handle is open.  Pre-fix this test failed — the whole-file F_WRLCK
+ * blocked the reader's F_RDLCK (exclusive-vs-shared is BOTH directions). */
 static void test_t1_writer_held(void)
 {
     const char *dir = "build-tmp/conc1";
@@ -178,7 +181,7 @@ static void test_t1_writer_held(void)
     int err = 0;
     dl_db *ro = NULL;
 
-    TEST("T1: writer held -> dl_open+dl_open_ro DL_E_LOCKED; RO ok after");
+    TEST("T1: writer held -> reader OK, second writer DL_E_LOCKED");
     rm_dir(dir);
     mk_db_dir(dir);
     {
@@ -207,9 +210,9 @@ static void test_t1_writer_held(void)
     }
     close(c2p[1]);
     close(p2c[0]);
-    assert(read(c2p[0], &b, 1) == 1);     /* child holds the lock now */
+    assert(read(c2p[0], &b, 1) == 1);     /* child holds the writer lock now */
 
-    /* RW open must fail with DL_E_LOCKED ... */
+    /* A SECOND WRITER must still be refused, with DL_E_LOCKED ... */
     if (dl_open2(dir, &err) != NULL) {
         FAIL("dl_open2 succeeded while a writer holds the lock");
         goto out;
@@ -218,15 +221,23 @@ static void test_t1_writer_held(void)
         FAIL("dl_open2 error is not DL_E_LOCKED");
         goto out;
     }
-    /* ... and so must the shared-lock RO open (F_RDLCK vs F_WRLCK). */
-    if (dl_open_ro(dir, &err) != NULL) {
-        FAIL("dl_open_ro succeeded while a writer holds the lock");
+
+    /* ... while a READER opens and reads the live writer's committed state
+     * (its WAL'd fact replays in memory). */
+    ro = dl_open_ro(dir, &err);
+    if (!ro) {
+        FAIL("dl_open_ro was refused while a writer holds the lock");
         goto out;
     }
-    if (err != DL_E_LOCKED) {
-        FAIL("dl_open_ro error is not DL_E_LOCKED");
-        goto out;
+    {
+        uint32_t cols[2] = { 1, 2 };
+        if (dl_lookup(ro, "r", cols, 2) != 1) {
+            FAIL("RO handle cannot see the live writer's WAL'd fact");
+            goto out;
+        }
     }
+    dl_close(ro);
+    ro = NULL;
 
     PASS();
 out:
@@ -699,11 +710,440 @@ out:
     rm_dir(dir);
 }
 
+/* ─── T8: a reader lives ALONGSIDE a writer that keeps writing ─────────── */
+/* The headline of the two-scope lock: one session holding the writer handle
+ * no longer makes another session's reads fail.  Each reader open sees the
+ * writer's committed state as of THAT open (the durability contract's cycle
+ * boundary), which is exactly what the pre-fix code refused to allow. */
+static void test_t8_reader_lives_alongside_writer(void)
+{
+    const char *dir = "build-tmp/conc8";
+    int c2p[2], p2c[2];
+    pid_t pid;
+    int st;
+    char b;
+    int err = 0;
+
+    TEST("T8: reader opens+reads while a live writer keeps writing");
+    rm_dir(dir);
+    mk_db_dir(dir);
+    {
+        dl_db *p = dl_open(dir);
+        assert(p);
+        assert(dl_declare_relation(p, "r", 2) == 0);
+        dl_close(p);
+    }
+
+    assert(pipe(c2p) == 0);
+    assert(pipe(p2c) == 0);
+    pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        dl_db *c;
+        uint32_t a[2] = { 1, 2 }, bf[2] = { 3, 4 };
+        close(c2p[0]);
+        close(p2c[1]);
+        c = dl_open(dir);
+        if (!c) _exit(2);
+        if (dl_add_fact(c, "r", a, 2) != 1) _exit(3);
+        if (write(c2p[1], "1", 1) != 1) _exit(4);
+        if (read(p2c[0], &b, 1) != 1) _exit(5);
+        if (dl_add_fact(c, "r", bf, 2) != 1) _exit(6);
+        if (write(c2p[1], "2", 1) != 1) _exit(7);
+        if (read(p2c[0], &b, 1) != 1) _exit(8);
+        dl_close(c);
+        _exit(0);
+    }
+    close(c2p[1]);
+    close(p2c[0]);
+
+    /* Reader 1: while the writer is live and has appended its first fact. */
+    assert(read(c2p[0], &b, 1) == 1);
+    {
+        dl_db *ro;
+        uint32_t a[2] = { 1, 2 }, bf[2] = { 3, 4 };
+        ro = dl_open_ro(dir, &err);
+        if (!ro) {
+            FAIL("reader refused while a live writer holds the db");
+            goto out;
+        }
+        if (dl_lookup(ro, "r", a, 2) != 1)
+            FAIL("reader cannot see the writer's first WAL'd fact");
+        if (dl_lookup(ro, "r", bf, 2) != 0)
+            FAIL("reader sees a fact the writer had not added yet");
+        dl_close(ro);
+    }
+    assert(write(p2c[1], "a", 1) == 1);
+
+    /* Reader 2: after the writer's SECOND append, a fresh open sees it. */
+    assert(read(c2p[0], &b, 1) == 1);
+    {
+        dl_db *ro;
+        uint32_t bf[2] = { 3, 4 };
+        ro = dl_open_ro(dir, &err);
+        if (!ro) {
+            FAIL("second reader refused while the writer is still live");
+            goto out;
+        }
+        if (dl_lookup(ro, "r", bf, 2) != 1)
+            FAIL("a fresh reader does not see the writer's later append");
+        dl_close(ro);
+    }
+    assert(write(p2c[1], "a", 1) == 1);
+    close(c2p[0]);
+    close(p2c[1]);
+    assert(waitpid(pid, &st, 0) == pid);
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+        FAIL("writer child did not exit cleanly");
+        rm_dir(dir);
+        return;
+    }
+    PASS();
+    rm_dir(dir);
+    return;
+out:
+    write(p2c[1], "a", 1);
+    write(p2c[1], "a", 1);
+    close(c2p[0]);
+    close(p2c[1]);
+    waitpid(pid, &st, 0);
+    rm_dir(dir);
+}
+
+/* ─── T9: a torn WAL tail is IGNORED, never mis-parsed ─────────────────── */
+/* The WAL is self-framing: op(1) | key_len(u32 LE) | key | crc32(u32 LE),
+ * after a 16-byte header.  Two tails are hand-appended here:
+ *   (a) TRUNCATED — op + len + key, no CRC (a crash mid-append);
+ *   (b) WRONG CRC — a complete record whose CRC does not match.
+ * A read-only open must stop at the torn record: the complete record before
+ * it is still visible, the torn record's fact is NOT (it is rejected, not
+ * parsed), and the read-only handle leaves the WAL bytes untouched (it never
+ * repairs what it did not write). */
+static void append_torn_tail(const char *dir, int variant)
+{
+    char wal[512];
+    unsigned char rec[32];
+    size_t n = 0, i;
+    FILE *f;
+    uint32_t klen = 9;
+    unsigned char key[9] = { 0, 0, 0, 7, 0, 0, 0, 8, 0 };  /* fact (7,8) */
+
+    snprintf(wal, sizeof(wal), "%s/r.wal", dir);
+    f = fopen(wal, "ab");
+    assert(f != NULL);
+    rec[n++] = 1;                                  /* ADD */
+    rec[n++] = (unsigned char)(klen & 0xff);
+    rec[n++] = (unsigned char)((klen >> 8) & 0xff);
+    rec[n++] = (unsigned char)((klen >> 16) & 0xff);
+    rec[n++] = (unsigned char)((klen >> 24) & 0xff);
+    for (i = 0; i < sizeof(key); i++) rec[n++] = key[i];
+    if (variant == 0) {
+        /* (a) truncated: stop here, no CRC at all. */
+    } else {
+        /* (b) complete framing, deliberately wrong CRC. */
+        rec[n++] = 0xde;
+        rec[n++] = 0xad;
+        rec[n++] = 0xbe;
+        rec[n++] = 0xef;
+    }
+    assert(fwrite(rec, 1, n, f) == n);
+    assert(fclose(f) == 0);
+}
+
+static void test_t9_torn_wal_tail(int variant)
+{
+    const char *dir = variant == 0 ? "build-tmp/conc9a" : "build-tmp/conc9b";
+    int err = 0;
+    long wal_before, wal_after;
+    pid_t pid;
+    int st;
+
+    TEST(variant == 0 ? "T9a: truncated WAL tail ignored by a reader"
+                      : "T9b: bad-CRC WAL tail ignored by a reader");
+    rm_dir(dir);
+    mk_db_dir(dir);
+
+    /* A writer that appends ONE fact and dies without closing: the fact lives
+     * only in the WAL (no compaction, so the WAL keeps its record). */
+    pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        dl_db *c = dl_open(dir);
+        uint32_t a[2] = { 1, 2 };
+        if (!c) _exit(2);
+        if (dl_declare_relation(c, "r", 2) != 0) _exit(3);
+        if (dl_add_fact(c, "r", a, 2) != 1) _exit(4);
+        _exit(0);            /* crash-sim: no dl_close */
+    }
+    assert(waitpid(pid, &st, 0) == pid);
+    assert(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+
+    append_torn_tail(dir, variant);
+    {
+        char wal[512];
+        snprintf(wal, sizeof(wal), "%s/r.wal", dir);
+        wal_before = file_size(wal);
+        if (wal_before <= 16) {
+            FAIL("premise: the WAL has no complete record to replay");
+            goto out;
+        }
+    }
+
+    {
+        dl_db *ro;
+        uint32_t a[2] = { 1, 2 }, torn[2] = { 7, 8 };
+        ro = dl_open_ro(dir, &err);
+        if (!ro) {
+            FAIL("dl_open_ro failed on a WAL with a torn tail");
+            goto out;
+        }
+        if (dl_lookup(ro, "r", a, 2) != 1) {
+            FAIL("the complete record before the torn tail was lost");
+            dl_close(ro);
+            goto out;
+        }
+        if (dl_lookup(ro, "r", torn, 2) != 0) {
+            FAIL("the torn record was PARSED (its fact became visible)");
+            dl_close(ro);
+            goto out;
+        }
+        dl_close(ro);
+    }
+    {
+        char wal[512];
+        snprintf(wal, sizeof(wal), "%s/r.wal", dir);
+        wal_after = file_size(wal);
+        if (wal_after != wal_before) {
+            FAIL("a read-only handle modified the WAL (repaired a torn tail)");
+            goto out;
+        }
+    }
+    PASS();
+out:
+    rm_dir(dir);
+}
+
+/* ─── T10: a live READER does not block the writer ─────────────────────── */
+/* The mirror of T1: the reader holds no lock after its open returns, so the
+ * sole writer can open and write while a read-only handle is live.  Pre-fix
+ * this was refused (the reader's whole-lifetime F_RDLCK blocked F_WRLCK). */
+static void test_t10_reader_does_not_block_writer(void)
+{
+    const char *dir = "build-tmp/conc10";
+    uint32_t cols[2] = { 5, 6 };
+    int err = 0;
+    dl_db *ro = NULL;
+    pid_t pid;
+    int st;
+
+    TEST("T10: writer opens+writes while a reader handle is live");
+    rm_dir(dir);
+    mk_db_dir(dir);
+    {
+        dl_db *p = dl_open(dir);
+        assert(p);
+        assert(dl_declare_relation(p, "r", 2) == 0);
+        dl_close(p);
+    }
+
+    ro = dl_open_ro(dir, &err);
+    if (!ro) {
+        FAIL("dl_open_ro failed on a quiet db");
+        rm_dir(dir);
+        return;
+    }
+
+    pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        dl_db *w = dl_open2(dir, &err);
+        if (!w) _exit(err == DL_E_LOCKED ? 7 : 2);   /* 7 = refused */
+        if (dl_add_fact(w, "r", cols, 2) != 1) _exit(3);
+        dl_close(w);
+        _exit(0);
+    }
+    assert(waitpid(pid, &st, 0) == pid);
+    if (!WIFEXITED(st)) {
+        FAIL("writer child died abnormally");
+        dl_close(ro);
+        rm_dir(dir);
+        return;
+    }
+    if (WEXITSTATUS(st) == 7) {
+        FAIL("writer was refused (DL_E_LOCKED) by a live READER handle");
+        dl_close(ro);
+        rm_dir(dir);
+        return;
+    }
+    if (WEXITSTATUS(st) != 0) {
+        FAIL("writer child failed");
+        dl_close(ro);
+        rm_dir(dir);
+        return;
+    }
+    dl_close(ro);
+    PASS();
+    rm_dir(dir);
+}
+
+/* ─── T11: an RO open in the writer's OWN process no longer admits a ─────── */
+/* ─── second writer elsewhere (the old same-process hazard) ──────────────── */
+/* Pre-fix the whole-file F_RDLCK of a same-process dl_open_ro SILENTLY
+ * REPLACED that process's F_WRLCK (fcntl locks are per process, and F_SETLK
+ * succeeds against the process's own lock), so a second writer in ANOTHER
+ * process could then take the file while the RW handle was live — the hazard
+ * dl.h warned about.  The byte-range split removes the mechanism: the RO
+ * open touches byte 1 only, byte 0 keeps the writer's exclusive lock, and a
+ * second writer elsewhere is still refused. */
+static void test_t11_same_process_ro_keeps_writer_exclusion(void)
+{
+    const char *dir = "build-tmp/conc11";
+    uint32_t cols[2] = { 1, 2 };
+    int err = 0;
+    dl_db *w = NULL, *ro = NULL;
+    pid_t pid;
+    int st;
+
+    TEST("T11: same-process RO open keeps the writer's exclusion of others");
+    rm_dir(dir);
+    mk_db_dir(dir);
+    {
+        dl_db *p = dl_open(dir);
+        assert(p);
+        assert(dl_declare_relation(p, "r", 2) == 0);
+        assert(dl_add_fact(p, "r", cols, 2) == 1);
+        dl_close(p);
+    }
+
+    w = dl_open2(dir, &err);
+    if (!w) {
+        FAIL("writer open failed on a quiet db");
+        rm_dir(dir);
+        return;
+    }
+    ro = dl_open_ro(dir, &err);
+    if (!ro) {
+        FAIL("same-process dl_open_ro refused (pre-fix whole-file lock)");
+        dl_close(w);
+        rm_dir(dir);
+        return;
+    }
+    if (dl_lookup(ro, "r", cols, 2) != 1)
+        FAIL("same-process RO handle cannot read the writer's fact");
+    if (dl_lookup(w, "r", cols, 2) != 1)
+        FAIL("writer handle lost its fact after the RO open");
+
+    /* The hazard check: a writer in ANOTHER process must still be refused
+     * while this process's RW handle is live. */
+    pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        int e2 = 0;
+        dl_db *x = dl_open2(dir, &e2);
+        if (x) {
+            dl_close(x);
+            _exit(6);            /* admitted a second writer: the hazard */
+        }
+        _exit(e2 == DL_E_LOCKED ? 0 : 2);
+    }
+    assert(waitpid(pid, &st, 0) == pid);
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+        if (WIFEXITED(st) && WEXITSTATUS(st) == 6)
+            FAIL("a same-process RO open admitted a second writer elsewhere");
+        else
+            FAIL("second-writer probe child failed unexpectedly");
+    }
+    dl_close(ro);
+    dl_close(w);
+    PASS();
+    rm_dir(dir);
+}
+
+/* ─── T12: the CLI's read commands work under a live writer ────────────── */
+/* End-to-end through `dl` (the binary run_zig_suites.sh shadows at ./dl):
+ * a pure read (`lookup`) must answer while another process holds the writer
+ * handle.  The CLI prefers a read-write open (its read paths mint symbol ids)
+ * and falls back to dl_open_ro when a writer holds the db; pre-fix the
+ * fallback did not exist and the CLI printed "dl: cannot open database".
+ * The writer here is this test process itself holding LOCK byte 0 with
+ * fcntl — the same byte-range lock dl_open takes. */
+static void test_t12_cli_read_under_live_writer(void)
+{
+    const char *dir = "build-tmp/conc12";
+    uint32_t cols[2] = { 1, 2 };
+    const char *cli = NULL;
+    int lockfd, rc;
+    struct flock fl;
+    char cmd[512];
+
+    TEST("T12: CLI `lookup` answers while a writer holds the db");
+    if (access("./dl", X_OK) == 0) cli = "./dl";
+    else if (access("zig-out/bin/dl", X_OK) == 0) cli = "zig-out/bin/dl";
+    if (cli == NULL) {
+        printf("SKIP (no dl binary) ... ");
+        PASS();
+        return;
+    }
+    rm_dir(dir);
+    mk_db_dir(dir);
+    {
+        dl_db *p = dl_open(dir);
+        assert(p);
+        assert(dl_declare_relation(p, "r", 2) == 0);
+        assert(dl_add_fact(p, "r", cols, 2) == 1);
+        dl_close(p);
+    }
+
+    {
+        char lockpath[512];
+        snprintf(lockpath, sizeof(lockpath), "%s/LOCK", dir);
+        lockfd = open(lockpath, O_RDWR);
+        assert(lockfd >= 0);
+        memset(&fl, 0, sizeof(fl));
+        fl.l_type = F_WRLCK;
+        fl.l_whence = SEEK_SET;
+        fl.l_start = 0;          /* byte 0 = writer exclusivity */
+        fl.l_len = 1;
+        assert(fcntl(lockfd, F_SETLK, &fl) == 0);
+    }
+
+    snprintf(cmd, sizeof(cmd), "%s -d %s lookup r 1 2 2>&1", cli, dir);
+    {
+        FILE *p = popen(cmd, "r");
+        char out[256] = "";
+        if (p == NULL) {
+            FAIL("popen failed");
+            close(lockfd);
+            rm_dir(dir);
+            return;
+        }
+        if (fgets(out, sizeof(out), p) == NULL) out[0] = '\0';
+        rc = pclose(p);
+        if (rc != 0) {
+            FAIL("CLI read failed under a live writer (refused / wrong rc)");
+            close(lockfd);
+            rm_dir(dir);
+            return;
+        }
+        if (strncmp(out, "found", 5) != 0) {
+            FAIL("CLI read under a live writer did not answer `found`");
+            close(lockfd);
+            rm_dir(dir);
+            return;
+        }
+    }
+    fl.l_type = F_UNLCK;
+    assert(fcntl(lockfd, F_SETLK, &fl) == 0);
+    close(lockfd);
+    PASS();
+    rm_dir(dir);
+}
+
 /* ─── Main ─────────────────────────────────────────────────────────────── */
 
 int main(void)
 {
-    printf("concurrency (shared-lock RO + dirty-tracked close) tests\n");
+    printf("concurrency (two-scope lock + dirty-tracked close) tests\n");
 
     test_t1_writer_held();
     test_t2_two_readers();
@@ -712,6 +1152,12 @@ int main(void)
     test_t5_ro_write_apis_rejected();
     test_t6_crash_then_ro_replay();
     test_t7_clean_rw_close_noop();
+    test_t8_reader_lives_alongside_writer();
+    test_t9_torn_wal_tail(0);
+    test_t9_torn_wal_tail(1);
+    test_t10_reader_does_not_block_writer();
+    test_t11_same_process_ro_keeps_writer_exclusion();
+    test_t12_cli_read_under_live_writer();
 
     printf("\n%d tests run, %d failed\n", tests_run, tests_failed);
     return tests_failed ? 1 : 0;

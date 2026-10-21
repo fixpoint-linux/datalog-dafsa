@@ -352,13 +352,13 @@ class TestLocking(unittest.TestCase):
         ro2 = dlb.Db.open_ro(d)  # second RO after the first closed
         ro2.close()
 
-    def test_reader_in_other_process_blocked_by_writer(self):
-        """MEASURED SEMANTICS (contradicts a naive reading of the dl.h intro
-        sentence "use dl_open_ro from other processes alongside one writer"):
-        a reader in ANOTHER process gets DL_E_LOCKED while a writer holds the
-        handle — the LOCK fcntl is exclusive-vs-shared in BOTH directions.
-        Readers and the writer never coexist across processes; they alternate
-        (the writer must close before readers can open, and vice versa)."""
+    def test_reader_in_other_process_runs_alongside_writer(self):
+        """The two-scope lock (<dir>/LOCK byte 0 = writer exclusivity, byte 1 =
+        the mutation window a reader holds only across its own open): a live
+        writer EXCLUDES WRITERS, NOT READERS.  A reader in another process
+        opens while the writer's handle is held and reads the writer's WAL'd
+        state.  Pre-fix this was DL_E_LOCKED (a whole-file F_WRLCK blocks
+        F_RDLCK in both directions)."""
         d = fresh_dir()
         with dlb.Db.open(d) as w:
             w.declare_relation("edge", 2)
@@ -368,11 +368,13 @@ class TestLocking(unittest.TestCase):
                 "try:\n"
                 f"    ro=dlb.Db.open_ro({d!r})\n"
                 "except dlb.DlLockedError: print('LOCKED'); sys.exit(0)\n"
-                "ro.close(); print('OPEN-RO'); sys.exit(1)\n"
+                "print('OPEN-RO', ro.lookup('edge',(1,2)), ro.count('edge'))\n"
+                "ro.close()\n"
             )
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("LOCKED", r.stdout)
-        # after the writer closes, the reader CAN open and sees the commit
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("OPEN-RO True 1", r.stdout)
+        # the reader's view is its own open boundary: after the writer closed,
+        # a fresh reader sees the same committed state
         r2 = self._child(
             "import dlb\n"
             f"ro=dlb.Db.open_ro({d!r})\n"
@@ -382,12 +384,17 @@ class TestLocking(unittest.TestCase):
         self.assertEqual(r2.returncode, 0, r2.stderr)
         self.assertIn("OPEN-RO True 1", r2.stdout)
 
-    def test_writer_blocked_while_reader_open(self):
+    def test_writer_opens_while_reader_open(self):
+        """A live READER no longer blocks the writer: dl_open_ro holds no lock
+        after its open returns (it needs the shared window only to replay the
+        WAL without racing a truncation), so the sole writer can open and
+        write while a read-only handle is live.  Pre-fix the reader's
+        whole-lifetime F_RDLCK refused the writer."""
         d = fresh_dir()
         with dlb.Db.open(d) as w:
             w.declare_relation("edge", 2)
             w.add_fact("edge", (1, 2))
-        # reader holds F_RDLCK in a child process
+        # reader holds an RO handle in a child process
         proc = subprocess.Popen(
             [sys.executable, "-c",
              "import dlb,time\n"
@@ -400,21 +407,21 @@ class TestLocking(unittest.TestCase):
                 os.path.dirname(__file__), "..")},
         )
         try:
-            proc.stdout.readline()  # wait until the reader holds the lock
+            proc.stdout.readline()  # wait until the reader holds its handle
             r = self._child(
                 "import dlb,sys\n"
                 "try:\n"
                 f"    db=dlb.Db.open({d!r})\n"
                 "except dlb.DlLockedError: print('LOCKED'); sys.exit(0)\n"
-                "print('OPENED'); sys.exit(1)\n"
+                "db.add_fact('edge',(3,4)); db.close(); print('OPENED'); sys.exit(0)\n"
             )
             self.assertEqual(r.returncode, 0, r.stderr)
-            self.assertIn("LOCKED", r.stdout)
+            self.assertIn("OPENED", r.stdout)
         finally:
             proc.wait(timeout=30)
-        # once the reader is gone the writer may open
         with dlb.Db.open(d) as w2:
             self.assertTrue(w2.lookup("edge", (1, 2)))
+            self.assertTrue(w2.lookup("edge", (3, 4)))
 
 
 class TestSnapshot(unittest.TestCase):

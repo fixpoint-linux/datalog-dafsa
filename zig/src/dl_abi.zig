@@ -241,6 +241,8 @@ pub const sym_walk_cb = ?*const fn (sym_id: u32, user: ?*anyopaque) callconv(.c)
 
 // ─── dl.h / dl_internal.h ────────────────────────────────────────────────
 pub extern "c" fn dl_open(dir: [*c]const u8) [*c]dl_db;
+pub extern "c" fn dl_open2(dir: [*c]const u8, err_out: [*c]c_int) [*c]dl_db;
+pub extern "c" fn dl_open_ro(dir: [*c]const u8, err_out: [*c]c_int) [*c]dl_db;
 pub extern "c" fn dl_close(db: [*c]dl_db) void;
 pub extern "c" fn dl_declare_relation(db: [*c]dl_db, name: [*c]const u8, arity: u8) c_int;
 pub extern "c" fn dl_load_facts(db: [*c]dl_db, rel: [*c]const u8, csv_path: [*c]const u8) c_int;

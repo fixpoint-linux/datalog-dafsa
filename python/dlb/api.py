@@ -170,15 +170,18 @@ class Transaction:
 
 class Db:
     """A dl_db handle. open() = read-write (sole writer); open_ro() = shared
-    read-only (use from other processes; never alongside an RW handle of the
-    same directory in THIS process).
+    read-only (coexists with a live writer in another process — it sees that
+    writer's committed state as of its own open; never alongside an RW handle
+    of the same directory in THIS process).
 
     Per-process handle registry: fcntl locks never conflict within one
     process, so the C library CANNOT enforce (and does not enforce — measured)
     the single-writer invariant against a second same-process open. This
     binding enforces it: at most one open handle per database directory per
-    process, and never an RO handle alongside an RW one (dl.h same-process
-    caveat). Cross-process exclusion IS enforced by the C lock."""
+    process, and never an RO handle alongside an RW one (one handle per
+    directory per process — dl.h CONCURRENCY MODEL). Cross-process WRITER
+    exclusion IS enforced by the C lock (LOCK byte 0); a cross-process reader
+    is not excluded, it coexists."""
 
     _open_handles: dict[str, "Db"] = {}  # realpath -> live handle
     _registry_lock = threading.Lock()

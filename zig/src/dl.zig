@@ -703,6 +703,105 @@ pub export fn dl_ensure_variant(db: ?*DlDb, rel_id: c_int, arity: u8) ?*relation
     return variadicOpenVariant(d, &d.rels[@intCast(rel_id)], arity);
 }
 
+// ─── Concurrency: the two lock scopes on <dir>/LOCK ────────────────────────
+//
+// <dir>/LOCK carries TWO INDEPENDENT fcntl BYTE-RANGE locks.  They are
+// separate ranges because the two roles they arbitrate are different, and a
+// single whole-file lock cannot express both: an F_WRLCK on a range blocks
+// every F_RDLCK on that same range — POSIX advisory locking is
+// exclusive-vs-shared in BOTH directions (MEASURED; it is why a live writer
+// used to exclude every reader).
+//
+//   byte 0 (LOCK_EXCL_BYTE) — WRITER EXCLUSIVITY, held by a read-write
+//       handle for its whole lifetime.  Readers never touch it, so a live
+//       writer no longer excludes them.  A second dl_open/dl_open2 in
+//       another process is still refused at open with DL_E_LOCKED.
+//
+//   byte 1 (LOCK_WINDOW_BYTE) — MUTATION WINDOW.  The writer takes it
+//       exclusively around every on-disk state REPLACEMENT (WAL truncation
+//       in rel_compact, the snapshot materialization/publish sweep,
+//       rels.txt, the dl_close save sweep).  A reader takes it SHARED for
+//       the whole of its open — the metadata read plus the eager
+//       per-relation WAL replay — and releases it before the handle is
+//       returned.  That is the only window in which the two must not
+//       overlap: rel_compact FTRUNCATES the WAL, and a replay that mmap'd
+//       the pre-truncate size would SIGBUS or parse two generations mixed.
+//
+// NOT in the window, because it is safe by construction:
+//   * WAL APPENDS are O_APPEND writes of self-framing records
+//     (op / len / key / CRC32).  A reader replaying concurrently sees only
+//     whole records; a torn tail fails the CRC and replay STOPS there (never
+//     mis-parsed), and an append cannot invalidate a mapping already held.
+//   * DAFSA / rels.txt / symbols / terms saves commit as
+//     write-tmp + fsync + RENAME, so a lazyrel loader opens either the
+//     complete old or the complete new inode — never a partial file.
+// Taking the window per fact-add would buy nothing and cost two fcntl
+// round-trips per write.
+//
+// SUPPORTED MODEL: MANY READERS AND ONE WRITER, LIVE AT THE SAME TIME.
+// A reader sees the writer's committed state as of its own open (the
+// durability contract's cycle boundary — dl.h "Durability"), never a torn
+// record; cross-process read-your-own-writes needs a re-open.  Writers stay
+// serialized: exactly one per database directory.
+const LOCK_EXCL_BYTE: posix.off_t = 0;
+const LOCK_WINDOW_BYTE: posix.off_t = 1;
+
+extern "c" fn __errno_location() *c_int;
+const LOCK_EINTR: c_int = 4; // Linux glibc EINTR
+
+/// One fcntl byte-range lock operation on `start` (length 1).  `wait`
+/// selects F_SETLKW (block) over F_SETLK (fail fast).  Returns 0 on
+/// success, -1 on error.
+fn lockRange(fd: c_int, ty: c_short, start: posix.off_t, wait: bool) c_int {
+    var fl: posix.struct_flock = undefined;
+    fl.l_type = ty;
+    fl.l_whence = posix.SEEK_SET;
+    fl.l_start = start;
+    fl.l_len = 1;
+    fl.l_pid = 0;
+    const cmd: c_int = if (wait) posix.F_SETLKW else posix.F_SETLK;
+    while (true) {
+        if (posix.fcntl(fd, cmd, &fl) == 0) return 0;
+        if (__errno_location().* == LOCK_EINTR) continue;
+        return -1;
+    }
+}
+
+// Mutation-window state, per thread.  fcntl locks are per (process, file)
+// and the engine is single-threaded per db (no internal mutex — see dl.h),
+// so tracking the window by the LOCK fd held in this thread is enough to
+// make a nested window (dl_close -> writeRelsTxt) a no-op instead of an
+// early unlock of the outer one.
+threadlocal var mut_window_fd: c_int = -1;
+threadlocal var mut_window_depth: c_int = 0;
+
+/// Enter the writer's mutation window: EXCLUSIVE on LOCK_WINDOW_BYTE,
+/// BLOCKING — the only holder that can be in the way is another process's
+/// open-time replay, which is bounded by its WAL size.  A lock error is not
+/// fatal to the mutation (the write path's convention: durability failures
+/// are surfaced by the fsync/rename that follows, not by the lock); the
+/// depth accounting stays balanced either way.
+fn mutWindowBegin(db: *DlDb) void {
+    if (db.read_only != 0 or db.lock_fd < 0) return;
+    if (mut_window_fd == db.lock_fd) {
+        mut_window_depth += 1;
+        return;
+    }
+    if (lockRange(db.lock_fd, posix.F_WRLCK, LOCK_WINDOW_BYTE, true) == 0) {
+        mut_window_fd = db.lock_fd;
+        mut_window_depth = 1;
+    }
+}
+
+fn mutWindowEnd(db: *DlDb) void {
+    if (db.read_only != 0 or db.lock_fd < 0) return;
+    if (mut_window_fd != db.lock_fd or mut_window_depth <= 0) return;
+    mut_window_depth -= 1;
+    if (mut_window_depth > 0) return;
+    _ = lockRange(db.lock_fd, posix.F_UNLCK, LOCK_WINDOW_BYTE, false);
+    mut_window_fd = -1;
+}
+
 // ─── Lifecycle ─────────────────────────────────────────────────────────────
 
 pub export fn dl_open(dir: ?[*:0]const u8) ?*DlDb {
@@ -754,20 +853,35 @@ fn dlOpenCommon(dir: ?[*:0]const u8, err_out: ?*c_int, ro: c_int) ?*DlDb {
         return null;
     }
 
-    {
-        var fl: posix.struct_flock = undefined;
-        fl.l_type = if (ro != 0) posix.F_RDLCK else posix.F_WRLCK;
-        fl.l_whence = posix.SEEK_SET;
-        fl.l_start = 0;
-        fl.l_len = 0; // whole file
-        fl.l_pid = 0;
-
-        if (posix.fcntl(lfd, posix.F_SETLK, &fl) != 0) {
+    // Lock scopes (see "Concurrency: the two lock scopes on <dir>/LOCK"):
+    //  * writer: EXCLUSIVE on byte 0 for the handle's whole lifetime — a
+    //    second writer is refused HERE (DL_E_LOCKED); readers never take it;
+    //  * reader: SHARED on byte 1, held only across this open (released
+    //    before the handle is returned) so it cannot overlap a
+    //    WAL-truncating mutation.  BLOCKING, so a reader is never refused by
+    //    a live writer: it waits out at most one mutation window.
+    var reader_window: bool = false;
+    if (ro != 0) {
+        if (lockRange(lfd, posix.F_RDLCK, LOCK_WINDOW_BYTE, true) != 0) {
             _ = posix.close(lfd);
             if (err_out) |e| e.* = DL_E_LOCKED;
             return null;
         }
+        reader_window = true;
+    } else if (lockRange(lfd, posix.F_WRLCK, LOCK_EXCL_BYTE, false) != 0) {
+        _ = posix.close(lfd);
+        if (err_out) |e| e.* = DL_E_LOCKED;
+        return null;
     }
+    // Every early return below must drop the reader's shared window; the
+    // lock fd itself stays open for the handle's lifetime (dl_close closes
+    // it) — closing it is NOT what releases this lock on the success path.
+    // On a FAILURE path the body closes lfd first, which drops the process's
+    // locks on the file anyway; the deferred unlock then returns EBADF, which
+    // is ignored (no fd is allocated between that close and the return).
+    defer if (reader_window) {
+        _ = lockRange(lfd, posix.F_UNLCK, LOCK_WINDOW_BYTE, false);
+    };
 
     const mem = c.calloc(1, @sizeOf(DlDb)) orelse {
         _ = posix.close(lfd);
@@ -1014,6 +1128,13 @@ pub export fn dl_close(db: ?*DlDb) void {
     vm_clear_deletes(d);
 
     // Save interner (skipped entirely on read-only handles).
+    //
+    // Clean shutdown IS a cycle boundary and the whole save sweep below
+    // (interner, term store, WAL fsync, per-relation compaction with its WAL
+    // truncation, rels.txt) replaces on-disk state, so it runs inside ONE
+    // mutation window: a reader that opens while this process is closing
+    // waits for the sweep instead of replaying a half-truncated WAL set.
+    mutWindowBegin(d);
     {
         const fwd_path = makePath(d, "symbols", ".dafsa");
         const rev_path = makePath(d, "symbols", ".array");
@@ -1097,6 +1218,10 @@ pub export fn dl_close(db: ?*DlDb) void {
     if (d.read_only == 0 and d.meta_dirty != 0)
         writeRelsTxt(d);
 
+    // End of the save sweep: the mutation window is released HERE, not by a
+    // defer — everything below frees `d` and closes its lock fd.
+    mutWindowEnd(d);
+
     // Free relations and their names
     i = 0;
     while (i < d.nrels) : (i += 1) {
@@ -1160,6 +1285,8 @@ fn isReservedPiName(name: [*c]const u8) bool {
 /// keep their exact bytes (and old engines keep reading new ones: their
 /// parser stops at the 2nd ':').
 fn writeRelsTxt(db: *DlDb) void {
+    mutWindowBegin(db);
+    defer mutWindowEnd(db);
     const rels_path = makePath(db, "rels", ".txt") orelse return;
 
     var total: usize = 1; // trailing NUL
@@ -2129,6 +2256,11 @@ fn maybeCompact(db: *DlDb, idx: c_int) void {
         // Overlay facts must be IN the DAFSA before the WAL is truncated,
         // or a crash between truncate and re-open loses them.
         if (relation.rel_overlay_flush(rel) != 0) return;
+        // rel_compact ftruncates the WAL: a state replacement, so it runs
+        // inside the mutation window (a reader's open-time replay must not
+        // see the truncation).
+        mutWindowBegin(db);
+        defer mutWindowEnd(db);
         const path = if (relation.rel_is_idb(rel) != 0)
             makePath(db, db.rels[@intCast(idx)].name, ".base.dafsa")
         else
@@ -2914,6 +3046,9 @@ fn replayTxnWal(db: *DlDb) void {
     }
 
     // Compact each touched relation so the facts are durable in the base DAFSA.
+    // WAL truncation is a state replacement: mutation window.
+    mutWindowBegin(db);
+    defer mutWindowEnd(db);
     var compact_failed: c_int = 0;
     var i: usize = 0;
     while (i < db.nrels) : (i += 1) {
@@ -4416,8 +4551,9 @@ fn pruneSnapshots(db: *DlDb) void {
 // ─── Access-epoch decay (selfreg-dl-storage, design decision C20) ─────────
 //
 // WHY EPOCHS, NOT PER-ACCESS WRITES: tracking last-access per fact would
-// make every read a write — fatal under the exclusive reader/writer lock
-// (C13: readers and the writer cannot coexist) and outside the ~10us
+// make every read a write — impossible on a read-only handle (dl_open_ro
+// rejects every write API; the reader coexists with the writer and holds no
+// lock after its open) and outside the ~10us
 // per-step budget (point reads measure 1.5-8.5us; a per-read WAL append +
 // fsync measures 0.7us BEST-case on tmpfs and forces reader/writer
 // alternation per read).  So "last access" is approximated at CYCLE
@@ -4588,9 +4724,11 @@ fn sumRelWalAppended(d: *DlDb) u64 {
 }
 
 /// Consolidation (selfreg-dl-storage): the single maintenance point shared by
-/// dl_publish_snapshot and dl_consolidate.  Because readers and the writer
-/// cannot coexist (C13), this is the quiescent boundary — the natural
-/// "stop the world".  ALL non-materializing store maintenance happens here:
+/// dl_publish_snapshot and dl_consolidate.  Readers DO coexist with the
+/// writer (dl.h CONCURRENCY MODEL), so this is not a stop-the-world point for
+/// them: a reader's visibility boundary is its own open.  What it IS: the
+/// writer's quiescent point, where all non-materializing store maintenance
+/// happens:
 ///   0. fsync every per-relation WAL (the cycle-boundary durability
 ///      barrier — selfreg-batched-fsync);
 ///   1. fold every relation's hot-write overlay into its DAFSA (C19);
@@ -4796,6 +4934,12 @@ fn publishDerivedDafsa(d: *DlDb, rev: *[4096:0]u8, fwd: *[4096:0]u8, prev_snap_d
 /// Also resets the WAL-append watermark so the next budget window counts
 /// only traffic since THIS materialization.
 fn materializeSnapshot(d: *DlDb) c_int {
+    // The whole materialization is a state replacement (new versioned dir,
+    // CURRENT flip, prune) — one mutation window for all of it, including
+    // the dlPublishFail cleanup on the error paths (defers run after the
+    // cleanup call returns).
+    mutWindowBegin(d);
+    defer mutWindowEnd(d);
     var snapshots_dir: [4096:0]u8 = undefined;
     var tmp_dir: [4096:0]u8 = undefined;
     var new_dir: [4096:0]u8 = undefined;

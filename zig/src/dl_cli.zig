@@ -64,6 +64,21 @@ fn eq(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
 
+/// CLI commands that only READ the store (opened with dl_open_ro, so they
+/// work while another process holds the writer handle).  Deliberately
+/// excluded, because they WRITE: load, publish, cas, txn, index, and search
+/// (it interns the query terms into the live interner and ensures the
+/// __postings__ relation exists).
+fn commandReadsOnly(cmd: []const u8) bool {
+    const ro_cmds = [_][]const u8{
+        "lookup", "prefix", "bound", "pattern", "rev", "traverse", "obs", "similar", "versions",
+    };
+    for (ro_cmds) |n| {
+        if (eq(cmd, n)) return true;
+    }
+    return false;
+}
+
 /// strncmp(argv[i], "--max-nodes", 11) == 0 — equal iff the first 11 bytes
 /// match (a shorter arg fails at its NUL, exactly like strncmp).
 fn eqFirst11(a: [:0]const u8, b: *const [11:0]u8) bool {
@@ -536,7 +551,22 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
 
     const cmd = requirePositional(argv, &argp);
 
-    const db = c.dl_open(db_dir);
+    // Open mode.  The CLI's read paths mint symbol ids for their string
+    // arguments (cliParseValue -> intern_str), so a read command normally
+    // takes the read-write handle and behaves exactly as it always has.  When
+    // a WRITER IN ANOTHER PROCESS holds the db, the read-write open is
+    // refused (DL_E_LOCKED); a READ-ONLY command then falls back to the
+    // shared read-only open, which coexists with that writer (dl.h
+    // CONCURRENCY MODEL) — the arguments still resolve, in that handle's
+    // replayed vocabulary, and nothing is persisted.  Commands that WRITE
+    // (load/publish/cas/txn/index, and `search`, which interns its terms and
+    // may declare __postings__) have no read-only fallback: they need the
+    // writer handle.
+    var db: [*c]c.dl_db = c.dl_open(db_dir);
+    if (db == null and commandReadsOnly(cmd)) {
+        var oerr: c_int = 0;
+        db = c.dl_open_ro(db_dir, &oerr);
+    }
     if (db == null) {
         _ = fprintf(stderr, "dl: cannot open database at %s\n", db_dir);
         return 1;

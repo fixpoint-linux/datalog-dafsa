@@ -48,7 +48,7 @@ relation *rel_open_writable(const char *dafsa_path, const char *wal_path,
 relation *rel_open_writable_idb(const char *base_path, const char *dafsa_path,
                                 const char *wal_path, uint8_t arity);
 
-/* READ-ONLY open under a shared lock (concurrency-ro-open): loads the base
+/* READ-ONLY open (coexists with a live writer): loads the base
  * DAFSA, opens the WAL with dafsa_wal_open_ro (O_RDONLY, never mutates) and
  * replays it IN MEMORY only — no compaction, no file is created or written.
  * A missing (or header-only/corrupt) WAL is tolerated (wal handle stays

@@ -91,8 +91,11 @@ read-only views instead of running the VM. Single writer, multiple readers (mmap
 **Durability.** `dl_add_fact`/`dl_delete_fact` append to a per-relation WAL; the WAL is fsync'd at
 cycle boundaries (`dl_publish_snapshot` / `dl_close` / WAL compaction), not per fact — an unclean
 stop loses the current cycle's appends, everything before the last boundary replays at open. A
-`fcntl` single-writer lock guards the database; the interner is
-saved durably (and ordered *before* WAL records so crash recovery can decode symbol ids).
+`fcntl` single-writer lock guards the database (a second *writer* is refused with
+`DL_E_LOCKED`); a read-only handle (`dl_open_ro`) coexists with a live writer and sees its
+committed state as of the reader's own open — the lock is split into two byte-range scopes,
+writer exclusivity and a short mutation window (see `src/dl.h`, CONCURRENCY MODEL). The interner
+is saved durably (and ordered *before* WAL records so crash recovery can decode symbol ids).
 WAL compaction triggers at 25% of the relation size.
 
 ## Python bindings — `python/`

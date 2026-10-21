@@ -59,25 +59,13 @@ void    dl_close(dl_db *db);
  * err_out may be NULL (behaviour identical to dl_open). */
 dl_db  *dl_open2(const char *dir, int *err_out);
 
-/* Open an EXISTING database READ-ONLY under a SHARED fcntl lock (F_RDLCK on
- * <dir>/LOCK): multiple read-only handles coexist; a handle fails with
- * DL_E_LOCKED while a writer (dl_open/dl_open2) holds the lock, and a
- * writer fails while any read-only handle is open — the single-writer
- * invariant is unchanged.
+/* Open an EXISTING database READ-ONLY.  A read-only handle COEXISTS with a
+ * live writer in another process (see "CONCURRENCY MODEL" below).
  *
  * The directory must already be a database (it is NEVER created): *err_out
  * is -1 unless <dir> exists and contains rels.txt or symbols.dafsa AND the
  * <dir>/LOCK file exists (dl_open_ro never creates files, LOCK included;
  * every database directory created by dl_open/dl_open2 has one).
- *
- * SAME-PROCESS LOCKING CAVEAT: fcntl locks are per (process, file), so
- * never hold a read-write handle (dl_open/dl_open2) and a read-only handle
- * (dl_open_ro) of the SAME database directory in one process at the same
- * time — the RO open's F_RDLCK silently replaces that process's own F_WRLCK
- * (the F_SETLK succeeds against the process's own lock), admitting a second
- * writer in another process while the RW handle is live.  One handle per
- * directory per process; use dl_open_ro from other PROCESSES alongside an
- * active writer.
  *
  * A read-only handle never writes: no mkdir, no LOCK creation, per-relation
  * and txn WALs are replayed IN MEMORY only (no compaction, no truncation,
@@ -93,6 +81,46 @@ dl_db  *dl_open2(const char *dir, int *err_out);
  * dl_prefix reads the live WAL-replayed state.
  */
 dl_db  *dl_open_ro(const char *dir, int *err_out);
+
+/* ─── CONCURRENCY MODEL (MEASURED) ─────────────────────────────────────── */
+/*
+ * MANY READERS AND ONE WRITER, LIVE AT THE SAME TIME.  <dir>/LOCK carries
+ * two independent fcntl BYTE-RANGE locks, because the two roles are
+ * different and one whole-file lock cannot express both:
+ *
+ *   byte 0 — WRITER EXCLUSIVITY.  A read-write handle (dl_open/dl_open2)
+ *       holds F_WRLCK here for its whole lifetime.  Read-only handles never
+ *       touch this byte, so a live writer does NOT exclude readers.  A
+ *       second writer in another process is still refused at open with
+ *       DL_E_LOCKED: exactly one writer per database directory.
+ *
+ *   byte 1 — MUTATION WINDOW.  The writer holds F_WRLCK here around every
+ *       on-disk state REPLACEMENT (WAL truncation during compaction, the
+ *       snapshot materialization/publish sweep, rels.txt, the dl_close save
+ *       sweep).  A reader holds F_RDLCK here for the whole of its open — the
+ *       metadata read plus the eager per-relation WAL replay — and RELEASES
+ *       it before the handle is returned.  A reader that arrives mid-window
+ *       BLOCKS for it (it is never refused because a writer is alive).
+ *
+ * What a reader sees: the writer's committed state as of the reader's own
+ * OPEN — the durability contract's cycle boundary (below), not a live view.
+ * Cross-process read-your-own-writes therefore needs a re-open.  A reader
+ * never observes a torn record: WAL appends are self-framing
+ * (op | key_len | key | CRC32), a torn tail fails its CRC and replay stops
+ * there, and every file that is REPLACED (DAFSA, rels.txt, symbols, terms)
+ * commits as write-tmp + fsync + rename, so a lazy loader sees a complete
+ * old or a complete new inode.  That is why the writer does not hold the
+ * window per fact-add: appends and atomic renames are already safe against
+ * a concurrent reader; only the WAL truncation is not.
+ *
+ * One handle per directory per PROCESS remains the supported rule: the
+ * engine has no internal mutex, and two handles hold independent in-memory
+ * views.  (The byte-range split did remove the old hazard in which a
+ * same-process dl_open_ro's F_RDLCK silently REPLACED that process's own
+ * F_WRLCK — fcntl locks are per process — and so admitted a second writer in
+ * another process while the RW handle was live; a same-process RO open now
+ * touches byte 1 only and leaves byte 0 exclusive.)
+ */
 
 /* ─── Schema ──────────────────────────────────────────────────────────── */
 

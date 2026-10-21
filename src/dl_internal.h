@@ -92,9 +92,15 @@ struct dl_db {
     termstore *terms;      /* v2-lists: hash-consed list term store (terms.bin) */
     rel_entry  rels[MAX_RELS];
     size_t     nrels;
-    int        lock_fd;    /* M7: fcntl lock file descriptor, or -1 */
-    int        read_only;  /* 1 if opened via dl_open_ro (shared F_RDLCK):
-                              every write API rejects, close never saves */
+    int        lock_fd;    /* fcntl lock fd on <dir>/LOCK, or -1.  Two
+                              byte-range scopes: byte 0 = writer exclusivity
+                              (F_WRLCK, RW handle lifetime), byte 1 = the
+                              mutation window (F_WRLCK for a writer's
+                              state-replacing ops, F_RDLCK for a reader's
+                              open-time replay).  See dl.h CONCURRENCY MODEL */
+    int        read_only;  /* 1 if opened via dl_open_ro (coexists with a
+                              live writer): every write API rejects, close
+                              never saves */
     int        meta_dirty; /* 1 if rels.txt needs rewriting (new relation
                               declared); guards the close-time write */
     int        rev_rel_id; /* CAS: cached index of the internal "rev" relation
