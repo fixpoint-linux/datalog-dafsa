@@ -60,7 +60,8 @@ pub const Relation = struct {
     arity: u8,
     wal: [*c]dc.dafsa_wal, // per-relation WAL handle, or NULL
     wal_path: [*c]u8, // path to WAL file (owned, strdup'd)
-    dirty: c_int, // 1 if mutated since open (rel_is_dirty)
+    dirty: c_int, // 1 if base/ov changed since open — a mutation OR the
+    // open-time WAL replay (rel_is_dirty); the windowed sweeps compact it
     // ─── selfreg-dl-storage overlay (beyond C's sizeof(struct relation)) ───
     ov: ?*tupleset.tuple_set = null, // hot-write overlay (append-only union)
     ov_dirty: u64 = 0, // adds since last consolidation (decay/sizing signal)
@@ -135,8 +136,9 @@ pub const ReadState = enum(u8) {
 };
 
 /// Bump the content revision (every mutation site that sets dirty=1 calls
-/// this too; open-time WAL replay deliberately does not — a fresh process
-/// starts at rev 0 and its first publish must serialize everything).
+/// this too, with ONE exception: open-time WAL replay sets dirty WITHOUT
+/// touching rev — a fresh process starts at rev 0 and its first publish
+/// must serialize everything).
 pub export fn rel_touch(rel: ?*Relation) void {
     const r = rel orelse return;
     r.rev +%= 1;
@@ -1845,7 +1847,9 @@ pub export fn rel_dafsa_size(rel: ?*const Relation) u64 {
 ///                             uint8_t arity)
 /// WAL opens EAGERLY (its tail repair is part of open), but the DAFSA read
 /// is deferred unless the WAL holds committed records — recovery must
-/// replay into the in-memory DAFSA and compact, which needs it loaded.
+/// replay into the in-memory DAFSA, which needs it loaded.  The replay does
+/// NOT compact (no WAL truncate): compaction belongs to the windowed sweeps
+/// (see the dirty=1 note in the body).
 pub export fn rel_open_writable(dafsa_path: [*c]const u8, wal_path: [*c]const u8, arity: u8) ?*Relation {
     if (arity == 0 or arity > MAX_ARITY) return null;
 
@@ -1869,8 +1873,8 @@ pub export fn rel_open_writable(dafsa_path: [*c]const u8, wal_path: [*c]const u8
     }
 
     if (rel.wal.*.size > 16) {
-        // Committed records: recover NOW (replay + compact), loading the
-        // DAFSA eagerly — the lazyrel deferral never delays recovery.
+        // Committed records: recover NOW (replay), loading the DAFSA
+        // eagerly — the lazyrel deferral never delays recovery.
         rel.d = dc.dafsa_load(dafsa_path);
         if (rel.d == null) rel.d = dc.dafsa_create();
         if (rel.d == null) {
@@ -1883,11 +1887,20 @@ pub export fn rel_open_writable(dafsa_path: [*c]const u8, wal_path: [*c]const u8
             rel_free(rel);
             return null;
         }
-        // Compact immediately: save DAFSA + truncate WAL
-        if (rel_compact(rel, dafsa_path) != 0) {
-            rel_free(rel);
-            return null;
-        }
+        // NO compaction here: rel_compact FTRUNCATES the WAL, and this site is
+        // NOT inside the mutation window (dlOpenCommon's rels.txt loop, not
+        // mutWindowBegin).  A READER opened concurrently holds byte-1 SHARED
+        // only across its own open, and this truncation ignores it: the
+        // reader captures the pre-truncate WAL size at dafsa_wal_open_ro,
+        // spends dafsa_load on the (pre-WAL-record) DAFSA, then replays a
+        // VALID EMPTY 16-byte WAL — dl_open_ro returns success and committed
+        // facts are silently gone for that handle (measured, /tmp/mw/m4.py:
+        // 5/5 loss at reader-release deltas >= 30ms with 500 WAL records).
+        // Leave the records in the WAL and mark the relation dirty instead:
+        // the replay above already folded them into BASE, so the WINDOWED
+        // sweeps that own compaction (dl_close, maybeCompact, the snapshot
+        // sweep) persist exactly these records and then truncate safely.
+        rel.dirty = 1;
         return rel;
     }
 
@@ -1928,9 +1941,8 @@ pub export fn rel_open_writable_idb(base_path: [*c]const u8, dafsa_path: [*c]con
     }
 
     if (rel.wal.*.size > 16) {
-        // Committed records: recover NOW (replay + compact), loading base
-        // and view DAFSAs eagerly — the lazyrel deferral never delays
-        // recovery.
+        // Committed records: recover NOW (replay), loading base and view
+        // DAFSAs eagerly — the lazyrel deferral never delays recovery.
         rel.base = dc.dafsa_load(base_path);
         if (rel.base == null) rel.base = dc.dafsa_create();
         if (rel.base == null) {
@@ -1946,15 +1958,15 @@ pub export fn rel_open_writable_idb(base_path: [*c]const u8, dafsa_path: [*c]con
             return null;
         }
 
-        // Replay WAL into BASE and compact immediately.
+        // Replay WAL into BASE.  NO compaction here — same reader-loss
+        // hazard as rel_open_writable (see the comment there): the truncate
+        // would be outside the mutation window.  dirty=1 hands the
+        // compaction (base save + WAL truncate) to the windowed sweeps.
         if (rel_wal_replay_into(rel) != 0) {
             rel_free(rel);
             return null;
         }
-        if (rel_compact(rel, base_path) != 0) {
-            rel_free(rel);
-            return null;
-        }
+        rel.dirty = 1;
         return rel;
     }
 

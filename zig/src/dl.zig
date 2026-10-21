@@ -6461,16 +6461,34 @@ test "lazyrel: WAL records at open are recovered EAGERLY (never deferred)" {
         // NO dl_close: the WAL record stays unconsolidated.
     }
 
-    // Session 2: the reopen must see the committed WAL records, load the
-    // DAFSA EAGERLY (not lazily), replay, and compact.
-    const db = dl_open(dir) orelse return error.TestUnexpectedResult;
-    defer dl_close(db);
-    const ia = findRel(db, "alpha");
-    try testing.expect(ia >= 0);
-    try testing.expectEqual(@as(c_int, 1), relation.rel_is_loaded(db.rels[@intCast(ia)].rel));
-    try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "alpha", &[2]u32{ 7, 8 }, 2));
-    // The WAL was compacted back to the 16-byte header at open.
-    try testing.expectEqual(@as(u64, 16), relation.rel_wal_size(db.rels[@intCast(ia)].rel));
+    // Session 2: the reopen must see the committed WAL records and load the
+    // DAFSA EAGERLY (not lazily), replaying them — but it must NOT truncate
+    // the WAL.  Truncating at open was the reader-loss defect: the open-time
+    // replay+compact runs OUTSIDE the mutation window, so a reader that was
+    // mid-open (in dafsa_load) captured the pre-truncate WAL size and then
+    // replayed a valid EMPTY WAL into a DAFSA that predates the records —
+    // success, no error, committed facts silently gone (/tmp/mw/m4.py).
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        const ia = findRel(db, "alpha");
+        try testing.expect(ia >= 0);
+        try testing.expectEqual(@as(c_int, 1), relation.rel_is_loaded(db.rels[@intCast(ia)].rel));
+        try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "alpha", &[2]u32{ 7, 8 }, 2));
+        // Still in the WAL: a concurrent opener's replay must find it.
+        try testing.expect(relation.rel_wal_size(db.rels[@intCast(ia)].rel) > 16);
+        dl_close(db); // windowed close sweep owns the compaction
+    }
+
+    // The WINDOWED close sweep compacted it: the WAL is back to its 16-byte
+    // header and the fact lives in the base DAFSA.
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        const ia = findRel(db, "alpha");
+        try testing.expect(ia >= 0);
+        try testing.expectEqual(@as(u64, 16), relation.rel_wal_size(db.rels[@intCast(ia)].rel));
+        try testing.expectEqual(@as(c_int, 1), dl_lookup(db, "alpha", &[2]u32{ 7, 8 }, 2));
+    }
 }
 
 test "zerocopy: a READ-ONLY opener parses no relation (reads go through views)" {

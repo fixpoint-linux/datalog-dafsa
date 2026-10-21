@@ -628,8 +628,10 @@ static void test_t6_crash_then_ro_replay(void)
         goto out;
     }
 
-    /* RW open replays + compacts at open; the close is clean (relation not
-     * dirty).  The fact must now live in the base DAFSA. */
+    /* RW open replays the WAL (in memory only — the truncate must happen in
+     * a WINDOWED sweep, never at open: an open-time truncate silently eats a
+     * concurrently-opening reader's records).  The windowed close sweep then
+     * compacts.  The fact must now live in the base DAFSA. */
     {
         dl_db *w = dl_open(dir);
         dl_db *ro;
