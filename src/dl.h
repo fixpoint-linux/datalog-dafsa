@@ -649,22 +649,34 @@ int dl_publish_snapshot(dl_db *db);
  * read-only handle, open txn, or a consolidation/materialization failure;
  * DL_E_FRAMES propagates as it does from dl_publish_snapshot).
  *
- * The skip is a CONSERVATIVE conjunction of cheap proofs that no work is
- * pending — no un-materialized fixpoint (fixpoint_dirty with a compiled
- * programme), no rels.txt change (meta_dirty), no list node created
- * (term_is_dirty), no symbol interned since the snapshot (append-only interner:
- * live count == the count the CURRENT manifest records), no open txn, no
- * variadic relation and no permutation index, CURRENT still naming the version
- * THIS process published, every relation's content already in that snapshot
- * (.deferred/.view ⇒ its live file is the SAME INODE as the snapshot's copy;
- * .owned ⇒ its revision equals the saved_rev watermark the last publish
- * committed), and the snapshot dir carrying its symbols.array, terms.bin and
- * every relation file.  Any doubt publishes.
+ * It CONSOLIDATES FIRST — the same maintenance point dl_publish_snapshot runs
+ * before materializing — and judges the store only afterwards.  That order is
+ * what makes the early-out reachable on a read path: a process that loaded
+ * rules (which sets fixpoint_dirty) has a VM run owed, and only after that run
+ * can "nothing new was derived" be answered.  The run itself is not evidence —
+ * a full re-evaluation resets each rule head's view (bumping its revision) and
+ * re-adds the same tuples — so the gate asks whether every relation's CONTENT
+ * is already the bytes the CURRENT snapshot holds.
  *
- * NOTHING is written on the skip path, so there is no durability work to
- * defer: the WAL, the root arrays and the snapshot already describe exactly
- * that state.  A requested retention prune (dl_set_snapshot_retain) still runs
- * — pruning is not a publish. */
+ * The skip is a CONSERVATIVE conjunction of cheap proofs that no work is
+ * pending — the VM owing no run (fixpoint_dirty with a compiled programme), no
+ * rels.txt change (meta_dirty), no list node created (term_is_dirty), no
+ * symbol interned since the snapshot (append-only interner: live count == the
+ * count the CURRENT manifest records), no open txn, no variadic relation and no
+ * permutation index, CURRENT still naming this process's version, every
+ * relation's content already in that snapshot (.deferred/.view ⇒ its live file
+ * has the same size and the same v4 trailing CRC32 as the snapshot's copy, or
+ * it has no live file at all and its empty content does; .owned ⇒ its
+ * revision equals the saved_rev watermark the last publish committed, or the
+ * serialization of its in-memory content matches the snapshot's copy byte for
+ * byte), and the snapshot dir carrying its symbols.array, terms.bin and every
+ * relation file.  Any doubt publishes.
+ *
+ * No SNAPSHOT FILE is written on the skip path: the store is provably the state
+ * CURRENT already describes, so no version is created and no durability work is
+ * deferred.  Consolidation still ran and keeps its own writes (WAL fsync,
+ * overlay folds, decay).  A requested retention prune (dl_set_snapshot_retain)
+ * still runs — pruning is not a publish. */
 int dl_publish_if_needed(dl_db *db);
 
 /* ─── Periodic consolidation (selfreg periodic snapshot) ───────────────── */

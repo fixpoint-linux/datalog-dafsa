@@ -5414,6 +5414,12 @@ fn publishFull(d: *DlDb) c_int {
         const m = consolidate(d);
         if (m != 0) return m; // DL_E_FRAMES (-2) propagates (dl.h)
     }
+    return finishPublish(d, t_start, t_cons);
+}
+
+/// The half of a publish that follows consolidation: materialize the new
+/// version (and report the split when DL_PUB_TIMING asked for it).
+fn finishPublish(d: *DlDb, t_start: u64, t_cons: u64) c_int {
     const t_mat = nowNs();
     if (materializeSnapshot(d) != 0) return -1;
     if (pub_timers_on) {
@@ -5483,6 +5489,40 @@ fn relFileCrc(path: [*c]const u8, size: i64, crc_out: *[4]u8) bool {
     return true;
 }
 
+/// Is this relation's content the same BYTES the snapshot holds for it?
+/// Serializes it to a scratch path in the db dir and compares size + the
+/// format's own trailing CRC32 (relFilesSameContent) — the same comparison
+/// relSaveGated makes when a relation's live file and the snapshot's copy are
+/// separate inodes.  Costs one dafsa_save of THAT relation and nothing else (no
+/// fsync, no rename into a version dir, no interner work), and the gate pays it
+/// only for a relation whose content memory holds rather than disk: an .owned
+/// one (the VM rewrote it) or one whose live file was never written.
+///
+/// The scratch file is unlinked on every path.  Its name is derived from the
+/// relation, which is unique inside the writer lock dl_open holds for a
+/// read-write handle, so two processes cannot collide on it.
+///
+/// Conservative on every doubt — serialize failure, size mismatch, a pre-v4 or
+/// unreadable file — the caller publishes.
+fn relContentIsInSnapshot(
+    d: *DlDb,
+    r: *relation.Relation,
+    name: [*c]const u8,
+    spath: [*c]const u8,
+    ssize: i64,
+) bool {
+    var scratch: [4096:0]u8 = undefined;
+    const n = snprintf(&scratch, 4096, "%s/.pubgate-%s.tmp", d.dir.?, name);
+    if (n < 0 or @as(usize, @intCast(n)) >= 4096) return false;
+    const rc = relation.rel_save(r, &scratch);
+    defer _ = posix.unlink(&scratch);
+    if (rc != 0) return false;
+    var st: Stat = undefined;
+    if (stat(&scratch, &st) != 0) return false;
+    if (st.st_size != ssize) return false;
+    return relFilesSameContent(&scratch, spath, ssize);
+}
+
 /// Is the store already represented by the CURRENT snapshot — i.e. would a
 /// publish right now create a version whose every file is a hardlink (or an
 /// identical re-serialization) of what CURRENT already holds?
@@ -5492,10 +5532,13 @@ fn relFileCrc(path: [*c]const u8, size: i64, crc_out: *[4]u8) bool {
 /// publish costs correctness — so each check asks "can I PROVE nothing is
 /// pending", never "does it look unchanged":
 ///
-///   1. fixpoint_dirty — the VM owes a materialization.  Only meaningful with a
-///      compiled programme: dl_add_fact sets the flag unconditionally, but
-///      consolidate clears it only inside its own `n_crules > 0` guard, so a
-///      rule-free store keeps it set forever and has nothing to derive.
+///   1. fixpoint_dirty — the VM still owes a materialization.  This gate is
+///      only consulted AFTER consolidation (dl_publish_if_needed runs it
+///      first), so the flag is 0 once the run happened and the check only
+///      catches a run that was skipped.  Only meaningful with a compiled
+///      programme: dl_add_fact sets the flag unconditionally, but consolidate
+///      clears it only inside its own `n_crules > 0` guard, so a rule-free
+///      store keeps it set forever and has nothing to derive.
 ///   2. meta_dirty — rels.txt (declarations + recorded column kinds) changed.
 ///      A publish is what writes the snapshot's manifest, so the snapshot would
 ///      describe a schema the store no longer has.
@@ -5528,14 +5571,24 @@ fn relFileCrc(path: [*c]const u8, size: i64, crc_out: *[4]u8) bool {
 ///          commits by tmp+rename, so the live PATH gets a new inode and the
 ///          snapshot keeps the old bytes.  Unequal content means a writer that
 ///          never published — publish.
-///        * .owned — content exists only in memory; accepted only when its
-///          revision is the one the last publish in this process serialized
-///          (saved_rev, the watermark relSaveGated commits at publish step 7b,
-///          i.e. only after the rename AND the CURRENT flip succeeded, so it
-///          never claims content that is not durable in a snapshot).  Any
-///          mutation or VM reset bumps rev and disqualifies.
-///        * anything else (a .deferred relation with no live file yet) —
-///          publish.
+///        * .owned — content exists only in memory.  The revision watermark
+///          (saved_rev, the rev relSaveGated commits at publish step 7b, i.e.
+///          only after the rename AND the CURRENT flip succeeded) proves it
+///          for free while it matches.  It no longer can on its own: a VM run
+///          resets every head's view and bumps its rev even when it re-derives
+///          the very same tuples, and a FRESH process has no watermark at all
+///          (saved_rev is per-process, re-armed to the sentinel at open) — and
+///          a fresh process is exactly what `dl query` is.  So when the rev
+///          does not match, prove the CONTENT: serialize the relation and
+///          compare bytes with the snapshot's copy (relContentIsInSnapshot).  A
+///          mutation or a real derivation moves the bytes and disqualifies;
+///          a rewrite of identical tuples does not, which is the whole point.
+///        * a .deferred/.view relation whose live file does not exist — nothing
+///          was ever written for it, so its content is EMPTY; the same content
+///          proof decides (an empty relation against the snapshot's copy, which
+///          is what a derived relation whose rows live only in snapshots looks
+///          like).  Its state is NOT required to be .owned: the empty content
+///          is the fact being compared, not where it lives.
 ///   8. no variadic relations and no permutation indices: both carry their own
 ///      watermark arrays (saved_rev_var / saved_rev_perm, plus object identity
 ///      for a rebuilt index) that this check does not re-derive.  Skip the
@@ -5549,38 +5602,78 @@ fn relFileCrc(path: [*c]const u8, size: i64, crc_out: *[4]u8) bool {
 /// snapshot files are already exactly the state being described.  Every write
 /// path that WOULD need a fsync (a fact, a symbol, a list node, a declaration)
 /// trips one of the checks above first.
+
+/// Optional diagnostic (DL_PUB_GATE=1): name the check that declined the
+/// early-out, so "why did this publish" is answerable without a rebuild.
+/// One getenv per process; the reason strings are compile-time constants.
+var pub_gate_debug_on: bool = false;
+var pub_gate_env_checked: bool = false;
+
+fn gateDecline(comptime why: []const u8) bool {
+    return gateDeclineRel(why, null);
+}
+
+fn gateDeclineRel(comptime why: []const u8, rel_name: [*c]const u8) bool {
+    if (!pub_gate_env_checked) {
+        pub_gate_env_checked = true;
+        const v = getenv("DL_PUB_GATE");
+        pub_gate_debug_on = (v != null and v.?[0] != 0 and !strEq(v.?, "0"));
+    }
+    if (pub_gate_debug_on) {
+        if (rel_name == null) dlErr("pubgate: publish ({s})\n", .{why}) else dlErr("pubgate: publish ({s}: {s})\n", .{ why, rel_name });
+    }
+    return false;
+}
+
 fn storeIsCurrent(d: *DlDb) bool {
-    if (d.n_crules > 0 and d.fixpoint_dirty != 0) return false; // 1
-    if (d.meta_dirty != 0) return false; // 2
-    if (d.txn != null) return false; // 3
-    if (d.snap_version == 0 or d.dir == null) return false; // 4
-    if (snapshot_read_current(d.dir.?) != d.snap_version) return false; // 4
-    if (d.n_perms != 0) return false; // 8
+    if (d.n_crules > 0 and d.fixpoint_dirty != 0) return gateDecline("vm still owes a run"); // 1
+    if (d.meta_dirty != 0) return gateDecline("rels.txt stale"); // 2
+    if (d.txn != null) return gateDecline("open txn"); // 3
+    if (d.snap_version == 0 or d.dir == null) return gateDecline("no snapshot"); // 4
+    if (snapshot_read_current(d.dir.?) != d.snap_version) return gateDecline("CURRENT moved"); // 4
+    if (d.n_perms != 0) return gateDecline("permutation indices"); // 8
 
     var sdir: [4096:0]u8 = undefined;
     _ = snprintf(&sdir, 4096, "%s/snapshots/%u", d.dir.?, d.snap_version);
 
-    if (intern_is_dirty(d.ir) != 0) return false; // 5
+    if (intern_is_dirty(d.ir) != 0) return gateDecline("interner dirty"); // 5
     var stamp: SymStampOnDisk = undefined;
-    if (!readSymStamp(&sdir, &stamp)) return false; // 5: no stamp ⇒ cannot prove
-    if (intern_mod.liveSymBound(d.ir) -% 1 != stamp.count) return false; // 5
-    if (term_is_dirty(d.terms) != 0) return false; // 6
+    if (!readSymStamp(&sdir, &stamp)) return gateDecline("no symbols stamp"); // 5: cannot prove
+    if (intern_mod.liveSymBound(d.ir) -% 1 != stamp.count) return gateDecline("new symbols"); // 5
+    if (term_is_dirty(d.terms) != 0) return gateDecline("terms dirty"); // 6
 
     var i: usize = 0;
     while (i < d.nrels) : (i += 1) { // 7
-        if (d.rels[i].kind == RELK_VARIADIC) return false; // 8
-        const r = d.rels[i].rel orelse return false;
+        const name = d.rels[i].name;
+        if (d.rels[i].kind == RELK_VARIADIC) return gateDeclineRel("variadic relation", name); // 8
+        const r = d.rels[i].rel orelse return gateDeclineRel("null relation", name);
         var spath: [4096:0]u8 = undefined;
-        _ = snprintf(&spath, 4096, "%s/%s.dafsa", &sdir, d.rels[i].name);
+        _ = snprintf(&spath, 4096, "%s/%s.dafsa", &sdir, name);
         var ss: Stat = undefined;
-        if (stat(&spath, &ss) != 0) return false; // 9
+        if (stat(&spath, &ss) != 0) return gateDeclineRel("relation missing from snapshot", name); // 9
+        var require_owned = true;
         if (relation.rel_content_file(r)) |live| {
-            if (!relFilesSameContent(live, &spath, ss.st_size)) return false;
-            continue;
+            var ls: Stat = undefined;
+            if (stat(live, &ls) == 0) {
+                if (ls.st_size != ss.st_size or !relFilesSameContent(live, &spath, ss.st_size))
+                    return gateDeclineRel("live content differs", name);
+                continue;
+            }
+            // No live file at all: nothing was ever written for this relation,
+            // so its content is EMPTY and the snapshot's copy is the only
+            // candidate.  Fall through to the content proof, which serializes
+            // the (empty) relation — relEnsureOwned creates an empty DAFSA for
+            // a missing path — and compares bytes.  A derived relation whose
+            // rows live only in snapshots is the normal shape of this case, and
+            // it is why the state check below does not apply to it.
+            require_owned = false;
         }
-        if (relation.rel_read_state(r) != @intFromEnum(relation.ReadState.owned)) return false;
-        if (d.saved_rev[i] == SAVED_REV_NONE) return false;
-        if (relation.rel_rev(r) != d.saved_rev[i]) return false;
+        if (require_owned and relation.rel_read_state(r) != @intFromEnum(relation.ReadState.owned))
+            return gateDeclineRel("relation state", name);
+        // The rev watermark proves it while it matches (this process published
+        // this content); otherwise the CONTENT has to prove it.
+        if (d.saved_rev[i] != SAVED_REV_NONE and relation.rel_rev(r) == d.saved_rev[i]) continue;
+        if (!relContentIsInSnapshot(d, r, name, &spath, ss.st_size)) return gateDeclineRel("content differs", name);
     }
 
     var arr: [4096:0]u8 = undefined;
@@ -5588,8 +5681,8 @@ fn storeIsCurrent(d: *DlDb) bool {
     var terms: [4096:0]u8 = undefined;
     _ = snprintf(&terms, 4096, "%s/terms.bin", &sdir);
     var st: Stat = undefined;
-    if (stat(&arr, &st) != 0) return false; // 9
-    if (stat(&terms, &st) != 0) return false; // 9
+    if (stat(&arr, &st) != 0) return gateDecline("no symbols.array"); // 9
+    if (stat(&terms, &st) != 0) return gateDecline("no terms.bin"); // 9
     return true;
 }
 
@@ -5601,10 +5694,25 @@ fn storeIsCurrent(d: *DlDb) bool {
 ///
 /// When the early-out declines, this is byte-for-byte dl_publish_snapshot: a
 /// new version, the same durability, the same retention prune.  When it fires,
-/// NO version is created and NOTHING is written — the store is provably the
-/// state CURRENT already describes (see storeIsCurrent).  Retention is not a
-/// publish, so a requested prune (dl_set_snapshot_retain / --keep N) still
-/// happens on the skipped path.
+/// NO version is created and no snapshot file is written — the store is
+/// provably the state CURRENT already describes (see storeIsCurrent).
+/// Consolidation still ran (it is the maintenance point this gate sits behind,
+/// and the VM run it may perform is what makes the question answerable), so
+/// the skipped path keeps consolidation's own writes: WAL fsyncs, overlay
+/// folds and decay.  Retention is not a publish, so a requested prune
+/// (dl_set_snapshot_retain / --keep N) still happens on the skipped path.
+///
+/// THE QUERY PATH: `dl query` loads rules (which sets fixpoint_dirty), so the
+/// gate is only reachable when it judges the store AFTER that run — a gate on
+/// "nothing was loaded" could never fire there.  The run itself is not
+/// evidence: a full re-evaluation resets every rule head's view (bumping its
+/// revision) and re-adds the same tuples, so "the VM ran" and "a revision
+/// moved" both stay true when nothing was derived.  What the gate asks
+/// instead is the ground truth a publish would otherwise write: is every
+/// relation's CONTENT — byte for byte, the format's own CRC — already in
+/// CURRENT's snapshot?  Derived relations are monotone here (rel_reset_view
+/// splits base from the view and rel_build_from_tupleset only ever unions
+/// into it), so a run that derives nothing new leaves the bytes untouched.
 ///
 /// dl_publish_snapshot keeps its own contract: it ALWAYS creates a version
 /// (v1, v2, ...), which the C oracle and every explicit checkpoint rely on.
@@ -5613,11 +5721,24 @@ pub export fn dl_publish_if_needed(db: ?*DlDb) c_int {
     if (d.read_only != 0) return -1;
     if (d.txn != null) return -1;
 
+    pubTimersCheckEnv();
+    const t_start = nowNs();
+    const t_cons = nowNs();
+    {
+        // The VM run a dirty fixpoint owes is NOT a publish.  Consolidation is
+        // the maintenance point publishFull runs first anyway, so doing it
+        // here leaves the published path byte-for-byte what it was — and it
+        // lets the gate judge the store AFTER the derivation (which is the
+        // only point at which "nothing new was derived" is answerable).
+        const m = consolidate(d);
+        if (m != 0) return m; // DL_E_FRAMES (-2) propagates (dl.h)
+    }
+
     if (storeIsCurrent(d)) {
         if (d.snapshot_retain > 0) pruneSnapshots(d);
         return 0;
     }
-    return publishFull(d);
+    return finishPublish(d, t_start, t_cons);
 }
 
 /// Periodic consolidation (selfreg periodic snapshot): the per-turn
@@ -7044,6 +7165,73 @@ test "dl_publish_if_needed: no version when the store is already current" {
     try testing.expectEqual(@as(u32, 5), db.snap_version); // published for the symbol
     try testing.expectEqual(@as(c_int, 0), dl_publish_if_needed(db));
     try testing.expectEqual(@as(u32, 5), db.snap_version);
+}
+
+test "dl_publish_if_needed: the query path's own VM run creates no version" {
+    // THE QUERY PATH, which the gate above cannot reach: `dl query` loads
+    // rules first and dl_load_rules sets fixpoint_dirty unconditionally, so a
+    // gate on "nothing was loaded" never fires there.  The gate has to judge
+    // the store AFTER the run, on CONTENT — the run itself is not evidence,
+    // because a full re-evaluation resets every head's view (bumping its rev)
+    // and re-adds the very same tuples: "the VM ran" and "a revision moved"
+    // are both true when nothing was derived.
+    //
+    // PRE-FIX BEHAVIOUR: the query arm called dl_publish_snapshot, which always
+    // creates a version — so every read persisted one (that is where the
+    // 172k-symbol store's ~390 historical versions came from).
+    const dir = "/tmp/datalog_zig_publish_if_needed_rules";
+    rmrfTestDir(dir);
+    defer rmrfTestDir(dir);
+
+    // A publishing process: an EDB relation, a rule deriving an IDB head, v1.
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "edge", 2));
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "edge", &[2]u32{ 1, 2 }, 2));
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "edge", &[2]u32{ 2, 3 }, 2));
+        try testing.expectEqual(@as(c_int, 0), dl_load_rules(db, "path(X,Y) :- edge(X,Y)."));
+        try testing.expectEqual(@as(c_int, 0), dl_compile(db));
+        try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db));
+        try testing.expectEqual(@as(u32, 1), db.snap_version);
+    }
+
+    // A LATER process, shaped exactly like `dl query`: the same rules loaded
+    // (so fixpoint_dirty is set), nothing written.
+    const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+    defer dl_close(db);
+    try testing.expectEqual(@as(c_int, 0), dl_load_rules(db, "path(X,Y) :- edge(X,Y)."));
+    try testing.expectEqual(@as(c_int, 1), db.fixpoint_dirty); // the run is owed
+
+    // The run happens inside dl_publish_if_needed and derives nothing new, so
+    // the gate fires on the content: no version — and it stays that way.
+    try testing.expectEqual(@as(c_int, 0), dl_publish_if_needed(db));
+    try testing.expectEqual(@as(c_int, 0), db.fixpoint_dirty); // it ran
+    try testing.expectEqual(@as(u32, 1), db.snap_version); // and created nothing
+    try testing.expectEqual(@as(c_int, 0), dl_publish_if_needed(db));
+    try testing.expectEqual(@as(u32, 1), db.snap_version);
+
+    // A fact added in this process changes what the run derives: publish (v2),
+    // and the derived head must be in the new snapshot for a fresh reader.
+    try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "edge", &[2]u32{ 3, 4 }, 2));
+    try testing.expectEqual(@as(c_int, 0), dl_publish_if_needed(db));
+    try testing.expectEqual(@as(u32, 2), db.snap_version); // it DID publish
+    var got = CollectCbCtx{};
+    try testing.expectEqual(@as(c_long, 3), snapshot_query_scan(dir, db.snap_version, &db.vcache, "path", null, 0, collectCb, &got));
+    try testing.expectEqualSlices(u32, &[2]u32{ 3, 4 }, got.rows[2][0..2]);
+    try testing.expectEqual(@as(c_int, 0), dl_publish_if_needed(db)); // then quiet again
+    try testing.expectEqual(@as(u32, 2), db.snap_version);
+
+    // A rule set that derives NEW tuples must publish as well.  The closure
+    // adds (1,3) and (2,4), which v2 does not hold — content differs, so the
+    // gate declines and a version is created.
+    try testing.expectEqual(@as(c_int, 0), dl_load_rules(db, "path(X,Y) :- edge(X,Y). path(X,Y) :- edge(X,Z), path(Z,Y)."));
+    try testing.expectEqual(@as(c_int, 0), dl_publish_if_needed(db));
+    try testing.expectEqual(@as(u32, 3), db.snap_version); // it DID publish
+    var got2 = CollectCbCtx{};
+    try testing.expectEqual(@as(c_long, 6), snapshot_query_scan(dir, db.snap_version, &db.vcache, "path", null, 0, collectCb, &got2));
+    try testing.expectEqual(@as(c_int, 0), dl_publish_if_needed(db)); // the closure is stable
+    try testing.expectEqual(@as(u32, 3), db.snap_version);
 }
 
 test "zerocopy: a write after a view read promotes and works end to end" {

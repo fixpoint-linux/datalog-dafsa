@@ -752,10 +752,12 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
         }
         free(source_buf);
 
-        // Publish (runs VM automatically if fixpoint_dirty), then query.  The
-        // publish is SKIPPED when the store is provably already what CURRENT
-        // describes (dl_publish_if_needed — no version, nothing written); on an
-        // unchanged store that is the whole cost of a read-only query, since
+        // Publish (runs the VM automatically if fixpoint_dirty), then query.
+        // The publish is SKIPPED when the store is provably already what
+        // CURRENT describes (dl_publish_if_needed — no version, no snapshot
+        // file written).  That gate consolidates FIRST, so the VM run this
+        // process owes happens before the decision: on an unchanged store the
+        // run derives nothing, the gate proves the content is CURRENT's, and
         // the snapshot the query reads is already the answer.
         if (c.dl_publish_if_needed(db) != 0) {
             _ = fprintf(stderr, "dl: publish failed\n");

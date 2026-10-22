@@ -1,0 +1,16 @@
+--raw --raw
+--raw doc1
+--raw red fox jumps over the lazy dog
+--raw doc2
+doc1 --raw
+doc1 doc1
+doc1 red fox jumps over the lazy dog
+doc1 doc2
+red fox jumps over the lazy dog --raw
+red fox jumps over the lazy dog doc1
+red fox jumps over the lazy dog red fox jumps over the lazy dog
+red fox jumps over the lazy dog doc2
+doc2 --raw
+doc2 doc1
+doc2 red fox jumps over the lazy dog
+doc2 doc2

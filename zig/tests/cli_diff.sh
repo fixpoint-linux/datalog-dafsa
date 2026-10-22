@@ -198,6 +198,12 @@ build_corpus() {
     # --with-derived is the CLI binding of DL_PUB_DERIVED=1: the snapshot gets
     # its own symbols.dafsa, so the tree manifest below proves it was written.
     run_cmd "$out" c97 "$db" publish --with-derived
+    # c98 re-runs c41's query on the now-current store: the CLI's query arm
+    # publishes through dl_publish_if_needed, and a run that derives nothing new
+    # must NOT create a version.  The stdout is c41's exactly; what this command
+    # is here for is the TREE manifest — a version created here would add
+    # snapshots/<N>/ files that the golden does not have.
+    run_cmd "$out" c98 "$db" query "$DATA/tc.dl" tc
 }
 
 # read_corpus <dbdir> <outdir> — the read-only persistence corpus (queries
