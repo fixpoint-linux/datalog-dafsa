@@ -636,8 +636,36 @@ long dl_fuzzy_lookup(dl_db *db, const char *needle, uint32_t k,
  * directory, flips the CURRENT pointer.  Returns 0 on success, -1 on error
  * (or DL_E_FRAMES when the fixpoint hits the frame limit — see the block
  * above; the incremental ladder may mask it as -1, see there).
- * After publish, dl_query reads from mmap instead of the VM. */
+ * After publish, dl_query reads from mmap instead of the VM.
+ *
+ * ALWAYS creates a version (v1, v2, ...) — callers rely on the version
+ * advancing.  Use dl_publish_if_needed for the "only if something changed"
+ * shape. */
 int dl_publish_snapshot(dl_db *db);
+
+/* Publish ONLY if the store is not already current: the no-op publish
+ * early-out.  Returns 0 both when it published (a new version, identical to
+ * dl_publish_snapshot) and when it skipped, and -1 on error (NULL db,
+ * read-only handle, open txn, or a consolidation/materialization failure;
+ * DL_E_FRAMES propagates as it does from dl_publish_snapshot).
+ *
+ * The skip is a CONSERVATIVE conjunction of cheap proofs that no work is
+ * pending — no un-materialized fixpoint (fixpoint_dirty with a compiled
+ * programme), no rels.txt change (meta_dirty), no list node created
+ * (term_is_dirty), no symbol interned since the snapshot (append-only interner:
+ * live count == the count the CURRENT manifest records), no open txn, no
+ * variadic relation and no permutation index, CURRENT still naming the version
+ * THIS process published, every relation's content already in that snapshot
+ * (.deferred/.view ⇒ its live file is the SAME INODE as the snapshot's copy;
+ * .owned ⇒ its revision equals the saved_rev watermark the last publish
+ * committed), and the snapshot dir carrying its symbols.array, terms.bin and
+ * every relation file.  Any doubt publishes.
+ *
+ * NOTHING is written on the skip path, so there is no durability work to
+ * defer: the WAL, the root arrays and the snapshot already describe exactly
+ * that state.  A requested retention prune (dl_set_snapshot_retain) still runs
+ * — pruning is not a publish. */
+int dl_publish_if_needed(dl_db *db);
 
 /* ─── Periodic consolidation (selfreg periodic snapshot) ───────────────── */
 

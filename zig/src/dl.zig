@@ -5399,7 +5399,13 @@ pub export fn dl_publish_snapshot(db: ?*DlDb) c_int {
     const d = db orelse return -1;
     if (d.read_only != 0) return -1;
     if (d.txn != null) return -1;
+    return publishFull(d);
+}
 
+/// The publish body, shared by dl_publish_snapshot (which always reaches it)
+/// and dl_publish_if_needed (which reaches it only after its early-out
+/// declined): consolidate, then ALWAYS materialize a new version.
+fn publishFull(d: *DlDb) c_int {
     pubTimersCheckEnv();
     const t_start = nowNs();
 
@@ -5428,6 +5434,190 @@ pub export fn dl_publish_snapshot(db: ?*DlDb) c_int {
         pub_timers.n_publishes += 1;
     }
     return 0;
+}
+
+// ─── "Already current" publish early-out ────────────────────────────────────
+
+/// Do two relation files hold the same content?  O(1), and the answer this gate
+/// needs when the live file and the snapshot's copy are separate INODES holding
+/// the same bytes — the normal shape after a publish from memory (the publish
+/// writes <snapshot>/<rel>.dafsa, dl_close then rewrites the live path: same
+/// content, two inodes).
+///
+/// Proof: equal size, both v4-format ('PDWG' + version 4), and the same
+/// trailing CRC32 — the checksum the format keeps over EVERY preceding byte.
+/// dafsa_save renumbers states in canonical BFS order, so equal content
+/// serializes to equal bytes and therefore to an equal trailer, and that
+/// trailer is the same integrity check dafsa_load itself trusts (a file failing
+/// it is rejected as corrupt).  A legacy pre-v4 file (no trailer) and any read
+/// failure answer false — publish.
+///
+/// (A byte-for-byte memcmp — filesIdentical — would drop the CRC's 2^-32
+/// accidental-collision bound, but it reads the whole store and so costs what
+/// the early-out exists to save.)
+fn relFilesSameContent(a: [*c]const u8, b: [*c]const u8, size: i64) bool {
+    if (size < 12) return false; // header (8) + trailer (4)
+    var ta: [4]u8 = undefined;
+    var tb: [4]u8 = undefined;
+    if (!relFileCrc(a, size, &ta)) return false;
+    if (!relFileCrc(b, size, &tb)) return false;
+    return ta[0] == tb[0] and ta[1] == tb[1] and ta[2] == tb[2] and ta[3] == tb[3];
+}
+
+// fseek is not in the musl @cImport surface dl.zig gets; declared directly
+// (the same reason the other libc calls in this file are).
+extern "c" fn fseek(stream: *c.FILE, off: c_long, whence: c_int) c_int;
+const SEEK_SET: c_int = 0;
+
+/// Read a v4 relation file's identity head and its trailing CRC32.  Returns
+/// false for a foreign, pre-v4 or unreadable file (no trailer to compare).
+fn relFileCrc(path: [*c]const u8, size: i64, crc_out: *[4]u8) bool {
+    const f = c.fopen(path, "r") orelse return false;
+    defer _ = c.fclose(f);
+    var head: [8]u8 = undefined;
+    if (c.fread(&head, 1, head.len, f) != head.len) return false;
+    if (!std.mem.eql(u8, head[0..4], "PDWG")) return false;
+    if (std.mem.readInt(u32, head[4..8], .little) != 4) return false;
+    if (fseek(f, @intCast(size - 4), SEEK_SET) != 0) return false;
+    if (c.fread(crc_out, 1, 4, f) != 4) return false;
+    return true;
+}
+
+/// Is the store already represented by the CURRENT snapshot — i.e. would a
+/// publish right now create a version whose every file is a hardlink (or an
+/// identical re-serialization) of what CURRENT already holds?
+///
+/// CONSERVATIVE BY CONSTRUCTION: every check is O(1) or O(#relations), and any
+/// doubt answers NO.  An unnecessary publish costs time; a skipped NEEDED
+/// publish costs correctness — so each check asks "can I PROVE nothing is
+/// pending", never "does it look unchanged":
+///
+///   1. fixpoint_dirty — the VM owes a materialization.  Only meaningful with a
+///      compiled programme: dl_add_fact sets the flag unconditionally, but
+///      consolidate clears it only inside its own `n_crules > 0` guard, so a
+///      rule-free store keeps it set forever and has nothing to derive.
+///   2. meta_dirty — rels.txt (declarations + recorded column kinds) changed.
+///      A publish is what writes the snapshot's manifest, so the snapshot would
+///      describe a schema the store no longer has.
+///   3. txn — buffered transaction ops are not applied yet (publish refuses an
+///      open txn for the same reason).
+///   4. snap_version != 0 AND CURRENT still names it.  saved_rev is a
+///      PER-PROCESS watermark, so "owned content is published" can only be
+///      proven against the version THIS process published.  The store is
+///      multi-writer: another process publishing since moves CURRENT and
+///      leaves our watermarks describing an older version.
+///   5. the interner needs no save: intern_is_dirty == 0 (the root
+///      <db>/symbols.array does not lag the live interner) AND the live symbol
+///      count equals the count the CURRENT snapshot's manifest records.  The
+///      interner is APPEND-ONLY (no path rewrites an existing entry), so count
+///      equality means no symbol was interned since the snapshot — the whole
+///      question in O(1) (one small manifest read + one counter).  The stamp's
+///      128-bit content hash is deliberately NOT consulted: it exists to prove
+///      byte identity for a HARD LINK decision, and a skipped publish makes no
+///      such decision (nothing is written).
+///   6. term_is_dirty == 0 — no list node was created since the last save, so
+///      terms.bin needs no rewrite.
+///   7. every relation's content is already in the snapshot, proven per state:
+///        * .deferred/.view — never mutated in this process, so its content IS
+///          the live <db>/<rel>.dafsa (rel_content_file's contract, the
+///          cross-process half of the publish gate).  That file must hold the
+///          same bytes as the snapshot's copy (relFilesSameContent: size + the
+///          format's own trailing CRC32, so the two may be separate inodes —
+///          which is the normal shape after a publish from memory).  Equal
+///          content is the proof a later save cannot have replaced it: a save
+///          commits by tmp+rename, so the live PATH gets a new inode and the
+///          snapshot keeps the old bytes.  Unequal content means a writer that
+///          never published — publish.
+///        * .owned — content exists only in memory; accepted only when its
+///          revision is the one the last publish in this process serialized
+///          (saved_rev, the watermark relSaveGated commits at publish step 7b,
+///          i.e. only after the rename AND the CURRENT flip succeeded, so it
+///          never claims content that is not durable in a snapshot).  Any
+///          mutation or VM reset bumps rev and disqualifies.
+///        * anything else (a .deferred relation with no live file yet) —
+///          publish.
+///   8. no variadic relations and no permutation indices: both carry their own
+///      watermark arrays (saved_rev_var / saved_rev_perm, plus object identity
+///      for a rebuilt index) that this check does not re-derive.  Skip the
+///      early-out for them rather than re-implement permSaveGated.
+///   9. the snapshot directory must actually carry its vocabulary, term store
+///      and every relation file — a pruned, truncated or copied-over version
+///      dir is not "current" even when the store side looks clean.
+///
+/// DELIBERATELY NOT CHECKED — durability.  A skipped publish writes nothing, so
+/// there is no fsync obligation to satisfy: the WAL, the root arrays and the
+/// snapshot files are already exactly the state being described.  Every write
+/// path that WOULD need a fsync (a fact, a symbol, a list node, a declaration)
+/// trips one of the checks above first.
+fn storeIsCurrent(d: *DlDb) bool {
+    if (d.n_crules > 0 and d.fixpoint_dirty != 0) return false; // 1
+    if (d.meta_dirty != 0) return false; // 2
+    if (d.txn != null) return false; // 3
+    if (d.snap_version == 0 or d.dir == null) return false; // 4
+    if (snapshot_read_current(d.dir.?) != d.snap_version) return false; // 4
+    if (d.n_perms != 0) return false; // 8
+
+    var sdir: [4096:0]u8 = undefined;
+    _ = snprintf(&sdir, 4096, "%s/snapshots/%u", d.dir.?, d.snap_version);
+
+    if (intern_is_dirty(d.ir) != 0) return false; // 5
+    var stamp: SymStampOnDisk = undefined;
+    if (!readSymStamp(&sdir, &stamp)) return false; // 5: no stamp ⇒ cannot prove
+    if (intern_mod.liveSymBound(d.ir) -% 1 != stamp.count) return false; // 5
+    if (term_is_dirty(d.terms) != 0) return false; // 6
+
+    var i: usize = 0;
+    while (i < d.nrels) : (i += 1) { // 7
+        if (d.rels[i].kind == RELK_VARIADIC) return false; // 8
+        const r = d.rels[i].rel orelse return false;
+        var spath: [4096:0]u8 = undefined;
+        _ = snprintf(&spath, 4096, "%s/%s.dafsa", &sdir, d.rels[i].name);
+        var ss: Stat = undefined;
+        if (stat(&spath, &ss) != 0) return false; // 9
+        if (relation.rel_content_file(r)) |live| {
+            if (!relFilesSameContent(live, &spath, ss.st_size)) return false;
+            continue;
+        }
+        if (relation.rel_read_state(r) != @intFromEnum(relation.ReadState.owned)) return false;
+        if (d.saved_rev[i] == SAVED_REV_NONE) return false;
+        if (relation.rel_rev(r) != d.saved_rev[i]) return false;
+    }
+
+    var arr: [4096:0]u8 = undefined;
+    _ = snprintf(&arr, 4096, "%s/symbols.array", &sdir);
+    var terms: [4096:0]u8 = undefined;
+    _ = snprintf(&terms, 4096, "%s/terms.bin", &sdir);
+    var st: Stat = undefined;
+    if (stat(&arr, &st) != 0) return false; // 9
+    if (stat(&terms, &st) != 0) return false; // 9
+    return true;
+}
+
+/// Publish only if the store is not already current — the no-op publish
+/// early-out.  Returns 0 in BOTH the skipped and the published case, and -1 on
+/// error (NULL db, read-only handle, open txn, or a consolidation /
+/// materialization failure; DL_E_FRAMES propagates exactly as
+/// dl_publish_snapshot's does).
+///
+/// When the early-out declines, this is byte-for-byte dl_publish_snapshot: a
+/// new version, the same durability, the same retention prune.  When it fires,
+/// NO version is created and NOTHING is written — the store is provably the
+/// state CURRENT already describes (see storeIsCurrent).  Retention is not a
+/// publish, so a requested prune (dl_set_snapshot_retain / --keep N) still
+/// happens on the skipped path.
+///
+/// dl_publish_snapshot keeps its own contract: it ALWAYS creates a version
+/// (v1, v2, ...), which the C oracle and every explicit checkpoint rely on.
+pub export fn dl_publish_if_needed(db: ?*DlDb) c_int {
+    const d = db orelse return -1;
+    if (d.read_only != 0) return -1;
+    if (d.txn != null) return -1;
+
+    if (storeIsCurrent(d)) {
+        if (d.snapshot_retain > 0) pruneSnapshots(d);
+        return 0;
+    }
+    return publishFull(d);
 }
 
 /// Periodic consolidation (selfreg periodic snapshot): the per-turn
@@ -6777,6 +6967,83 @@ test "zerocopy: publishing with a VIEW-BACKED relation keeps the snapshot correc
         try testing.expectEqual(@as(c_long, 1), snapshot_query_scan(dir, db.snap_version, &db.vcache, "alpha", &lead, 1, collectCb, &got));
         try testing.expectEqual(@as(usize, 1), got.n);
     }
+}
+
+test "dl_publish_if_needed: no version when the store is already current" {
+    // PRE-FIX BEHAVIOUR: the CLI's query arm called dl_publish_snapshot
+    // unconditionally, and that ALWAYS creates a version — so a
+    // publish-then-query loop bumped snap_version on every call even when
+    // nothing had changed since the previous one (MEASURED on the 172k-symbol
+    // store: ~31 ms of re-materialization per query, mostly the 46 MB interner
+    // stamp hash, plus the tmp-dir/fsync/CURRENT work).
+    const dir = "/tmp/datalog_zig_publish_if_needed";
+    rmrfTestDir(dir);
+    defer rmrfTestDir(dir);
+
+    // A publishing process: declare + write + publish v1.
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "alpha", 2));
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "alpha", &[2]u32{ 1, 2 }, 2));
+        try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db));
+        try testing.expectEqual(@as(u32, 1), db.snap_version);
+    }
+
+    // A LATER process — the shape every `dl query` has: the declarations come
+    // from rels.txt (so meta_dirty is 0), nothing has been written, and the
+    // relation is still .deferred with its live file hardlinked into v1.
+    const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+    defer dl_close(db);
+    try testing.expectEqual(@as(c_int, 0), db.meta_dirty);
+    try testing.expectEqual(@as(c_int, 0), db.fixpoint_dirty);
+    {
+        const ia = findRel(db, "alpha");
+        try testing.expect(ia >= 0);
+        try testing.expectEqual(@as(u8, @intFromEnum(relation.ReadState.deferred)), relation.rel_read_state(db.rels[@intCast(ia)].rel));
+    }
+
+    // Nothing changed since: the early-out must return 0 WITHOUT a version.
+    try testing.expectEqual(@as(c_int, 0), dl_publish_if_needed(db));
+    try testing.expectEqual(@as(u32, 1), db.snap_version); // NOT bumped
+    try testing.expectEqual(@as(c_int, 0), dl_publish_if_needed(db));
+    try testing.expectEqual(@as(u32, 1), db.snap_version); // still not
+
+    // dl_publish_snapshot's own contract is untouched: it always advances.
+    try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db));
+    try testing.expectEqual(@as(u32, 2), db.snap_version);
+    try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db));
+    try testing.expectEqual(@as(u32, 3), db.snap_version);
+
+    // A fact added in this process MUST disqualify the early-out (the store is
+    // no longer what CURRENT describes): the publish happens, and a fresh
+    // reader of the new snapshot sees the new row.  The disqualifier here is
+    // the relation's revision (raw-int values intern nothing, so the interner
+    // count still matches).
+    try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "alpha", &[2]u32{ 3, 4 }, 2));
+    try testing.expectEqual(@as(c_int, 0), dl_publish_if_needed(db));
+    try testing.expectEqual(@as(u32, 4), db.snap_version); // it DID publish
+
+    var got = CollectCbCtx{};
+    try testing.expectEqual(@as(c_long, 2), snapshot_query_scan(dir, db.snap_version, &db.vcache, "alpha", null, 0, collectCb, &got));
+    try testing.expectEqualSlices(u32, &[2]u32{ 1, 2 }, got.rows[0][0..2]);
+    try testing.expectEqualSlices(u32, &[2]u32{ 3, 4 }, got.rows[1][0..2]);
+
+    // With that published, the early-out fires again...
+    try testing.expectEqual(@as(c_int, 0), dl_publish_if_needed(db));
+    try testing.expectEqual(@as(u32, 4), db.snap_version);
+
+    // ...and a NEW SYMBOL alone disqualifies it: one interned string (no fact,
+    // no declaration) makes the snapshot's vocabulary stale.  Here the intern
+    // leaves the root array lagging, so the interner gate that fires is the
+    // dirty flag; the count half of that gate is belt-and-braces on top of it
+    // (every engine path that reaches count-changed-with-dirty-clear also moves
+    // a relation revision, so no path exercises the count check alone).
+    try testing.expect(dl_intern_str(db, "hello") != 0);
+    try testing.expectEqual(@as(c_int, 0), dl_publish_if_needed(db));
+    try testing.expectEqual(@as(u32, 5), db.snap_version); // published for the symbol
+    try testing.expectEqual(@as(c_int, 0), dl_publish_if_needed(db));
+    try testing.expectEqual(@as(u32, 5), db.snap_version);
 }
 
 test "zerocopy: a write after a view read promotes and works end to end" {

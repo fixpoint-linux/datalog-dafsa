@@ -752,8 +752,12 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
         }
         free(source_buf);
 
-        // Publish (runs VM automatically if fixpoint_dirty), then query
-        if (c.dl_publish_snapshot(db) != 0) {
+        // Publish (runs VM automatically if fixpoint_dirty), then query.  The
+        // publish is SKIPPED when the store is provably already what CURRENT
+        // describes (dl_publish_if_needed — no version, nothing written); on an
+        // unchanged store that is the whole cost of a read-only query, since
+        // the snapshot the query reads is already the answer.
+        if (c.dl_publish_if_needed(db) != 0) {
             _ = fprintf(stderr, "dl: publish failed\n");
             return 1;
         }
