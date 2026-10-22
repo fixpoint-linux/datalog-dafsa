@@ -212,8 +212,17 @@ static void test_t1_writer_held(void)
     close(p2c[0]);
     assert(read(c2p[0], &b, 1) == 1);     /* child holds the writer lock now */
 
-    /* A SECOND WRITER must still be refused, with DL_E_LOCKED ... */
-    if (dl_open2(dir, &err) != NULL) {
+    /* A SECOND WRITER must still be refused, with DL_E_LOCKED.  The engine's
+     * DEFAULT is now to QUEUE for byte 0 (F_SETLKW, so a fresh process per
+     * call queues instead of racing — see dl.h CONCURRENCY MODEL), so the
+     * refusal contract is exercised in its explicit fail-fast mode: the
+     * assertion is "a live writer excludes other writers", and it is the
+     * caller that chooses to be told "busy" rather than to wait. */
+    assert(setenv("DL_LOCK_FAIL_FAST", "1", 1) == 0);
+    dl_db *probe = dl_open2(dir, &err);
+    assert(unsetenv("DL_LOCK_FAIL_FAST") == 0);
+    if (probe != NULL) {
+        dl_close(probe);
         FAIL("dl_open2 succeeded while a writer holds the lock");
         goto out;
     }
@@ -1036,11 +1045,15 @@ static void test_t11_same_process_ro_keeps_writer_exclusion(void)
         FAIL("writer handle lost its fact after the RO open");
 
     /* The hazard check: a writer in ANOTHER process must still be refused
-     * while this process's RW handle is live. */
+     * while this process's RW handle is live.  Fail-fast mode on purpose: the
+     * engine's default now QUEUES for byte 0 (dl.h CONCURRENCY MODEL), and
+     * this probe must report the refusal rather than wait for a lock this
+     * parent will not release until the child is reaped. */
     pid = fork();
     assert(pid >= 0);
     if (pid == 0) {
         int e2 = 0;
+        assert(setenv("DL_LOCK_FAIL_FAST", "1", 1) == 0);
         dl_db *x = dl_open2(dir, &e2);
         if (x) {
             dl_close(x);

@@ -91,16 +91,36 @@ dl_db  *dl_open_ro(const char *dir, int *err_out);
  *   byte 0 — WRITER EXCLUSIVITY.  A read-write handle (dl_open/dl_open2)
  *       holds F_WRLCK here for its whole lifetime.  Read-only handles never
  *       touch this byte, so a live writer does NOT exclude readers.  A
- *       second writer in another process is still refused at open with
- *       DL_E_LOCKED: exactly one writer per database directory.
+ *       second writer in another process QUEUES for it: the acquisition is
+ *       F_SETLKW, so the waiter sleeps on the kernel's per-inode lock queue
+ *       and is woken when the holder releases — still exactly one writer per
+ *       database directory, but writers queue instead of racing (MEASURED
+ *       Phase-0 M1b: with a fail-fast acquire, a fresh-process-per-call
+ *       workload at K=4/8/16 succeeded first try only 31%/14%/8% of the
+ *       time, with p95 open waits of 1.08/3.35/7.78 s and bimodal retries;
+ *       the lock was costing LATENCY through unfairness, not capacity).
+ *       An unbounded wait is safe here because fcntl locks are released
+ *       automatically when the holding process dies (so a crashed writer
+ *       cannot leave a stale lock) and because the hold is short (a publish
+ *       is ~90 ms worst case, a new-string fact 0.05 ms).
+ *
+ *       DL_LOCK_FAIL_FAST=1 selects F_SETLK instead and returns NULL with
+ *       *err_out = DL_E_LOCKED at once.  That is the mode for a caller that
+ *       wants "busy" rather than "queued" — the `dl` CLI's read commands use
+ *       it so their read-only fallback still fires instead of blocking
+ *       behind a live writer.  THE DEFAULT IS TO QUEUE.
  *
  *   byte 1 — MUTATION WINDOW.  The writer holds F_WRLCK here around every
  *       on-disk state REPLACEMENT (WAL truncation during compaction, the
  *       snapshot materialization/publish sweep, rels.txt, the dl_close save
  *       sweep).  A reader holds F_RDLCK here for the whole of its open — the
  *       metadata read plus the eager per-relation WAL replay — and RELEASES
- *       it before the handle is returned.  A reader that arrives mid-window
- *       BLOCKS for it (it is never refused because a writer is alive).
+ *       it before the handle is returned.  The writer's acquisition BLOCKS
+ *       (F_SETLKW); a reader's is BOUNDED: F_SETLK plus a short jittered
+ *       sleep retried until a deadline (DL_LOCK_READ_WAIT_MS, default 2000),
+ *       after which the reader fails with DL_E_LOCKED.  A reader therefore
+ *       waits out at most one mutation window but can never hang forever
+ *       behind a writer that is alive-but-slow.
  *
  * What a reader sees: the writer's committed state as of the reader's own
  * OPEN — the durability contract's cycle boundary (below), not a live view.

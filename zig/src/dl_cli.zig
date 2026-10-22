@@ -562,6 +562,15 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
     // (load/publish/cas/txn/index, and `search`, which interns its terms and
     // may declare __postings__) have no read-only fallback: they need the
     // writer handle.
+    //
+    // A read command therefore asks for the FAIL-FAST acquisition
+    // (DL_LOCK_FAIL_FAST): the engine's default is to QUEUE for byte 0, which
+    // would make `dl query` block for the whole lifetime of another process's
+    // writer instead of falling back to the read-only open.  A WRITE command
+    // keeps the default and queues — it has no fallback, so waiting is the
+    // only useful thing it can do.
+    if (commandReadsOnly(cmd))
+        _ = setenv("DL_LOCK_FAIL_FAST", "1", 1);
     var db: [*c]c.dl_db = c.dl_open(db_dir);
     if (db == null and commandReadsOnly(cmd)) {
         var oerr: c_int = 0;

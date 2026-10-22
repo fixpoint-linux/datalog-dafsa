@@ -185,6 +185,7 @@ extern "c" fn snprintf(buf: [*c]u8, size: usize, fmt: [*c]const u8, ...) c_int;
 extern "c" fn fprintf(stream: *c.FILE, fmt: [*c]const u8, ...) c_int;
 extern "c" fn getline(lineptr: *?[*]u8, n: *usize, stream: *c.FILE) isize;
 extern "c" fn fputs(s: [*:0]const u8, stream: *c.FILE) c_int;
+extern "c" fn nanosleep(req: *const Timespec, rem: ?*Timespec) c_int;
 
 // ─── Constants (mirror src/dl_internal.h / dl.h / compiler.h / txnwal.h) ───
 
@@ -721,7 +722,7 @@ pub export fn dl_ensure_variant(db: ?*DlDb, rel_id: c_int, arity: u8) ?*relation
 //   byte 0 (LOCK_EXCL_BYTE) — WRITER EXCLUSIVITY, held by a read-write
 //       handle for its whole lifetime.  Readers never touch it, so a live
 //       writer no longer excludes them.  A second dl_open/dl_open2 in
-//       another process is still refused at open with DL_E_LOCKED.
+//       another process QUEUES for it (see "Acquisition modes" below).
 //
 //   byte 1 (LOCK_WINDOW_BYTE) — MUTATION WINDOW.  The writer takes it
 //       exclusively around every on-disk state REPLACEMENT (WAL truncation
@@ -749,6 +750,61 @@ pub export fn dl_ensure_variant(db: ?*DlDb, rel_id: c_int, arity: u8) ?*relation
 // durability contract's cycle boundary — dl.h "Durability"), never a torn
 // record; cross-process read-your-own-writes needs a re-open.  Writers stay
 // serialized: exactly one per database directory.
+//
+// ─── Acquisition modes (WHICH PRIMITIVE, AND WHY) ──────────────────────────
+//
+// MEASURED (Phase-0 M1b, a fresh process per call, K concurrent slots): with
+// the writer-exclusive byte 0 acquired FAIL-FAST, writers RACE in user space
+// and the loser STARVES — at K=4 only 31% of opens succeeded first try, K=16
+// ~8%, with p95 open waits of 1.08/3.35/7.78 s and maxima 3.14/9.12/11.1 s
+// while throughput stayed at ~1.0x sequential.  The lock cost LATENCY through
+// unfairness, not capacity: whoever retried fastest won, and an honest
+// backoff starved.  Retry counts were BIMODAL (attempt 1, or >10).
+//
+// So byte 0 BLOCKS BY DEFAULT: F_SETLKW, i.e. the waiter SLEEPS on the
+// kernel's per-inode POSIX-lock wait queue and is woken when the holder
+// releases, instead of re-racing in user space between backoff sleeps.  An
+// UNBOUNDED wait is safe here for two reasons:
+//   * fcntl locks are released automatically when the holding process dies
+//     (close, exit, SIGKILL alike — the kernel drops every lock of the
+//     exiting file table), so a crashed writer cannot leave a stale lock
+//     behind and no waiter can be wedged by one;
+//   * the hold is SHORT: the byte-0 hold is the handle's lifetime, but what
+//     other writers actually queue behind is the handle's work — publish
+//     ~90 ms worst case (7de1c0c/110b5f9: hardlinked unchanged relations +
+//     append-instead-of-rewrite interning), a new-string fact 0.05 ms.
+// FAIL-FAST remains available for callers that want to be told "busy" rather
+// than queued: DL_LOCK_FAIL_FAST=1 selects F_SETLK and an immediate
+// DL_E_LOCKED (the CLI's read-only commands and the suites that assert the
+// refusal contract use it).
+//
+// MEASURED AFTER the change (tests/fairlock_m1b.py, the same M1b shape: a
+// fresh process per batch, 120 batches, K slots staggered, seeded 100k-fact
+// store so a batch is ~11 ms of work, loadavg ~4 on a 16-core 3950X), before
+// = the 110b5f9 binary, after = this default:
+//   K=8  first-try 3.3% -> 100%, opens refused 96.7% -> 0%,
+//        open wait p95/max 209/384 ms -> 102/109 ms, retries >20: 65 -> 0;
+//   K=16 first-try 3.3% -> 100%, opens refused 96.7% -> 0%,
+//        open wait p95/max 359/752 ms -> 356/502 ms, retries >20: 89 -> 0.
+//   wall vs sequential unchanged (0.90-0.93x both arms): the lock never cost
+//   capacity, only latency through unfairness — which is what went away.
+//
+// A READER's shared window (byte 1) is BOUNDED, never indefinite: it uses
+// F_SETLK + a short jittered sleep until a deadline (DL_LOCK_READ_WAIT_MS,
+// default 2000) and then fails with DL_E_LOCKED.  A reader queued behind the
+// writer's short mutation window is fine, but a reader must not hang forever
+// behind a writer that is alive-but-slow (F_SETLKW has no timeout, which is
+// why the bounded wait is a retry loop rather than that primitive).
+// The WRITER's own mutation window stays F_SETLKW: its only possible blocker
+// is another process's open-time WAL replay (a reader's shared hold), and a
+// writer that abandoned the window would let rel_compact FTRUNCATE a WAL
+// under a live reader's mapping — a bounded wait would have to give up the
+// guarantee, so it stays unbounded.
+//
+// No lock cycle exists between the two bytes: a writer takes byte 1 only
+// while holding byte 0, and a reader takes byte 1 only and never byte 0, so
+// a waiting writer can never be the thing a reader waits for while that
+// reader waits for the writer.
 const LOCK_EXCL_BYTE: posix.off_t = 0;
 const LOCK_WINDOW_BYTE: posix.off_t = 1;
 
@@ -756,8 +812,8 @@ extern "c" fn __errno_location() *c_int;
 const LOCK_EINTR: c_int = 4; // Linux glibc EINTR
 
 /// One fcntl byte-range lock operation on `start` (length 1).  `wait`
-/// selects F_SETLKW (block) over F_SETLK (fail fast).  Returns 0 on
-/// success, -1 on error.
+/// selects F_SETLKW (block on the kernel's per-inode queue) over F_SETLK
+/// (fail fast).  Returns 0 on success, -1 on error.
 fn lockRange(fd: c_int, ty: c_short, start: posix.off_t, wait: bool) c_int {
     var fl: posix.struct_flock = undefined;
     fl.l_type = ty;
@@ -773,6 +829,54 @@ fn lockRange(fd: c_int, ty: c_short, start: posix.off_t, wait: bool) c_int {
     }
 }
 
+/// BOUNDED acquisition: F_SETLK, and on EAGAIN a short JITTERED sleep before
+/// the next attempt, until `deadline_ms` elapses.  Returns 0 on success, -1
+/// on deadline expiry or a real error.  Never a bare spin: the sleep is what
+/// keeps a queued reader off the CPU while the writer finishes (F_SETLKW has
+/// no timeout, so this loop — not that primitive — is how a bounded wait is
+/// expressed).  The jitter de-synchronises several readers retrying at once;
+/// it is derived from the clock + the attempt count, so no RNG is pulled into
+/// the library.
+fn lockRangeBounded(fd: c_int, ty: c_short, start: posix.off_t, deadline_ms: u64) c_int {
+    const deadline = nowNs() + deadline_ms * 1_000_000;
+    var attempt: u64 = 0;
+    while (true) {
+        if (lockRange(fd, ty, start, false) == 0) return 0;
+        if (nowNs() >= deadline) return -1;
+        attempt += 1;
+        // 0.25 ms .. 1.25 ms, jittered.
+        const sleep_ns: u64 = 250_000 + (nowNs() +% attempt *% 7919) % 1_000_000;
+        var req = Timespec{ .sec = @intCast(sleep_ns / 1_000_000_000), .nsec = @intCast(sleep_ns % 1_000_000_000) };
+        while (nanosleep(&req, &req) != 0) {
+            if (__errno_location().* != LOCK_EINTR) return -1;
+        }
+    }
+}
+
+/// DL_LOCK_FAIL_FAST=1: acquire the writer-exclusive byte with F_SETLK and
+/// refuse at once with DL_E_LOCKED instead of queueing.  Read PER OPEN (not
+/// cached like the publish/timing env vars): the C oracle and the CLI flip it
+/// within one process, and an open is never on a hot path.
+fn lockFailFast() bool {
+    const v = getenv("DL_LOCK_FAIL_FAST");
+    return v != null and v.?[0] != 0 and !strEq(v.?, "0");
+}
+
+/// Default deadline (ms) for a reader's shared-window acquisition.
+const LOCK_READ_WAIT_MS_DEFAULT: u64 = 2000;
+
+/// DL_LOCK_READ_WAIT_MS: how long a READER may wait for the shared mutation
+/// window before giving up with DL_E_LOCKED.  Bounded on purpose — a reader
+/// must never hang forever behind a writer that is alive but slow.
+fn lockReadWaitMs() u64 {
+    const v = getenv("DL_LOCK_READ_WAIT_MS");
+    if (v != null and v.?[0] != 0) {
+        const ms = strtoul(v, null, 10);
+        if (ms > 0) return ms;
+    }
+    return LOCK_READ_WAIT_MS_DEFAULT;
+}
+
 // Mutation-window state, per thread.  fcntl locks are per (process, file)
 // and the engine is single-threaded per db (no internal mutex — see dl.h),
 // so tracking the window by the LOCK fd held in this thread is enough to
@@ -782,11 +886,14 @@ threadlocal var mut_window_fd: c_int = -1;
 threadlocal var mut_window_depth: c_int = 0;
 
 /// Enter the writer's mutation window: EXCLUSIVE on LOCK_WINDOW_BYTE,
-/// BLOCKING — the only holder that can be in the way is another process's
-/// open-time replay, which is bounded by its WAL size.  A lock error is not
-/// fatal to the mutation (the write path's convention: durability failures
-/// are surfaced by the fsync/rename that follows, not by the lock); the
-/// depth accounting stays balanced either way.
+/// BLOCKING (F_SETLKW) — the only holder that can be in the way is another
+/// process's open-time replay, which is bounded by its WAL size.  Unbounded
+/// on purpose: a bounded wait would have to give up and then let the mutation
+/// run WITHOUT the window, and that window is what stops rel_compact
+/// FTRUNCATING a WAL under a live reader's mapping (see the lock-scope
+/// block).  A lock error is not fatal to the mutation (the write path's
+/// convention: durability failures are surfaced by the fsync/rename that
+/// follows, not by the lock); the depth accounting stays balanced either way.
 fn mutWindowBegin(db: *DlDb) void {
     if (db.read_only != 0 or db.lock_fd < 0) return;
     if (mut_window_fd == db.lock_fd) {
@@ -860,21 +967,25 @@ fn dlOpenCommon(dir: ?[*:0]const u8, err_out: ?*c_int, ro: c_int) ?*DlDb {
     }
 
     // Lock scopes (see "Concurrency: the two lock scopes on <dir>/LOCK"):
-    //  * writer: EXCLUSIVE on byte 0 for the handle's whole lifetime — a
-    //    second writer is refused HERE (DL_E_LOCKED); readers never take it;
+    //  * writer: EXCLUSIVE on byte 0 for the handle's whole lifetime —
+    //    BLOCKING (F_SETLKW) by default, so a second writer QUEUES on the
+    //    kernel's lock queue instead of racing and starving; DL_LOCK_FAIL_FAST=1
+    //    selects F_SETLK and an immediate DL_E_LOCKED instead.  Readers never
+    //    take this byte;
     //  * reader: SHARED on byte 1, held only across this open (released
     //    before the handle is returned) so it cannot overlap a
-    //    WAL-truncating mutation.  BLOCKING, so a reader is never refused by
-    //    a live writer: it waits out at most one mutation window.
+    //    WAL-truncating mutation.  BOUNDED wait (F_SETLK + jittered sleep,
+    //    DL_LOCK_READ_WAIT_MS default 2000) so a reader waits out at most a
+    //    mutation window but can never hang forever behind a slow writer.
     var reader_window: bool = false;
     if (ro != 0) {
-        if (lockRange(lfd, posix.F_RDLCK, LOCK_WINDOW_BYTE, true) != 0) {
+        if (lockRangeBounded(lfd, posix.F_RDLCK, LOCK_WINDOW_BYTE, lockReadWaitMs()) != 0) {
             _ = posix.close(lfd);
             if (err_out) |e| e.* = DL_E_LOCKED;
             return null;
         }
         reader_window = true;
-    } else if (lockRange(lfd, posix.F_WRLCK, LOCK_EXCL_BYTE, false) != 0) {
+    } else if (lockRange(lfd, posix.F_WRLCK, LOCK_EXCL_BYTE, !lockFailFast()) != 0) {
         _ = posix.close(lfd);
         if (err_out) |e| e.* = DL_E_LOCKED;
         return null;

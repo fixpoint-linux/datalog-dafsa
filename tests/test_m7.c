@@ -92,7 +92,15 @@ static void test_t1_two_writers_same_dir(void)
     close(pipefd[0]);
 
     int err = -99;
+    /* Fail-fast mode on purpose: the engine's DEFAULT is now to QUEUE for the
+     * writer-exclusive byte (F_SETLKW — writers queue instead of racing; see
+     * dl.h CONCURRENCY MODEL).  This test asserts the other half of the
+     * contract: a live writer excludes other writers, and a caller that asks
+     * to be told "busy" (DL_LOCK_FAIL_FAST=1) still gets DL_E_LOCKED at
+     * once instead of waiting for the child's 5 s hold. */
+    assert(setenv("DL_LOCK_FAIL_FAST", "1", 1) == 0);
     dl_db *db2 = dl_open2("build-tmp/m7t1", &err);
+    assert(unsetenv("DL_LOCK_FAIL_FAST") == 0);
     assert(db2 == NULL);
     assert(err == DL_E_LOCKED);
 

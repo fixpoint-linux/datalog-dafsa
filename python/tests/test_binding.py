@@ -314,12 +314,12 @@ class TestLocking(unittest.TestCase):
     """Cross-process single-writer semantics via subprocesses (the model the
     architecture uses: CEN is the sole writer, readers are other processes)."""
 
-    def _child(self, code: str) -> subprocess.CompletedProcess:
+    def _child(self, code: str, env_extra: dict | None = None):
         return subprocess.run(
             [sys.executable, "-c", code],
             capture_output=True, text=True, timeout=120,
             env={**os.environ, "PYTHONPATH": os.path.join(
-                os.path.dirname(__file__), "..")},
+                os.path.dirname(__file__), ".."), **(env_extra or {})},
         )
 
     def test_second_writer_gets_locked(self):
@@ -336,7 +336,13 @@ class TestLocking(unittest.TestCase):
                 "try:\n"
                 f"    db=dlb.Db.open({d!r})\n"
                 "except dlb.DlLockedError: print('LOCKED'); sys.exit(0)\n"
-                "print('OPENED'); sys.exit(1)\n"
+                "print('OPENED'); sys.exit(1)\n",
+                # The engine's DEFAULT is now to QUEUE for the writer-exclusive
+                # byte (F_SETLKW: writers queue instead of racing), so a second
+                # writer waits for this parent's handle instead of being told
+                # "busy".  The refusal contract is the fail-fast mode, and it
+                # still holds: exactly one writer per directory.
+                env_extra={"DL_LOCK_FAIL_FAST": "1"},
             )
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("LOCKED", r.stdout)
