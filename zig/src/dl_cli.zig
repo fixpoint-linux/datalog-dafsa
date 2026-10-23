@@ -46,8 +46,12 @@ extern "c" fn strtol(nptr: [*c]const u8, endptr: [*c][*c]u8, base: c_int) c_long
 extern "c" fn __errno_location() *c_int;
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
+extern "c" fn fwrite(ptr: [*c]const u8, size: usize, nmemb: usize, stream: *std.c.FILE) usize;
+
 /// glibc's unbuffered stderr stream global (same symbol the C oracle uses).
 extern "c" var stderr: *std.c.FILE;
+/// stdout, for the buffered result writer (see outFlush).
+extern "c" var stdout: *std.c.FILE;
 
 // ─── Constants (mirrors of the C oracle's / headers' values) ────────────────
 const ERANGE = 34;
@@ -127,6 +131,87 @@ fn cliParseValue(db: [*c]c.dl_db, s: [*c]const u8) u32 {
     return c.intern_str(ir, s);
 }
 
+// ─── Buffered result output ───────────────────────────────────────────────
+//
+// A result set is printed one row at a time, so `dl query` on the agent store
+// (7,778 rows of two columns) made 31,112 printf calls — MEASURED at ~2.5 ms of
+// a ~56 ms invocation, for 7,778 rows whose whole engine-side scan is ~0.7 ms.
+// The cost is glibc's per-call format parsing + stream locking, not the bytes.
+//
+// The four ROW-PRODUCING commands (query, prefix, bound, pattern) therefore
+// render through outStr/outU32/outLit into a fixed 64 KiB staging buffer that
+// is handed to fwrite a block at a time.  Bytes are identical by construction:
+// outStr emits the same NUL-terminated string printf("%s") would, outU32 the
+// same decimal printf("%u") would, outLit the same literal.  Every OTHER
+// command keeps calling printf directly (out_on is false), so their output —
+// and its interleaving with the CLI's own printf lines — is untouched.
+//
+// out_on is true only for the duration of those four commands' row callbacks,
+// which are the ONLY thing they write to stdout: each prints "(no results)"
+// afterwards, and only when the callback produced no rows at all, so the
+// staged buffer is always empty by then.
+var out_on: bool = false;
+var out_len: usize = 0;
+var out_buf: [64 * 1024]u8 = undefined;
+
+fn outFlush() void {
+    if (out_len == 0) return;
+    _ = fwrite(&out_buf, 1, out_len, stdout);
+    out_len = 0;
+}
+
+fn outWrite(bytes: []const u8) void {
+    if (bytes.len > out_buf.len - out_len) outFlush();
+    if (bytes.len > out_buf.len) { // a single value longer than the buffer
+        _ = fwrite(bytes.ptr, 1, bytes.len, stdout);
+        return;
+    }
+    @memcpy(out_buf[out_len..][0..bytes.len], bytes);
+    out_len += bytes.len;
+}
+
+/// printf("%s", s) — buffered when out_on.
+fn outStr(s: [*:0]const u8) void {
+    if (!out_on) {
+        _ = printf("%s", s);
+        return;
+    }
+    outWrite(std.mem.span(s));
+}
+
+/// printf("%u", v) — buffered when out_on.
+fn outU32(v: u32) void {
+    if (!out_on) {
+        _ = printf("%u", v);
+        return;
+    }
+    var b: [10]u8 = undefined;
+    const t = std.fmt.bufPrint(&b, "{d}", .{v}) catch return;
+    outWrite(t);
+}
+
+/// printf(literal) — buffered when out_on.
+inline fn outLit(comptime s: [:0]const u8) void {
+    if (!out_on) {
+        _ = printf(s.ptr);
+        return;
+    }
+    outWrite(s);
+}
+
+/// Enable the staged sink for one row-producing engine call and flush it
+/// afterwards.  The flush is unconditional: on a mid-enumeration failure the
+/// rows the engine already emitted are on stdout exactly as the streaming
+/// printf path would have left them.
+fn outRowsBegin() void {
+    out_on = true;
+}
+
+fn outRowsEnd() void {
+    out_on = false;
+    outFlush();
+}
+
 // ─── Value / tuple printing (byte-exact reverse-mapping heuristics) ────────
 
 /// What a printed tuple's ids MEAN: the live term store, plus the SYMBOL MAP
@@ -160,9 +245,9 @@ fn printValue(ctx: *const PrintCtx, v: u32, depth: c_int) void {
     else
         c.intern_str_of(db.*.ir, v);
     if (s != null and s[0] != 0) {
-        _ = printf("%s", s);
+        outStr(s.?);
     } else {
-        _ = printf("%u", v);
+        outU32(v);
     }
 }
 
@@ -173,16 +258,16 @@ fn printList(ctx: *const PrintCtx, h_in: u32, depth: c_int) void {
     const db = ctx.db;
     var h = h_in;
     if (depth > 4096) {
-        _ = printf("[...]");
+        outLit("[...]");
         return;
     }
-    _ = printf("[");
+    outLit("[");
     while (h != c.TERM_NIL) {
         printValue(ctx, c.term_car(db.*.terms, h), depth + 1);
         h = c.term_cdr(db.*.terms, h);
-        if (h != c.TERM_NIL) _ = printf(", ");
+        if (h != c.TERM_NIL) outLit(", ");
     }
-    _ = printf("]");
+    outLit("]");
 }
 
 /// Callback for dl_prefix / dl_query / dl_query_bound / dl_pattern: print one
@@ -191,10 +276,10 @@ fn printTuple(cols: [*c]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_
     const ctx: *const PrintCtx = @ptrCast(@alignCast(user.?));
     var i: u8 = 0;
     while (i < arity) : (i += 1) {
-        if (i > 0) _ = printf(" ");
+        if (i > 0) outLit(" ");
         printValue(ctx, cols[i], 0);
     }
-    _ = printf("\n");
+    outLit("\n");
     return 0;
 }
 
@@ -205,10 +290,10 @@ fn printTupleRaw(cols: [*c]const u32, arity: u8, user: ?*anyopaque) callconv(.c)
     _ = user;
     var i: u8 = 0;
     while (i < arity) : (i += 1) {
-        if (i > 0) _ = printf(" ");
-        _ = printf("%u", cols[i]);
+        if (i > 0) outLit(" ");
+        outU32(cols[i]);
     }
-    _ = printf("\n");
+    outLit("\n");
     return 0;
 }
 
@@ -710,7 +795,9 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
 
         // LIVE relation: the ids are the live interner's (version 0).
         var pctx = PrintCtx{ .db = db, .version = 0 };
+        outRowsBegin();
         const n = c.dl_prefix(db, rel_name.ptr, &leading, k, if (raw) printTupleRaw else printTuple, @ptrCast(&pctx));
+        outRowsEnd();
         if (n < 0) {
             _ = fprintf(stderr, "dl: prefix query failed\n");
             return 1;
@@ -768,7 +855,9 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
         // snapshot whenever snap_version > 0), so render its ids in that
         // snapshot's vocabulary.
         var qctx = PrintCtx{ .db = db, .version = db.*.snap_version };
+        outRowsBegin();
         const n = c.dl_query(db, goal_rel.ptr, printTuple, @ptrCast(&qctx));
+        outRowsEnd();
         if (n < 0) {
             _ = fprintf(stderr, "dl: query failed\n");
             return 1;
@@ -822,7 +911,9 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
 
         // VERSION read whenever a snapshot is published (same rule as query).
         var bctx = PrintCtx{ .db = db, .version = db.*.snap_version };
+        outRowsBegin();
         const n = c.dl_query_bound(db, rel_name.ptr, &leading, k, printTuple, @ptrCast(&bctx));
+        outRowsEnd();
         if (n < 0) {
             _ = fprintf(stderr, "dl: bound query failed\n");
             return 1;
@@ -861,7 +952,9 @@ fn realMain(argc: c_int, argv: []const [:0]const u8) c_int {
         // snapshot's vocabulary too — the live map printed the right rows under
         // another string's name on a diverged store.
         var pctx = PrintCtx{ .db = db, .version = db.*.snap_version };
+        outRowsBegin();
         const n = c.dl_pattern(db, rel_name.ptr, col, dfa, printTuple, @ptrCast(&pctx));
+        outRowsEnd();
         c.regex_dfa_free(dfa);
         if (n < 0) {
             _ = fprintf(stderr, "dl: pattern query failed\n");
