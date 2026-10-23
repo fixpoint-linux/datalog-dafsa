@@ -360,10 +360,14 @@ pub const DlDb = extern struct {
     // ─── VERSION pattern queries on a symbol-DFA-less snapshot (beyond C) ──
     // The snapshot's OWN interner, rebuilt from its symbols.array on first use
     // and reused while snap_version is unchanged (freed by dl_close, replaced
-    // when snap_version moves).  Never the live interner: sym ids are reused
-    // across a publish, so the live map is not the snapshot's map.
+    // when snap_version moves).  Never ASSUMED to be the live interner: sym ids
+    // are reused across a publish, so the live map is not the snapshot's map.
+    // It IS the live interner when the snapshot's manifest stamp proves the two
+    // vocabularies identical (snapshotInterner) — then snap_sym_shared is set
+    // and this handle must NOT be freed.
     snap_sym_ir: ?*anyopaque = null,
     snap_sym_version: u32 = 0,
+    snap_sym_shared: bool = false,
 };
 
 /// Marker for "not yet serialized by any publish of this process".
@@ -1370,8 +1374,12 @@ pub export fn dl_close(db: ?*DlDb) void {
     }
 
     // VERSION pattern queries may hold a private interner built from a
-    // snapshot's symbols.array (snapshotSymSet); dl_close owns it.
-    if (d.snap_sym_ir) |sir| intern_free(sir);
+    // snapshot's symbols.array (snapshotSymSet); dl_close owns it — unless it
+    // is the live interner borrowed under a proven-equal stamp (snapshotInterner),
+    // which the next line frees.
+    if (d.snap_sym_ir) |sir| {
+        if (!d.snap_sym_shared) intern_free(sir);
+    }
 
     intern_free(d.ir);
     term_free(d.terms);
@@ -6140,17 +6148,37 @@ fn symsetAddCb(sym_id: u32, user: ?*anyopaque) callconv(.c) c_int {
     return regexwalk.symset_add(set, sym_id);
 }
 
-/// Load (or reuse) the interner built from snapshot `version`'s OWN
-/// <snapshots/version>/symbols.array — THE SNAPSHOT'S VOCABULARY, never the
-/// live interner.  Cached in DlDb per version (snap_sym_ir / snap_sym_version:
-/// freed by dl_close, replaced when a different version is asked for), so a
-/// process pays the array read once per version it reads.
+/// Load (or reuse) the interner that answers for snapshot `version`'s OWN
+/// <snapshots/version>/symbols.array — THE SNAPSHOT'S VOCABULARY.  Cached in
+/// DlDb per version (snap_sym_ir / snap_sym_version: freed by dl_close,
+/// replaced when a different version is asked for), so a process pays the
+/// array read once per version it reads.
 ///
 /// TWO READERS SHARE IT, which is why it is one function: the VERSION pattern
 /// path (snapshotSymSet, which scans this table with the compiled regex DFA)
 /// and VERSION term interning (dl_intern_str_version).  Both need the mapping
-/// "id → the string THIS snapshot means by it", and neither may use the live
-/// interner.
+/// "id → the string THIS snapshot means by it", and neither may ASSUME the live
+/// interner — sym ids are reused across a publish, so the two maps can name
+/// different strings at the same id.
+///
+/// WHAT MAKES THE LIVE INTERNER USABLE ANYWAY.  When the snapshot's own
+/// manifest stamp and the live interner's content stamp agree on all of
+/// (count, bytes, hash), the snapshot's symbols.array holds exactly the bytes
+/// the live interner holds — so borrowing it is not an assumption, it is the
+/// same file content.  That is the whole reason intern_load maintains the stamp
+/// as it parses (intern.zig SymHash): the comparison is O(1) here, and the
+/// alternative is parsing the same 49.5 MB array a second time (MEASURED
+/// 22.8 ms in `dl query` on the agent store — the largest remaining term).
+///
+/// The COUNT ALONE IS NOT ENOUGH, and that is the shape a previous review
+/// proved reachable: a restored or hand-edited db-ROOT symbols.array has the
+/// same count with different bytes, and the live interner is loaded from the
+/// ROOT array, not from the snapshot's copy.  Gating on the count would then
+/// hand a version read the WRONG map and answer with the right rows under the
+/// wrong names — exit 0, silently wrong.  The 128-bit hash is what sees that
+/// divergence; `bytes` is the O(1) check on the FILE, and the manifest stamp is
+/// the snapshot's own record of what its array contains (the same record
+/// inheritSymbolsArray trusts to hardlink it into the next publish).
 ///
 /// Returns null when the snapshot's array is missing, unreadable, a directory,
 /// or DISAGREES with the size/count the snapshot's own manifest recorded for
@@ -6160,10 +6188,11 @@ fn symsetAddCb(sym_id: u32, user: ?*anyopaque) callconv(.c) c_int {
 fn snapshotInterner(d: *DlDb, version: u32) ?*anyopaque {
     if (d.snap_sym_ir != null and d.snap_sym_version == version) return d.snap_sym_ir;
     if (d.snap_sym_ir) |old| {
-        intern_free(old);
+        if (!d.snap_sym_shared) intern_free(old);
         d.snap_sym_ir = null;
     }
     d.snap_sym_version = 0;
+    d.snap_sym_shared = false;
     if (d.dir == null or version == 0) return null;
     var sdir: [16384:0]u8 = undefined;
     _ = snprintf(&sdir, 16384, "%s/snapshots/%u", d.dir.?, version);
@@ -6195,9 +6224,37 @@ fn snapshotInterner(d: *DlDb, version: u32) ?*anyopaque {
     // nothing to compare against and skips the gate.
     var stamp: SymStampOnDisk = undefined;
     const have_stamp = readSymStamp(&sdir, &stamp);
-    const ir = intern_load(null, &arr_path) orelse return null;
+    const bytes = fileSize(&arr_path);
+
+    // REUSE THE LIVE INTERNER when the two vocabularies are PROVABLY identical:
+    // the snapshot's manifest stamp (count, bytes, hash — the record its own
+    // publisher made of the array it wrote or inherited) and the live interner's
+    // content stamp must agree on all three, and the array file must be exactly
+    // the recorded size.  All three are required; see the count-only hazard in
+    // this function's doc comment.
+    //
+    // Why this is sound for the ids a version read resolves: the live interner
+    // was loaded from the db-ROOT symbols.array, and an interner is APPEND-ONLY
+    // (intern.zig's module doc), so a live append can only ADD ids above the
+    // stamp's count — never renumber one the snapshot references.  A live read
+    // between two version reads therefore cannot make the borrowed map lie about
+    // ids 1..count, which is the entire range a snapshot's rows use.
+    if (have_stamp and bytes != null and bytes.? == stamp.bytes) {
+        if (d.ir) |live| {
+            const ls = intern_mod.symStamp(live);
+            if (ls.count == stamp.count and ls.h0 == stamp.h0 and ls.h1 == stamp.h1) {
+                d.snap_sym_ir = live;
+                d.snap_sym_version = version;
+                d.snap_sym_shared = true;
+                return live;
+            }
+        }
+    }
+
+    // internLoadNoStamp: this map is only ever looked up in (never published,
+    // never stamped), so it does not pay the load-time content-stamp pass.
+    const ir = intern_mod.internLoadNoStamp(&arr_path) orelse return null;
     if (have_stamp) {
-        const bytes = fileSize(&arr_path);
         if (bytes == null or bytes.? != stamp.bytes or
             intern_mod.liveSymBound(ir) -% 1 != stamp.count)
         {
@@ -6207,6 +6264,7 @@ fn snapshotInterner(d: *DlDb, version: u32) ?*anyopaque {
     }
     d.snap_sym_ir = ir;
     d.snap_sym_version = version;
+    d.snap_sym_shared = false;
     return ir;
 }
 
@@ -6257,11 +6315,12 @@ fn snapshotInterner(d: *DlDb, version: u32) ?*anyopaque {
 ///
 /// Cost: one symbols.array read (MEASURED ~19 ms for 166k symbols, ~55 ms for
 /// 500k) + one linear scan, cached per snapshot version (so repeated queries
-/// pay it once).  A process that publishes AND issues a VERSION pattern query
-/// then holds two symbol tables (the live one and this one); sharing the live
-/// map is exactly the assumption that broke, and proving the two maps agree
-/// for every id a snapshot references costs a full array comparison on every
-/// query.
+/// pay it once) — and NO read at all when snapshotInterner proves the
+/// snapshot's vocabulary identical to the live one and lends its interner.  A
+/// process that publishes AND issues a VERSION pattern query otherwise holds
+/// two symbol tables; sharing the live map UNPROVEN is exactly the assumption
+/// that broke, and the manifest content stamp is what makes proving it O(1)
+/// instead of a full array comparison per query.
 fn snapshotSymSet(d: *DlDb, version: u32, dfa: ?*const regexwalk.regex_dfa, set: *regexwalk.sym_set) c_long {
     if (d.dir == null) return -1;
     // A snapshot without symbols.array is a damaged store, not an empty
@@ -8394,6 +8453,91 @@ test "version pattern: a same-count, different-bytes root array cannot keep a sn
     var wrong = CollectCbCtx{};
     // ... and it cannot be widened by it either.
     try testing.expectEqual(@as(c_long, 0), dl_pattern(db, "e", 0, dzob, collectCb, &wrong));
+}
+
+test "version read: reuses the LIVE interner only when the stamp proves it identical" {
+    // THE PROOF, BOTH WAYS.  snapshotInterner borrows the live interner when the
+    // snapshot's manifest stamp and the live content stamp agree on all of
+    // (count, bytes, hash) — the duplicate 22.8 ms load `dl query` used to pay
+    // on the agent store.  Arm 2 is the shape a COUNT-ONLY gate cannot see: a
+    // db-ROOT symbols.array with the same count, the same byte length and
+    // different bytes (a restored or hand-edited root — the case 4727cb2 and
+    // df22e55 exist for).  Loosening the gate to the count makes arm 2 answer
+    // with the live map: `bob` finds nothing and `zob` matches the snapshot's
+    // row, exit 0, silently wrong.
+    const dir = "/tmp/datalog_zig_u12_symreuse";
+    rmrfTestDir(dir);
+    defer rmrfTestDir(dir);
+
+    var rootbuf: [512:0]u8 = undefined;
+    const root_path = std.fmt.bufPrintZ(&rootbuf, "{s}/symbols.array", .{dir}) catch unreachable;
+
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "e", 2));
+        const first = [2]u32{ intern_str(db.ir, "alice"), intern_str(db.ir, "nyc") };
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "e", &first, 2));
+        const bob = intern_str(db.ir, "bob"); // id 3
+        try testing.expectEqual(@as(u32, 3), bob);
+        const brow = [2]u32{ bob, first[1] };
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "e", &brow, 2));
+        try testing.expectEqual(@as(c_int, 0), dl_publish_snapshot(db)); // v1
+    }
+
+    // ARM 1 — HEALTHY STORE: root array and v1's array hold the same
+    // vocabulary, so the version read must BORROW the live interner.  Without
+    // this arm, arm 2 could pass for the wrong reason (a gate that never fires).
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        var sym: u32 = 99;
+        try testing.expectEqual(@as(c_int, 0), dl_intern_str_version(db, 1, "bob", &sym));
+        try testing.expectEqual(@as(u32, 3), sym);
+        try testing.expect(db.snap_sym_ir == db.ir); // reused, not re-parsed
+        try testing.expect(db.snap_sym_shared);
+        // The pattern path shares it and still answers the snapshot's rows.
+        const dbob = regexwalk.regex_compile("bob");
+        defer regexwalk.regex_dfa_free(dbob);
+        var got = CollectCbCtx{};
+        try testing.expectEqual(@as(c_long, 1), dl_pattern(db, "e", 0, dbob, collectCb, &got));
+        try testing.expectEqual(@as(usize, 1), got.n);
+        try testing.expectEqual(@as(u32, 3), got.rows[0][0]);
+        // dl_close must not free the borrowed interner twice (it is the live
+        // one); reaching the end of this arm with no crash is that check.
+    }
+
+    // ARM 2 — SAME COUNT, SAME BYTE LENGTH, DIFFERENT BYTES.  Only the hash can
+    // tell these apart: 3 symbols, 15 bytes, id 3 = "zob" in the root and "bob"
+    // in the snapshot.
+    try testing.expect(writeFileRaw(root_path, "alice\nnyc\nzob\n"));
+    {
+        const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+        defer dl_close(db);
+        try testing.expectEqualStrings("zob", std.mem.span(intern_str_of(db.ir, 3).?));
+        var sym: u32 = 99;
+        // The version read answers with the SNAPSHOT's id and the SNAPSHOT's
+        // name…
+        try testing.expectEqual(@as(c_int, 0), dl_intern_str_version(db, 1, "bob", &sym));
+        try testing.expectEqual(@as(u32, 3), sym);
+        const v3 = dl_intern_str_of_version(db, 1, 3) orelse return error.TestUnexpectedResult;
+        try testing.expectEqualStrings("bob", std.mem.span(v3));
+        // …because it did NOT borrow the live map.
+        try testing.expect(db.snap_sym_ir != db.ir);
+        try testing.expect(!db.snap_sym_shared);
+        // And the rows agree with the snapshot's own vocabulary, both ways: the
+        // snapshot's string matches, the live string does not.
+        const dbob = regexwalk.regex_compile("bob");
+        defer regexwalk.regex_dfa_free(dbob);
+        var got = CollectCbCtx{};
+        try testing.expectEqual(@as(c_long, 1), dl_pattern(db, "e", 0, dbob, collectCb, &got));
+        try testing.expectEqual(@as(usize, 1), got.n);
+        try testing.expectEqual(@as(u32, 3), got.rows[0][0]);
+        const dzob = regexwalk.regex_compile("zob");
+        defer regexwalk.regex_dfa_free(dzob);
+        var wrong = CollectCbCtx{};
+        try testing.expectEqual(@as(c_long, 0), dl_pattern(db, "e", 0, dzob, collectCb, &wrong));
+    }
 }
 
 test "publish persists the db-root symbols.array (rule-interned literal path)" {

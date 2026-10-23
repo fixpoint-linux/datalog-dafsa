@@ -151,18 +151,30 @@ pub const SymStamp = struct {
 /// stream: text with '\\'->"\\\\" and '\n'->"\\n", then a '\n' per symbol).
 /// Two independently seeded 64-bit Wyhashes = a 128-bit stamp.
 ///
-/// LAZY and INCREMENTAL: the hash covers rev[] slots [0, sym_hashed) only.
-/// intern_str feeds each APPEND for free when the hash is caught up (the array
-/// is append-only, so earlier bytes never change) and symStamp catches up the
-/// rest in one sequential pass.  A read-only process therefore never hashes,
-/// and a publishing one hashes the pending prefix at most once, OUTSIDE its
-/// write path — MEASURED: hashing interleaved with intern_save's per-byte write
-/// loop cost ~37 ms on a 44 MB array vs ~25 ms for the sequential catch-up, so
-/// the write path deliberately does not fuse it.
+/// INCREMENTAL: the hash covers rev[] slots [0, sym_hashed) only, and every
+/// producer feeds it in slot order as the bytes become final — intern_load
+/// feeds the whole array in ONE update (see loadImpl), intern_str feeds each
+/// APPEND (the array is append-only, so earlier bytes never change), and
+/// symStamp catches up anything left in one sequential pass.  A process
+/// therefore pays ONE pass over the array, at load, instead of a second one the
+/// first time a stamp is needed — MEASURED on the agent store (49.6 MB,
+/// 178,186 symbols): the load's split pass 11.0 -> 15.5 ms, of which ~4.3 ms is
+/// the hash pass itself.  Feeding per SYMBOL instead (two updates per line) was
+/// ~20 ms and was rejected: one update per contiguous span is the whole point.
+///
+/// The alternative — leave the hash lazy and let symStamp do the pass — was
+/// what this did before, and it costs ~25-29 ms at the first publish OR the
+/// first version read (dl.zig now asks for the stamp on that path to decide
+/// whether a snapshot's vocabulary can reuse the live interner).
 ///
 /// WHAT IS FED is literally writeSymbolsTo's output (the same function the
 /// save writes with), through one of the sinks below — so the stamp cannot
-/// drift from the bytes a save produces.
+/// drift from the bytes a save produces.  The one shortcut is taken only when
+/// it is provably the same bytes: for an array whose every line is already
+/// canonical (no backslash, or only valid escape pairs, no CRLF, no NUL), the
+/// FILE's own bytes ARE that stream, so the load hashes them in one update
+/// instead of re-encoding 178k symbols — and discards the hash if any line
+/// turns out otherwise (Splitter.done).
 const SymHash = struct {
     a: std.hash.Wyhash,
     b: std.hash.Wyhash,
@@ -179,12 +191,13 @@ const SymHash = struct {
     }
 };
 
-/// Hash sink for the CATCH-UP pass: stages the canonical bytes in one buffer
-/// and feeds the hash a whole chunk at a time.  MEASURED on the agent store's
-/// 45 MB array: one update per symbol/escape/newline (~700k calls) made the
-/// first publish of every process cost ~48 ms; 64 KiB batches make the same
-/// content hash ~29 ms (the rest is the escape scan and the staging copy, both
-/// memory-bandwidth-bound).
+/// Hash sink for canonical bytes that have to be RE-ENCODED: stages them in one
+/// buffer and feeds the hash a whole chunk at a time.  Used by symStamp's
+/// catch-up — the fallback for an interner whose load could not fuse the hash.
+/// MEASURED on the agent store's 45 MB array: one update per
+/// symbol/escape/newline (~700k calls) made the first publish of every process
+/// cost ~48 ms; 64 KiB batches make the same content hash ~29 ms (the rest is
+/// the escape scan and the staging copy, both memory-bandwidth-bound).
 const HashSink = struct {
     h: *SymHash,
     buf: [64 * 1024]u8 = undefined,
@@ -504,21 +517,27 @@ pub fn liveSymBound(ir: ?*const anyopaque) u32 {
 }
 
 /// Zig-internal (NOT a C export): the interner's content stamp — symbol count
-/// plus the running 128-bit hash of symbols.array's canonical bytes.  The
-/// publish gate (dl.zig inheritSymbolsArray) compares it with the stamp the
-/// previous snapshot recorded to decide whether that snapshot's array is
-/// already byte-identical to what intern_save would write now — replacing an
-/// unconditional 44 MB write + read-back.
+/// plus the running 128-bit hash of symbols.array's canonical bytes.  TWO
+/// readers in dl.zig, both asking "is this the same vocabulary?":
+///   - inheritSymbolsArray (publish): compares it with the stamp the previous
+///     snapshot recorded to decide whether that snapshot's array is already
+///     byte-identical to what intern_save would write now — replacing an
+///     unconditional 44 MB write + read-back;
+///   - snapshotInterner (version read): compares it with the stamp THIS
+///     snapshot's manifest recorded to decide whether the snapshot's own
+///     symbols.array holds exactly the live interner's vocabulary, in which
+///     case the version read reuses the live map instead of parsing the array
+///     a second time (MEASURED 22.8 ms on the agent store's 49.5 MB array).
 ///
-/// The hash is LAZY: intern_load hashes nothing (a read-only process must not
-/// pay a second pass over a 44 MB array it may never publish from — MEASURED:
-/// fusing it into the load costs every open ~5 ms, and it has to be thrown
-/// away and redone whenever a line needs escaping), so the first call here
-/// feeds every slot loaded since — O(one pass over the array, once per
-/// process) — and later calls are O(1) until the next append, which intern_str
-/// feeds inline.  A publish therefore pays ~29 ms of hashing instead of ~150 ms
-/// of per-byte rewriting, and nothing else pays anything.  Wyhash.final()
-/// shallow-copies its state, so stamping is idempotent.
+/// Nothing is lazy any more: intern_load feeds the hash as it parses (fusing it
+/// into the load MEASURED ~5 ms on the agent store's 49.6 MB array, against
+/// ~25-29 ms for the catch-up pass this call used to trigger), so this is O(1)
+/// for a loaded interner, and intern_str keeps it caught up on appends.  The
+/// catch-up below still exists as the safety net for anything that left slots
+/// unfed — a load whose array was not in canonical form, an interner built by
+/// internLoadNoStamp, an OOM'd slot — and it redoes the WHOLE array in slot
+/// order rather than a gap.  Wyhash.final() shallow-copies its state, so
+/// stamping is idempotent.
 pub fn symStamp(ir: ?*anyopaque) SymStamp {
     if (ir == null) return .{ .count = 0, .h0 = 0, .h1 = 0 };
     const s: *Interner = @ptrCast(@alignCast(ir.?));
@@ -710,10 +729,23 @@ fn internTimingMsg(comptime fmt: []const u8, args: anytype) void {
 /// the write index never overtakes the read index — so the first NUL in the
 /// input bounds the decoded line exactly, and the prefix is decoded the same
 /// way without a per-byte NUL test.
-fn decodeRuns(buf: [*]u8, pos: usize, seg_len_in: usize) void {
+///
+/// What it reports matters to the content-stamp feed: `canonical` means every
+/// backslash in the line was a valid "\\\\" or "\\n" pair, so re-encoding
+/// the decoded symbol reproduces the line's RAW bytes exactly — the condition
+/// under which the load's whole-file hash is the canonical stream (see
+/// Splitter.fuse_ok).  An array written by intern_save is canonical by
+/// construction; a hand-edited or older one may not be, and then the fused hash
+/// is discarded and symStamp redoes it through writeSymbolsTo.
+fn decodeRuns(buf: [*]u8, pos: usize, seg_len_in: usize) Decoded {
     var seg_len = seg_len_in;
     const p = buf + pos;
-    if (memchr(p, 0, seg_len)) |q| seg_len = @intFromPtr(q) - @intFromPtr(p);
+    var nul_free = true;
+    if (memchr(p, 0, seg_len)) |q| {
+        seg_len = @intFromPtr(q) - @intFromPtr(p);
+        nul_free = false;
+    }
+    var canonical = true;
     var in_i: usize = 0;
     var out_i: usize = 0;
     while (in_i < seg_len) {
@@ -738,12 +770,21 @@ fn decodeRuns(buf: [*]u8, pos: usize, seg_len_in: usize) void {
             in_i += 1;
         } else {
             // lone trailing backslash, or unknown escape
+            canonical = false;
             p[out_i] = '\\';
             out_i += 1;
         }
     }
     p[out_i] = 0;
+    return .{ .canonical = canonical, .nul_free = nul_free };
 }
+
+/// What the decoder learned about a line, beyond the decoded bytes: see
+/// decodeRuns.
+const Decoded = struct {
+    canonical: bool,
+    nul_free: bool,
+};
 
 /// The split/decode pass over the load buffer: one rev[] slot per physical
 /// line, in file order, each line NUL-terminated in place and (when it carries
@@ -757,7 +798,17 @@ const Splitter = struct {
     t_start: u64 = 0,
     t_esc: u64 = 0,
     t_grow: u64 = 0,
+    t_hash: u64 = 0,
     timing: bool = false,
+    // ── Content-stamp feed state (see intern_load / done) ─────────────────
+    // The file's raw bytes are hashed ONCE, before the split pass below
+    // NUL-terminates and escape-decodes them in place (that in-place edit is
+    // why the feed cannot wait).  The raw stream IS the canonical one exactly
+    // when every line is canonical — no CRLF, no embedded NUL, no
+    // non-canonical escape — so the split pass reports any violation here and
+    // `done` throws the fused hash away in favour of symStamp's catch-up.
+    fuse_ok: bool = true,
+    stamp: bool = true, // false: this map is never stamped, so do not feed
 
     /// Consume every complete line: split on '\n' up to `to`.
     fn run(self: *Splitter, to: usize) void {
@@ -786,7 +837,8 @@ const Splitter = struct {
         const buf = self.buf;
         var seg_len = end - pos;
         // One trailing '\r' (the CRLF the old strip-after-getline removed).
-        if (seg_len > 0 and buf[end - 1] == '\r') seg_len -= 1;
+        const crlf = seg_len > 0 and buf[end - 1] == '\r';
+        if (crlf) seg_len -= 1;
 
         // Decode escapes in place, the old loop's exact state machine:
         // '\\' '\\' -> 0x5C, '\\' 'n' -> 0x0A, else verbatim (a lone trailing
@@ -794,12 +846,24 @@ const Splitter = struct {
         // where the old strdup did.  A line with no '\\' (the overwhelming
         // case — memchr, vectorized) needs no copy at all: the bytes are
         // already the answer, just terminate.
-        if (memchr(buf + pos, '\\', seg_len) == null) {
+        //
+        // THE CONTENT-STAMP CHECK (see fuse_ok).  The raw bytes hashed by
+        // intern_load ARE this line's canonical encoding exactly when it has no
+        // backslash or only valid escape pairs, no CRLF strip, and no embedded
+        // NUL truncation; any violation means the fused hash is not the
+        // canonical stream and `done` discards it.  This is the same state
+        // machine that decodes the line — no second interpretation of what
+        // "canonical" means.
+        const escaped = memchr(buf + pos, '\\', seg_len) != null;
+        if (crlf) self.fuse_ok = false;
+        if (!escaped) {
+            if (memchr(buf + pos, 0, seg_len) != null) self.fuse_ok = false;
             buf[pos + seg_len] = 0;
         } else {
             self.esc_n += 1;
             const te = if (self.timing) internNowNs() else 0;
-            decodeRuns(buf, pos, seg_len);
+            const dec = decodeRuns(buf, pos, seg_len);
+            if (!dec.canonical or !dec.nul_free) self.fuse_ok = false;
             if (self.timing) self.t_esc += internNowNs() - te;
         }
 
@@ -831,6 +895,20 @@ const Splitter = struct {
     /// record, the timing probe, and the interner itself.
     fn done(self: *Splitter, len: usize, ends_nl: bool, path: [*:0]const u8, t_read: u64) *Interner {
         const ir = self.ir;
+        // SETTLE THE CONTENT STAMP.  intern_load hashed the file's raw bytes
+        // before this pass edited them in place; that stream is the canonical
+        // one when every line was canonical (fuse_ok) and the file ended at a
+        // line boundary — the last symbol's '\n' is then already in the file,
+        // and only an unterminated tail needs one appended.  Otherwise the
+        // fused hash describes bytes no save would write: drop it (sym_hashed
+        // back to 0) so symStamp recomputes from slot 1 instead.
+        if (self.stamp and self.fuse_ok) {
+            if (!ends_nl) ir.sym_hash.feed("\n");
+            ir.sym_hashed = ir.next_id - 1;
+        } else {
+            ir.sym_hash = SymHash.init();
+            ir.sym_hashed = 0;
+        }
         // The file holds exactly the ids just parsed, so a later save can
         // append to it — unless it does not end at a line boundary, in which
         // case the parse consumed a PARTIAL line and appending would join the
@@ -840,8 +918,8 @@ const Splitter = struct {
             const total = internNowNs() - self.t_start;
             const split = total - t_read; // everything after the read loop
             internTimingMsg(
-                "intern_load: bytes={d} syms={d} esc={d} read_ms={d}.{d:0>3} split_ms={d}.{d:0>3} esc_ms={d}.{d:0>3} grow_ms={d}.{d:0>3} rev_cap={d}\n",
-                .{ len, ir.next_id - 1, self.esc_n, t_read / 1_000_000, (t_read / 1000) % 1000, split / 1_000_000, (split / 1000) % 1000, self.t_esc / 1_000_000, (self.t_esc / 1000) % 1000, self.t_grow / 1_000_000, (self.t_grow / 1000) % 1000, ir.rev_cap },
+                "intern_load: bytes={d} syms={d} esc={d} read_ms={d}.{d:0>3} split_ms={d}.{d:0>3} esc_ms={d}.{d:0>3} grow_ms={d}.{d:0>3} hash_ms={d}.{d:0>3} rev_cap={d}\n",
+                .{ len, ir.next_id - 1, self.esc_n, t_read / 1_000_000, (t_read / 1000) % 1000, split / 1_000_000, (split / 1000) % 1000, self.t_esc / 1_000_000, (self.t_esc / 1000) % 1000, self.t_grow / 1_000_000, (self.t_grow / 1000) % 1000, self.t_hash / 1_000_000, (self.t_hash / 1000) % 1000, ir.rev_cap },
             );
         }
         return ir;
@@ -1077,7 +1155,23 @@ pub export fn intern_save(ir: ?*Interner, fwd_path: ?[*:0]const u8, rev_path: ?[
 /// Returns an empty interner if the rev file doesn't exist; NULL on OOM.
 /// Bulk read: one fread'd buffer split/decoded in place, rev[] pointing into
 /// it (see the body comment for the measurement that retired getline).
+/// The content stamp is fed during that same pass (see loadImpl), so a caller
+/// that needs symStamp afterwards does not re-read the array.
 pub export fn intern_load(fwd_path: ?[*:0]const u8, rev_path: ?[*:0]const u8) ?*Interner {
+    return loadImpl(fwd_path, rev_path, true);
+}
+
+/// Zig-internal (NOT a C export — abi_audit stays clean): intern_load for a
+/// map that will never be stamped — dl.zig's snapshotInterner, which builds a
+/// snapshot's OWN vocabulary, only ever looks strings up in it, and throws it
+/// away with the version.  Skips the fused content-stamp pass (MEASURED ~4.3 ms
+/// of a 49.6 MB array) and leaves sym_hashed at 0, so a later symStamp would
+/// still compute the stamp by catch-up rather than be wrong.
+pub fn internLoadNoStamp(rev_path: [*:0]const u8) ?*anyopaque {
+    return loadImpl(null, rev_path, false);
+}
+
+fn loadImpl(fwd_path: ?[*:0]const u8, rev_path: ?[*:0]const u8, want_stamp: bool) ?*Interner {
     const mem = c.calloc(1, @sizeOf(Interner)) orelse return null;
     const ir: *Interner = @ptrCast(@alignCast(mem));
     ir.* = .{
@@ -1142,7 +1236,7 @@ pub export fn intern_load(fwd_path: ?[*:0]const u8, rev_path: ?[*:0]const u8) ?*
     //
     // Without a usable size (no fstatx, or an empty/non-regular file) the
     // buffer grows while it is read, as it did before.
-    var st = Splitter{ .ir = ir, .buf = undefined, .timing = timing };
+    var st = Splitter{ .ir = ir, .buf = undefined, .timing = timing, .stamp = want_stamp };
     if (timing) st.t_start = t_start;
     var last_byte: u8 = 0; // the file's raw final byte, before the split overwrites it
     var stx: linux.Statx = undefined;
@@ -1171,6 +1265,18 @@ pub export fn intern_load(fwd_path: ?[*:0]const u8, rev_path: ?[*:0]const u8) ?*
             return ir;
         }
         last_byte = st.buf[got - 1];
+        // CONTENT STAMP, FUSED INTO THE LOAD: one hash pass over the bytes just
+        // read, taken HERE because the split pass below rewrites them in place
+        // (NUL terminators and escape decoding) — and hashing them later is the
+        // ~25-29 ms catch-up symStamp would otherwise pay the first time a
+        // publish or a version read asks for the stamp.  MEASURED on the agent
+        // store's 49.6 MB array: this pass is 4.3 ms, and it is only VALIDATED
+        // in done() (fuse_ok).
+        if (want_stamp) {
+            const th = if (timing) internNowNs() else 0;
+            ir.sym_hash.feed(st.buf[0..got]);
+            if (timing) st.t_hash = internNowNs() - th;
+        }
         st.run(got);
         st.finish();
         return st.done(got, last_byte == '\n', rev_path.?, t_read);
@@ -1219,6 +1325,13 @@ pub export fn intern_load(fwd_path: ?[*:0]const u8, rev_path: ?[*:0]const u8) ?*
 
     st.buf = buf;
     ir.load_buf = buf; // retained for intern_free, as above
+    // The content stamp is fused here for the same reason as the sized path
+    // above (the split pass edits the buffer in place).
+    if (want_stamp) {
+        const th = if (timing) internNowNs() else 0;
+        ir.sym_hash.feed(buf[0..len]);
+        if (timing) st.t_hash = internNowNs() - th;
+    }
     st.run(len);
     st.finish();
     return st.done(len, ends_nl, rev_path.?, t_read);
@@ -1451,7 +1564,7 @@ test "escape decode: run-copy answers the byte-at-a-time state machine exactly" 
         }
         @memcpy(ref[0 .. off + n + 24], fast[0 .. off + n + 24]);
         Reference.decode(&ref, off, n);
-        decodeRuns(&fast, off, n);
+        _ = decodeRuns(&fast, off, n);
         try std.testing.expectEqualSlices(u8, ref[0 .. off + n + 24], fast[0 .. off + n + 24]);
     }
 
@@ -1472,7 +1585,7 @@ test "escape decode: run-copy answers the byte-at-a-time state machine exactly" 
     };
     for (cases) |cs| {
         @memcpy(fast[off .. off + cs.in.len], cs.in);
-        decodeRuns(&fast, off, cs.in.len);
+        _ = decodeRuns(&fast, off, cs.in.len);
         try std.testing.expectEqualStrings(cs.out, std.mem.sliceTo(fast[off .. off + cs.in.len + 1], 0));
     }
 }
@@ -1637,6 +1750,44 @@ test "content stamp: append-only hash survives a save/load round trip" {
         try std.testing.expectEqual(st_a.count, st_b.count);
         try std.testing.expectEqual(st_a.h0, st_b.h0);
         try std.testing.expectEqual(st_a.h1, st_b.h1);
+    }
+}
+
+test "content stamp: a FUSED load stamp equals the catch-up stamp on every line shape" {
+    // The load hashes the file's RAW bytes before the split pass edits them, and
+    // keeps that hash only when every line is canonical (Splitter.done).  This
+    // asserts the invariant directly — the stamp a load fuses must be the stamp
+    // symStamp computes from rev[] — including for each shape that must
+    // DISQUALIFY the fuse, where a wrong (raw-byte) stamp would be silently
+    // different from the canonical one and the publish/version gates would
+    // compare against the wrong value.
+    const cases = [_][]const u8{
+        "plain\ntwo\n", // canonical, no escapes
+        "esc\\naped\nx\\\\y\n", // canonical escapes
+        "crlf\r\nline\r\n", // CRLF: the raw bytes are NOT canonical
+        "nul\x00truncated\nok\n", // embedded NUL truncates the symbol
+        "no trailing newline", // unterminated tail (a torn append)
+        "odd\\xescape\n", // non-canonical escape
+        "", // empty array
+    };
+    const path = "/tmp/datalog_zig_u12_stamp_fuse.array";
+    defer _ = c.unlink(path);
+    for (cases) |content| {
+        {
+            const wf = c.fopen(path, "w") orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(content.len, c.fwrite(content.ptr, 1, content.len, wf));
+            try std.testing.expectEqual(@as(c_int, 0), c.fclose(wf));
+        }
+        const ir = intern_load(null, path) orelse return error.OutOfMemory;
+        defer intern_free(ir);
+        const fused = symStamp(ir);
+        // Recompute the same hash from slot 1, the way the catch-up does.
+        ir.sym_hash = SymHash.init();
+        ir.sym_hashed = 0;
+        const catchup = symStamp(ir);
+        try std.testing.expectEqual(catchup.count, fused.count);
+        try std.testing.expectEqual(catchup.h0, fused.h0);
+        try std.testing.expectEqual(catchup.h1, fused.h1);
     }
 }
 
