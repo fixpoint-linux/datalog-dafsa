@@ -10610,3 +10610,56 @@ test "publish surfaces DL_E_FRAMES when a rule body exhausts the frame limit" {
     try testing.expectEqual(@as(c_int, -2), dl_publish_snapshot(db));
     try testing.expectEqual(@as(c_int, -2), dl_compile(db));
 }
+
+// ─── Removed-tier ABI shims ────────────────────────────────────────────────
+//
+// The vector tier was REMOVED (67df9ae): it needs an embedding encoder, and the
+// consumers that matter query with the words they wrote, so retrieval is lexical
+// (dl_search_top).  Two corpus entry points are kept here ONLY so binaries built
+// before the removal still LOAD: the deployed fx-agent-memory links them with
+// BIND_NOW, so a missing symbol stops it starting at all.
+//
+// They do nothing but return -1 — a LOUD error to the caller, never a silent
+// wrong answer — and they must be deleted as soon as no built consumer imports
+// them (check with `nm -D --undefined-only <binary> | grep dl_vector_`).
+// Signatures match the removed vector.h prototypes; the corpus/callback
+// parameters are taken as opaque pointers because the engine no longer has the
+// types, and a pointer argument's ABI does not depend on its pointee's type.
+
+pub export fn dl_vector_search_corpus(
+    db: ?*DlDb,
+    corpus: ?*const anyopaque,
+    q_int8: ?[*]const u32,
+    k: c_int,
+    cb: ?*const anyopaque,
+    user: ?*anyopaque,
+) c_long {
+    _ = db;
+    _ = corpus;
+    _ = q_int8;
+    _ = k;
+    _ = cb;
+    _ = user;
+    return -1;
+}
+
+pub export fn dl_vector_rerank_corpus(
+    db: ?*DlDb,
+    corpus: ?*const anyopaque,
+    q_int8: ?[*]const u32,
+    cand_syms: ?[*]const u32,
+    n_cand: c_int,
+    k: c_int,
+    cb: ?*const anyopaque,
+    user: ?*anyopaque,
+) c_long {
+    _ = db;
+    _ = corpus;
+    _ = q_int8;
+    _ = cand_syms;
+    _ = n_cand;
+    _ = k;
+    _ = cb;
+    _ = user;
+    return -1;
+}
