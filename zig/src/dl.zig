@@ -5458,8 +5458,9 @@ fn finishPublish(d: *DlDb, t_start: u64, t_cons: u64) c_int {
 /// writes <snapshot>/<rel>.dafsa, dl_close then rewrites the live path: same
 /// content, two inodes).
 ///
-/// Proof: equal size, both v4-format ('PDWG' + version 4), and the same
-/// trailing CRC32 — the checksum the format keeps over EVERY preceding byte.
+/// Proof: equal size, both CRC-bearing format (v4 or v5: 'PDWG' + version >= 4),
+/// and the same trailing CRC32 — the checksum the format keeps over EVERY
+/// preceding byte.
 /// dafsa_save renumbers states in canonical BFS order, so equal content
 /// serializes to equal bytes and therefore to an equal trailer, and that
 /// trailer is the same integrity check dafsa_load itself trusts (a file failing
@@ -5491,7 +5492,11 @@ fn relFileCrc(path: [*c]const u8, size: i64, crc_out: *[4]u8) bool {
     var head: [8]u8 = undefined;
     if (c.fread(&head, 1, head.len, f) != head.len) return false;
     if (!std.mem.eql(u8, head[0..4], "PDWG")) return false;
-    if (std.mem.readInt(u32, head[4..8], .little) != 4) return false;
+    // v4 introduced the trailing CRC32 this function reads; v5 adds a
+    // persisted state_off table BEFORE the CSR, so the trailer stays the last
+    // 4 bytes and the comparison remains valid.  Anything older has no trailer.
+    const ver = std.mem.readInt(u32, head[4..8], .little);
+    if (ver < 4) return false;
     if (fseek(f, @intCast(size - 4), SEEK_SET) != 0) return false;
     if (c.fread(crc_out, 1, 4, f) != 4) return false;
     return true;
