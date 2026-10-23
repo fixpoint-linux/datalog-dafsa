@@ -4,8 +4,9 @@
 //! cache of the reverse array (the source of truth); it is never persisted
 //! (intern_save writes only symbols.array) and rebuilt lazily from rev[].
 //! Reverse map: growable array of char* (rev[sym_id-1]) — intern_load points
-//! the slots straight into one whole-file buffer (zero per-symbol
-//! allocation), intern_str appends strdup'd ones past that.
+//! the slots straight into one whole-file buffer sized from fstatx and read in
+//! one pass (zero per-symbol allocation, no growth copies), intern_str appends
+//! strdup'd ones past that.
 //! Sym ids are 1-based; 0 = not-found sentinel.
 //!
 //! WHO ACTUALLY WANTS THE FORWARD DAFSA (as of the ensureFwd-cliff unit): no
@@ -668,6 +669,185 @@ fn writeSymbolsTo(s: *Interner, sink: anytype, from: u32, to: u32) bool {
     return sink.flush();
 }
 
+// ─── intern_load timing probe (DL_INTERN_TIMING) ─────────────────────────
+//
+// The load is the floor under every CLI invocation, so where its milliseconds
+// go is a measurement, not an assumption: the bulk-read copy, the split pass,
+// the escape-decode share of it and rev[]'s growth are timed separately on the
+// SAME file in one process.  Zero overhead when unset (one cached getenv).
+// Uses the Timespec/clock_gettime declarations further down this file.
+var intern_timing_state: i8 = -1; // -1 unknown, 0 off, 1 on
+
+fn internTimingOn() bool {
+    if (intern_timing_state < 0) {
+        const v = c.getenv("DL_INTERN_TIMING");
+        intern_timing_state = if (v != null and v.?[0] != 0) 1 else 0;
+    }
+    return intern_timing_state == 1;
+}
+
+fn internNowNs() u64 {
+    var ts: Timespec = undefined;
+    _ = clock_gettime(CLOCK_MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
+fn internTimingMsg(comptime fmt: []const u8, args: anytype) void {
+    var buf: [512]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, fmt, args) catch buf[0..0];
+    _ = c.write(2, msg.ptr, msg.len);
+}
+
+// ─── The split/decode pass ───────────────────────────────────────────────
+
+/// The escape decoder: copies the clean runs between backslashes whole.  MEASURED
+/// on the agent store's array: the escaped lines are 4,547 of 177,576 but hold
+/// 12.8 MB (avg 2.8 kB each, one backslash per ~145 bytes), so the byte loop
+/// spends its time on branch-per-byte over bytes that need no change at all.
+///
+/// Exactness: the byte loop stopped at the first embedded NUL, and no decode
+/// step can PRODUCE one (it emits 0x5C, 0x0A, or a copied non-NUL byte) while
+/// the write index never overtakes the read index — so the first NUL in the
+/// input bounds the decoded line exactly, and the prefix is decoded the same
+/// way without a per-byte NUL test.
+fn decodeRuns(buf: [*]u8, pos: usize, seg_len_in: usize) void {
+    var seg_len = seg_len_in;
+    const p = buf + pos;
+    if (memchr(p, 0, seg_len)) |q| seg_len = @intFromPtr(q) - @intFromPtr(p);
+    var in_i: usize = 0;
+    var out_i: usize = 0;
+    while (in_i < seg_len) {
+        const run = if (memchr(p + in_i, '\\', seg_len - in_i)) |q|
+            @intFromPtr(q) - @intFromPtr(p) - in_i
+        else
+            seg_len - in_i;
+        if (run != 0) {
+            std.mem.copyForwards(u8, p[out_i .. out_i + run], p[in_i .. in_i + run]);
+            in_i += run;
+            out_i += run;
+        }
+        if (in_i >= seg_len) break;
+        in_i += 1; // the '\\' itself
+        if (in_i < seg_len and p[in_i] == 'n') {
+            p[out_i] = '\n';
+            out_i += 1;
+            in_i += 1;
+        } else if (in_i < seg_len and p[in_i] == '\\') {
+            p[out_i] = '\\';
+            out_i += 1;
+            in_i += 1;
+        } else {
+            // lone trailing backslash, or unknown escape
+            p[out_i] = '\\';
+            out_i += 1;
+        }
+    }
+    p[out_i] = 0;
+}
+
+/// The split/decode pass over the load buffer: one rev[] slot per physical
+/// line, in file order, each line NUL-terminated in place and (when it carries
+/// a backslash) escape-decoded in place.
+const Splitter = struct {
+    ir: *Interner,
+    buf: [*]u8,
+    len: usize = 0,
+    pos: usize = 0,
+    esc_n: u64 = 0,
+    t_start: u64 = 0,
+    t_esc: u64 = 0,
+    t_grow: u64 = 0,
+    timing: bool = false,
+
+    /// Consume every complete line: split on '\n' up to `to`.
+    fn run(self: *Splitter, to: usize) void {
+        self.len = to;
+        const base = @intFromPtr(self.buf);
+        while (self.pos < to) {
+            const p = memchr(self.buf + self.pos, '\n', to - self.pos) orelse return;
+            const end = @intFromPtr(p) - base; // exclusive: the '\n' itself
+            self.one(self.pos, end);
+            self.pos = end + 1;
+        }
+    }
+
+    /// Consume the trailing line of a file that does not end at a line
+    /// boundary (accepted, as getline did).
+    fn finish(self: *Splitter) void {
+        if (self.pos < self.len) {
+            self.one(self.pos, self.len);
+            self.pos = self.len;
+        }
+    }
+
+    /// One physical line, [pos, end) — exactly the symbol getline+strdup
+    /// produced at that index, in the same order.
+    fn one(self: *Splitter, pos: usize, end: usize) void {
+        const buf = self.buf;
+        var seg_len = end - pos;
+        // One trailing '\r' (the CRLF the old strip-after-getline removed).
+        if (seg_len > 0 and buf[end - 1] == '\r') seg_len -= 1;
+
+        // Decode escapes in place, the old loop's exact state machine:
+        // '\\' '\\' -> 0x5C, '\\' 'n' -> 0x0A, else verbatim (a lone trailing
+        // backslash stays a backslash), stopping at an embedded NUL exactly
+        // where the old strdup did.  A line with no '\\' (the overwhelming
+        // case — memchr, vectorized) needs no copy at all: the bytes are
+        // already the answer, just terminate.
+        if (memchr(buf + pos, '\\', seg_len) == null) {
+            buf[pos + seg_len] = 0;
+        } else {
+            self.esc_n += 1;
+            const te = if (self.timing) internNowNs() else 0;
+            decodeRuns(buf, pos, seg_len);
+            if (self.timing) self.t_esc += internNowNs() - te;
+        }
+
+        // Grow rev array if needed.
+        const ir = self.ir;
+        if (ir.next_id > ir.rev_cap) {
+            const tg = if (self.timing) internNowNs() else 0;
+            var new_cap = ir.rev_cap *% 2;
+            if (new_cap < ir.next_id) new_cap = ir.next_id *% 2;
+            const nm = c.realloc(@ptrCast(ir.rev.?), @as(usize, new_cap) * @sizeOf(?[*:0]u8)) orelse {
+                // No rev[] slot was handed out for this line, so leaving the
+                // interner as it stands is what the old in-loop OOM did too.
+                return;
+            };
+            const new_rev: [*]?[*:0]u8 = @ptrCast(@alignCast(nm));
+            @memset(new_rev[ir.rev_cap..new_cap], null);
+            ir.rev = new_rev;
+            ir.rev_cap = new_cap;
+            if (self.timing) self.t_grow += internNowNs() - tg;
+        }
+
+        // Zero-copy: the slot points at the NUL-terminated line in the buffer.
+        ir.rev.?[ir.next_id - 1] = @ptrCast(buf + pos);
+        ir.buf_owned_n = ir.next_id;
+        ir.next_id += 1;
+    }
+
+    /// Bookkeeping once every line has been consumed: the appendable-prefix
+    /// record, the timing probe, and the interner itself.
+    fn done(self: *Splitter, len: usize, ends_nl: bool, path: [*:0]const u8, t_read: u64) *Interner {
+        const ir = self.ir;
+        // The file holds exactly the ids just parsed, so a later save can
+        // append to it — unless it does not end at a line boundary, in which
+        // case the parse consumed a PARTIAL line and appending would join the
+        // next symbol onto it.
+        if (ends_nl) rememberSavedAt(ir, path, len);
+        if (self.timing) {
+            const total = internNowNs() - self.t_start;
+            const split = total - t_read; // everything after the read loop
+            internTimingMsg(
+                "intern_load: bytes={d} syms={d} esc={d} read_ms={d}.{d:0>3} split_ms={d}.{d:0>3} esc_ms={d}.{d:0>3} grow_ms={d}.{d:0>3} rev_cap={d}\n",
+                .{ len, ir.next_id - 1, self.esc_n, t_read / 1_000_000, (t_read / 1000) % 1000, split / 1_000_000, (split / 1000) % 1000, self.t_esc / 1_000_000, (self.t_esc / 1000) % 1000, self.t_grow / 1_000_000, (self.t_grow / 1000) % 1000, ir.rev_cap },
+            );
+        }
+        return ir;
+    }
+};
+
 // ─── Incremental save: the durable-prefix records ────────────────────────
 //
 // A save is O(k) when the destination file is still the exact file this
@@ -934,20 +1114,69 @@ pub export fn intern_load(fwd_path: ?[*:0]const u8, rev_path: ?[*:0]const u8) ?*
 
     const f = c.fopen(rev_path.?, "r") orelse return ir; // no file: start empty
 
+    const timing = internTimingOn();
+    var t_read: u64 = 0;
+    var t_start: u64 = 0;
+    if (timing) t_start = internNowNs();
+
     // SHARED lock for the length of the read: a save that APPENDS to this file
     // holds it exclusively, so a reader can never observe a half-appended
     // array (the whole-file path commits by rename and needs no lock).  The
     // close below releases it.
     _ = c.flock(fileno(f), c.LOCK.SH);
 
-    // Bulk read the whole array into one buffer (fread on large requests
-    // bypasses stdio's buffer for direct read()s), then split/decode in
-    // place.  MEASURED on a 171,933-symbol / 44 MB array: the old loop —
-    // one getline per symbol, a byte-at-a-time escape decode and one
-    // strdup per symbol — cost ~100 ms of a CLI invocation's open; this
-    // shape answers the same ids/bytes from ~two vectorized memchr scans.
-    // The +1 is the sentinel byte a final unterminated line's NUL
-    // terminator lands in.
+    // Read the array into ONE buffer of EXACTLY its size, then split/decode it
+    // in place.  MEASURED on the agent store's 49 MB / 177,576-symbol array,
+    // where the read copy is the largest single term of a CLI invocation:
+    // sizing the buffer from fstatx up front (one malloc, one fread, no
+    // doubling) is 4.7 ms cheaper than growing it by doubling while reading —
+    // the growth path re-reads/re-copies up to a whole extra array and leaves
+    // ~15 MB of over-allocation to fault in.
+    //
+    // The size is taken from fstatx on the fd this process holds the SHARED
+    // lock on, which is what makes it trustworthy: an appender needs that lock
+    // exclusively, and a whole-file save replaces the inode (tmp+rename)
+    // without touching the one this fd refers to.  rev[] then points INTO this
+    // buffer, so it must never be realloc'd — which is exactly what pre-sizing
+    // guarantees (nothing is appended to it after the split starts).
+    //
+    // Without a usable size (no fstatx, or an empty/non-regular file) the
+    // buffer grows while it is read, as it did before.
+    var st = Splitter{ .ir = ir, .buf = undefined, .timing = timing };
+    if (timing) st.t_start = t_start;
+    var last_byte: u8 = 0; // the file's raw final byte, before the split overwrites it
+    var stx: linux.Statx = undefined;
+    const pre: usize = if (statxOfFd(fileno(f), &stx)) @intCast(stx.size) else 0;
+
+    if (pre > 0) {
+        const bufm = c.malloc(pre + 1) orelse {
+            _ = c.fclose(f);
+            intern_free(ir);
+            return null;
+        };
+        st.buf = @ptrCast(bufm);
+        // Retained for intern_free to release ONCE: every rev[] slot below
+        // buf_owned_n points into it and must not be freed individually.
+        ir.load_buf = st.buf;
+        // fread loops internally until the count is met or EOF, so one call
+        // fills the whole buffer.
+        const got = c.fread(st.buf, 1, pre, f);
+        if (timing) t_read = internNowNs() - t_start;
+        _ = c.fclose(f);
+        if (got == 0) {
+            // Empty file (or an unreadable one): empty interner, no buffer
+            // retained.  A 0-byte file IS a valid appendable prefix.
+            c.free(bufm);
+            rememberSavedAt(ir, rev_path.?, 0);
+            return ir;
+        }
+        last_byte = st.buf[got - 1];
+        st.run(got);
+        st.finish();
+        return st.done(got, last_byte == '\n', rev_path.?, t_read);
+    }
+
+    // Grow-while-reading fallback: fstatx gave no usable size.
     var cap: usize = 1 << 16;
     var len: usize = 0;
     var bufm: ?*anyopaque = c.malloc(cap + 1) orelse {
@@ -970,7 +1199,7 @@ pub export fn intern_load(fwd_path: ?[*:0]const u8, rev_path: ?[*:0]const u8) ?*
         };
         buf = @ptrCast(bufm.?);
     }
-    // Does the file end at a LINE BOUNDARY?  Read before the decode below
+    // Does the file end at a LINE BOUNDARY?  Read before the split below
     // overwrites the final '\n' with a NUL terminator.  A file that does not
     // (a torn append — the one crash shape this module can leave behind) is
     // still parsed (the last line is a symbol, as getline accepted it) but is
@@ -978,6 +1207,7 @@ pub export fn intern_load(fwd_path: ?[*:0]const u8, rev_path: ?[*:0]const u8) ?*
     // which both canonicalizes it and prevents appending onto a partial line.
     const ends_nl = len > 0 and buf[len - 1] == '\n';
     _ = c.fclose(f);
+    if (timing) t_read = internNowNs() - t_start;
 
     if (len == 0) {
         // Empty file (or an unopenable/unreadable one): empty interner, no
@@ -987,86 +1217,11 @@ pub export fn intern_load(fwd_path: ?[*:0]const u8, rev_path: ?[*:0]const u8) ?*
         return ir;
     }
 
-    ir.load_buf = buf;
-
-    // Split on '\n' and decode in place, one rev[] slot per physical line —
-    // exactly the symbols getline+strdup produced, in the same order.
-    var pos: usize = 0;
-    while (pos < len) {
-        const base = @intFromPtr(buf);
-        const end = if (memchr(buf + pos, '\n', len - pos)) |p|
-            @intFromPtr(p) - base // exclusive: the '\n' itself
-        else
-            len; // final line without a trailing '\n' (accepted, as getline did)
-
-        var seg_len = end - pos;
-        // One trailing '\r' (the CRLF the old strip-after-getline removed).
-        if (seg_len > 0 and buf[end - 1] == '\r') seg_len -= 1;
-
-        // Decode escapes in place, the old loop's exact state machine:
-        // '\\' '\\' -> 0x5C, '\\' 'n' -> 0x0A, else verbatim (a lone trailing
-        // backslash stays a backslash), stopping at an embedded NUL exactly
-        // where the old strdup did.  A line with no '\\' (the overwhelming
-        // case — memchr, vectorized) needs no copy at all: the bytes are
-        // already the answer, just terminate.
-        if (memchr(buf + pos, '\\', seg_len) == null) {
-            buf[pos + seg_len] = 0;
-        } else {
-            var in_i: usize = 0;
-            var out_i: usize = 0;
-            while (in_i < seg_len and buf[pos + in_i] != 0) {
-                if (buf[pos + in_i] == '\\') {
-                    in_i += 1;
-                    if (in_i < seg_len and buf[pos + in_i] == 'n') {
-                        buf[pos + out_i] = '\n';
-                        out_i += 1;
-                        in_i += 1;
-                    } else if (in_i < seg_len and buf[pos + in_i] == '\\') {
-                        buf[pos + out_i] = '\\';
-                        out_i += 1;
-                        in_i += 1;
-                    } else {
-                        // lone trailing backslash, or unknown escape
-                        buf[pos + out_i] = '\\';
-                        out_i += 1;
-                    }
-                } else {
-                    buf[pos + out_i] = buf[pos + in_i];
-                    out_i += 1;
-                    in_i += 1;
-                }
-            }
-            buf[pos + out_i] = 0;
-        }
-
-        // Grow rev array if needed.
-        if (ir.next_id > ir.rev_cap) {
-            var new_cap = ir.rev_cap *% 2;
-            if (new_cap < ir.next_id) new_cap = ir.next_id *% 2;
-            const nm = c.realloc(@ptrCast(ir.rev.?), @as(usize, new_cap) * @sizeOf(?[*:0]u8)) orelse {
-                intern_free(ir);
-                return null;
-            };
-            const new_rev: [*]?[*:0]u8 = @ptrCast(@alignCast(nm));
-            @memset(new_rev[ir.rev_cap..new_cap], null);
-            ir.rev = new_rev;
-            ir.rev_cap = new_cap;
-        }
-
-        // Zero-copy: the slot points at the NUL-terminated line in load_buf.
-        ir.rev.?[ir.next_id - 1] = @ptrCast(buf + pos);
-        ir.buf_owned_n = ir.next_id;
-        ir.next_id += 1;
-        pos = end + 1;
-    }
-
-    // The file holds exactly the ids just parsed, so a later save can append
-    // to it — unless it does not end at a line boundary, in which case the
-    // parse consumed a PARTIAL line and appending would join the next symbol
-    // onto it.
-    if (ends_nl) rememberSavedAt(ir, rev_path.?, len);
-
-    return ir;
+    st.buf = buf;
+    ir.load_buf = buf; // retained for intern_free, as above
+    st.run(len);
+    st.finish();
+    return st.done(len, ends_nl, rev_path.?, t_read);
 }
 
 // ─── Dirty tracking (M7) ─────────────────────────────────────────────────
@@ -1235,6 +1390,119 @@ test "bulk load: CRLF, embedded NUL, truncated final line, empty file" {
     defer intern_free(eir);
     try std.testing.expectEqual(@as(u32, 0), intern_str_find(eir, "anything"));
     try std.testing.expect(intern_str_of(eir, 1) == null);
+}
+
+test "escape decode: run-copy answers the byte-at-a-time state machine exactly" {
+    // The reference: the decoder this module used before it was rewritten to
+    // copy the clean runs between backslashes whole.  Every shape it has to
+    // answer is in here ('\\' 'n' -> LF, '\\' '\\' -> backslash, an unknown
+    // escape or a lone trailing backslash kept verbatim, a stop at the first
+    // embedded NUL), plus a seeded random corpus over exactly those bytes.
+    const Reference = struct {
+        fn decode(buf: [*]u8, pos: usize, seg_len: usize) void {
+            var in_i: usize = 0;
+            var out_i: usize = 0;
+            while (in_i < seg_len and buf[pos + in_i] != 0) {
+                if (buf[pos + in_i] == '\\') {
+                    in_i += 1;
+                    if (in_i < seg_len and buf[pos + in_i] == 'n') {
+                        buf[pos + out_i] = '\n';
+                        out_i += 1;
+                        in_i += 1;
+                    } else if (in_i < seg_len and buf[pos + in_i] == '\\') {
+                        buf[pos + out_i] = '\\';
+                        out_i += 1;
+                        in_i += 1;
+                    } else {
+                        buf[pos + out_i] = '\\';
+                        out_i += 1;
+                    }
+                } else {
+                    buf[pos + out_i] = buf[pos + in_i];
+                    out_i += 1;
+                    in_i += 1;
+                }
+            }
+            buf[pos + out_i] = 0;
+        }
+    };
+
+    // Offset the corpus inside the buffer: the caller hands the decoder a
+    // pointer into the middle of the load buffer, never index 0.
+    const off = 7;
+    var ref: [128]u8 = undefined;
+    var fast: [128]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(0x5eed_1775);
+    const rand = prng.random();
+    const alphabet = [_]u8{ 'a', 'z', ' ', 'q', '\\', 'n', 0x00, '\r', '\n' };
+
+    var round: usize = 0;
+    while (round < 20_000) : (round += 1) {
+        const n = rand.intRangeAtMost(usize, 0, 96);
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            fast[off + i] = alphabet[rand.intRangeAtMost(usize, 0, alphabet.len - 1)];
+        }
+        // Tail garbage after the segment must survive identically too.
+        i = 0;
+        while (i < 24) : (i += 1) {
+            const g = rand.int(u32);
+            fast[off + n + i] = @truncate(g);
+        }
+        @memcpy(ref[0 .. off + n + 24], fast[0 .. off + n + 24]);
+        Reference.decode(&ref, off, n);
+        decodeRuns(&fast, off, n);
+        try std.testing.expectEqualSlices(u8, ref[0 .. off + n + 24], fast[0 .. off + n + 24]);
+    }
+
+    // And the named shapes, spelled out so a corpus change cannot lose them.
+    const cases = [_]struct { in: []const u8, out: []const u8 }{
+        .{ .in = "", .out = "" },
+        .{ .in = "plain", .out = "plain" },
+        .{ .in = "a\\nb", .out = "a\nb" },
+        .{ .in = "a\\\\b", .out = "a\\b" },
+        .{ .in = "a\\qb", .out = "a\\qb" },
+        .{ .in = "trailing\\", .out = "trailing\\" },
+        .{ .in = "\\", .out = "\\" },
+        .{ .in = "\\n", .out = "\n" },
+        .{ .in = "\\\\n", .out = "\\n" },
+        .{ .in = "nul\\n\x00tail", .out = "nul\n" },
+        .{ .in = "\x00leading", .out = "" },
+        .{ .in = "\\\\\\n", .out = "\\\n" },
+    };
+    for (cases) |cs| {
+        @memcpy(fast[off .. off + cs.in.len], cs.in);
+        decodeRuns(&fast, off, cs.in.len);
+        try std.testing.expectEqualStrings(cs.out, std.mem.sliceTo(fast[off .. off + cs.in.len + 1], 0));
+    }
+}
+
+test "bulk load retains its buffer for intern_free (no leak of the array)" {
+    // intern_free frees the load buffer ONCE and the slots past buf_owned_n
+    // individually.  If intern_load stops recording the buffer, every slot
+    // below buf_owned_n becomes unfreeable and the whole array leaks — silently,
+    // since nothing else reads the field.  This pins the invariant.
+    const path = "/tmp/datalog_zig_u3_loadbuf.array";
+    defer _ = c.unlink(path);
+    {
+        const wf = c.fopen(path, "w") orelse return error.TestUnexpectedResult;
+        defer _ = c.fclose(wf);
+        try std.testing.expectEqual(@as(usize, 11), c.fwrite("one\ntwo\n3rd", 1, 11, wf));
+    }
+    const ir = intern_load(null, path) orelse return error.OutOfMemory;
+    defer intern_free(ir);
+    try std.testing.expect(ir.load_buf != null);
+    try std.testing.expectEqual(@as(u32, 3), ir.buf_owned_n);
+    try std.testing.expectEqual(@as(u32, 4), ir.next_id);
+    // Every loaded slot points INTO that buffer.
+    const lo = @intFromPtr(ir.load_buf.?);
+    var i: u32 = 0;
+    while (i < ir.buf_owned_n) : (i += 1) {
+        const p = @intFromPtr(ir.rev.?[i].?);
+        try std.testing.expect(p >= lo and p < lo + 11);
+    }
+    try std.testing.expectEqualStrings("one", std.mem.span(ir.rev.?[0].?));
+    try std.testing.expectEqualStrings("3rd", std.mem.span(ir.rev.?[2].?));
 }
 
 test "bulk load grows rev[] past initial capacity (zero-copy slots + append)" {
