@@ -1077,6 +1077,55 @@ fn parseBodyAtom(p: *parser) ?*atom {
         tokFree(lst);
         return null;
     }
+    if (t != null and (t.?.kind == TOK_INT or t.?.kind == TOK_STRING)) {
+        // Constant LHS equality: `1 = 1`, `"x" = X`, `1 = "x"`.  The compiler
+        // lowers both sides through the const-slot + OP_EQ_CONST pair, so the
+        // comparison happens in the same value space a variable LHS uses.
+        const op = peekAt(p, 1);
+        if (op != null and op.?.kind == TOK_EQ) {
+            const rhs = peekAt(p, 2);
+            if (rhs == null or (rhs.?.kind != TOK_VAR and
+                rhs.?.kind != TOK_INT and
+                rhs.?.kind != TOK_IDENT and
+                rhs.?.kind != TOK_STRING))
+            {
+                perr(p, if (rhs) |rp| rp.off else t.?.off, "parser: expected variable or constant after '=' in " ++
+                    "equality, got kind {d}\n", .{if (rhs) |rp| rp.kind else @as(c_int, 0)});
+                return null;
+            }
+            if (rhs.?.kind == TOK_VAR) {
+                const after = peekAt(p, 3);
+                if (after != null and (after.?.kind == TOK_PLUS or
+                    after.?.kind == TOK_MINUS or
+                    after.?.kind == TOK_STAR or
+                    after.?.kind == TOK_SLASH or
+                    after.?.kind == TOK_PERCENT))
+                {
+                    // `1 = X + 2` is an arithmetic assignment, which needs a
+                    // variable on the left — say so instead of mis-parsing.
+                    perr(p, after.?.off, "parser: arithmetic assignment requires a variable " ++
+                        "on the left of '='\n", .{});
+                    return null;
+                }
+            }
+            const lv = advance(p).?;
+            _ = advance(p); // =
+            const rv = advance(p).?;
+            const a = atomNew() orelse return null;
+            a.pred = strdup("=");
+            a.args = @ptrCast(@alignCast(c.malloc(2 * @sizeOf(?*token))));
+            if (a.pred == null or a.args == null) {
+                atomFree(a);
+                return null;
+            }
+            a.args.?[0] = tokDup(lv);
+            a.args.?[1] = tokDup(rv);
+            a.nargs = 2;
+            a.negated = negated;
+            return a;
+        }
+    }
+
     if (t != null and t.?.kind == TOK_VAR) {
         const op = peekAt(p, 1);
         if (op != null and op.?.kind == TOK_EQ) {
@@ -2046,4 +2095,55 @@ test "rule_free / parse_free round-trip (no leaks under valgrind in CI)" {
     try std.testing.expectEqual(@as(c_int, 1), rules[0].?.has_negation);
     rule_free(rules[0]);
     c.free(@ptrCast(rules));
+}
+
+test "body equality with a constant on the left parses (1 = 1, \"q\" = \"q\")" {
+    const p = parse_create("w(A) :- want(A,B), 1 = 1.\n") orelse return error.NoParser;
+    defer parse_free(p);
+    var n: c_int = 0;
+    const rules = parse_rules(p, &n) orelse return error.NoRules;
+    defer {
+        var i: c_int = 0;
+        while (i < n) : (i += 1) rule_free(rules[@intCast(i)]);
+        c.free(@ptrCast(rules));
+    }
+    try std.testing.expectEqual(@as(c_int, 1), n);
+    const r = rules[0].?;
+    try std.testing.expectEqual(@as(c_int, 2), r.nbody);
+    const eq = r.body.?[1].?;
+    try std.testing.expectEqualStrings("=", std.mem.span(eq.pred.?));
+    try std.testing.expectEqual(@as(c_int, 2), eq.nargs);
+    try std.testing.expectEqual(TOK_INT, eq.args.?[0].?.kind);
+    try std.testing.expectEqual(@as(c_uint, 1), eq.args.?[0].?.ival);
+    try std.testing.expectEqual(TOK_INT, eq.args.?[1].?.kind);
+
+    // A string constant on the left, a variable on the right.
+    const p2 = parse_create("s(A) :- want(A,B), 'q' = B.\n") orelse return error.NoParser;
+    defer parse_free(p2);
+    var n2: c_int = 0;
+    const r2 = parse_rules(p2, &n2) orelse return error.NoRules;
+    defer {
+        var i: c_int = 0;
+        while (i < n2) : (i += 1) rule_free(r2[@intCast(i)]);
+        c.free(@ptrCast(r2));
+    }
+    try std.testing.expectEqual(@as(c_int, 1), n2);
+    const eq2 = r2[0].?.body.?[1].?;
+    try std.testing.expectEqualStrings("=", std.mem.span(eq2.pred.?));
+    try std.testing.expectEqual(TOK_STRING, eq2.args.?[0].?.kind);
+    try std.testing.expectEqual(TOK_VAR, eq2.args.?[1].?.kind);
+
+    // `1 = X + 2` is an arithmetic assignment, which needs a variable on the
+    // left: it must be a LOUD parse error, never a silently truncated atom.
+    if (parse_create("g(A) :- want(A,B), 1 = B + 2.\n")) |bp| {
+        defer parse_free(bp);
+        var nb: c_int = 0;
+        const rb = parse_rules(bp, &nb);
+        if (rb) |rbr| {
+            var i: c_int = 0;
+            while (i < nb) : (i += 1) rule_free(rbr[@intCast(i)]);
+            c.free(@ptrCast(rbr));
+        }
+        try std.testing.expect(rb == null);
+    }
 }

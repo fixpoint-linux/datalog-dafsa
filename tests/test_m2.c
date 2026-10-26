@@ -1263,6 +1263,298 @@ static void test_strict_stratification(void)
     PASS();
 }
 
+/* ─── Existential negation: a variable bound by NOTHING under ! ─────────
+ * `!p(a,W)` with W occurring only in negated atoms is the standard's
+ * existential negation — "there is no W such that p(a,W)" — an existence
+ * probe over the columns the rule DOES bind.  Before this fix the compiler
+ * rejected it outright ("unsafe negation"), so the rule was unusable.
+ * edge rows (a,b,c): (1,10,1) (2,20,1) (2,30,2) (3,30,1) (4,2,2). */
+static void test_neg_existential_wildcard(void)
+{
+    dl_db *db;
+    tuple_set result;
+    uint32_t e[] = {1, 10, 1, 2, 20, 1, 2, 30, 2, 3, 30, 1, 4, 2, 2};
+
+    TEST("existential negation: x(R):-edge(R,U,1),!edge(R,W,2)");
+    setup_db(&db);
+    load_rows(db, "edge", 3, e, 5);
+    if (dl_load_rules(db, "x(R):-edge(R,U,1),!edge(R,W,2).") != 0) {
+        teardown_db(db);
+        FAIL("rejected: W is an existential wildcard (no other occurrence)");
+        return;
+    }
+    if (dl_compile(db) != 0) {
+        teardown_db(db);
+        FAIL("compile failed");
+        return;
+    }
+    memset(&result, 0, sizeof(result));
+    dl_query(db, "x", tset_cb, &result);
+    /* R has a col2=1 row for 1,2,3; R has a col2=2 row for 2 and 4.
+     * x = {1,3}. */
+    {
+        uint32_t want[] = {1, 3};
+        tuple_set exp;
+        memset(&exp, 0, sizeof(exp));
+        exp.data = want;
+        exp.count = 2;
+        exp.arity = 1;
+        exp.cap = 2;
+        if (!tset_eq(&result, &exp)) {
+            printf("  got %ld tuples, expected 2\n", result.count);
+            tset_free(&result);
+            teardown_db(db);
+            FAIL("existential negation: wrong answer");
+            return;
+        }
+    }
+    tset_free(&result);
+    teardown_db(db);
+    PASS();
+
+    /* Non-leading bound column: only col 1 and col 2 are bound, so the probe
+     * has no leading prefix to descend — it must still answer exactly.
+     * (W,R,2) exists for R=2 only (row (4,2,2)) -> y = {1,3}. */
+    TEST("existential negation: non-leading bound column, y(R):-edge(R,U,1),!edge(W,R,2)");
+    setup_db(&db);
+    load_rows(db, "edge", 3, e, 5);
+    if (dl_load_rules(db, "y(R):-edge(R,U,1),!edge(W,R,2).") != 0 ||
+        dl_compile(db) != 0) {
+        teardown_db(db);
+        FAIL("rejected/failed to compile");
+        return;
+    }
+    memset(&result, 0, sizeof(result));
+    dl_query(db, "y", tset_cb, &result);
+    {
+        uint32_t want[] = {1, 3};
+        tuple_set exp;
+        memset(&exp, 0, sizeof(exp));
+        exp.data = want;
+        exp.count = 2;
+        exp.arity = 1;
+        exp.cap = 2;
+        if (!tset_eq(&result, &exp)) {
+            printf("  got %ld tuples, expected 2\n", result.count);
+            tset_free(&result);
+            teardown_db(db);
+            FAIL("non-leading bound column: wrong answer");
+            return;
+        }
+    }
+    tset_free(&result);
+    teardown_db(db);
+    PASS();
+
+    /* No bound column at all: `!empty(W)` asks "is empty/1 empty?".
+     * empty={}  -> every R with a col2=1 row qualifies: {1,2,3}.
+     * any1={9}  -> the negation fails for every R: {}. */
+    TEST("existential negation: zero bound columns (!empty(W) / !any1(W))");
+    setup_db(&db);
+    load_rows(db, "edge", 3, e, 5);
+    assert(dl_declare_relation(db, "empty", 1) == 0);
+    {
+        uint32_t one[] = {9};
+        load_rows(db, "any1", 1, one, 1);
+    }
+    if (dl_load_rules(db, "z1(R):-edge(R,U,1),!empty(W).\n"
+                          "z2(R):-edge(R,U,1),!any1(W).\n") != 0 ||
+        dl_compile(db) != 0) {
+        teardown_db(db);
+        FAIL("rejected/failed to compile");
+        return;
+    }
+    memset(&result, 0, sizeof(result));
+    dl_query(db, "z1", tset_cb, &result);
+    {
+        uint32_t want[] = {1, 2, 3};
+        tuple_set exp;
+        memset(&exp, 0, sizeof(exp));
+        exp.data = want;
+        exp.count = 3;
+        exp.arity = 1;
+        exp.cap = 3;
+        if (!tset_eq(&result, &exp)) {
+            printf("  z1: got %ld tuples, expected 3\n", result.count);
+            tset_free(&result);
+            teardown_db(db);
+            FAIL("empty-relation wildcard negation: wrong answer");
+            return;
+        }
+    }
+    tset_free(&result);
+    memset(&result, 0, sizeof(result));
+    dl_query(db, "z2", tset_cb, &result);
+    if (result.count != 0) {
+        printf("  z2: got %ld tuples, expected 0\n", result.count);
+        tset_free(&result);
+        teardown_db(db);
+        FAIL("non-empty relation wildcard negation: wrong answer");
+        return;
+    }
+    tset_free(&result);
+    teardown_db(db);
+    PASS();
+}
+
+/* The wildcard relaxation must NOT accept a variable that is bound (or
+ * constrained) somewhere else in the rule — those keep the old safety rule. */
+static void test_neg_wildcard_still_rejected(void)
+{
+    dl_db *db;
+    uint32_t e[] = {1, 10, 1, 2, 20, 1};
+    static const char *bad[] = {
+        /* W appears in a LATER positive atom (not an earlier one) */
+        "b1(R):-edge(R,U,1),!edge(R,W,2),edge(W,V,1).",
+        /* W appears in an equality */
+        "b2(R):-edge(R,U,1),!edge(R,W,2),W=7.",
+        /* W reaches the HEAD — it must never be silently unbound there */
+        "b3(W):-edge(R,U,1),!edge(R,W,2).",
+        /* W appears in an arithmetic assignment */
+        "b4(R):-edge(R,U,1),!edge(R,W,2),W=U+1.",
+        /* W is REPEATED inside ONE negated atom: the same value in both
+         * positions (col0==col1).  That correlated question cannot be
+         * expressed by the bound-columns probe, which would run with ZERO
+         * bound columns and answer "is edge2 nonempty" instead — a silently
+         * different question.  edge2={(5,6)} has no tuple with col0==col1,
+         * so the correlated reading ACCEPTS every R while the probe reading
+         * rejects every R: must stay a loud rejection. */
+        "b5(R):-edge(R,U,1),!edge2(W,W).",
+        /* W appears in a comparison */
+        "b6(R):-edge(R,U,1),!edge(R,W,2),W<3.",
+        /* W is an operand of a str builtin */
+        "b7(R):-edge(R,U,1),!edge(R,W,2),prefix(W,\"a\").",
+        /* W is an operand of a list builtin */
+        "b8(R):-edge(R,U,1),!edge(R,W,2),member(W,[1,2]).",
+        /* W is an operand of a range builtin */
+        "b9(R):-edge(R,U,1),!edge(R,W,2),range(W,edge,1,3).",
+        /* W is the SOURCE var of an aggregate */
+        "b10(R,S):-edge(R,U,1),!edge(R,W,2),S=sum(W).",
+        /* W sits inside a LIST PATTERN of a positive atom */
+        "b11(R):-edge(R,U,1),!edge(R,W,2),pair([W|_],U).",
+    };
+    int i;
+
+    /* Every relation the rules mention is declared+loaded, so the ONLY error
+     * class left is the negation-safety check: the acceptance boundary is
+     * pinned, never a rejection borrowed from an unknown-predicate error. */
+    for (i = 0; i < (int)(sizeof(bad) / sizeof(bad[0])); i++) {
+        TEST(bad[i]);
+        setup_db(&db);
+        load_rows(db, "edge", 3, e, 2);
+        {
+            uint32_t p[] = {5, 6};
+            load_rows(db, "edge2", 2, p, 1);
+        }
+        {
+            uint32_t p[] = {7, 10};
+            load_rows(db, "pair", 2, p, 1);
+        }
+        if (dl_load_rules(db, bad[i]) == 0) {
+            teardown_db(db);
+            FAIL("expected rejection, got success");
+            continue;
+        }
+        teardown_db(db);
+        PASS();
+    }
+}
+
+/* A wildcard variable appearing in a SECOND negated atom is accepted: the
+ * wildcard is PER-ATOM.  Each negated atom asks its own "is there a tuple
+ * matching MY bound columns?" question, so the two probes are independent
+ * (this pins the documented per-atom reading — a shared-value reading would
+ * need a correlation the probe does not implement, cf. b5). */
+static void test_neg_wildcard_second_atom(void)
+{
+    dl_db *db;
+    tuple_set result;
+    /* (1,10,1) (2,20,1) (2,30,2) (3,30,1) (4,2,2) (9,1,9) */
+    uint32_t e[] = {1, 10, 1, 2, 20, 1, 2, 30, 2, 3, 30, 1, 4, 2, 2, 9, 1, 9};
+
+    TEST("per-atom wildcard: !edge(R,W,2),!edge(W,R,9) -> {3}");
+    setup_db(&db);
+    load_rows(db, "edge", 3, e, 6);
+    if (dl_load_rules(db, "ok(R):-edge(R,U,1),!edge(R,W,2),!edge(W,R,9).") != 0 ||
+        dl_compile(db) != 0) {
+        teardown_db(db);
+        FAIL("rejected/failed to compile");
+        return;
+    }
+    memset(&result, 0, sizeof(result));
+    dl_query(db, "ok", tset_cb, &result);
+    /* First probe (!edge(R,*,2)) holds for R=1,3.  The second probe
+     * (!edge(*,R,9)) is FALSE for R=1 because of the row (9,1,9), so the
+     * second atom's bound columns really are used: ok = {3}. */
+    if (result.count != 1 || result.arity != 1 || result.data[0] != 3) {
+        printf("  got %ld tuples, expected 1 (the value 3)\n", result.count);
+        tset_free(&result);
+        teardown_db(db);
+        FAIL("per-atom wildcard: wrong answer");
+        return;
+    }
+    tset_free(&result);
+    teardown_db(db);
+    PASS();
+}
+
+/* ─── Body equality with a CONSTANT on the left (`1 = 1`) ───────────────
+ * parseBodyAtom required a variable before '=', so `1 = 1` was a parse
+ * error ("expected predicate name, got kind 3").  want = (1,10) (2,20) (3,1). */
+static void test_eq_const_lhs(void)
+{
+    dl_db *db;
+    tuple_set result;
+    uint32_t w[] = {1, 10, 2, 20, 3, 1};
+    struct {
+        const char *head;
+        long n;
+        uint32_t first;
+    } cases[] = {
+        {"w(A) :- want(A,B), 1 = 1.", 3, 0},
+        {"f(A) :- want(A,B), 1 = 2.", 0, 0},
+        {"s(A) :- want(A,B), 'q' = 'q'.", 3, 0},
+        {"g(A) :- want(A,B), 1 = B.", 1, 3},
+    };
+    int i;
+
+    for (i = 0; i < 4; i++) {
+        TEST(cases[i].head);
+        setup_db(&db);
+        load_rows(db, "want", 2, w, 3);
+        if (dl_load_rules(db, cases[i].head) != 0) {
+            teardown_db(db);
+            FAIL("parse/compile error");
+            continue;
+        }
+        if (dl_compile(db) != 0) {
+            teardown_db(db);
+            FAIL("compile failed");
+            continue;
+        }
+        memset(&result, 0, sizeof(result));
+        dl_query(db, i == 0 ? "w" : (i == 1 ? "f" : (i == 2 ? "s" : "g")),
+                 tset_cb, &result);
+        if (result.count != cases[i].n) {
+            printf("  got %ld tuples, expected %ld\n", result.count, cases[i].n);
+            tset_free(&result);
+            teardown_db(db);
+            FAIL("wrong answer for a constant-LHS equality");
+            continue;
+        }
+        if (cases[i].n == 1 && result.data[0] != cases[i].first) {
+            printf("  got %u, expected %u\n", result.data[0], cases[i].first);
+            tset_free(&result);
+            teardown_db(db);
+            FAIL("wrong tuple for a constant-LHS equality");
+            continue;
+        }
+        tset_free(&result);
+        teardown_db(db);
+        PASS();
+    }
+}
+
 /* ─── Main ────────────────────────────────────────────────────────────── */
 
 int main(void)
@@ -1290,6 +1582,10 @@ int main(void)
     /* New regression tests (B1, B2, semi-naive correctness) */
     test_b1_head_var_unbound();
     test_b1_neg_before_pos();
+    test_neg_existential_wildcard();
+    test_neg_wildcard_still_rejected();
+    test_neg_wildcard_second_atom();
+    test_eq_const_lhs();
     test_tc_long_chain();
     test_scc_not_overmarked();
     test_mutual_recursion();

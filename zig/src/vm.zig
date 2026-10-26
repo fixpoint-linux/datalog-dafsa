@@ -211,6 +211,33 @@ fn tbufFree(tb: *TupleBuf) void {
     tb.* = std.mem.zeroes(TupleBuf);
 }
 
+/// Existence probe for a negated atom that has EXISTENTIAL (wildcard)
+/// columns — a variable the rule never binds, so `!p(a,W)` means "there is no
+/// W with p(a,W)".  `bound[j]` marks the columns the rule DOES bind; a tuple
+/// matching all of them proves the negation false, so `hit` is set and the
+/// enumeration stops early (prefixDfs propagates the non-zero return).
+/// NOTE: rel_prefix's RETURN VALUE is the number of tuples EXAMINED, not the
+/// number matched — `hit` is the answer, never the count.
+const NegProbeCtx = struct {
+    cols: *const [8]u32,
+    bound: *const [8]u8,
+    ar: c_int,
+    hit: u8 = 0,
+};
+
+fn negProbeCb(tup: ?[*]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_int {
+    _ = arity;
+    const ctx: *NegProbeCtx = @ptrCast(@alignCast(user orelse return 0));
+    const p = tup orelse return 0;
+    var j: usize = 0;
+    const n: usize = @intCast(ctx.ar);
+    while (j < n) : (j += 1) {
+        if (ctx.bound[j] != 0 and p[j] != ctx.cols[j]) return 0;
+    }
+    ctx.hit = 1;
+    return 1;
+}
+
 // ─── Bindings ──────────────────────────────────────────────────────────────
 
 const Bindings = struct {
@@ -1168,22 +1195,38 @@ fn execRange(
                     break :blk;
                 }
                 var cols: [8]u32 = undefined;
+                var bound: [8]u8 = [_]u8{0} ** 8;
                 const ar: c_int = @intCast(in.b);
-                var all: c_int = 1;
+                var n_bound: c_int = 0;
+                var lead: c_int = 0;
                 var j: c_int = 0;
                 while (j < ar) : (j += 1) {
-                    const s: u8 = in.slots[@intCast(j)];
-                    if (bOk(&b, s) == 0) {
-                        all = 0;
-                        break;
-                    }
-                    cols[@intCast(j)] = bGet(&b, s);
+                    if (bOk(&b, in.slots[@intCast(j)]) == 0) continue;
+                    cols[@intCast(j)] = bGet(&b, in.slots[@intCast(j)]);
+                    bound[@intCast(j)] = 1;
+                    n_bound += 1;
+                    // `lead` is the leading run of bound columns: only that run
+                    // can be descended as a DAFSA prefix.
+                    if (n_bound == j + 1) lead += 1;
                 }
-                if (all == 0) {
-                    if (backtrack(frames[0..], &sp, &b, p, &ip) == 0) ip = end;
+                if (n_bound == ar) {
+                    // Every column is bound: the exact-tuple test, unchanged.
+                    if (relation.rel_exact(r, &cols) != 0) {
+                        if (backtrack(frames[0..], &sp, &b, p, &ip) == 0) ip = end;
+                        break :blk;
+                    }
+                    ip += 1;
                     break :blk;
                 }
-                if (relation.rel_exact(r, &cols) != 0) {
+                // Some column is an existential wildcard (a variable the rule
+                // never binds), so the negated atom asks "does ANY tuple match
+                // the columns that ARE bound?".  The bound leading run is
+                // descended as a prefix; any further bound columns are filtered
+                // by the probe, which stops at the first match.  A wildcard
+                // column never becomes a join key.
+                var pctx = NegProbeCtx{ .cols = &cols, .bound = &bound, .ar = ar };
+                _ = relation.rel_prefix(r, &cols, @intCast(lead), negProbeCb, &pctx);
+                if (pctx.hit != 0) {
                     if (backtrack(frames[0..], &sp, &b, p, &ip) == 0) ip = end;
                     break :blk;
                 }

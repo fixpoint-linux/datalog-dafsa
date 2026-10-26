@@ -362,6 +362,56 @@ out:
     rm_dir(dir);
 }
 
+/* ─── T7: the CAS verdict the CLI's import path depends on ────────────────
+ * CONTRACT, not new behaviour: dl_txn_cas only BUFFERS the op; the conflict
+ * is detected at COMMIT and the whole transaction is refused with
+ * DL_E_CONFLICT (2), nothing applied.  The fx-agent-memory `import` path
+ * re-imports an entity that already exists at rev R != 0 and emits
+ * cas(name, 0, R) — this pins the verdict that fix relies on. */
+static void test_t7_txn_cas_conflict_contract(void)
+{
+    dl_db *db;
+    uint32_t r;
+    const char *dir = "build-tmp/cast7";
+
+    TEST("T7: begin+add_fact+cas(name,0,R) on rev!=0 -> commit DL_E_CONFLICT(2)");
+    if (DL_E_CONFLICT != 2) { FAIL("DL_E_CONFLICT is no longer 2"); return; }
+    rm_dir(dir);
+    mk_db_dir(dir);
+    db = dl_open(dir);
+    assert(db);
+
+    assert(dl_declare_relation(db, "r7", 2) == 0);
+    /* The entity already exists at rev 1 — exactly the re-import state. */
+    assert(dl_cas_revision(db, "e9", 0, 1) == 0);
+    {
+        uint32_t sym = dl_intern_str(db, "e9");
+        uint32_t row[2] = { sym, 7 };
+        if (dl_txn_begin(db) != 0) { FAIL("txn_begin"); goto out; }
+        if (dl_txn_add_fact(db, "r7", row, 2) != 0) { FAIL("txn_add_fact"); goto out; }
+        /* Buffered, NOT validated here — this is the whole contract. */
+        if (dl_txn_cas(db, "e9", 0, 2) != 0) { FAIL("txn_cas rejected the buffered op"); goto out; }
+        if (dl_txn_commit(db) != DL_E_CONFLICT) {
+            FAIL("commit did not return DL_E_CONFLICT(2)");
+            goto out;
+        }
+    }
+    /* Nothing applied: rev stays 1 and the buffered fact is absent. */
+    if (dl_rev_get(db, "e9", &r) != 0 || r != 1) { FAIL("rev changed"); goto out; }
+    {
+        uint32_t sym = dl_intern_str(db, "e9");
+        uint32_t row[2] = { sym, 7 };
+        if (dl_lookup(db, "r7", row, 2) != 0) {
+            FAIL("the conflicting txn applied its fact");
+            goto out;
+        }
+    }
+    PASS();
+out:
+    dl_close(db);
+    rm_dir(dir);
+}
+
 /* ─── Main ─────────────────────────────────────────────────────────────── */
 
 int main(void)
@@ -374,6 +424,7 @@ int main(void)
     test_t4_atomic_commit();
     test_t5_rollback();
     test_t6_crash_in_txn();
+    test_t7_txn_cas_conflict_contract();
 
     printf("\n%d tests run, %d failed\n", tests_run, tests_failed);
     return tests_failed ? 1 : 0;

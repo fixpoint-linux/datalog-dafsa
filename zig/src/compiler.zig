@@ -684,6 +684,49 @@ fn is_reserved_builtin_name(name: [*c]const u8) bool {
         strEq(name, "range");
 }
 
+fn expr_contains_var(e: ?*const parser.expr, name: [*c]const u8) bool {
+    const ee = e orelse return false;
+    if (ee.kind == parser.EX_VAR) return strEq(cs(ee.@"var"), name);
+    if (ee.kind == parser.EX_BINOP)
+        return expr_contains_var(ee.l, name) or expr_contains_var(ee.r, name);
+    return false;
+}
+
+/// True iff `name` occurs ONLY inside NEGATED relational atoms of `r`.
+///
+/// Such a variable is an EXISTENTIAL WILDCARD under negation: the rule never
+/// binds it, so `!p(a,W)` means the standard's "there is no W with p(a,W)" —
+/// an existence probe over the columns the rule DOES bind, not a join on W.
+/// Any other occurrence (the head, a positive relational atom, an equality /
+/// comparison / arithmetic / aggregate, or a builtin operand) makes the
+/// variable a real binding or constraint, and the pre-existing safety rule
+/// applies unchanged (bound by an EARLIER positive relational atom).
+fn neg_wildcard_var(r: *const parser.rule, name: [*c]const u8) bool {
+    var i: c_int = 0;
+    while (i < r.head.?.nargs) : (i += 1) {
+        if (token_contains_var(r.head.?.args.?[@intCast(i)], name) != 0) return false;
+    }
+    var in_neg = false;
+    i = 0;
+    while (i < r.nbody) : (i += 1) {
+        const ba = r.body.?[@intCast(i)] orelse continue;
+        if (ba.negated != 0 and ba.aggregate == 0 and !is_builtin_pred(ba)) {
+            var j: c_int = 0;
+            while (j < ba.nargs) : (j += 1) {
+                if (token_contains_var(ba.args.?[@intCast(j)], name) != 0) in_neg = true;
+            }
+            continue;
+        }
+        if (ba.aggregate != 0 and ba.pred != null and strEq(cs(ba.pred), name)) return false;
+        if (is_arith(ba) and expr_contains_var(ba.arith, name)) return false;
+        var j: c_int = 0;
+        while (j < ba.nargs) : (j += 1) {
+            if (token_contains_var(ba.args.?[@intCast(j)], name) != 0) return false;
+        }
+    }
+    return in_neg;
+}
+
 fn str_operand_ok(t: ?*const parser.token) bool {
     const tt = t orelse return false;
     return tt.kind == parser.TOK_VAR or tt.kind == parser.TOK_IDENT;
@@ -2320,9 +2363,28 @@ fn compile_one(db: *dl.DlDb, r: *parser.rule, rel_strata: ?[*]const c_int, recur
                 j = 0;
                 while (j < ba.nargs) : (j += 1) {
                     if (ba.args.?[@intCast(j)].?.kind == parser.TOK_VAR) {
-                        const vi = v_find(&vt, cs(ba.args.?[@intCast(j)].?.text));
+                        const vname = cs(ba.args.?[@intCast(j)].?.text);
+                        const vi = v_find(&vt, vname);
                         if (vi < 0 or bound_vars[@intCast(vi)] == 0) {
-                            cerr(r.off, "compile error: unsafe negation — variable '{s}' in negated atom '{s}' is not bound by a positive body atom (rule '{s}')\n", .{ cs(ba.args.?[@intCast(j)].?.text), cs(ba.pred), cs(r.head.?.pred) });
+                            // Existential wildcard: a variable that occurs
+                            // nowhere but in negated atoms is never bound, so
+                            // the negated atom is an existence probe over the
+                            // columns that ARE bound (VM OP_NEG_CHECK).
+                            // BUT a variable REPEATED inside one atom (p(W,W))
+                            // means the SAME value in both positions, i.e. the
+                            // correlated question "no tuple with col0==col1" —
+                            // which the bound-columns probe cannot express (it
+                            // would run with zero bound columns and answer "is
+                            // p nonempty", a silently different question).
+                            // Keep the loud rejection rather than answer it.
+                            var occ: c_int = 0;
+                            var q: c_int = 0;
+                            while (q < ba.nargs) : (q += 1) {
+                                if (ba.args.?[@intCast(q)].?.kind == parser.TOK_VAR and
+                                    strEq(cs(ba.args.?[@intCast(q)].?.text), vname)) occ += 1;
+                            }
+                            if (occ == 1 and neg_wildcard_var(r, vname)) continue;
+                            cerr(r.off, "compile error: unsafe negation — variable '{s}' in negated atom '{s}' is not bound by a positive body atom (rule '{s}')\n", .{ vname, cs(ba.pred), cs(r.head.?.pred) });
                             return null;
                         }
                     }
@@ -2800,13 +2862,17 @@ fn compile_one(db: *dl.DlDb, r: *parser.rule, rel_strata: ?[*]const c_int, recur
             if (emit_pattern(db, ba.args.?[0].?, @intCast(rs), &vt, &ib, &cc, cs(r.head.?.pred)) != 0) return null;
             continue;
         }
-        const vi_l = v_find(&vt, cs(ba.args.?[0].?.text));
-        const vi_r = v_find(&vt, cs(ba.args.?[1].?.text));
-        if (vi_l < 0 or vi_r < 0) return null;
+        // A constant on either side (`1 = 1`, `"x" = X`) goes through the
+        // same const-slot + OP_EQ_CONST pair a variable uses, so the compare
+        // runs in the one value space equality has always used.
+        const ls = cmp_operand_slot(db, ba.args.?[0], &vt, &ib, &cc, 0);
+        if (ls < 0) return null;
+        const rs = cmp_operand_slot(db, ba.args.?[1], &vt, &ib, &cc, 0);
+        if (rs < 0) return null;
         const eq = i_emit(&ib) orelse return null;
         eq.op = OP_EQ;
-        eq.a = vt.e.?[@intCast(vi_l)].slot;
-        eq.b = vt.e.?[@intCast(vi_r)].slot;
+        eq.a = @intCast(ls);
+        eq.b = @intCast(rs);
         eq.body_idx = @intCast(bi);
     }
 
@@ -3538,6 +3604,11 @@ fn checkRuleVarKinds(db: *dl.DlDb, cache: [*][HOMOG_MAX_ARITY]u8, r: *parser.rul
         while (k < ba.nargs) : (k += 1) {
             const t = ba.args.?[@intCast(k)] orelse continue;
             if (t.kind != parser.TOK_VAR) continue;
+            // An existential wildcard (a variable occurring ONLY in negated
+            // atoms) is not a join key: each negated occurrence probes its own
+            // atom's column independently, so two negated atoms over
+            // different-kind columns are NOT an int/sym conflict.
+            if (ba.negated != 0 and neg_wildcard_var(r, cs(t.text))) continue;
             const col: u8 = @intCast(k);
             const ck = relColKind(db, cache, ri, col, @intCast(ba.nargs));
             var f: usize = 0;
@@ -4486,6 +4557,126 @@ test "stratified negation: NEG_CHECK filter inside the scan frame + stratum 1" {
     try testing.expectEqualSlices(u8, &.{1}, neg.slots[0..1]); // Y bound by edge
 }
 
+test "existential negation: a variable occurring only under ! compiles to a wildcard NEG_CHECK" {
+    defer testResetToggles();
+    testResetToggles();
+
+    const path = "/tmp/datalog_zig_u8_compiler_negwild";
+    const db = testOpenDb(path);
+    defer testCloseDb(db, path);
+
+    try testing.expectEqual(@as(c_int, 0), dl.dl_declare_relation(db, "edge", 3));
+    testAddFacts(db, "edge", &.{ 1, 10, 1, 2, 30, 2 }, 3, 2);
+
+    // W occurs nowhere but in the negated atom: existential wildcard.
+    var n: c_int = 0;
+    const arr = testCompile(db, "x(R):-edge(R,U,1),!edge(R,W,2).\n", &n) orelse return error.TestUnexpectedResult;
+    defer testFreeCompiled(arr, n);
+    try testing.expectEqual(@as(c_int, 1), n);
+
+    const cr: *compiled_rule = arr[0].?;
+    try testing.expectEqualStrings("x", std.mem.span(cr.head_pred.?));
+    // edge=0, head x auto-declared=1; the negated edge lifts x to stratum 1.
+    try testing.expectEqual(@as(u8, 1), cr.head_rel_id);
+    try testing.expectEqual(@as(c_int, 1), cr.stratum);
+
+    var n_neg: c_int = 0;
+    var n_eqc: c_int = 0;
+    var neg_idx: c_int = -1;
+    var k: c_int = 0;
+    while (k < cr.n_instrs) : (k += 1) {
+        const ins = cr.instrs.?[@intCast(k)];
+        if (ins.op == OP_NEG_CHECK) {
+            n_neg += 1;
+            neg_idx = k;
+            try testing.expectEqual(@as(u8, 0), ins.a); // rel edge
+            try testing.expectEqual(@as(u8, 3), ins.b); // arity 3
+        }
+        if (ins.op == OP_EQ_CONST) n_eqc += 1;
+    }
+    try testing.expectEqual(@as(c_int, 1), n_neg);
+    // one const slot for edge's col2=1 in the positive atom, one for the
+    // negated atom's col2=2: the two bound columns of the probe.
+    try testing.expectEqual(@as(c_int, 2), n_eqc);
+
+    // The WILDCARD column's slot must be DISTINCT from both const slots (and
+    // from the bound var's): a shared slot would turn the probe into an
+    // all-bound exact test and silently answer a different question.
+    var const_slots: [2]u8 = undefined;
+    var nc: usize = 0;
+    k = 0;
+    while (k < cr.n_instrs) : (k += 1) {
+        const ins = cr.instrs.?[@intCast(k)];
+        if (ins.op == OP_EQ_CONST and nc < const_slots.len) {
+            const_slots[nc] = ins.a;
+            nc += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 2), nc);
+    const neg = cr.instrs.?[@intCast(neg_idx)];
+    // neg.slots = [R, W, const(col2)]
+    try testing.expect(neg.slots[1] != const_slots[0]);
+    try testing.expect(neg.slots[1] != const_slots[1]);
+    try testing.expect(neg.slots[1] != neg.slots[0]);
+    try testing.expect(neg.slots[2] == const_slots[0] or neg.slots[2] == const_slots[1]);
+}
+
+test "a wildcard variable repeated inside ONE negated atom is rejected" {
+    defer testResetToggles();
+    testResetToggles();
+
+    const path = "/tmp/datalog_zig_u8_compiler_negwild_repeat";
+    const db = testOpenDb(path);
+    defer testCloseDb(db, path);
+
+    try testing.expectEqual(@as(c_int, 0), dl.dl_declare_relation(db, "edge", 3));
+    try testing.expectEqual(@as(c_int, 0), dl.dl_declare_relation(db, "edge2", 2));
+    testAddFacts(db, "edge2", &.{ 5, 6 }, 2, 1);
+
+    // p(W,W) means col0 == col1 (the SAME value in both positions).  The
+    // bound-columns probe cannot express that correlation — it would run with
+    // ZERO bound columns and answer "edge2 is nonempty" instead — so the rule
+    // must stay a loud rejection rather than answer a different question.
+    const src = "x(R):-edge(R,U,1),!edge2(W,W).\n";
+    const pd = testParse(src) orelse return error.TestUnexpectedResult;
+    defer testParseFree(pd);
+    var arr: ?[*]?*compiled_rule = null;
+    var n: c_int = 0;
+    try testing.expectEqual(@as(c_int, -1), compile_rules(db, pd.rules, pd.n, &arr, &n));
+
+    var off: c_uint = 0xFFFF;
+    const msg = compile_last_error(&off) orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, std.mem.span(msg), "unsafe negation") != null);
+    try testing.expect(std.mem.indexOf(u8, std.mem.span(msg), "'W'") != null);
+}
+
+test "existential wildcard rejected when the variable is bound elsewhere" {
+    defer testResetToggles();
+    testResetToggles();
+
+    const path = "/tmp/datalog_zig_u8_compiler_negwild_rej";
+    const db = testOpenDb(path);
+    defer testCloseDb(db, path);
+
+    try testing.expectEqual(@as(c_int, 0), dl.dl_declare_relation(db, "edge", 3));
+    try testing.expectEqual(@as(c_int, 0), dl.dl_declare_relation(db, "q", 1));
+
+    // A later positive atom, an equality, and the head all make W a real
+    // variable again — each stays a loud rejection.
+    const bad = [_][*:0]const u8{
+        "p(R):-edge(R,U,1),!edge(R,W,2),edge(W,V,1).\n",
+        "p(R):-edge(R,U,1),!edge(R,W,2),W=7.\n",
+        "p(W):-edge(R,U,1),!edge(R,W,2).\n",
+    };
+    for (bad) |src| {
+        const pd = testParse(src) orelse return error.TestUnexpectedResult;
+        defer testParseFree(pd);
+        var arr: ?[*]?*compiled_rule = null;
+        var n: c_int = 0;
+        try testing.expectEqual(@as(c_int, -1), compile_rules(db, pd.rules, pd.n, &arr, &n));
+    }
+}
+
 test "unsafe negation rejected: message + rule-head offset" {
     defer testResetToggles();
     testResetToggles();
@@ -4497,7 +4688,9 @@ test "unsafe negation rejected: message + rule-head offset" {
     try testing.expectEqual(@as(c_int, 0), dl.dl_declare_relation(db, "edge", 1));
     try testing.expectEqual(@as(c_int, 0), dl.dl_declare_relation(db, "q", 1));
 
-    const src = "p(X):-edge(X),!q(Y).\n";
+    // Y is disqualified from being an existential wildcard by the equality,
+    // so the pre-existing safety rule (and its message) still applies.
+    const src = "p(X):-edge(X),!q(Y),Y=1.\n";
     const pd = testParse(src) orelse return error.TestUnexpectedResult;
     defer testParseFree(pd);
     var arr: ?[*]?*compiled_rule = null;

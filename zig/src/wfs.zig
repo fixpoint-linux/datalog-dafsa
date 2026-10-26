@@ -495,6 +495,16 @@ fn checkSubset(rules: [*]?*parser.rule, n_rules: c_int) c_int {
                     const t = a.args.?[@intCast(k)] orelse continue;
                     if (t.kind != parser.TOK_VAR) continue;
                     const vi = findVar(&vnames, nv, t);
+                    // S1 keeps the STRATIFIED path's rule here: a variable in
+                    // a negated atom must be bound by an earlier positive atom.
+                    // The stratified compiler/VM additionally accepts an
+                    // EXISTENTIAL WILDCARD (a variable occurring only in
+                    // negated atoms — "there is no W with p(a,W)"), but this
+                    // complement rewrite cannot express it: a positive wfs_c_P
+                    // atom with an unbound argument ENUMERATES Active^arity
+                    // instead of negating the existential.  Expressing it needs
+                    // a projected complement (Active^k \ pi_bound(P)) rebuilt
+                    // per round — a follow-up, not a silent narrowing here.
                     if (vi < 0 or bound[@intCast(vi)] == 0) return -1; // unsafe negation
                 }
             } else {
