@@ -29,7 +29,21 @@ extern "c" fn strdup(s: [*:0]const u8) ?[*:0]u8;
 /// termstore.h only for this constant).
 const TERM_BASE: u64 = 0x80000000;
 
-const MAX_TOKENS = 4096;
+/// Initial token-table capacity, in tokens.  A programme that fits here
+/// allocates exactly what it always did (32 KiB of pointers).
+const TOKENS_INITIAL: c_int = 4096;
+
+/// HARD CEILING on the token table, in tokens.  The table starts at
+/// TOKENS_INITIAL and DOUBLES with realloc up to this (mirroring how
+/// parse_rules grows its rules array), so a large generated programme parses
+/// instead of dying at a fixed wall — the rules array was always able to grow
+/// while the token table could not.  A programme that exceeds the ceiling is
+/// refused LOUDLY (perr: stderr + parse_last_error) rather than hitting the old
+/// silent `-1`.
+///
+/// 65536 tokens is ~6.5k rules of the shape `p(X) :- base(X).` — ~13x the
+/// largest measured plan (47 resources, ~5k tokens).
+const MAX_TOKENS: c_int = 65536;
 
 // ─── token_kind (C enum; plain c_int in the ABI) ────────────────────────────
 pub const token_kind = c_int;
@@ -156,6 +170,7 @@ const parser = struct {
     pos: [*:0]const u8, // current position
     tokens: ?[*]?*token, // token buffer (array of token*)
     ntok: c_int, // number of tokens
+    tok_cap: c_int, // token-buffer CAPACITY; doubles up to MAX_TOKENS
     cur: c_int, // current token index
     src_owned: ?[*:0]u8, // owned copy of source (for parse_create)
     line_starts: ?[*]c_uint, // heap: byte offset of the start of each line;
@@ -357,8 +372,35 @@ fn isAggregate(s: [*]const u8, len: usize) bool {
     return false;
 }
 
-fn lex(p: *parser) c_int {
-    if (p.ntok >= MAX_TOKENS) return -1;
+/// Grow the token table by doubling — the same policy parse_rules applies to
+/// its rules array — and return true when there is room for one more token.
+/// Returns false ONLY at the hard ceiling (or on OOM), and in both cases
+/// records + prints a diagnostic first: the `-1` return contract is unchanged,
+/// the message is what is new.  The old table stays valid on failure, so
+/// parse_free's single c.free(base) contract holds either way.
+fn growTokenTable(p: *parser, ceiling: c_int) bool {
+    if (p.tok_cap >= ceiling) {
+        perr(p, ptrOff(p, p.pos), "parser: program exceeds the maximum of {d} tokens " ++
+            "(the token table's hard ceiling)\n", .{ceiling});
+        return false;
+    }
+    // A hand-built parser that never set tok_cap must not realloc to zero (the
+    // store below would then write past the block): start it at the initial
+    // capacity instead.
+    const cap: c_int = if (p.tok_cap > 0) p.tok_cap else TOKENS_INITIAL;
+    const newcap: c_int = @min(cap * 2, ceiling);
+    const nt: ?[*]?*token = @ptrCast(@alignCast(c.realloc(@ptrCast(p.tokens), @as(usize, @intCast(newcap)) * @sizeOf(?*token))));
+    if (nt == null) {
+        perr(p, ptrOff(p, p.pos), "parser: out of memory growing the token table to {d} tokens\n", .{newcap});
+        return false;
+    }
+    p.tokens = nt;
+    p.tok_cap = newcap;
+    return true;
+}
+
+fn lex(p: *parser, ceiling: c_int) c_int {
+    if (p.ntok >= p.tok_cap and !growTokenTable(p, ceiling)) return -1;
 
     var s = p.pos;
 
@@ -532,12 +574,15 @@ fn lex(p: *parser) c_int {
 }
 
 /// Tokenize the entire source. Returns 0 on success, -1 on error.
-fn tokenize(p: *parser) c_int {
+/// `ceiling` is the token table's hard ceiling (MAX_TOKENS in production; a
+/// test lowers it to pin the ceiling diagnostic without building a 65k-token
+/// programme).
+fn tokenize(p: *parser, ceiling: c_int) c_int {
     while (true) {
         if (p.ntok > 0 and
             p.tokens.?[@intCast(p.ntok - 1)].?.kind == TOK_EOF)
             break;
-        if (lex(p) != 0) return -1;
+        if (lex(p, ceiling) != 0) return -1;
     }
     return 0;
 }
@@ -1569,14 +1614,15 @@ export fn parse_create(source: ?[*:0]const u8) ?*parser {
     p.pos = p.src;
     buildLineStarts(p);
 
-    p.tokens = @ptrCast(@alignCast(c.calloc(MAX_TOKENS, @sizeOf(?*token))));
+    p.tokens = @ptrCast(@alignCast(c.calloc(TOKENS_INITIAL, @sizeOf(?*token))));
     if (p.tokens == null) {
         c.free(@ptrCast(p.src_owned));
         c.free(p);
         return null;
     }
+    p.tok_cap = TOKENS_INITIAL;
 
-    if (tokenize(p) != 0) {
+    if (tokenize(p, MAX_TOKENS) != 0) {
         parse_free(p);
         return null;
     }
@@ -1601,14 +1647,15 @@ export fn parse_create_reporting(source: ?[*:0]const u8) ?*parser {
     p.pos = p.src;
     buildLineStarts(p);
 
-    p.tokens = @ptrCast(@alignCast(c.calloc(MAX_TOKENS, @sizeOf(?*token))));
+    p.tokens = @ptrCast(@alignCast(c.calloc(TOKENS_INITIAL, @sizeOf(?*token))));
     if (p.tokens == null) {
         c.free(@ptrCast(p.src_owned));
         c.free(p);
         return null;
     }
+    p.tok_cap = TOKENS_INITIAL;
 
-    if (tokenize(p) != 0)
+    if (tokenize(p, MAX_TOKENS) != 0)
         return p; // keep the parser: the caller reads parse_last_error()
 
     return p;
@@ -2146,4 +2193,81 @@ test "body equality with a constant on the left parses (1 = 1, \"q\" = \"q\")" {
         }
         try std.testing.expect(rb == null);
     }
+}
+
+/// Test-only generator for a token-heavy rule programme.  Every line has the
+/// shape `p({k}) :- base({k}).` = 10 tokens (pred, (, int, ), :-, pred, (, int,
+/// ), .), so `n_rules` lines hold exactly `10*n_rules + 1` tokens (the +1 is
+/// EOF).  The assertions derive their counts from that shape instead of
+/// hard-coding a token number, so the test documents the programme it builds.
+/// The shape deliberately reuses ONE head predicate and ONE body predicate:
+/// the engine caps a programme at 64 relations (vm.zig MAX_RELS), so a
+/// one-predicate-per-rule programme would hit that unrelated wall first.
+fn genRuleProgram(buf: []u8, n_rules: usize) ![:0]u8 {
+    var off: usize = 0;
+    var i: usize = 0;
+    while (i < n_rules) : (i += 1) {
+        off += (try std.fmt.bufPrint(buf[off..], "p({d}) :- base({d}).\n", .{ i, i })).len;
+    }
+    buf[off] = 0;
+    return buf[0..off : 0];
+}
+
+test "token table: a >4096-token programme parses (capacity grows past the old wall)" {
+    var buf: [16384]u8 = undefined;
+    const n_rules: usize = 500;
+    const src = try genRuleProgram(&buf, n_rules);
+    const want_tokens: usize = 10 * n_rules + 1; // line shape + EOF
+    try std.testing.expect(want_tokens > 4096);
+
+    // PRE-FIX: the token table was a fixed MAX_TOKENS = 4096 calloc and lex
+    // returned -1 past it, so this parse returned null for a programme whose
+    // only sin was size.
+    const p = parse_create(src.ptr) orelse return error.NoParser;
+    defer parse_free(p);
+
+    try std.testing.expectEqual(@as(c_int, @intCast(want_tokens)), p.ntok);
+    try std.testing.expect(p.tok_cap >= p.ntok);
+    try std.testing.expect(p.tok_cap > TOKENS_INITIAL); // the table GREW
+
+    var n: c_int = 0;
+    const rules = parse_rules(p, &n) orelse return error.NoRules;
+    defer {
+        var i: c_int = 0;
+        while (i < n) : (i += 1) rule_free(rules[@intCast(i)]);
+        c.free(@ptrCast(rules));
+    }
+    try std.testing.expectEqual(@as(c_int, @intCast(n_rules)), n);
+    const last = rules[@intCast(n_rules - 1)].?.head.?;
+    try std.testing.expectEqualStrings("p", std.mem.span(last.pred.?));
+    try std.testing.expectEqual(@as(c_uint, 499), last.args.?[0].?.ival);
+}
+
+test "token table: the hard ceiling is a DIAGNOSTIC, not a silent -1" {
+    // Pins the second half of the fix: reaching the ceiling must be
+    // explainable.  The ceiling is lowered to 2048 here (a hand-built parser,
+    // so no 65k-token programme is needed) and the table starts at 1024, so
+    // the >4096-token programme below hits the ceiling after ONE doubling.
+    var buf: [16384]u8 = undefined;
+    const src = try genRuleProgram(&buf, 500); // 5001 tokens
+    const ceiling: c_int = 2048;
+
+    const p: *parser = @ptrCast(@alignCast(c.calloc(1, @sizeOf(parser)) orelse return error.OutOfMemory));
+    defer parse_free(p);
+    p.src_owned = strdup(src.ptr) orelse return error.OutOfMemory;
+    p.src = p.src_owned.?;
+    p.pos = p.src;
+    buildLineStarts(p);
+    p.tokens = @ptrCast(@alignCast(c.calloc(1024, @sizeOf(?*token)) orelse return error.OutOfMemory));
+    p.tok_cap = 1024;
+
+    // The -1 return contract is unchanged; the MESSAGE is what is new.
+    try std.testing.expectEqual(@as(c_int, -1), tokenize(p, ceiling));
+    try std.testing.expectEqual(@as(c_int, 1), p.has_err);
+    try std.testing.expectEqual(@as(c_int, 2048), p.ntok); // grew, then stopped
+    const msg = parse_last_error(p, null) orelse return error.NoError;
+    try std.testing.expectEqualStrings(
+        "parser: program exceeds the maximum of 2048 tokens (the token table's hard ceiling)\n",
+        std.mem.span(msg),
+    );
 }

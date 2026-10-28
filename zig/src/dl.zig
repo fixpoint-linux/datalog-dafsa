@@ -7771,6 +7771,57 @@ test "dl query: rule load + compile + query" {
     try testing.expectEqual(@as(usize, 3), got.n);
 }
 
+const CountCbCtx = struct { n: usize = 0 };
+
+fn countCb(cols: ?[*]const u32, arity: u8, user: ?*anyopaque) callconv(.c) c_int {
+    _ = cols;
+    _ = arity;
+    const self: *CountCbCtx = @ptrCast(@alignCast(user.?));
+    self.n += 1;
+    return 0;
+}
+
+test "dl query: a >4096-token rule programme loads, compiles and queries" {
+    // Pins the token wall end to end: the parser capped a programme at 4096
+    // tokens, so a generated plan with more rules than that failed to parse at
+    // all and the caller saw a bare EngineQuery with no hint.  Each line below
+    // is `p({k}) :- base({k}).` = 10 tokens, so 500 lines is 5001 tokens — past
+    // the old wall — and the programme still has to EVALUATE, not just lex.
+    // One head and one body predicate keep the programme inside the engine's
+    // unrelated 64-relation cap (vm.zig MAX_RELS).
+    const dir = "/tmp/datalog_zig_u11_token_capacity";
+    rmrfTestDir(dir);
+    defer rmrfTestDir(dir);
+
+    const db = dl_open(dir) orelse return error.TestUnexpectedResult;
+    defer dl_close(db);
+
+    try testing.expectEqual(@as(c_int, 0), dl_declare_relation(db, "base", 1));
+    const n_rules: usize = 500;
+    var i: usize = 0;
+    while (i < n_rules) : (i += 1) {
+        const b = [1]u32{@intCast(i)};
+        try testing.expectEqual(@as(c_int, 1), dl_add_fact(db, "base", &b, 1));
+    }
+
+    var buf: [16384]u8 = undefined;
+    var off: usize = 0;
+    i = 0;
+    while (i < n_rules) : (i += 1) {
+        off += (try std.fmt.bufPrint(buf[off..], "p({d}) :- base({d}).\n", .{ i, i })).len;
+    }
+    buf[off] = 0;
+    try testing.expect(10 * n_rules + 1 > 4096); // shape-derived token count
+
+    try testing.expectEqual(@as(c_int, 0), dl_load_rules(db, buf[0..off : 0].ptr));
+    try testing.expectEqual(@as(c_int, 0), dl_compile(db));
+
+    // Every rule fires: p holds one tuple per base fact.
+    var got = CountCbCtx{};
+    try testing.expectEqual(@as(c_long, @intCast(n_rules)), dl_query(db, "p", countCb, &got));
+    try testing.expectEqual(n_rules, got.n);
+}
+
 test "dl txn commit + rollback" {
     const dir = "/tmp/datalog_zig_u11_txn";
     rmrfTestDir(dir);
